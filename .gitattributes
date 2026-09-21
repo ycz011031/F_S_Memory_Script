@@ -1,5 +1,6 @@
-# These run on Linux. CRLF would break them with a baffling ": command not found".
-*.sh   text eol=lf
-*.py   text eol=lf
-*.diff text eol=lf
+# These run on Linux. CRLF endings would break them with a baffling
+# "bash: \r: command not found" at the first line of the script.
+*.sh    text eol=lf
+*.py    text eol=lf
+*.diff  text eol=lf
 *.patch text eol=lf
