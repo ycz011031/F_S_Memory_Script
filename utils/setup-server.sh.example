@@ -30,9 +30,9 @@ CLIENT_PWD=""
 # ==================================================================== paths
 # Must resolve to the SAME absolute path on BOTH machines: the runner builds
 # the remote command locally and ships it over ssh as a literal.
-DEP_DIR="/home/yz69"              # TODO confirm: /home/yz69 or /fast-lab-share/...
+DEP_DIR="/home/yz69"
 REPO_NAME="F_S_Memory_Script"     # this clone's directory name
-PCM_DIR="/home/yz69/tools/pcm"    # TODO confirm: own build, or /home/jiaqi/tools/pcm
+PCM_DIR="/home/jiaqi/tools/pcm"   # world-executable; your own build is safer long-term
 
 REPO_DIR="$DEP_DIR/$REPO_NAME"
 
@@ -86,14 +86,23 @@ CLIENT_NIC_IPS=( "192.168.10.52" "192.168.100.90" )
 # and watch total IOTLB misses and per-NIC iperf3 throughput -- but do not claim
 # "NIC-1's misses rose"; you cannot see that here.
 #
-# They also share that root port's bandwidth: x16 @ 16GT/s (PCIe 4.0) is about
-# 220 Gbps usable. 2x100G would be ~90% of it, but the Broadwell sender caps
-# near 100-130 Gbps aggregate, landing the root port around 60% -- so PCIe
-# should not be saturated and the contention you observe should be IOMMU-side.
-# Verify with PCIe_wr_tput before drawing conclusions.
+# BANDWIDTH -- UNRESOLVED, and it decides whether dual-NIC is even possible.
+# Each NIC negotiated x8 @ 16GT/s (PCIe 4.0), NOT x16:
+#     16 GT/s * 8 lanes * 128/130 = ~126 Gbps usable per NIC.
+# That is just enough for one 100G NIC. The open question is the width of the
+# hops they SHARE -- the switch upstream port 0000:97:00.0 and the root port
+# 0000:96:02.0:
+#   - shared hop x16 (~252 Gbps): both NICs fit; contention seen should be
+#     IOMMU-side, especially since the Broadwell sender caps near 100-130 Gbps
+#   - shared hop x8  (~126 Gbps): BOTH NICs share one NIC's worth of bandwidth.
+#     Dual-NIC is PCIe-bound from the start and any degradation is link
+#     contention, not IOMMU contention. The experiment would need rethinking.
+# Section 2 of discover-pcie-topology.sh now measures every hop and prints the
+# shared-path budget. Run it before trusting any dual-NIC number, and confirm
+# against PCIe_wr_tput once traffic is flowing.
 #
-# TODO confirm the exact string once PCM is built (section 3 of the discovery
-# script). Both entries are intentionally identical.
+# TODO confirm the exact pattern string from section 3 of the discovery script.
+# Both entries are intentionally identical (shared root port, see above).
 SERVER_PCIE_PATTERNS=(
     "Socket1,IIO Stack 0 - PCIe0,Part0"
     "Socket1,IIO Stack 0 - PCIe0,Part0"
@@ -110,9 +119,9 @@ PCIE_COUNTERS_SHARED=1
 SERVER_CORES=( "42,44,48,52,56"  "58,60,62,66,68" )
 
 # styx-tower: 28 logical / 14 physical, single NUMA node. Use PHYSICAL cores
-# only -- hyperthread siblings share a pipeline and will not add throughput.
-# TODO verify the physical set:  lscpu -p=CPU,CORE | grep -v '^#' | head -30
-CLIENT_CORES=( "0,1,2,3,4,5,6"   "7,8,9,10,11,12,13" )
+# only: CPUs 0-13 are the 14 physical cores, 14-27 are their HT siblings.
+# Verified 2026-09-27 via lscpu -p=CPU,CORE.
+CLIENT_CORES=( "0,1,2,3,4,5,6"   "7,8,9,10,11,12,13" )   # verified: CPUs 0-13 are the 14 physical cores
 
 # Disjoint port ranges so the two NICs' iperf3 groups never collide.
 BASE_PORTS=( 3000 4000 )
@@ -125,7 +134,7 @@ BANDWIDTH="100g"
 DURATION=20
 
 # Sender ceiling note: styx-tower is a 14-core 2.0 GHz Broadwell with 40 PCIe
-# 3.0 lanes. Two 100G links (2x x16 = 32 lanes) fit electrically, but ~200 Gbps
+# 3.0 lanes. The icx NICs negotiated x8 (~126 Gbps each), so ~200 Gbps
 # of TCP from these cores is not realistic -- budget for roughly 100-130 Gbps
 # aggregate. Measure the single-NIC ceiling on each link BEFORE trusting any
 # dual-NIC number, or a sender-bound run will read as "the IOMMU is free".

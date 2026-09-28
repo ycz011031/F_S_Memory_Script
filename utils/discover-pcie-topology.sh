@@ -9,7 +9,27 @@
 set -u
 
 HERE=$(cd "$(dirname "$0")" && pwd)
+
+# An explicit PCM_DIR from the environment must win over setup-server.sh,
+# otherwise `sudo PCM_DIR=... bash this` is silently overridden by the file.
+PCM_DIR_ENV="${PCM_DIR:-}"
 [ -f "$HERE/setup-server.sh" ] && . "$HERE/setup-server.sh" 2>/dev/null
+[ -n "$PCM_DIR_ENV" ] && PCM_DIR="$PCM_DIR_ENV"
+
+# "16GT/s x8" for a bdf, from its LnkSta line.
+bdf_link() {
+    lspci -vv -s "$1" 2>/dev/null | awk '/LnkSta:/{
+        for(n=1;n<=NF;n++){if($n=="Speed")s=$(n+1);if($n=="Width")w=$(n+1)}
+        gsub(/,/,"",s); gsub(/,/,"",w); print s" "w; exit}'
+}
+
+# Usable Gbps for a "<speed> <width>" pair. 8GT/s and up use 128b/130b
+# encoding; 2.5 and 5 GT/s use 8b/10b.
+link_gbps() {
+    local s="${1%GT/s}" w="${2#x}"
+    case "$s$w" in ''|*[!0-9.]*) echo 0; return ;; esac
+    awk -v s="$s" -v w="$w" 'BEGIN{ printf "%d", s*w*((s+0>=8)?128/130:0.8) }'
+}
 
 # Locate pcm-iio: config, then PATH, then the usual build spots.
 PCM_IIO=""
@@ -84,12 +104,81 @@ rm -f "$RPFILE"
 
 echo
 echo "=============================================================="
-echo "== 2. Root port chain per NIC"
+echo "== 2. Per-hop link width along each NIC's PCIe path"
 echo "=============================================================="
+echo "  The NARROWEST hop caps that NIC. For NICs sharing a root port, the"
+echo "  narrowest SHARED hop caps them COLLECTIVELY -- that is the number that"
+echo "  decides whether running both at once is physically possible."
 for i in "${INTFS[@]}"; do
     dev=$(readlink -f "/sys/class/net/$i/device" 2>/dev/null) || continue
-    echo "$i:"
-    printf '%s' "$dev" | tr '/' '\n' | grep -E '^(pci)?[0-9a-f]{4}:' | sed 's/^/    /'
+    chain=$(printf '%s' "$dev" | tr '/' '\n' | grep -E '^[0-9a-f]{4}:[0-9a-f]{2}:')
+    total=$(printf '%s\n' "$chain" | grep -c .)
+    echo
+    echo "  $i:"
+    n=0
+    printf '%s\n' "$chain" | while read -r bdf; do
+        [ -z "$bdf" ] && continue
+        n=$((n+1))
+        if   [ "$n" -eq 1 ];      then role="root port"
+        elif [ "$n" -eq "$total" ]; then role="NIC"
+        elif [ "$n" -eq 2 ];      then role="switch upstream"
+        else                           role="switch downstream"
+        fi
+        l=$(bdf_link "$bdf")
+        if [ -n "$l" ]; then
+            g=$(link_gbps $l)
+            printf '    %-14s %-18s %-12s ~%s Gbps\n' "$bdf" "$role" "$l" "$g"
+        else
+            printf '    %-14s %-18s %s\n' "$bdf" "$role" "(no LnkSta)"
+        fi
+    done
+done
+
+echo
+echo "  -- shared-path budget --"
+# For each root port with >1 NIC, compare the sum of the NICs' own link
+# bandwidth against the narrowest hop they share. If the shared hop is
+# smaller, concurrent full-rate operation is impossible by construction.
+for rp in $(for i in "${INTFS[@]}"; do
+        dev=$(readlink -f "/sys/class/net/$i/device" 2>/dev/null) || continue
+        printf '%s' "$dev" | tr '/' '\n' | grep -E '^[0-9a-f]{4}:[0-9a-f]{2}:' | head -1
+    done | sort -u); do
+    members=""; sum=0; upg=""
+    for i in "${INTFS[@]}"; do
+        dev=$(readlink -f "/sys/class/net/$i/device" 2>/dev/null) || continue
+        chain=$(printf '%s' "$dev" | tr '/' '\n' | grep -E '^[0-9a-f]{4}:[0-9a-f]{2}:')
+        [ "$(printf '%s\n' "$chain" | head -1)" = "$rp" ] || continue
+        # only count NICs that actually have carrier
+        sp=$(cat "/sys/class/net/$i/speed" 2>/dev/null)
+        case "$sp" in ''|-*|0) continue ;; esac
+        members="$members $i"
+        g=$(link_gbps $(bdf_link "$(printf '%s\n' "$chain" | tail -1)"))
+        sum=$((sum + g))
+    done
+    [ -z "$members" ] && continue
+    cnt=$(printf '%s' "$members" | wc -w)
+    [ "$cnt" -lt 2 ] && continue
+    # narrowest hop on the shared prefix (root port + switch upstream)
+    shared_min=0
+    for bdf in "$rp" $(for i in $members; do
+            dev=$(readlink -f "/sys/class/net/$i/device"); printf '%s' "$dev" \
+              | tr '/' '\n' | grep -E '^[0-9a-f]{4}:[0-9a-f]{2}:' | sed -n 2p
+        done | sort -u); do
+        g=$(link_gbps $(bdf_link "$bdf"))
+        [ "$g" -gt 0 ] || continue
+        if [ "$shared_min" -eq 0 ] || [ "$g" -lt "$shared_min" ]; then shared_min=$g; fi
+    done
+    echo
+    echo "  root port $rp  <-$members"
+    echo "    sum of per-NIC links : ~$sum Gbps"
+    echo "    narrowest shared hop : ~$shared_min Gbps"
+    if [ "$shared_min" -gt 0 ] && [ "$shared_min" -lt "$sum" ]; then
+        echo "    => SHARED HOP IS THE BOTTLENECK. Concurrent full rate is not"
+        echo "       possible; expect roughly $shared_min Gbps aggregate, and treat"
+        echo "       any degradation as PCIe contention until proven otherwise."
+    elif [ "$shared_min" -gt 0 ]; then
+        echo "    => shared path has headroom; contention should be IOMMU-side."
+    fi
 done
 
 if [ -z "$PCM_IIO" ]; then
