@@ -35,7 +35,7 @@ fi
 warmup_time=10
 
 # 5 10 20 40
-for i in 80; do
+for i in 5; do
     for j in $(seq 1 1 1) # start from 1, increment by 2 until 10
     do
         cd $working_dir
@@ -45,8 +45,8 @@ for i in 80; do
         # exp_name="$(uname -r)-${iommu_config}-flow-${format_i}-core4-warmup${warmup_time}-leshna"
         exp_name="$(uname -r)-${iommu_config}-flow-${format_i}-test"
         echo $exp_name
-        exp_name="${exp_name}-pips-6.12"
-        bash ./run-dctcp-tput-experiment.sh -E "$exp_name" --num_servers $i --num_clients $i -c '40,44,48,52,56' --bandwidth '100g'
+        exp_name="${exp_name}-pips-client-6.12"
+        bash ./run-dctcp-tput-experiment-client.sh -E "$exp_name" --num_servers $i --num_clients $i -c '56,58,60,62,64,68,70,74,76,78' --bandwidth '100g'
         # sudo bash -c "./run-dctcp-tput-experiment.sh -E '$exp_name' -M 4000 --num_servers $i --num_clients $i -c '0,4,8,12,16' --ring_buffer 256 --buf 1 --mlc_cores 'none' --bandwidth '100g' --server_intf $SERVER_INTF --client_intf $CLIENT_INTF"
 
     # > /dev/null 2>&1
@@ -67,6 +67,8 @@ for i in 80; do
 
         python3 sosp24-experiments/count_invalidation.py --dir "../utils/reports/$exp_name" 
     done
+
+    sleep 60
     
 done
 

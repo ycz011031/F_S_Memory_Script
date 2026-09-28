@@ -182,7 +182,7 @@ function cleanup() {
     sleep 2
     sudo ip link set $server_intf up
     sleep 2
-    sudo bash /home/benny/restart.sh
+    # sudo bash /home/benny/restart.sh
 }
 
 
@@ -197,8 +197,6 @@ sudo bash /home/benny/restart.sh
 #### start MLC
 sudo bash ../utils/set_mba_levels.sh
 cd /home/benny/hostCC/src
-sudo rm hostcc-module.ko
-sudo make
 if [ "$mlc_cores" = "none" ]; then
     echo "No MLC instance used..."
     echo "sudo insmod hostcc-module.ko mode=0 target_iio_wr_thresh=70 target_pcie_thresh=84"
@@ -230,7 +228,7 @@ cd -
 
 echo "starting server instances..."
 cd $exp_dir
-sudo bash run-netapp-tput.sh -m server -S $num_servers -o $exp-RUN-$j -p $init_port -c $cpu_mask &
+sudo bash run-netapp-tput.sh -m server -S $num_servers -o $exp-RUN-server-$j -p $init_port -c $cpu_mask &
 sleep 2
 cd -
 
@@ -240,7 +238,7 @@ sudo echo 1 > /sys/kernel/debug/tracing/tracing_on
 
 #### setup and start clients
 echo "setting up and starting clients..."
-sshpass -p $password ssh $uname@$ssh_hostname 'screen -dmS client_session sudo bash -c "cd '$setup_dir'; sudo bash setup-envir.sh -i '$client_intf' -a '$client' -m '$mtu' -d '$ddio' --ring_buffer '$ring_buffer' --buf '$buf' -f 1 -r 0 -p 0 -e 0 -o 1; cd '$exp_dir'; sudo bash run-netapp-tput.sh -m client -a '$server' -C '$num_clients' -S '$num_servers' -o '$exp'-RUN-'$j' -p '$init_port' -c '$cpu_mask' -b '$bandwidth'; exec bash"'
+sshpass -p $password ssh $uname@$ssh_hostname 'screen -dmS client_session sudo bash -c "cd '$setup_dir'; sudo bash setup-envir.sh -i '$client_intf' -a '$client' -m '$mtu' -d '$ddio' --ring_buffer '$ring_buffer' --buf '$buf' -f 1 -r 0 -p 0 -e 0 -o 1; cd '$exp_dir'; sudo bash run-netapp-tput.sh -m client -a '$server' -C '$num_clients' -S '$num_servers' -o '$exp'-RUN-client-'$j' -p '$init_port' -c '$cpu_mask' -b '$bandwidth'; exec bash"'
 
 #### warmup
 echo "warming up..."
@@ -249,17 +247,17 @@ progress_bar 10 1
 #record stats
 ##start sender side logging
 echo "starting logging at client..."
-sshpass -p $password ssh $uname@$ssh_hostname 'screen -dmS logging_session sudo bash -c "cd '$setup_dir'; sudo bash record-host-metrics.sh -f 0 -t 1 -i '$client_intf' -o '$exp-RUN-$j' --type 0 --cpu_util 1 --retx 1 --pcie 0 --membw 0 --dur '$dur' --cores '$cpu_mask' ; exec bash"'
+sshpass -p $password ssh $uname@$ssh_hostname 'screen -dmS logging_session sudo bash -c "cd '$setup_dir'; sudo bash record-host-metrics.sh -f 0 -t 1 --intf '$client_intf' -o '$exp-RUN-client-$j' --type 0 --cpu-util 1 --retx 1 --pcie 0 --membw 0 --dur '$dur' --cores '$cpu_mask' ; exec bash"'
 
 ##start receiver side logging
 echo "starting logging at server..."
 cd $setup_dir
-sudo bash record-host-metrics.sh -f 0 -I 1 -t 1 -i $server_intf -o $exp-RUN-$j --type 0 --cpu_util 1 --pcie 1 --membw 1 --dur $dur --cores $cpu_mask
+sudo bash record-host-metrics.sh -f 0 --iio 1 -t 1 --intf $server_intf -o $exp-RUN-server-$j --type 0 --cpu_util 1 --pcie 1 --membw 1 --dur $dur --cores $cpu_mask
 echo "done logging..."
 cd -
 
 #transfer sender-side info back to receiver
-sshpass -p $password scp $uname@$ssh_hostname:$setup_dir/reports/$exp-RUN-$j/retx.rpt $setup_dir/reports/$exp-RUN-$j/retx.rpt
+sshpass -p $password scp $uname@$ssh_hostname:$setup_dir/reports/$exp-RUN-client-$j/retx.rpt $setup_dir/reports/$exp-RUN-server-$j/retx.rpt
 
 sleep $(($dur * 2))
 

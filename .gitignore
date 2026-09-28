@@ -162,3 +162,16 @@ x509.genkey
 
 # Documentation toolchain
 sphinx_*/
+
+# --- ICX / PIPS testbed additions ---
+utils/setup-server.sh
+linux-6.0.3/*
+linux-6.0.3.tar.gz
+*.log
+*.png
+*.out
+utils/logs/
+utils/reports/
+utils/collect_iio_occ
+pcie-topology.csv
+pcie-topology.txt

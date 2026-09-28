@@ -19,4 +19,3 @@ python3 report-tput-metrics.py hcc-mlc2 tput
 echo "Running hostcc mlc3 experiment... this may take a few minutes"
 sudo bash run-dctcp-tput-experiment-hcc.sh -E "hcc-mlc3" -M 4000 --num_servers 5 --num_clients 5 -c "4,8,12,16,20" --ring_buffer 256 --buf 1 --mlc_cores '1,2,3' --bandwidth "100g" --server_intf ens2f1np1 > /dev/null 2>&1
 python3 report-tput-metrics.py hcc-mlc3 tput
-

@@ -8,9 +8,11 @@ NUM_RUNS = int(sys.argv[2])
 COLLECT_MLC_TPUT = int(sys.argv[3])
 
 FILE_NAME = "../utils/reports/" + EXP_NAME
+print("Collecting throughput metrics for experiment:", EXP_NAME, "with", NUM_RUNS, "runs and MLC throughput collection set to", COLLECT_MLC_TPUT)
 command = 'mkdir -p ' + FILE_NAME
 result = subprocess.run(command, shell=True, capture_output=True, text=True)
 
+print("Collecting throughput stats from all runs and storing to", FILE_NAME + '/tput_metrics.dat')
 
 net_tputs = []
 retx_rates = []
@@ -28,14 +30,14 @@ cpu_utils = []
 mlc_tputs = []
 
 for i in range(NUM_RUNS):
-    with open(FILE_NAME + '-RUN-' + str(i) + '/iperf.bw.rpt') as f1:
+    with open(FILE_NAME + '-RUN-server-' + str(i) + '/iperf.bw.rpt') as f1:
         for line in f1:
             tput = float(line.split()[-1])
             if (tput > 0):
                 net_tputs.append(tput)
             break
 
-    with open(FILE_NAME + '-RUN-' + str(i) + '/retx.rpt') as f1:
+    with open(FILE_NAME + '-RUN-server-' + str(i) + '/retx.rpt') as f1:
         for line in f1:
             line_str = line.split()
             if (line_str[0] == 'Retx_percent:'):  # always come last so we can break
@@ -47,11 +49,11 @@ for i in range(NUM_RUNS):
                 sent = float(line_str[-1])
                 sent_packets.append(sent)
 
-    with open(FILE_NAME + '-RUN-' + str(i) + '/membw.rpt') as f1:
+    with open(FILE_NAME + '-RUN-server-' + str(i) + '/membw.rpt') as f1:
         try:
             for line in f1:
                 line_str = line.split()
-                if (line_str[0] != 'Node0_total_bw:'):
+                if (line_str[0] != 'Node1_total_bw:'):
                     continue
                 else:
                     membw = float(line_str[-1])
@@ -61,7 +63,7 @@ for i in range(NUM_RUNS):
         except Exception as e:
             mem_bws.append(0)
 
-    with open(FILE_NAME + '-RUN-' + str(i) + '/cpu_util.rpt') as f1:
+    with open(FILE_NAME + '-RUN-server-' + str(i) + '/cpu_util.rpt') as f1:
         for line in f1:
             line_str = line.split()
             if (line_str[0] != 'avg_cpu_util:'):
@@ -72,7 +74,7 @@ for i in range(NUM_RUNS):
                     cpu_utils.append(cpu_util)
                 break
     try: 
-        with open(FILE_NAME + '-RUN-' + str(i) + '/pcie.rpt') as f1:
+        with open(FILE_NAME + '-RUN-server-' + str(i) + '/pcie.rpt') as f1:
             for line in f1:
                 line_str = line.split()
                 if (line_str[0] == 'PCIe_wr_tput:'):
@@ -121,8 +123,9 @@ for i in range(NUM_RUNS):
 
 
 net_tput_mean = statistics.mean(net_tputs)
+# the -client and randread runners skip the retx scp, so these can be empty
 retx_rate_mean = statistics.mean(retx_rates) if retx_rates else 0
-sent_packets_mean = statistics.mean(sent_packets)
+sent_packets_mean = statistics.mean(sent_packets) if sent_packets else 0
 mem_bw_mean = statistics.mean(mem_bws)
 pcie_wr_tput_mean = statistics.mean(pcie_wr_tput)
 iotlb_hits_mean = statistics.mean(iotlb_hits)

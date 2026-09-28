@@ -34,10 +34,10 @@ eval set -- "$OPTS"
 
 #default values
 exp="dctcp-lat-test"
-server="192.168.11.116"
-client="192.168.11.117"
-server_intf="ens2f1np1"
-client_intf="ens2f1"
+server=$SERVER_NIC_IP
+client=$CLIENT_NIC_IP
+server_intf=$SERVER_INTF
+client_intf=$CLIENT_INTF
 num_servers=5
 num_clients=5
 init_port=3000
@@ -51,21 +51,15 @@ mlc_cores="none"
 mlc_dur=100
 ring_buffer=256
 num_runs=1
-home="/home/benny"
+home=$DEP_DIR
 setup_dir=$home/Fast-and-Safe-IO-Memory-Protection/utils
 exp_dir=$home/Fast-and-Safe-IO-Memory-Protection/utils/tcp
 mlc_dir=$home/mlc/Linux
 
-# echo -n "Enter SSH Username for client:"
-# read uname
-# echo -n "Enter SSH Address for client:"
-# read addr
-# echo -n "Enter SSH Password for client:"
-# read -s password
-uname=benny
-addr=192.168.11.117
-ssh_hostname=genie04.cs.cornell.edu
-password=benny
+
+uname=$CLIENT_USERNAME
+ssh_hostname=$CLIENT_SSH_IP
+password=$CLIENT_PWD
 
 
 while :
@@ -158,11 +152,11 @@ function cleanup() {
     sudo pkill -9 -f loaded_latency
     sudo pkill -9 -f iperf
     sudo pkill -9 -f netperf
-    sshpass -p $password ssh $uname@$addr 'screen -S $(screen -list | awk "/\\.client_session\t/ {print \$1}") -X quit'
-    sshpass -p $password ssh $uname@$addr 'screen -S $(screen -list | awk "/\\.logging_session\t/ {print \$1}") -X quit'
-    sshpass -p $password ssh $uname@$addr 'screen -wipe'
-    sshpass -p $password ssh $uname@$addr 'sudo pkill -9 -f iperf'
-    sudo bash /home/benny/restart.sh
+    sshpass -p $password ssh $uname@$ssh_hostname 'screen -S $(screen -list | awk "/\\.client_session\t/ {print \$1}") -X quit'
+    sshpass -p $password ssh $uname@$ssh_hostname 'screen -S $(screen -list | awk "/\\.logging_session\t/ {print \$1}") -X quit'
+    sshpass -p $password ssh $uname@$ssh_hostname 'screen -wipe'
+    sshpass -p $password ssh $uname@$ssh_hostname 'sudo pkill -9 -f iperf'
+    # sudo bash /home/benny/restart.sh
 }
 
 
@@ -199,7 +193,7 @@ cd -
 
 #### setup and start clients, and netserver on the client machine
 echo "setting up and starting clients..."
-sshpass -p $password ssh $uname@$addr 'screen -dmS client_session sudo bash -c "cd '$setup_dir'; sudo bash setup-envir.sh -i '$client_intf' -a '$client' -m '$mtu' -d '$ddio' -f 1 -r 0 -p 0 -e 1 -b 1 -o 1; cd '$exp_dir'; sudo bash run-netapp-tput.sh -m client -a '$server' -C '$num_clients' -S '$num_servers' -o '$exp'-RUN-'$j' -p '$init_port' -c '$cpu_mask'; sudo bash run-netapp-lat.sh -m netserver -p '$lat_app_port' -c '$lat_app_core' ;exec bash"'
+sshpass -p $password ssh $uname@$ssh_hostname 'screen -dmS client_session sudo bash -c "cd '$setup_dir'; sudo bash setup-envir.sh -i '$client_intf' -a '$client' -m '$mtu' -d '$ddio' -f 1 -r 0 -p 0 -e 1 -b 1 -o 1; cd '$exp_dir'; sudo bash run-netapp-tput.sh -m client -a '$server' -C '$num_clients' -S '$num_servers' -o '$exp'-RUN-client-'$j' -p '$init_port' -c '$cpu_mask'; sudo bash run-netapp-lat.sh -m netserver -p '$lat_app_port' -c '$lat_app_core' ;exec bash"'
 
 
 #### warmup

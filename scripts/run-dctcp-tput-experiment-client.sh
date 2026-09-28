@@ -47,8 +47,8 @@ num_clients=1
 init_port=3000
 ddio=0
 mtu=4000
-dur=20
-cpu_mask="0,2,4,6,8"
+dur=120
+cpu_mask="0,2,4,6,8,10,12,14,16,18"
 client_cpu_mask=$cpu_mask
 mlc_cores="none"
 mlc_dur=100
@@ -235,20 +235,22 @@ for ((j = 0; j < $num_runs; j += 1)); do
   # cd -
 
   echo "starting server instances..."
-  cd $exp_dir
-  sudo bash run-netapp-tput.sh -m server -S $num_servers -o $exp-RUN-server-$j -p $init_port -c $cpu_mask &
-  cd -
+  echo "starting server session on $ssh_hostname, username: $uname, password: $password"
+  sshpass -p $password ssh $uname@$ssh_hostname 'screen -dmS client_session bash -c "cd '$setup_dir'; sudo bash '$setup_dir'/setup-envir.sh -i '$client_intf' -a '$client' -m '$mtu' --ring_buffer '$ring_buffer' --buf '$buf'; sleep 5; cd '$exp_dir'; sudo bash '$exp_dir'/run-netapp-tput.sh -m server -a '$server' -C '$num_clients' -S '$num_servers' -o '$exp'-RUN-client-'$j' -p '$init_port' -c '$client_cpu_mask' -b '$bandwidth'; exec bash"'
+  sleep 10
 
+  #### setup and start clients
+  echo "setting up and starting clients..."
+  cd $exp_dir
+  echo "Running command: sudo bash run-netapp-tput.sh -m client -C $num_clients -S $num_servers -o $exp-RUN-server-$j -p $init_port -l $cpu_mask -a $CLIENT_NIC_IP -b $bandwidth"
+  sudo bash run-netapp-tput.sh -m client -C $num_clients -S $num_servers -o $exp-RUN-server-$j -p $init_port -l $cpu_mask -a $CLIENT_NIC_IP -b $bandwidth &
+  sleep 2
+  cd -
+  
   echo "turning on IOVA logging via ftrace"
   sudo echo > /sys/kernel/debug/tracing/trace
   sudo echo 1 > /sys/kernel/debug/tracing/tracing_on
 
-  #### setup and start clients
-  echo "setting up and starting clients..."
-  echo "starting client session on $ssh_hostname, username: $uname, password: $password"
-  echo "command to send is 'screen -dmS client_session bash -c \"cd $exp_dir && sudo bash $exp_dir/run-netapp-tput.sh -m client -a $server -C $num_clients -S $num_servers -o $exp-RUN-client-$j -p $init_port -c $client_cpu_mask -b $bandwidth\"'"
-  sshpass -p $password ssh $uname@$ssh_hostname 'screen -dmS client_session bash -c "cd '$setup_dir'; sudo bash '$setup_dir'/setup-envir.sh -i '$client_intf' -a '$client' -m '$mtu' --ring_buffer '$ring_buffer' --buf '$buf'; sleep 5; cd '$exp_dir'; sudo bash '$exp_dir'/run-netapp-tput.sh -m client -a '$server' -C '$num_clients' -S '$num_servers' -o '$exp'-RUN-client-'$j' -p '$init_port' -c '$client_cpu_mask' -b '$bandwidth'; exec bash"'
-  # sshpass -p $password ssh $uname@$ssh_hostname 'screen -dmS client_session bash -c "cd '$setup_dir'; sudo bash '$setup_dir'/setup-envir.sh -i '$client_intf' -a '$client' -m '$mtu' -d '$ddio' --ring_buffer '$ring_buffer' --buf '$buf' -f 1 -r 0 -p 0 -e 1 -o 1; cd '$exp_dir'; sudo bash '$exp_dir'/run-netapp-tput.sh -m client -a '$server' -C '$num_clients' -S '$num_servers' -o '$exp'-RUN-client-'$j' -p '$init_port' -c '$cpu_mask' -b '$bandwidth'; exec bash"'
 
   #### warmup
   echo "warming up iperf..."
@@ -262,14 +264,21 @@ for ((j = 0; j < $num_runs; j += 1)); do
   ##start receiver side logging
   echo "starting logging at server..."
   cd $setup_dir
-  sudo bash record-host-metrics.sh -f 0 --iio 1 -t 1 --intf $server_intf -o $exp-RUN-server-$j --type 0 --cpu-util 1 --pcie 1 --membw 1 --dur $dur --cores $cpu_mask
+  sudo bash record-host-metrics.sh -f 0 --iio 1 -t 1 --intf $server_intf -o $exp-RUN-server-$j --type 0 --cpu-util 1 --pcie 1 --membw 1 --dur $dur --cores $cpu_mask --retx 1 --bw 1
   echo "done logging..."
   cd -
 
   #transfer sender-side info back to receiver
-  sshpass -p $password scp $uname@$ssh_hostname:$setup_dir/reports/$exp-RUN-client-$j/retx.rpt $setup_dir/reports/$exp-RUN-server-$j/retx.rpt
+#   sshpass -p $password scp $uname@$ssh_hostname:$setup_dir/reports/$exp-RUN-client-$j/retx.rpt $setup_dir/reports/$exp-RUN-server-$j/retx.rpt
 
-  sleep $(($dur * 2))
+  sleep 20
+
+  # Get FIO PID
+  sudo killall fio
+  sleep 5
+  # FIO_PID=$(cat /tmp/fio_pid.txt)
+  # echo "Killing FIO process with PID: $FIO_PID"
+  # sudo kill -2 $FIO_PID
 
   #post-run cleanup
   cleanup
