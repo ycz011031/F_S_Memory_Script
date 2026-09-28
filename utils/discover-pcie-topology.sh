@@ -112,11 +112,32 @@ fi
 TMP=$(mktemp -d /tmp/pcie-topo.XXXXXX)
 modprobe msr 2>/dev/null
 
+# pcm-iio loads its event definitions from opCode-<family>-<model>.txt in the
+# CURRENT directory. Run from anywhere else it silently falls back to defaults
+# that omit the IOMMU events, so the CSV columns shift and IOTLB/PWC data goes
+# missing without an error. record-host-metrics.sh gets this right only because
+# the runners cd into utils/ first; do the same here.
+cd "$HERE" || { echo "cannot cd to $HERE"; exit 1; }
+
+fam=$(awk -F: '/^cpu family/{gsub(/ /,"",$2); print $2; exit}' /proc/cpuinfo 2>/dev/null)
+mod=$(awk -F: '/^model[[:space:]]*:/{gsub(/ /,"",$2); print $2; exit}' /proc/cpuinfo 2>/dev/null)
+
 echo
 echo "=============================================================="
 echo "== 3. pcm-iio CSV: the exact Socket,Stack,Part strings"
 echo "=============================================================="
 echo "  (these are what record-host-metrics.sh greps for as PCIE_PATTERN)"
+echo "  cwd for pcm-iio : $HERE"
+echo "  CPU             : family $fam model $mod"
+if [ -f "opCode-$fam-$mod.txt" ]; then
+    echo "  event file      : opCode-$fam-$mod.txt  [FOUND]"
+elif [ -f "opCode-$mod.txt" ]; then
+    echo "  event file      : opCode-$mod.txt  [found, older naming]"
+else
+    echo "  event file      : opCode-$fam-$mod.txt  [** MISSING **]"
+    echo "                    IOMMU columns will be absent and column offsets"
+    echo "                    will not match parse_pciebw. Fix before trusting."
+fi
 echo
 "$PCM_IIO" 1 -csv="$TMP/pcie.csv" >/dev/null 2>&1 &
 sleep 6; pkill -f pcm-iio >/dev/null 2>&1; sleep 1
