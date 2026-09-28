@@ -256,8 +256,25 @@ if [ -s "$TMP/pcie.csv" ]; then
     echo "--- header (column order for parse_pciebw) ---"
     head -2 "$TMP/pcie.csv"
     echo
-    echo "--- unique Socket,Stack,Part rows ---"
-    cut -d, -f1-3 "$TMP/pcie.csv" | grep -i socket | sort -u | sed 's/^/    /'
+    # Layout is Date,Time,Socket,Name,Part,<events...> so the identity of a row
+    # is fields 3-5, NOT 1-3. PCIE_PATTERN is grepped as a substring of the
+    # joined "Socket,Name,Part" text.
+    echo "--- unique Socket,Stack,Part rows (these are PCIE_PATTERN candidates) ---"
+    cut -d, -f3-5 "$TMP/pcie.csv" | grep -i '^Socket[0-9]' | sort -u | sed 's/^/    /'
+
+    # Definitive Part identification: whichever Part is moving bytes is the one
+    # the NIC sits on. Needs traffic in flight; silent otherwise.
+    echo
+    echo "--- Parts with NON-ZERO inbound traffic (authoritative if traffic is running) ---"
+    awk -F, 'NR>1 && $6+0>0 {printf "    %s,%s,%s   IB write=%s IB read=%s\n",$3,$4,$5,$6,$7}' \
+        "$TMP/pcie.csv" | sort -u | head -20
+    if ! awk -F, 'NR>1 && $6+0>0 {found=1} END{exit !found}' "$TMP/pcie.csv"; then
+        echo "    (none -- every Part read zero, so no traffic was flowing)"
+        echo "    Re-run this while an iperf3 stream is active to pin the Part down:"
+        echo "      terminal 1:  iperf3 -s -p 3000"
+        echo "      terminal 2:  ssh <client> iperf3 -c <server-nic-ip> -p 3000 -t 60"
+        echo "      terminal 3:  sudo bash $0"
+    fi
     cp "$TMP/pcie.csv" ./pcie-topology.csv 2>/dev/null && \
         echo && echo "  full CSV saved to: $(pwd)/pcie-topology.csv"
 else
@@ -278,16 +295,25 @@ if [ -s "$TMP/pcie.txt" ]; then
         short=${pci#0000:}                      # pcm-iio often prints bb:dd.f
         # Walk the text, remembering the most recent Socket / Stack / Part header,
         # and report them when the NIC's BDF appears.
+        # pcm-iio prints every Part header for a stack BEFORE listing devices,
+        # so "most recent Part seen" always lands on the last one (Part7) and is
+        # meaningless. Only Socket and Stack are trustworthy from this parse;
+        # the Part comes from the non-zero-traffic check in section 3.
         awk -v bdf="$short" -v full="$pci" -v iface="$i" '
             /[Ss]ocket[ ]*[0-9]/ { if (match($0,/[Ss]ocket[ ]*[0-9]+/)) sock=substr($0,RSTART,RLENGTH) }
-            /IIO Stack/          { if (match($0,/IIO Stack[ ]*[0-9]+[ ]*-[ ]*[A-Za-z0-9]+/)) stack=substr($0,RSTART,RLENGTH) }
-            /Part[0-9]/          { if (match($0,/Part[0-9]+/)) part=substr($0,RSTART,RLENGTH) }
+            /IIO Stack/ { if (match($0,/IIO Stack[ ]*[0-9]+[ ]*-[ ]*[A-Za-z0-9]+/)) stack=substr($0,RSTART,RLENGTH) }
             index($0,bdf) || index($0,full) {
-                printf "  %-16s -> %s | %s | %s\n", iface, (sock?sock:"?"), (stack?stack:"?"), (part?part:"?")
+                printf "  %-16s -> %s | %s | Part: see section 3\n", iface, (sock?sock:"?"), (stack?stack:"?")
                 found=1; exit
             }
             END { if (!found) printf "  %-16s -> not found in pcm-iio text output\n", iface }
         ' "$TMP/pcie.txt"
+        # Dump the surrounding lines so the real layout is visible when the
+        # parse above fails or looks wrong.
+        if grep -q "$short" "$TMP/pcie.txt" 2>/dev/null; then
+            echo "      context:"
+            grep -n -B2 -A1 "$short" "$TMP/pcie.txt" | head -12 | sed 's/^/        /'
+        fi
     done
     cp "$TMP/pcie.txt" ./pcie-topology.txt 2>/dev/null && \
         echo && echo "  full text saved to: $(pwd)/pcie-topology.txt"
