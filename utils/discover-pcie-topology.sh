@@ -31,23 +31,56 @@ fi
 echo "=============================================================="
 echo "== 1. NIC -> PCI -> root complex (from sysfs, no root needed)"
 echo "=============================================================="
-printf '%-16s %-14s %-5s %-9s %-14s %s\n' IFACE PCI NUMA SPEED ROOT_COMPLEX LINK
+printf '%-16s %-14s %-5s %-8s %-13s %-8s %s\n' \
+    IFACE PCI NUMA SPEED ROOT_PORT LINK SWITCHED
+RPFILE=$(mktemp)
 for i in "${INTFS[@]}"; do
     dev=$(readlink -f "/sys/class/net/$i/device" 2>/dev/null) || continue
     pci=$(basename "$dev")
     numa=$(cat "/sys/class/net/$i/device/numa_node" 2>/dev/null)
     speed=$(cat "/sys/class/net/$i/speed" 2>/dev/null)
-    # .../devices/pci0000:97/0000:97:02.0/0000:99:00.0 -> root complex pci0000:97
-    rc=$(printf '%s' "$dev" | grep -o 'pci[0-9a-f]\{4\}:[0-9a-f]\{2\}' | head -1)
-    link=$(lspci -vv -s "$pci" 2>/dev/null | awk '/LnkSta:/{print $3,$4,$5; exit}' | tr -d ',')
-    printf '%-16s %-14s %-5s %-9s %-14s %s\n' \
-        "$i" "$pci" "${numa:--}" "${speed:--}" "${rc:--}" "${link:-?}"
+
+    # Split the sysfs chain: .../pci0000:96/0000:96:02.0/0000:97:00.0/.../0000:99:00.0
+    # The FIRST bdf after the root complex is the root port -- that is what
+    # determines the pcm-iio IIO stack and Part. Anything between it and the
+    # NIC is a PCIe switch.
+    chain=$(printf '%s' "$dev" | tr '/' '\n' | grep -E '^[0-9a-f]{4}:[0-9a-f]{2}:' )
+    rport=$(printf '%s\n' "$chain" | head -1)
+    hops=$(printf '%s\n' "$chain" | grep -c .)
+    if [ "$hops" -gt 2 ]; then sw="yes ($((hops-2)) hop)"; else sw="no"; fi
+
+    # LnkSta: Speed 16GT/s (ok), Width x16 (ok)  -> want speed AND width
+    link=$(lspci -vv -s "$pci" 2>/dev/null \
+           | awk '/LnkSta:/{for(n=1;n<=NF;n++){if($n=="Speed")s=$(n+1);if($n=="Width")w=$(n+1)};
+                            gsub(/,/,"",s); gsub(/,/,"",w); print s"/"w; exit}')
+    printf '%-16s %-14s %-5s %-8s %-13s %-8s %s\n' \
+        "$i" "$pci" "${numa:--}" "${speed:--}" "${rport:--}" "${link:-?}" "$sw"
+    [ -n "$rport" ] && echo "$rport $i" >> "$RPFILE"
 done
 
 echo
-echo "  Two NICs sharing a ROOT_COMPLEX usually sit on the same IIO stack,"
-echo "  which means pcm-iio may not separate them by stack alone -- they would"
-echo "  differ only by Part. Different root complexes give clean separation."
+echo "  -- root-port sharing --"
+# NICs behind the same ROOT PORT cannot be separated by pcm-iio at all:
+# same IIO stack (kills the IOMMU counters, which are per-stack totals) AND
+# same Part (kills per-NIC IB/OB bandwidth, which is per-Part).
+awk '{rp=$1; nic=$2; map[rp]=(rp in map)?map[rp]" "nic:nic; cnt[rp]++}
+     END{ shared=0
+          for (rp in cnt) {
+            if (cnt[rp] > 1) { shared=1
+              printf "  SHARED  %s  <-  %s\n", rp, map[rp]
+            } else printf "  alone   %s  <-  %s\n", rp, map[rp]
+          }
+          if (shared) {
+            print ""
+            print "  NICs on a SHARED root port give aggregate counters ONLY:"
+            print "    - IOMMU events are per-stack  (ch_mask=0x0, vname=Total)"
+            print "    - IB/OB bandwidth is per-Part, and one root port is one Part"
+            print "  Use ONE PCIE_PATTERN for them and treat all pcm-iio numbers as"
+            print "  the sum over both NICs. Per-NIC data must come from iperf3."
+            print "  They also share that root ports bandwidth -- check LINK above."
+          }
+        }' "$RPFILE"
+rm -f "$RPFILE"
 
 echo
 echo "=============================================================="

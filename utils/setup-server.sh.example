@@ -63,19 +63,45 @@ SERVER_NIC_BUSES=( "0x99"        "0x9a" )
 CLIENT_INTFS=( "ens1f1np1"       "ens1f0np0" )
 CLIENT_NIC_IPS=( "192.168.10.52" "192.168.100.90" )
 
-# TODO index 1: run discover-pcie-topology.sh on icx and paste the real string.
+# MEASURED TOPOLOGY (discover-pcie-topology.sh on icx, 2026-09-27):
 #
-# IMPORTANT: in opCode-6-106.txt the IB/OB bandwidth events are per-Part
-# (ch_mask=1,2,4,...  vname=Part0..Part7) but every IOMMU event -- IOTLB
-# Lookup/Miss, Ctxt Cache Hit, 512G/1G/2M/4K Cache Hit, IOMMU Mem Access --
-# is ch_mask=0x0, vname=Total, i.e. PER STACK.
-# So if both NICs land on the SAME IIO stack you get per-NIC PCIe bandwidth
-# but only ONE aggregate IOTLB/page-walk-cache number covering both. That is
-# still a valid contention metric; it just cannot attribute misses to one NIC.
+#   enp153s0f0np0  pci0000:96 -> 96:02.0 -> 97:00.0 -> 98:00.0 -> 99:00.0
+#   enp153s0f1np1  pci0000:96 -> 96:02.0 -> 97:00.0 -> 98:00.0 -> 99:00.1
+#   enp154s0np0    pci0000:96 -> 96:02.0 -> 97:00.0 -> 98:01.0 -> 9a:00.0
+#                                ^^^^^^^^   ^^^^^^^^
+#                                ONE root   PCIe switch
+#                                port       upstream port
+#
+# 0000:97:00.0 is a PCIe switch. BOTH 100G NICs sit behind it, sharing the
+# single root port 0000:96:02.0. Therefore they share:
+#   - the IIO stack -> IOMMU events (IOTLB Lookup/Miss, Ctxt Cache Hit,
+#     512G/1G/2M/4K Cache Hit, IOMMU Mem Access) are ch_mask=0x0 / vname=Total,
+#     i.e. per-stack totals, so they cover BOTH NICs
+#   - the Part      -> IB/OB bandwidth is per-Part, and one root port is one
+#     Part, so PCIe bandwidth ALSO covers both NICs
+#
+# Net effect: pcm-iio gives NO per-NIC attribution for this pair. One pattern
+# matches both. Per-NIC numbers must come from iperf3 at the application level.
+# This is still a valid contention experiment -- compare 1 NIC vs 2 NICs active
+# and watch total IOTLB misses and per-NIC iperf3 throughput -- but do not claim
+# "NIC-1's misses rose"; you cannot see that here.
+#
+# They also share that root port's bandwidth: x16 @ 16GT/s (PCIe 4.0) is about
+# 220 Gbps usable. 2x100G would be ~90% of it, but the Broadwell sender caps
+# near 100-130 Gbps aggregate, landing the root port around 60% -- so PCIe
+# should not be saturated and the contention you observe should be IOMMU-side.
+# Verify with PCIe_wr_tput before drawing conclusions.
+#
+# TODO confirm the exact string once PCM is built (section 3 of the discovery
+# script). Both entries are intentionally identical.
 SERVER_PCIE_PATTERNS=(
     "Socket1,IIO Stack 0 - PCIe0,Part0"
-    "TODO-run-discover-pcie-topology.sh"
+    "Socket1,IIO Stack 0 - PCIe0,Part0"
 )
+# Set to 1 when both NICs share a root port: the runner then collects pcm-iio
+# once and labels the result as an aggregate rather than writing two per-NIC
+# reports that would be identical copies.
+PCIE_COUNTERS_SHARED=1
 
 # Disjoint core sets, one group per NIC.
 # icx: NUMA node 1 is the 40-79 range (existing runners use 42,44,48,52,56
