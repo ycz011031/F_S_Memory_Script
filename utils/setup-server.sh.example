@@ -1,0 +1,105 @@
+#!/bin/bash
+# Testbed config. Sourced by every runner.
+#
+#   cp setup-server.sh.example setup-server.sh
+#   # then fill in the TODOs
+#
+# setup-server.sh is git-ignored ON PURPOSE: it holds credentials and
+# machine-specific paths. Never commit it. This .example file is the tracked
+# template -- keep it free of secrets.
+#
+# Testbed:
+#   icx         Ice Lake, NUMA1 NICs, IOMMU + PCM here   = SERVER / RECEIVER
+#   styx-tower  Broadwell E5-2660 v4, 14C/28T, 1 socket  = CLIENT / SENDER
+#
+# Run experiments ON icx. It drives styx-tower over ssh.
+
+# ============================================================ hosts / accounts
+SERVER_USERNAME="yz69"
+CLIENT_USERNAME="yz69"
+
+SERVER_SSH_IP="192.17.103.88"     # icx, campus link (control traffic only)
+CLIENT_SSH_IP="192.17.100.255"    # styx-tower, campus link
+
+# Leave EMPTY to use ssh keys (recommended: run ssh-copy-id once).
+# If set, runners fall back to `sshpass -p`, which puts the password on the
+# command line where `ps` can see it, and the runners echo it to stdout.
+SERVER_PWD=""
+CLIENT_PWD=""
+
+# ==================================================================== paths
+# Must resolve to the SAME absolute path on BOTH machines: the runner builds
+# the remote command locally and ships it over ssh as a literal.
+DEP_DIR="/home/yz69"              # TODO confirm: /home/yz69 or /fast-lab-share/...
+REPO_NAME="F_S_Memory_Script"     # this clone's directory name
+PCM_DIR="/home/yz69/tools/pcm"    # TODO confirm: own build, or /home/jiaqi/tools/pcm
+
+REPO_DIR="$DEP_DIR/$REPO_NAME"
+
+# ======================================================== NIC 0  (single-NIC)
+# The flat names below are what the existing single-NIC runners read.
+# They are aliases for NIC index 0 in the arrays further down.
+SERVER_INTF="enp153s0f0np0"       # 0000:99:00.0, NUMA 1, 100G
+SERVER_NIC_IP="192.168.10.88"
+CLIENT_INTF="ens1f1np1"           # styx-tower side of the same subnet
+CLIENT_NIC_IP="192.168.10.52"
+
+INTF="$SERVER_INTF"               # legacy aliases used by setup-envir.sh
+IP="$SERVER_NIC_IP"
+NIC_BUS="0x99"
+
+# pcm-iio CSV row to grep for this NIC's counters.
+# Get the exact string from:  sudo bash utils/discover-pcie-topology.sh
+PCIE_PATTERN="Socket1,IIO Stack 0 - PCIe0,Part0"
+
+# ============================================================== dual-NIC arrays
+# Used by run-dualnic-experiment.sh. Index 0 must match the flat vars above.
+NIC_COUNT=2
+
+SERVER_INTFS=( "enp153s0f0np0"   "enp154s0np0" )
+SERVER_NIC_IPS=( "192.168.10.88" "192.168.100.88" )
+SERVER_NIC_BUSES=( "0x99"        "0x9a" )
+
+CLIENT_INTFS=( "ens1f1np1"       "ens1f0np0" )
+CLIENT_NIC_IPS=( "192.168.10.52" "192.168.100.90" )
+
+# TODO index 1: run discover-pcie-topology.sh on icx and paste the real string.
+#
+# IMPORTANT: in opCode-6-106.txt the IB/OB bandwidth events are per-Part
+# (ch_mask=1,2,4,...  vname=Part0..Part7) but every IOMMU event -- IOTLB
+# Lookup/Miss, Ctxt Cache Hit, 512G/1G/2M/4K Cache Hit, IOMMU Mem Access --
+# is ch_mask=0x0, vname=Total, i.e. PER STACK.
+# So if both NICs land on the SAME IIO stack you get per-NIC PCIe bandwidth
+# but only ONE aggregate IOTLB/page-walk-cache number covering both. That is
+# still a valid contention metric; it just cannot attribute misses to one NIC.
+SERVER_PCIE_PATTERNS=(
+    "Socket1,IIO Stack 0 - PCIe0,Part0"
+    "TODO-run-discover-pcie-topology.sh"
+)
+
+# Disjoint core sets, one group per NIC.
+# icx: NUMA node 1 is the 40-79 range (existing runners use 42,44,48,52,56
+#      for the NIC and 64-79 for fio). Keep the two NIC groups disjoint and
+#      clear of the fio range if you plan to co-run with the SSD.
+SERVER_CORES=( "42,44,48,52,56"  "58,60,62,66,68" )
+
+# styx-tower: 28 logical / 14 physical, single NUMA node. Use PHYSICAL cores
+# only -- hyperthread siblings share a pipeline and will not add throughput.
+# TODO verify the physical set:  lscpu -p=CPU,CORE | grep -v '^#' | head -30
+CLIENT_CORES=( "0,1,2,3,4,5,6"   "7,8,9,10,11,12,13" )
+
+# Disjoint port ranges so the two NICs' iperf3 groups never collide.
+BASE_PORTS=( 3000 4000 )
+
+# ================================================================== workload
+MTU=4000
+RING_BUFFER=1024
+SOCK_BUF_MB=1
+BANDWIDTH="100g"
+DURATION=20
+
+# Sender ceiling note: styx-tower is a 14-core 2.0 GHz Broadwell with 40 PCIe
+# 3.0 lanes. Two 100G links (2x x16 = 32 lanes) fit electrically, but ~200 Gbps
+# of TCP from these cores is not realistic -- budget for roughly 100-130 Gbps
+# aggregate. Measure the single-NIC ceiling on each link BEFORE trusting any
+# dual-NIC number, or a sender-bound run will read as "the IOMMU is free".
