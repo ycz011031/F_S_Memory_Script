@@ -186,9 +186,30 @@ if [ -z "$PCM_IIO" ]; then
     echo "=============================================================="
     echo "== 3. pcm-iio  [SKIPPED - binary not found]"
     echo "=============================================================="
-    echo "  Looked in: \$PCM_DIR/build/bin, \$PATH, ~/pcm/build/bin,"
-    echo "             /usr/local/bin, /opt/pcm/bin"
-    echo "  Re-run as:  sudo PCM_DIR=/path/to/pcm bash $0 $*"
+    if [ -n "${PCM_DIR:-}" ]; then
+        if [ -n "$PCM_DIR_ENV" ]; then src="the environment"
+        elif [ -f "$HERE/setup-server.sh" ]; then src="$HERE/setup-server.sh"
+        else src="unknown"; fi
+        echo "  PCM_DIR is set to : $PCM_DIR"
+        echo "  set by            : $src"
+        if [ ! -d "$PCM_DIR" ]; then
+            echo "  -> that directory DOES NOT EXIST."
+        elif [ ! -e "$PCM_DIR/build/bin/pcm-iio" ]; then
+            echo "  -> directory exists but has no build/bin/pcm-iio (not built?)."
+        else
+            echo "  -> $PCM_DIR/build/bin/pcm-iio exists but is not executable by you."
+        fi
+        echo
+        echo "  Note: setup-server.sh is git-ignored, so 'git pull' never updates"
+        echo "  it. If you copied it from an older template, fix just that line:"
+        echo "    sed -i 's|^PCM_DIR=.*|PCM_DIR=\"/path/to/pcm\"|' $HERE/setup-server.sh"
+    else
+        echo "  PCM_DIR is not set, and no pcm-iio was found on PATH."
+        echo "  Looked in: \$PCM_DIR/build/bin, \$PATH, ~/pcm/build/bin,"
+        echo "             /usr/local/bin, /opt/pcm/bin"
+    fi
+    echo
+    echo "  Override for one run:  sudo PCM_DIR=/path/to/pcm bash $0 $*"
     exit 0
 fi
 

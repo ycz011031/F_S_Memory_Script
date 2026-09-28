@@ -86,20 +86,42 @@ CLIENT_NIC_IPS=( "192.168.10.52" "192.168.100.90" )
 # and watch total IOTLB misses and per-NIC iperf3 throughput -- but do not claim
 # "NIC-1's misses rose"; you cannot see that here.
 #
-# BANDWIDTH -- UNRESOLVED, and it decides whether dual-NIC is even possible.
-# Each NIC negotiated x8 @ 16GT/s (PCIe 4.0), NOT x16:
-#     16 GT/s * 8 lanes * 128/130 = ~126 Gbps usable per NIC.
-# That is just enough for one 100G NIC. The open question is the width of the
-# hops they SHARE -- the switch upstream port 0000:97:00.0 and the root port
-# 0000:96:02.0:
-#   - shared hop x16 (~252 Gbps): both NICs fit; contention seen should be
-#     IOMMU-side, especially since the Broadwell sender caps near 100-130 Gbps
-#   - shared hop x8  (~126 Gbps): BOTH NICs share one NIC's worth of bandwidth.
-#     Dual-NIC is PCIe-bound from the start and any degradation is link
-#     contention, not IOMMU contention. The experiment would need rethinking.
-# Section 2 of discover-pcie-topology.sh now measures every hop and prints the
-# shared-path budget. Run it before trusting any dual-NIC number, and confirm
-# against PCIe_wr_tput once traffic is flowing.
+# BANDWIDTH -- RESOLVED, and it constrains the workload. Measured per hop:
+#
+#   enp153s0f0np0   96:02.0 x8 -> 97:00.0 x8 -> 98:00.0 x8 -> 99:00.0 x8
+#   enp154s0np0     96:02.0 x8 -> 97:00.0 x8 -> 98:01.0 x8 -> 9a:00.0 x8
+#                   ^^^^^^^^^^    ^^^^^^^^^^
+#                   both shared, both x8 = ~126 Gbps
+#
+# Every hop is x8 @ 16GT/s (~126 Gbps). The two NICs sum to ~252 Gbps of
+# endpoint bandwidth but share a ~126 Gbps uplink: a hard 2:1 oversubscription.
+# Running both at line rate is physically impossible.
+#
+# Worse, the Broadwell sender also caps near 100-130 Gbps. The PCIe ceiling and
+# the sender ceiling nearly coincide, so a saturated dual-NIC run cannot tell
+# you which one bound it -- or whether the IOMMU mattered at all.
+#
+# THEREFORE: run dual-NIC WELL BELOW saturation. Cap each NIC around 35-40 Gbps
+# (DUALNIC_BANDWIDTH below) for ~70-80 Gbps aggregate, which is ~60% of the
+# shared uplink and ~60% of the sender. Both confounds are then out of the way
+# and the IOMMU is the variable under test.
+#
+# Generate IOMMU pressure with the ring-buffer / MTU / flow-count sweeps at
+# FIXED sub-saturation bandwidth, not by pushing throughput. IOTLB pressure
+# tracks the IOVA working set and descriptor rate, not raw Gbps, so the
+# contention result survives the lower rate intact.
+#
+# Treat PCIe_wr_tput as a CONTROL: if it approaches ~126 Gbps the run is link
+# bound and the IOMMU numbers are not interpretable.
+#
+# NOTE ON ATTRIBUTION: you cannot have both per-NIC IOMMU counters AND IOMMU
+# contention. Contention requires the NICs to share an IOMMU; sharing an IOMMU
+# means sharing its per-stack counters. A cross-socket pair (e.g. NUMA1
+# enp153s0f0np0 + NUMA0 ens2f0np0) would give clean per-NIC attribution and no
+# shared PCIe bottleneck -- but they would sit behind different DMAR units with
+# no shared IOTLB, so there would be no contention left to measure. The shared
+# stack is not a limitation of this setup; it is the precondition for the
+# experiment.
 #
 # TODO confirm the exact pattern string from section 3 of the discovery script.
 # Both entries are intentionally identical (shared root port, see above).
@@ -130,8 +152,14 @@ BASE_PORTS=( 3000 4000 )
 MTU=4000
 RING_BUFFER=1024
 SOCK_BUF_MB=1
-BANDWIDTH="100g"
+BANDWIDTH="100g"           # single-NIC runs: uncapped
 DURATION=20
+
+# Dual-NIC per-NIC cap. ~70-80 Gbps aggregate keeps the run at roughly 60% of
+# BOTH the ~126 Gbps shared PCIe uplink and the ~100-130 Gbps Broadwell sender,
+# so neither is the binding constraint and IOMMU effects are visible.
+# Raise only after confirming PCIe_wr_tput stays well clear of 126 Gbps.
+DUALNIC_BANDWIDTH="40g"
 
 # Sender ceiling note: styx-tower is a 14-core 2.0 GHz Broadwell with 40 PCIe
 # 3.0 lanes. The icx NICs negotiated x8 (~126 Gbps each), so ~200 Gbps
