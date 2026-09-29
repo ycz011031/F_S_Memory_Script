@@ -30,7 +30,7 @@ help()
 }
 
 SHORT=m:,o:,S:,C:,p:,a:,c:,l:,b:h
-LONG=mode:,outdir:,num_servers:,num_clients:,port:,addr:,cores:,client_cores:,bandwidth:,help
+LONG=mode:,outdir:,num_servers:,num_clients:,port:,addr:,cores:,client_cores:,bandwidth:,cca:,no_kill,help
 OPTS=$(getopt -a -n run-netapp-tput --options $SHORT --longoptions $LONG -- "$@")
 VALID_ARGUMENTS=$# # Returns the count of arguments that are in short or long options
 
@@ -73,6 +73,14 @@ do
     -l | --client_cores )
       CPU_MASK_CLIENT="$2"
       shift 2
+      ;;
+    --cca )
+      CCA="$2"
+      shift 2
+      ;;
+    --no_kill )
+      NO_KILL=1
+      shift
       ;;
     -b | --bandwidth )
       BANDWIDTH="$2"
@@ -128,14 +136,26 @@ function collect_stats() {
   echo "Avg_iperf_tput: " $(cat ../logs/$OUT_DIR/iperf.bw.log | grep "30.*-60.*" | awk  '{ sum += $7; n++ } END { if (n > 0) printf "%.3f", sum/1000; }') > ../reports/$OUT_DIR/iperf.bw.rpt
 }
 
+# --no_kill lets a second invocation add another group of iperf3 processes
+# instead of wiping the first. The dual-NIC runner calls this once per NIC:
+# the first call clears stale processes, later calls pass --no_kill.
+NO_KILL="${NO_KILL:-0}"
+CCA="${CCA:-dctcp}"
+
+# The repo directory name is configurable; it is not always
+# "Fast-and-Safe-IO-Memory-Protection". REPO_DIR comes from setup-server.sh.
+LOG_ROOT="${REPO_DIR:-$DEP_DIR/${REPO_NAME:-Fast-and-Safe-IO-Memory-Protection}}/utils/logs"
+
 counter=0
 if [ "$MODE" = "server" ]; then
-    sudo pkill -9 -f iperf #kill existing iperf servers/clients
-    sleep 1
+    if [ "$NO_KILL" != "1" ]; then
+        sudo pkill -9 -f iperf #kill existing iperf servers/clients
+        sleep 1
+    fi
     while [ $counter -lt $NUM_SERVERS ]; do
         index=$(( counter % ${#core_values[@]} ))
         core=${core_values[index]}
-        log_path=$DEP_DIR/Fast-and-Safe-IO-Memory-Protection/utils/logs/$OUT_DIR/iperf.bw.log
+        log_path=$LOG_ROOT/$OUT_DIR/iperf.bw.log
         echo "Starting server $counter on core $core, log path: $log_path"
         sudo taskset -c $core nice -n -20 iperf3 -s --port $(($PORT + $counter)) -i 30 -f m --logfile $log_path &
         # sudo taskset -c $core nice -n -20 iperf3 -s --port $(($PORT + $counter)) -i 30 -f m --logfile ../logs/$OUT_DIR/iperf.bw.log &
@@ -146,14 +166,16 @@ if [ "$MODE" = "server" ]; then
     echo "collecting stats..."
     collect_stats
 elif [ "$MODE" = "client" ]; then
-    sudo pkill -9 -f iperf #kill existing iperf servers/clients
-    sleep 1
+    if [ "$NO_KILL" != "1" ]; then
+        sudo pkill -9 -f iperf #kill existing iperf servers/clients
+        sleep 1
+    fi
     while [ $counter -lt $NUM_CLIENTS ]; do
         index=$(( counter % ${#core_values_client[@]} ))
         core=${core_values_client[index]}
-        log_path=$DEP_DIR/Fast-and-Safe-IO-Memory-Protection/utils/logs/$OUT_DIR/iperf.bw.log
+        log_path=$LOG_ROOT/$OUT_DIR/iperf.bw.log
         echo "Starting client $counter on core $core"
-        sudo taskset -c $core nice -n -20 iperf3 -c $SERVER_IP --port $(($PORT+$(($counter%$NUM_SERVERS)))) -i 30 -f m --logfile $log_path -t 10000 -C dctcp -b $BANDWIDTH &
+        sudo taskset -c $core nice -n -20 iperf3 -c $SERVER_IP --port $(($PORT+$(($counter%$NUM_SERVERS)))) -i 30 -f m --logfile $log_path -t 10000 -C $CCA -b $BANDWIDTH &
         ((counter++))
     done
 else
