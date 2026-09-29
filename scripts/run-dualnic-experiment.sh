@@ -48,6 +48,7 @@ while [ $# -gt 0 ]; do
         --cca)           cca="$2"; shift 2 ;;
         --sync-client)   sync_client=1; shift ;;
         -d|--dur)        dur="$2"; shift 2 ;;
+        --runs)          num_runs="$2"; shift 2 ;;
         -h|--help)
             sed -n '2,12p' "$0"; exit 0 ;;
         *) echo "unknown option: $1"; exit 2 ;;
@@ -425,17 +426,51 @@ echo
 echo "=============================================================="
 echo "  RESULT: $exp"
 echo "=============================================================="
+[ "$num_runs" -gt 1 ] && echo "  (mean +/- stddev over $num_runs runs)"
+
+# mean_sd <file-with-one-number-per-line> -> "mean sd"
+mean_sd() {
+    awk '{ x[n++]=$1; s+=$1 }
+         END { if (!n) { print "0 0"; exit }
+               m=s/n; for (i=0;i<n;i++) v+=(x[i]-m)^2
+               printf "%.3f %.3f", m, (n>1 ? sqrt(v/(n-1)) : 0) }'
+}
+
 total=0
 for i in "${ACTIVE[@]}"; do
-    f="$setup_dir/reports/$exp-RUN-server-0-nic$i/iperf.bw.rpt"
-    g=$(awk '{print $NF}' "$f" 2>/dev/null)
-    case "${g:-}" in ''|*[!0-9.]*) g=0 ;; esac
-    printf '  NIC %s (%-14s) : %s Gbps\n' "$i" "${SERVER_INTFS[$i]}" "$g"
-    total=$(awk -v a="$total" -v b="$g" 'BEGIN{printf "%.3f", a+b}')
+    vals=$(for ((j = 0; j < num_runs; j++)); do
+        g=$(awk '{print $NF}' \
+            "$setup_dir/reports/$exp-RUN-server-$j-nic$i/iperf.bw.rpt" 2>/dev/null)
+        case "${g:-}" in ''|*[!0-9.]*) g=0 ;; esac
+        echo "$g"
+    done)
+    read -r m sd <<< "$(printf '%s\n' "$vals" | mean_sd)"
+    if [ "$num_runs" -gt 1 ]; then
+        printf '  NIC %s (%-14s) : %s +/- %s Gbps\n' "$i" "${SERVER_INTFS[$i]}" "$m" "$sd"
+    else
+        printf '  NIC %s (%-14s) : %s Gbps\n' "$i" "${SERVER_INTFS[$i]}" "$m"
+    fi
+    total=$(awk -v a="$total" -v b="$m" 'BEGIN{printf "%.3f", a+b}')
 done
 printf '  %-22s : %s Gbps\n' "AGGREGATE" "$total"
 
-P="$setup_dir/reports/$exp-RUN-server-0/pcie.rpt"
+# Average each counter across runs so multi-run output stays comparable.
+if [ "$num_runs" -gt 1 ]; then
+    P="$setup_dir/reports/$exp-RUN-server-mean.rpt"
+    : > "$P"
+    for key in PCIe_wr_tput PCIe_rd_tput IOTLB_lookups IOTLB_misses \
+               IOTLB_hits_derived CTXT_cache_hits PWC_512G_hits PWC_1G_hits \
+               PWC_2M_hits PWC_4K_hits IOMMU_mem_access; do
+        v=$(for ((j = 0; j < num_runs; j++)); do
+                awk -v k="^$key:" '$0 ~ k {print $NF}' \
+                    "$setup_dir/reports/$exp-RUN-server-$j/pcie.rpt" 2>/dev/null
+            done | mean_sd)
+        set -- $v
+        printf '%s: %s   (sd %s)\n' "$key" "$1" "$2" >> "$P"
+    done
+else
+    P="$setup_dir/reports/$exp-RUN-server-0/pcie.rpt"
+fi
 if [ -f "$P" ]; then
     echo
     if [ "${PCIE_COUNTERS_SHARED:-1}" = "1" ]; then
