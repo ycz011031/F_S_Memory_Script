@@ -350,6 +350,26 @@ for ((j = 0; j < num_runs; j++)); do
     done
     sleep 5
 
+    # Data-plane IPs are set by ifconfig inside setup-envir.sh and do not
+    # survive a reboot; they were just re-applied above. Preflight only tests
+    # the MANAGEMENT link, so verify each test link here. Without this, a
+    # freshly rebooted host fails later at iperf3 connect with a much more
+    # obscure symptom.
+    for i in "${ACTIVE[@]}"; do
+        if ! ping -c 2 -W 3 -I "${SERVER_INTFS[$i]}" "${CLIENT_NIC_IPS[$i]}" >/dev/null 2>&1; then
+            echo >&2
+            echo "ERROR: no data-plane connectivity for NIC $i." >&2
+            echo "  ${SERVER_INTFS[$i]} (${SERVER_NIC_IPS[$i]}) cannot reach ${CLIENT_NIC_IPS[$i]}" >&2
+            echo "  Check both ends carry their address:" >&2
+            echo "    ip -br addr show ${SERVER_INTFS[$i]}" >&2
+            echo "    ssh $CLIENT_USERNAME@$CLIENT_SSH_IP ip -br addr show ${CLIENT_INTFS[$i]}" >&2
+            echo "  After a reboot these are unset until setup-envir.sh restores" >&2
+            echo "  them; if it ran and the link is still down, check cabling." >&2
+            exit 1
+        fi
+    done
+    echo "   data-plane links: OK"
+
     # ------------------------------------------------------------ receivers
     # Every invocation gets --no_kill and the stale-process sweep happens ONCE,
     # here. The invocations are backgrounded, so loop order is not execution
