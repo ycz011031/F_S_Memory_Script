@@ -216,12 +216,33 @@ preflight() {
         PROBLEMS+=("client is missing packages:$miss
     ssh $CLIENT_USERNAME@$CLIENT_SSH_IP 'sudo apt-get install -y net-tools python-is-python3'")
     fi
-    rsh_try "test -f '$DEP_DIR/Understanding-network-stack-overheads-SIGCOMM-2021/network_setup.py'" \
-        || PROBLEMS+=("network_setup.py missing on the client
-    setup-envir.sh uses it for TSO/GRO/aRFS and the ring-buffer size.
-      ssh $CLIENT_USERNAME@$CLIENT_SSH_IP 'git clone \\
-        https://github.com/Terabit-Ethernet/Understanding-network-stack-overheads-SIGCOMM-2021 \\
-        $DEP_DIR/Understanding-network-stack-overheads-SIGCOMM-2021'")
+    # network_setup.py applies TSO/GRO/aRFS and the ring-buffer size, so a
+    # missing copy does not just warn -- it silently changes the experiment.
+    # setup-envir.sh runs on BOTH hosts, so check both. DEP_DIR points at
+    # $HOME here; the lab's shared copy may live elsewhere, in which case a
+    # symlink is preferable to a second clone.
+    NSREPO="Understanding-network-stack-overheads-SIGCOMM-2021"
+    NSPATH="$DEP_DIR/$NSREPO/network_setup.py"
+    CLONE_URL="https://github.com/Terabit-Ethernet/$NSREPO"
+
+    for side in local remote; do
+        if [ "$side" = local ]; then
+            test -f "$NSPATH" && { echo "   local network_setup.py: OK"; continue; }
+            host="THIS host ($(hostname))"; prefix=""
+        else
+            rsh_try "test -f '$NSPATH'" && { echo "   remote network_setup.py: OK"; continue; }
+            host="the CLIENT ($CLIENT_SSH_IP)"
+            prefix="ssh $CLIENT_USERNAME@$CLIENT_SSH_IP "
+        fi
+        PROBLEMS+=("network_setup.py missing on $host
+    Expected at: $NSPATH
+    setup-envir.sh uses it for TSO/GRO/aRFS and the ring buffer, so without
+    it --ring_buffer $ring_buffer is silently not applied.
+    Clone it:
+      ${prefix}git clone $CLONE_URL $DEP_DIR/$NSREPO
+    Or, if the lab already has a copy (DEP_DIR used to be /fast-lab-share/...):
+      ${prefix}ln -s /path/to/existing/$NSREPO $DEP_DIR/$NSREPO")
+    done
     [ -z "$miss" ] && echo "   remote setup-envir deps: OK"
 
     if [ "${#PROBLEMS[@]}" -gt 0 ]; then
