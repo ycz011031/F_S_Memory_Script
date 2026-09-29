@@ -32,6 +32,7 @@ bandwidth="${DUALNIC_BANDWIDTH:-40g}"
 cca="${CCA:-dctcp}"
 num_runs=1
 sync_client=0
+results_file=""        # JSONL to append to; default ~/<exp>-<N>.jsonl, first unused N
 CLIENT_BRANCH="$(git -C "$HERE/.." rev-parse --abbrev-ref HEAD 2>/dev/null || echo icx-dualnic)"
 
 while [ $# -gt 0 ]; do
@@ -50,6 +51,7 @@ while [ $# -gt 0 ]; do
         -d|--dur)        dur="$2"; shift 2 ;;
         --runs)          num_runs="$2"; shift 2 ;;
         --uncapped)      bandwidth="uncapped"; shift ;;
+        --results)       results_file="$2"; shift 2 ;;
         -h|--help)
             sed -n '2,12p' "$0"; exit 0 ;;
         *) echo "unknown option: $1"; exit 2 ;;
@@ -290,6 +292,19 @@ rcp_back() {   # rcp_back <remote-path> <local-path>
 # Which NIC indices participate in this run.
 if [ "$nics" -eq 1 ]; then ACTIVE=( "$nic_index" ); else ACTIVE=( 0 1 ); fi
 
+# CPU utilisation is recorded over EVERY active NIC's cores. Recording only the
+# first NIC's meant a 2-NIC run reported half of its receive-side work.
+active_cores=""
+for i in "${ACTIVE[@]}"; do active_cores="${active_cores:+$active_cores,}${SERVER_CORES[$i]}"; done
+
+# What the kernel actually did, from sysfs, not what the cmdline asked for.
+# Stored with every result so an IOMMU-on and an IOMMU-off run cannot be
+# confused. Both NICs share one DMAR unit, so a mismatch ("lazy+strict") means
+# something unexpected happened at boot.
+iommu_mode=$(for i in "${ACTIVE[@]}"; do
+                 bash "$HERE/../utils/iommu-mode.sh" "${SERVER_INTFS[$i]}"
+             done | sort -u | paste -sd+)
+
 # pkill by process NAME, not -f. With -f the pattern "iperf3" also matches the
 # "sudo pkill -9 -f iperf3" command line itself, so pkill kills its own sudo
 # wrapper -- that is where the stream of "Killed" messages came from, and it
@@ -306,6 +321,7 @@ echo "  experiment : $exp"
 echo "  NICs       : $nics  (indices: ${ACTIVE[*]})"
 echo "  per NIC    : $num_servers flows, $( [ "$(per_flow_bw "$bandwidth" "$num_clients")" = 0 ] && echo "UNCAPPED (line rate)" || echo "$bandwidth aggregate ($(per_flow_bw "$bandwidth" "$num_clients") bps/flow)" ), cca=$cca"
 echo "  mtu $mtu  ring $ring_buffer  sockbuf ${buf}MB  dur ${dur}s"
+echo "  IOMMU      : $iommu_mode   (kernel $(uname -r))"
 echo "=============================================================="
 
 preflight
@@ -432,7 +448,7 @@ for ((j = 0; j < num_runs; j++)); do
     ( cd "$setup_dir" && sudo bash record-host-metrics.sh -f 0 --iio 0 -t 1 \
         --intf "${SERVER_INTFS[${ACTIVE[0]}]}" -o "$RUN" --type 0 \
         --cpu-util 1 --pcie 1 --membw 1 --bw 0 --dur "$dur" \
-        --cores "${SERVER_CORES[${ACTIVE[0]}]}" )
+        --cores "$active_cores" )
 
     # iperf3 server stats are written by run-netapp-tput.sh after its own
     # 80s wait; give those background jobs time to land their .rpt files.
@@ -548,3 +564,23 @@ if [ -f "$P" ]; then
 fi
 echo
 echo "  reports: $setup_dir/reports/$exp-RUN-server-0*/"
+
+# Machine-readable copy: config, IOMMU mode, every run, and mean/sd, as one
+# JSON line. The .rpt files above remain the source of truth. Unnamed dumps
+# get a fresh number rather than appending to a previous run's file.
+if [ -z "$results_file" ]; then
+    k=1; while [ -e "$HOME/$exp-$k.jsonl" ]; do k=$((k + 1)); done
+    results_file="$HOME/$exp-$k.jsonl"
+fi
+flow_bw=$(per_flow_bw "$bandwidth" "$num_clients")
+python3 "$HERE/dualnic-results.py" dump \
+    --reports "$setup_dir/reports" --exp "$exp" --runs "$num_runs" \
+    --nics "$(IFS=,; echo "${ACTIVE[*]}")" --out "$results_file" \
+    --meta mode="$( [ "$nics" -eq 2 ] && echo both || echo "nic${nic_index}only" )" \
+    --meta iommu="$iommu_mode" \
+    --meta flows_per_nic="$num_servers" \
+    --meta bandwidth_per_nic="$( [ "$flow_bw" = 0 ] && echo uncapped || echo "$bandwidth" )" \
+    --meta per_flow_bps="$flow_bw" \
+    --meta mtu="$mtu" --meta ring_buffer="$ring_buffer" --meta sockbuf_mb="$buf" \
+    --meta dur_s="$dur" --meta cca="$cca" --meta cpu_util_cores="$active_cores" \
+    || echo "WARNING: could not write $results_file; the .rpt files are intact." >&2

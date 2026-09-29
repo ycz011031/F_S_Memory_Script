@@ -69,6 +69,9 @@ git pull                                              # always first
 # load sweep: several rates plus line rate, with repeats
 ./scripts/sosp24-experiments/dualnic_load_sweep.sh "15 30 45 60 uncapped" 8 3
 
+# flow sweep: 5/10/15/30 flows/NIC, uncapped, 3 repeats. Once per IOMMU boot setting.
+./scripts/sosp24-experiments/dualnic_flow_sweep.sh              # [-o name] [flows] [rates] [runs]
+
 # single configuration
 ./scripts/run-dualnic-experiment.sh -E mytest --nics 2 --uncapped -S 8 --runs 3
 ```
@@ -87,6 +90,7 @@ git pull                                              # always first
 | `--cca <name>` | congestion control on the sender (default `dctcp`) |
 | `-M`, `--ring_buffer`, `--buf`, `-d` | MTU, NIC ring size, socket buffer MB, duration |
 | `--sync-client` | git fetch/checkout/pull on styx before running |
+| `--results <file>` | JSONL file to append the result to (default `~/<exp>-<N>.jsonl`, first unused N) |
 
 `-b` is an **aggregate per-NIC** rate and is divided by the flow count before
 reaching iperf3, whose own `-b` is per-flow. `-b 40g` with 8 flows sends 5 Gbps
@@ -108,6 +112,20 @@ Contention = `both / mean(nic0only, nic1only) - 1`.
 
 Results land in `utils/reports/<exp>-RUN-server-<run>[-nic<N>]/`:
 `iperf.bw.rpt` per NIC, `pcie.rpt` shared, `cpu_util.rpt`, `membw.rpt`.
+
+Every experiment also writes one JSON line (config, IOMMU mode read from
+sysfs, every run, mean/sd) to `~/<exp>-<N>.jsonl`. The flow sweep collects its
+experiments into `~/dualnic-flowsweep-<iommu>-<N>.{jsonl,txt}`, or
+`~/<name>.{jsonl,txt}` with `-o <name>`. Unnamed dumps take the first unused N,
+so a rerun never overwrites an earlier result. Side-by-side table of any set of
+these files:
+
+```bash
+python3 scripts/dualnic-results.py summary ~/dualnic-flowsweep-*.jsonl
+```
+
+`cpu_util` covers every active NIC's cores. Before the flow sweep was added it
+covered only NIC 0's, so 2-NIC `cpu_util` from earlier runs is half the picture.
 
 ### Diagnostics
 
@@ -155,6 +173,22 @@ ssh -o BatchMode=yes yz69@192.17.100.255 true && echo ssh OK
 The runner pings each data-plane link after NIC setup and aborts with both
 addresses if it fails, so a missed reboot step surfaces immediately rather than
 as a confusing iperf3 error.
+
+### Toggling the IOMMU
+
+```bash
+grep -n iommu /etc/default/grub /etc/default/grub.d/* 2>/dev/null   # current setting
+sudo nano /etc/default/grub   # in GRUB_CMDLINE_LINUX_DEFAULT, set the iommu tokens to
+                              #   on : intel_iommu=on iommu.strict=1
+                              #   off: intel_iommu=off
+sudo update-grub && sudo reboot
+bash utils/iommu-mode.sh enp153s0f0np0   # after reboot: strict | lazy | pt | off
+```
+
+Trust `iommu-mode.sh` over the command line: it reads the NIC's DMA domain
+type, i.e. what the kernel did rather than what it was asked. The runner
+records it in every JSON result, and the flow sweep puts it in every experiment
+name, so on and off sweeps never overwrite each other's reports.
 
 ### Cold start in a new session
 
