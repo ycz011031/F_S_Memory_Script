@@ -2,14 +2,17 @@
 # Dual-NIC contention as a function of FLOW COUNT, for the IOMMU mode the host
 # is currently booted in.
 #
-#   ./dualnic_flow_sweep.sh                            # 5,10,15,30 flows/NIC, uncapped, 3 runs
+#   ./dualnic_flow_sweep.sh                            # co-run, 5,10,15,30 flows/NIC, uncapped, 3 runs
 #   ./dualnic_flow_sweep.sh -o iommu-on                # same, results named ~/iommu-on.*
 #   ./dualnic_flow_sweep.sh "5 10 15 30" "30 uncapped" 3
-#   ./dualnic_flow_sweep.sh "5 10 15 30" uncapped 3 both   # skip the 1-NIC baselines
+#   ./dualnic_flow_sweep.sh "5 10 15 30" uncapped 3 "nic0only nic1only both"   # add 1-NIC baselines
 #
 # Arguments: flows per NIC, rates in Gbps per NIC (default "uncapped", i.e.
-# line rate), repeats, modes (default "nic0only nic1only both").
+# line rate), repeats, modes (default "both", the co-run).
 # -o NAME anywhere names the result files.
+#
+# Before the sweep, one single run of NIC0 alone at the lowest flow count checks
+# the datapath; the sweep stops there if it carries no traffic.
 #
 # Uncapped, the two NICs together hit the ~126 Gbps shared uplink, so 'both'
 # rows are link-bound and read as throughput loss that is not the IOMMU's.
@@ -43,7 +46,7 @@ done
 FLOWS="${POS[0]:-5 10 15 30}"
 RATES="${POS[1]:-uncapped}"
 RUNS="${POS[2]:-3}"
-MODES="${POS[3]:-nic0only nic1only both}"
+MODES="${POS[3]:-both}"
 
 IOMMU=$(for i in 0 1; do bash ../utils/iommu-mode.sh "${SERVER_INTFS[$i]}"; done \
         | sort -u | paste -sd+)
@@ -78,11 +81,38 @@ summarize() {
     } | tee "$TXT"
 }
 
-for r in $RATES; do
-    case "$r" in
+rate_args() {   # <rate> -> sets bwarg (for the runner) and tag (for names)
+    case "$1" in
         uncapped|unlimited|0) bwarg="uncapped"; tag="uncapped" ;;
-        *)                    bwarg="${r}g";    tag="${r}g" ;;
+        *)                    bwarg="${1}g";    tag="${1}g" ;;
     esac
+}
+
+# Datapath check: one short NIC0-alone run at the lowest flow count. The runner
+# already aborts when it cannot ping or start iperf3; this also catches a path
+# that connects but carries nothing, which would otherwise surface at the end
+# as a summary full of zeros.
+low=$(printf '%s\n' $FLOWS | sort -n | head -1)
+rate_args "${RATES%% *}"
+e="dnflows-$IOMMU-$tag-f$low-datapath"
+echo
+echo "######## datapath check: NIC0 alone, $low flows/NIC, $tag, 1 run"
+if ! ./run-dualnic-experiment.sh -E "$e" --nics 1 --nic-index 0 \
+        -S "$low" -C "$low" -b "$bwarg" --runs 1 --results "$JSONL"; then
+    echo "######## ABORTING: datapath check failed" >&2
+    exit 1
+fi
+got=$(awk '{print $NF}' "../utils/reports/$e-RUN-server-0-nic0/iperf.bw.rpt" 2>/dev/null)
+case "${got:-}" in ''|*[!0-9.]*) got=0 ;; esac
+if ! awk -v t="$got" 'BEGIN{exit !(t > 1)}'; then
+    echo "######## ABORTING: datapath check carried $got Gbps on NIC0." >&2
+    echo "######## See utils/reports/$e-RUN-server-0-nic0/ and utils/logs/$e-*" >&2
+    exit 1
+fi
+echo "######## datapath OK: $got Gbps on NIC0"
+
+for r in $RATES; do
+    rate_args "$r"
     for f in $FLOWS; do
         for mode in $MODES; do
             case "$mode" in

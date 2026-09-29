@@ -69,7 +69,8 @@ git pull                                              # always first
 # load sweep: several rates plus line rate, with repeats
 ./scripts/sosp24-experiments/dualnic_load_sweep.sh "15 30 45 60 uncapped" 8 3
 
-# flow sweep: 5/10/15/30 flows/NIC, uncapped, 3 repeats. Once per IOMMU boot setting.
+# flow sweep: one NIC0-alone datapath check, then co-run (both NICs) at
+# 5/10/15/30 flows/NIC, uncapped, 3 repeats. Once per IOMMU boot setting.
 ./scripts/sosp24-experiments/dualnic_flow_sweep.sh              # [-o name] [flows] [rates] [runs]
 
 # single configuration
