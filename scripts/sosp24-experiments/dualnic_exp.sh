@@ -19,23 +19,32 @@ cd "$(dirname "$0")/.."
 
 BW="${1:-40g}"
 FLOWS="${2:-8}"
+shift 2 2>/dev/null || shift $# 2>/dev/null || true
+EXTRA=( "$@" )      # forwarded to every run, e.g. --sync-client
 
 echo "######## dual-NIC contention sweep, ${BW} per NIC, ${FLOWS} flows per NIC"
+[ ${#EXTRA[@]} -gt 0 ] && echo "######## extra args: ${EXTRA[*]}"
 
-echo
-echo "######## 1/3  NIC0 alone"
-./run-dualnic-experiment.sh -E "dualnic-${BW}-nic0only" --nics 1 --nic-index 0 \
-    -S "$FLOWS" -C "$FLOWS" -b "$BW"
+# A failed run yields no data, so continuing to the next one only buries the
+# error under two more failures and a summary of zeros that looks like a result.
+run_or_die() {
+    local label="$1"; shift
+    echo
+    echo "######## $label"
+    if ! ./run-dualnic-experiment.sh "$@" "${EXTRA[@]}"; then
+        echo >&2
+        echo "######## ABORTING: '$label' failed. Later runs would be" >&2
+        echo "######## meaningless and the summary would show zeros." >&2
+        exit 1
+    fi
+}
 
-echo
-echo "######## 2/3  NIC1 alone"
-./run-dualnic-experiment.sh -E "dualnic-${BW}-nic1only" --nics 1 --nic-index 1 \
-    -S "$FLOWS" -C "$FLOWS" -b "$BW"
-
-echo
-echo "######## 3/3  both NICs"
-./run-dualnic-experiment.sh -E "dualnic-${BW}-both" --nics 2 \
-    -S "$FLOWS" -C "$FLOWS" -b "$BW"
+run_or_die "1/3  NIC0 alone" \
+    -E "dualnic-${BW}-nic0only" --nics 1 --nic-index 0 -S "$FLOWS" -C "$FLOWS" -b "$BW"
+run_or_die "2/3  NIC1 alone" \
+    -E "dualnic-${BW}-nic1only" --nics 1 --nic-index 1 -S "$FLOWS" -C "$FLOWS" -b "$BW"
+run_or_die "3/3  both NICs" \
+    -E "dualnic-${BW}-both" --nics 2 -S "$FLOWS" -C "$FLOWS" -b "$BW"
 
 echo
 echo "=============================================================="

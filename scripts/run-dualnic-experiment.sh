@@ -31,6 +31,8 @@ buf="${SOCK_BUF_MB:-1}"
 bandwidth="${DUALNIC_BANDWIDTH:-40g}"
 cca="${CCA:-dctcp}"
 num_runs=1
+sync_client=0
+CLIENT_BRANCH="$(git -C "$HERE/.." rev-parse --abbrev-ref HEAD 2>/dev/null || echo icx-dualnic)"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -44,6 +46,7 @@ while [ $# -gt 0 ]; do
         --buf)           buf="$2"; shift 2 ;;
         -b|--bandwidth)  bandwidth="$2"; shift 2 ;;
         --cca)           cca="$2"; shift 2 ;;
+        --sync-client)   sync_client=1; shift ;;
         -d|--dur)        dur="$2"; shift 2 ;;
         -h|--help)
             sed -n '2,12p' "$0"; exit 0 ;;
@@ -135,11 +138,25 @@ preflight() {
 
     # The remote copy must be new enough to understand --no_kill, or the second
     # NIC's client group will wipe the first.
+    if [ "${sync_client:-0}" = "1" ]; then
+        echo "   syncing client repo..."
+        rsh "cd '$REPO' && git fetch origin && git checkout $CLIENT_BRANCH && git pull --ff-only" \
+            || { echo "ERROR: client repo sync failed." >&2; exit 1; }
+    fi
+
     rsh_try "grep -q -- '--no_kill' '$exp_dir/run-netapp-tput.sh'" || {
         echo >&2
         echo "ERROR: the client's run-netapp-tput.sh has no --no_kill support." >&2
-        echo "  Its copy of the repo is stale. On $CLIENT_SSH_IP:" >&2
-        echo "    cd $REPO && git fetch origin && git checkout icx-dualnic && git pull" >&2
+        echo "  Its copy of the repo is stale." >&2
+        echo >&2
+        echo "  Fix it from HERE, as a single non-interactive command -- do not" >&2
+        echo "  open an interactive ssh and paste follow-up lines, because the" >&2
+        echo "  ssh session consumes them as stdin and they run on THIS host:" >&2
+        echo >&2
+        echo "    ssh $CLIENT_USERNAME@$CLIENT_SSH_IP \\" >&2
+        echo "      'cd $REPO && git fetch origin && git checkout $CLIENT_BRANCH && git pull'" >&2
+        echo >&2
+        echo "  Or re-run this script with --sync-client to do it automatically." >&2
         exit 1
     }
     echo "   remote script version: OK"
