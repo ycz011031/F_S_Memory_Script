@@ -279,6 +279,52 @@ Run-to-run standard deviation is ≤ 0.15 Gbps everywhere except off pass 1 at
 15 flows. PCIe write with the IOMMU off matched strict within ~2 Gbps. CPU % is
 the mean over the active NICs' receiver cores (5 per NIC).
 
+#### Derived metrics
+
+**IOMMU counters, strict.** Rates are per second (`pcm-iio` samples every 1 s).
+"Per 4 KB written" divides by PCIe write traffic, which runs 4.5% above TCP
+throughput in every configuration (headers, descriptors, completions).
+
+| Flows/NIC | NICs | Lookups/s | Misses/s | Miss rate | Lookups per 4 KB written | Misses per 4 KB written | 4K PWC hits per miss | Upper-level PWC hits per miss | Mem accesses per miss |
+|---|---|---|---|---|---|---|---|---|---|
+| 5 | NIC0 alone | 28.2 M | 3.36 M | 11.9% | 9.2 | 1.09 | 1.02 | 0.005 | 4.1 |
+| 5 | both | 31.1 M | 3.84 M | 12.4% | 9.2 | 1.14 | 1.05 | 0.016 | 5.2 |
+| 10 | both | 31.2 M | 3.86 M | 12.4% | 9.2 | 1.14 | 1.07 | 0.025 | 5.4 |
+| 15 | both | 28.9 M | 3.61 M | 12.5% | 9.3 | 1.16 | 1.08 | 0.028 | 5.5 |
+| 30 | both | 14.4 M | 1.84 M | 12.7% | 9.4 | 1.19 | 1.05 | 0.022 | 5.6 |
+
+PWC is the page-walk cache. "Upper-level" is the 2M, 1G and 512G PWC hits
+combined.
+
+**Receiver CPU cost:** cores busy per 100 Gbps, i.e. mean CPU % × active
+cores ÷ throughput.
+
+| Flows/NIC | NICs | strict | off (pass 1 / 2) |
+|---|---|---|---|
+| 5 | NIC0 alone | 3.8 | 3.5 / 3.5 |
+| 5 | both | 5.9 | 5.9 / 5.9 |
+| 10 | both | 6.0 | 6.0 / 6.0 |
+| 15 | both | 6.4 | 6.6 / 6.5 |
+| 30 | both | 12.7 | 11.5 / 11.6 |
+
+- **The miss rate is flat at ~12%** (11.9% → 12.7%; run-to-run SD ≤ 0.03
+  points). Flow count barely moves it.
+- **About one miss per 4 KB page written (1.1–1.2), and ~9 lookups per page.**
+  This fits each fresh receive page missing once, with its remaining writes
+  hitting.
+- **Walks are shallow.** 4K PWC hits about equal misses, and upper-level PWC
+  hits are 0.5–2.8% of misses. That fits each walk needing only the final
+  page-table read, which is the cheap case.
+- **Memory accesses per miss is the one IOMMU counter that grows with flows:**
+  4.1 → 5.6. Its meaning is unverified. It also reads 75–138 k/s with the IOMMU
+  off, so it counts something besides translation.
+- **Strict's CPU cost:** +8% alone, +10% at 30 flows, nothing at 5–15 flows with
+  both NICs.
+- **Two NICs cost 55–70% more receiver CPU per Gbps than one** (5.9 vs 3.5–3.8 at 5
+  flows), with the IOMMU on or off.
+- **Receiver CPU per Gbps doubles from 10 to 30 flows** in both modes (6.0 →
+  11.5–12.7), while total receiver CPU stays flat or falls.
+
 #### Observed
 
 1. **Throughput is the same with the IOMMU strict and off**, at every flow
@@ -343,6 +389,12 @@ of:
   in `cpu_util.rpt`, not in the JSON.
 - **TCP behaviour** (losses, retransmits, ECN marks): not collected at all.
 
+Receiver CPU per Gbps doubles at 30 flows (derived metrics). Two readings fit.
+Either per-flow overhead on the receiver is the limit, with the 10-core average
+hiding saturated cores. Or slower flows simply batch worse, with fewer bytes
+per interrupt and per GRO merge, and the cost is an effect of the cliff rather
+than its cause. Per-core CPU separates the two.
+
 *Confidence: low on which one; high that it is not the IOMMU. Test: §5 item 5.*
 
 **D. More flows barely grows the IOMMU working set here.** aRFS steers each
@@ -355,6 +407,11 @@ Gbps rising only 4.4% from 5 to 30 flows.
 **E. The uneven 5-flow split** (NIC1 64 vs NIC0 41) is probably arbitration in
 the PCIe switch or flow placement under uplink saturation. It is unexplained,
 consistent across runs, and harmless to the totals.
+
+**F. Two NICs cost 55–70% more receiver CPU per Gbps than one.** With both NICs
+each core carries ~10.6 Gbps instead of ~19.2, so fixed per-interrupt and
+per-wakeup costs are spread over fewer bytes. Backpressure from the saturated
+uplink may add to it. Not investigated.
 
 ### 4.2 Earlier: capped at 30 Gbps per NIC, 8 flows (before 2026-09-29)
 
