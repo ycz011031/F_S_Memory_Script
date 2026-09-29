@@ -24,7 +24,7 @@
 set -u
 cd "$(dirname "$0")/.."
 
-RATES="${1:-15 30 45 60}"     # Gbps per NIC
+RATES="${1:-15 30 45 60 uncapped}"   # Gbps per NIC; "uncapped" = line rate
 FLOWS="${2:-8}"
 RUNS="${3:-1}"
 
@@ -38,11 +38,16 @@ for r in $RATES; do
             nic1only) args="--nics 1 --nic-index 1" ;;
             both)     args="--nics 2" ;;
         esac
+        # "uncapped" is a valid rate: it means no -b limit, i.e. line rate.
+        case "$r" in
+            uncapped|unlimited|0) bwarg="uncapped"; tag="uncapped" ;;
+            *)                    bwarg="${r}g";    tag="${r}g" ;;
+        esac
         echo
-        echo "######## ${r}g/NIC  $mode"
-        if ! ./run-dualnic-experiment.sh -E "dnload-${r}g-$mode" $args \
-                -S "$FLOWS" -C "$FLOWS" -b "${r}g" --runs "$RUNS"; then
-            echo "######## ABORTING at ${r}g/$mode" >&2
+        echo "######## $tag/NIC  $mode"
+        if ! ./run-dualnic-experiment.sh -E "dnload-$tag-$mode" $args \
+                -S "$FLOWS" -C "$FLOWS" -b "$bwarg" --runs "$RUNS"; then
+            echo "######## ABORTING at $tag/$mode" >&2
             exit 1
         fi
     done
@@ -56,7 +61,7 @@ printf '  %-8s %-10s %-12s %-14s %-16s %s\n' \
     RATE MODE TPUT PCIe_wr IOTLB_miss MISS_PER_GBPS
 for r in $RATES; do
     for mode in nic0only nic1only both; do
-        e="dnload-${r}g-$mode"
+        case "$r" in uncapped|unlimited|0) tag="uncapped" ;; *) tag="${r}g" ;; esac; e="dnload-$tag-$mode"
         P="../utils/reports/$e-RUN-server-0/pcie.rpt"
         [ -f "../utils/reports/$e-RUN-server-mean.rpt" ] && \
             P="../utils/reports/$e-RUN-server-mean.rpt"
@@ -77,7 +82,7 @@ for r in $RATES; do
         flag=""
         awk -v p="$pcie" 'BEGIN{exit !(p > 100)}' && flag="  <-- LINK BOUND"
         printf '  %-8s %-10s %-12s %-14s %-16s %s%s\n' \
-            "${r}g" "$mode" "$tput" "$pcie" "$miss" "$mpg" "$flag"
+            "$tag" "$mode" "$tput" "$pcie" "$miss" "$mpg" "$flag"
     done
 done
 echo

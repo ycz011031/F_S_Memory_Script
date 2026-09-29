@@ -49,6 +49,7 @@ while [ $# -gt 0 ]; do
         --sync-client)   sync_client=1; shift ;;
         -d|--dur)        dur="$2"; shift 2 ;;
         --runs)          num_runs="$2"; shift 2 ;;
+        --uncapped)      bandwidth="uncapped"; shift ;;
         -h|--help)
             sed -n '2,12p' "$0"; exit 0 ;;
         *) echo "unknown option: $1"; exit 2 ;;
@@ -60,6 +61,11 @@ done
 # 320 Gbps and the cap does nothing at all.
 per_flow_bw() {   # <aggregate, e.g. 40g> <flow count> -> bits/sec per flow
     local v="$1" n="$2" mult num
+    # 0 is iperf3's "no limit". Accept the words too so --bandwidth uncapped
+    # and --uncapped behave identically.
+    case "$v" in
+        0|uncapped|unlimited|none|line|linerate) echo 0; return ;;
+    esac
     case "$v" in
         *[gG]) mult=1000000000; num="${v%[gG]}" ;;
         *[mM]) mult=1000000;    num="${v%[mM]}" ;;
@@ -298,7 +304,7 @@ trap cleanup EXIT INT TERM
 echo "=============================================================="
 echo "  experiment : $exp"
 echo "  NICs       : $nics  (indices: ${ACTIVE[*]})"
-echo "  per NIC    : $num_servers flows, $bandwidth aggregate ($(per_flow_bw "$bandwidth" "$num_clients") bps/flow), cca=$cca"
+echo "  per NIC    : $num_servers flows, $( [ "$(per_flow_bw "$bandwidth" "$num_clients")" = 0 ] && echo "UNCAPPED (line rate)" || echo "$bandwidth aggregate ($(per_flow_bw "$bandwidth" "$num_clients") bps/flow)" ), cca=$cca"
 echo "  mtu $mtu  ring $ring_buffer  sockbuf ${buf}MB  dur ${dur}s"
 echo "=============================================================="
 
@@ -490,11 +496,34 @@ if [ -f "$P" ]; then
     # PCIe is the control variable: the shared uplink is x8 @ 16GT/s, ~126 Gbps.
     wr=$(awk '/^PCIe_wr_tput:/{print $NF}' "$P" 2>/dev/null)
     case "${wr:-}" in ''|*[!0-9.]*) wr=0 ;; esac
+    # The comparison metric. Raw miss counts scale with bytes moved, so they
+    # cannot be compared between runs that carried different amounts of
+    # traffic -- which is exactly the uncapped 1-NIC vs 2-NIC case. Misses per
+    # Gbps of actual PCIe write traffic is the number to compare.
+    ms=$(awk '/^IOTLB_misses:/{print $2}' "$P" 2>/dev/null)
+    case "${ms:-}" in ''|*[!0-9.]*) ms=0 ;; esac
+    if awk -v w="$wr" 'BEGIN{exit !(w > 0)}'; then
+        echo
+        printf '  IOTLB misses per Gbps : %s   <-- compare THIS across runs\n' \
+            "$(awk -v m="$ms" -v p="$wr" 'BEGIN{printf "%.1f", m/p}')"
+    fi
+
     if awk -v w="$wr" 'BEGIN{exit !(w > 100)}'; then
         echo
-        echo "  WARNING: PCIe write tput ${wr} Gbps is close to the ~126 Gbps"
-        echo "  shared uplink. This run is link-bound, so the IOMMU counters"
-        echo "  are not interpretable as contention. Lower --bandwidth."
+        if [ "$(per_flow_bw "$bandwidth" "$num_clients")" = "0" ]; then
+            # Uncapped was asked for, so saturation is the intended condition,
+            # not a mistake. Say what it does to the reading instead.
+            echo "  NOTE: uncapped run. PCIe write ${wr} Gbps is $(awk -v w="$wr" \
+                'BEGIN{printf "%.0f", 100*w/126}')% of the ~126 Gbps shared uplink,"
+            echo "  so the link is a binding constraint here. Absolute throughput"
+            echo "  and raw miss counts between 1-NIC and 2-NIC runs are therefore"
+            echo "  not comparable -- use the misses-per-Gbps line above, which"
+            echo "  normalises out the difference in bytes moved."
+        else
+            echo "  WARNING: PCIe write ${wr} Gbps is close to the ~126 Gbps shared"
+            echo "  uplink despite a cap being set, so the cap is not binding."
+            echo "  Lower --bandwidth, or pass --uncapped if that is intended."
+        fi
     fi
 fi
 echo
