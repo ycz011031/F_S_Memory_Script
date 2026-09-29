@@ -178,7 +178,17 @@ printf '  %-22s : %s Gbps\n' "AGGREGATE" "$total"
 P="$setup_dir/reports/$exp-RUN-server-0/pcie.rpt"
 if [ -f "$P" ]; then
     echo
-    echo "  shared IIO stack counters (sum over ALL active NICs):"
+    if [ "${PCIE_COUNTERS_SHARED:-1}" = "1" ]; then
+        echo "  shared IIO stack counters (sum over ALL active NICs):"
+    else
+        # Only reachable if someone points the NICs at separate root ports.
+        # This runner still collects pcm-iio once, so the numbers would be a
+        # sum across whatever the single PCIE_PATTERN matched -- say so rather
+        # than implying a per-NIC breakdown that was never collected.
+        echo "  PCIE_COUNTERS_SHARED=0, but this runner collects pcm-iio once"
+        echo "  against a single PCIE_PATTERN. Per-NIC counters would need one"
+        echo "  pattern and one report per NIC. Numbers below are still a sum:"
+    fi
     grep -E '^(PCIe_wr_tput|PCIe_rd_tput|IOTLB_lookups|IOTLB_misses|IOTLB_hits_derived|CTXT_cache_hits|PWC_512G_hits|PWC_1G_hits|PWC_2M_hits|PWC_4K_hits|IOMMU_mem_access):' \
         "$P" | sed 's/^/    /'
 
