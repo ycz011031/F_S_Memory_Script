@@ -180,40 +180,62 @@ preflight() {
 
     # setup-envir.sh runs as root over ssh, where there is no TTY to answer a
     # sudo prompt. This is the single most common silent failure.
-    rsh_try "sudo -n true" >/dev/null 2>&1 || {
-        echo >&2
-        echo "ERROR: sudo on the client needs a password." >&2
-        echo "  The runner invokes it over ssh where there is no TTY, so the" >&2
-        echo "  prompt cannot be answered and NIC setup silently fails." >&2
-        echo "  On $CLIENT_SSH_IP:" >&2
-        echo "    echo \"\$USER ALL=(ALL) NOPASSWD:ALL\" | sudo tee /etc/sudoers.d/fands" >&2
-        exit 1
-    }
-    echo "   remote passwordless sudo: OK"
+    # The remaining checks are all "install/configure something" problems that
+    # get fixed in one sitting. Exiting on the first one turns a single fix
+    # session into one round trip per missing item, so collect them all.
+    PROBLEMS=()
 
-    sudo -n true >/dev/null 2>&1 || {
-        echo "ERROR: sudo on THIS host needs a password; the run will stall." >&2
-        echo "    echo \"\$USER ALL=(ALL) NOPASSWD:ALL\" | sudo tee /etc/sudoers.d/fands" >&2
-        exit 1
-    }
-    echo "   local passwordless sudo: OK"
+    # setup-envir.sh runs as root over ssh, where there is no TTY to answer a
+    # sudo prompt. Both hosts need this: the client for NIC setup, this host
+    # for everything the runner does locally.
+    if sudo -n true >/dev/null 2>&1; then
+        echo "   local passwordless sudo: OK"
+    else
+        PROBLEMS+=("passwordless sudo missing on THIS host ($(hostname))
+    Run here, answering the password prompt once:
+      echo \"\$USER ALL=(ALL) NOPASSWD:ALL\" | sudo tee /etc/sudoers.d/fands
+      sudo chmod 0440 /etc/sudoers.d/fands && sudo visudo -c")
+    fi
+
+    if rsh_try "sudo -n true" >/dev/null 2>&1; then
+        echo "   remote passwordless sudo: OK"
+    else
+        PROBLEMS+=("passwordless sudo missing on the CLIENT ($CLIENT_SSH_IP)
+    The runner invokes sudo over ssh, where there is no TTY to answer a
+    prompt, so NIC setup fails. ssh -t forces a TTY for this one command:
+      ssh -t $CLIENT_USERNAME@$CLIENT_SSH_IP \\
+        'echo \"$CLIENT_USERNAME ALL=(ALL) NOPASSWD:ALL\" | sudo tee /etc/sudoers.d/fands \\
+         && sudo chmod 0440 /etc/sudoers.d/fands && sudo visudo -c'")
+    fi
 
     # What setup-envir.sh reaches for on the client.
     miss=""
-    rsh_try "command -v ifconfig >/dev/null" || miss="$miss ifconfig(net-tools)"
-    rsh_try "command -v python   >/dev/null" || miss="$miss python(python-is-python3)"
-    rsh_try "test -f '$DEP_DIR/Understanding-network-stack-overheads-SIGCOMM-2021/network_setup.py'" \
-        || miss="$miss network_setup.py"
+    rsh_try "command -v ifconfig >/dev/null" || miss="$miss net-tools(ifconfig)"
+    rsh_try "command -v python   >/dev/null" || miss="$miss python-is-python3(python)"
     if [ -n "$miss" ]; then
+        PROBLEMS+=("client is missing packages:$miss
+    ssh $CLIENT_USERNAME@$CLIENT_SSH_IP 'sudo apt-get install -y net-tools python-is-python3'")
+    fi
+    rsh_try "test -f '$DEP_DIR/Understanding-network-stack-overheads-SIGCOMM-2021/network_setup.py'" \
+        || PROBLEMS+=("network_setup.py missing on the client
+    setup-envir.sh uses it for TSO/GRO/aRFS and the ring-buffer size.
+      ssh $CLIENT_USERNAME@$CLIENT_SSH_IP 'git clone \\
+        https://github.com/Terabit-Ethernet/Understanding-network-stack-overheads-SIGCOMM-2021 \\
+        $DEP_DIR/Understanding-network-stack-overheads-SIGCOMM-2021'")
+    [ -z "$miss" ] && echo "   remote setup-envir deps: OK"
+
+    if [ "${#PROBLEMS[@]}" -gt 0 ]; then
         echo >&2
-        echo "ERROR: the client is missing what setup-envir.sh needs:$miss" >&2
-        echo "  On $CLIENT_SSH_IP:" >&2
-        echo "    sudo apt-get install -y net-tools python-is-python3" >&2
-        echo "    git clone https://github.com/Terabit-Ethernet/Understanding-network-stack-overheads-SIGCOMM-2021 \\" >&2
-        echo "        $DEP_DIR/Understanding-network-stack-overheads-SIGCOMM-2021" >&2
+        echo "=== preflight found ${#PROBLEMS[@]} problem(s); fix all, then re-run ===" >&2
+        n=1
+        for p in "${PROBLEMS[@]}"; do
+            echo >&2
+            echo "[$n] $p" >&2
+            n=$((n + 1))
+        done
+        echo >&2
         exit 1
     fi
-    echo "   remote setup-envir deps: OK"
 }
 rcp_back() {   # rcp_back <remote-path> <local-path>
     if [ -n "${CLIENT_PWD:-}" ]; then
