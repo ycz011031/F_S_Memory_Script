@@ -54,6 +54,20 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# iperf3 -b is PER FLOW. To cap a NIC at an aggregate rate its flows have to
+# divide that rate between them, otherwise "-b 40g" with 8 flows asks for
+# 320 Gbps and the cap does nothing at all.
+per_flow_bw() {   # <aggregate, e.g. 40g> <flow count> -> bits/sec per flow
+    local v="$1" n="$2" mult num
+    case "$v" in
+        *[gG]) mult=1000000000; num="${v%[gG]}" ;;
+        *[mM]) mult=1000000;    num="${v%[mM]}" ;;
+        *[kK]) mult=1000;       num="${v%[kK]}" ;;
+        *)     mult=1;          num="$v" ;;
+    esac
+    awk -v x="$num" -v m="$mult" -v n="$n" 'BEGIN{ printf "%d", (x*m)/n }'
+}
+
 REPO="${REPO_DIR:-$DEP_DIR/${REPO_NAME:-Fast-and-Safe-IO-Memory-Protection}}"
 setup_dir="$REPO/utils"
 exp_dir="$REPO/utils/tcp"
@@ -283,7 +297,7 @@ trap cleanup EXIT INT TERM
 echo "=============================================================="
 echo "  experiment : $exp"
 echo "  NICs       : $nics  (indices: ${ACTIVE[*]})"
-echo "  per NIC    : $num_servers flows @ $bandwidth, cca=$cca"
+echo "  per NIC    : $num_servers flows, $bandwidth aggregate ($(per_flow_bw "$bandwidth" "$num_clients") bps/flow), cca=$cca"
 echo "  mtu $mtu  ring $ring_buffer  sockbuf ${buf}MB  dur ${dur}s"
 echo "=============================================================="
 
@@ -357,6 +371,7 @@ for ((j = 0; j < num_runs; j++)); do
     sudo bash -c 'echo 1 > /sys/kernel/debug/tracing/tracing_on' 2>/dev/null
 
     # -------------------------------------------------------------- senders
+    flow_bw=$(per_flow_bw "$bandwidth" "$num_clients")
     # Same rule as the receivers: sweep once, then --no_kill for every group.
     rsh "sudo pkill -9 iperf3 >/dev/null 2>&1; screen -wipe >/dev/null 2>&1; true"
     sleep 1
@@ -365,7 +380,7 @@ for ((j = 0; j < num_runs; j++)); do
              sudo bash run-netapp-tput.sh -m client -a ${SERVER_NIC_IPS[$i]} \
              -C $num_clients -S $num_servers -o $exp-RUN-client-$j-nic$i \
              -p ${BASE_PORTS[$i]} -l ${CLIENT_CORES[$i]} -c ${CLIENT_CORES[$i]} \
-             -b $bandwidth --cca $cca --no_kill\""
+             -b $flow_bw --cca $cca --no_kill\""
     done
 
     echo "warming up..."; sleep 12
