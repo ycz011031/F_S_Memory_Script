@@ -119,6 +119,20 @@ preflight() {
         echo "ERROR: iperf3 not installed on the client." >&2; exit 1; }
     echo "   remote iperf3: OK"
 
+    # setup-server.sh is git-ignored, so it never arrives via git clone. The
+    # client's setup-envir.sh sources it for DEP_DIR, which it needs to find
+    # network_setup.py. Without it the client NIC is never configured.
+    rsh_try "test -f '$setup_dir/setup-server.sh'" || {
+        echo >&2
+        echo "ERROR: $setup_dir/setup-server.sh is missing on the client." >&2
+        echo "  It is git-ignored, so git clone does not bring it. Copy yours:" >&2
+        echo "    scp $setup_dir/setup-server.sh \\" >&2
+        echo "        $CLIENT_USERNAME@$CLIENT_SSH_IP:$setup_dir/" >&2
+        echo "  (note this file holds credentials; keep it off shared storage)" >&2
+        exit 1
+    }
+    echo "   remote setup-server.sh: OK"
+
     # The remote copy must be new enough to understand --no_kill, or the second
     # NIC's client group will wipe the first.
     rsh_try "grep -q -- '--no_kill' '$exp_dir/run-netapp-tput.sh'" || {

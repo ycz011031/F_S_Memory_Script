@@ -1,5 +1,14 @@
 #!/bin/bash
-source ../setup-server.sh
+# Resolve paths from this script's own location, not from the caller's cwd and
+# not from setup-server.sh. setup-server.sh is git-ignored, so a fresh clone on
+# the client machine does not have one; depending on it here made every remote
+# iperf3 log path collapse to "/utils/logs/..." and silently produce no data.
+SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)   # <repo>/utils/tcp
+UTILS_DIR=$(cd "$SELF_DIR/.." && pwd)                     # <repo>/utils
+
+# Still source it when present, for testbed settings the caller may rely on,
+# but never require it.
+[ -f "$UTILS_DIR/setup-server.sh" ] && . "$UTILS_DIR/setup-server.sh"
 
 SCRIPT_NAME="run-netapp-tput"
 
@@ -142,9 +151,9 @@ function collect_stats() {
 NO_KILL="${NO_KILL:-0}"
 CCA="${CCA:-dctcp}"
 
-# The repo directory name is configurable; it is not always
-# "Fast-and-Safe-IO-Memory-Protection". REPO_DIR comes from setup-server.sh.
-LOG_ROOT="${REPO_DIR:-$DEP_DIR/${REPO_NAME:-Fast-and-Safe-IO-Memory-Protection}}/utils/logs"
+# Derived from this script's location, so it is correct whatever the clone is
+# named and whether or not setup-server.sh exists on this machine.
+LOG_ROOT="$UTILS_DIR/logs"
 
 counter=0
 if [ "$MODE" = "server" ]; then
