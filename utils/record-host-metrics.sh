@@ -242,7 +242,7 @@ if [ "$TYPE" -eq 0 ]; then
       sar -P $CPU_MASK 1 1000 > logs/$OUT_DIR/cpu_util.log &
       echo "Recording for $DURATION_S seconds..."
       sleep $DURATION_S
-      sudo pkill -9 -f "sar"
+      sudo pkill -9 -x sar
       python3 cpu_util.py logs/$OUT_DIR/cpu_util.log > reports/$OUT_DIR/cpu_util.rpt
     fi
 
@@ -287,7 +287,7 @@ if [ "$PCIE_REPORTING" -eq 1 ]; then
   echo "Collecting PCIe bandwidth..."
   dump_pciebw
   sleep $DURATION_S
-  sudo pkill -9 -f "pcm"
+  sudo pkill -9 pcm
   parse_pciebw
 fi
 
@@ -296,7 +296,7 @@ if [ "$MEMBW_REPORTING" -eq 1 ]; then
   dump_membw > logs/$OUT_DIR/membw.log &
   sleep 30
   sleep $DURATION_S
-  sudo pkill -9 -f "pcm"
+  sudo pkill -9 pcm
   parse_membw
 fi
 

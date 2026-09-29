@@ -149,7 +149,7 @@ LOG_ROOT="${REPO_DIR:-$DEP_DIR/${REPO_NAME:-Fast-and-Safe-IO-Memory-Protection}}
 counter=0
 if [ "$MODE" = "server" ]; then
     if [ "$NO_KILL" != "1" ]; then
-        sudo pkill -9 -f iperf #kill existing iperf servers/clients
+        sudo pkill -9 iperf3 #kill existing iperf servers/clients
         sleep 1
     fi
     while [ $counter -lt $NUM_SERVERS ]; do
@@ -167,7 +167,7 @@ if [ "$MODE" = "server" ]; then
     collect_stats
 elif [ "$MODE" = "client" ]; then
     if [ "$NO_KILL" != "1" ]; then
-        sudo pkill -9 -f iperf #kill existing iperf servers/clients
+        sudo pkill -9 iperf3 #kill existing iperf servers/clients
         sleep 1
     fi
     while [ $counter -lt $NUM_CLIENTS ]; do
