@@ -177,6 +177,43 @@ preflight() {
         exit 1
     }
     echo "   remote script version: OK"
+
+    # setup-envir.sh runs as root over ssh, where there is no TTY to answer a
+    # sudo prompt. This is the single most common silent failure.
+    rsh_try "sudo -n true" >/dev/null 2>&1 || {
+        echo >&2
+        echo "ERROR: sudo on the client needs a password." >&2
+        echo "  The runner invokes it over ssh where there is no TTY, so the" >&2
+        echo "  prompt cannot be answered and NIC setup silently fails." >&2
+        echo "  On $CLIENT_SSH_IP:" >&2
+        echo "    echo \"\$USER ALL=(ALL) NOPASSWD:ALL\" | sudo tee /etc/sudoers.d/fands" >&2
+        exit 1
+    }
+    echo "   remote passwordless sudo: OK"
+
+    sudo -n true >/dev/null 2>&1 || {
+        echo "ERROR: sudo on THIS host needs a password; the run will stall." >&2
+        echo "    echo \"\$USER ALL=(ALL) NOPASSWD:ALL\" | sudo tee /etc/sudoers.d/fands" >&2
+        exit 1
+    }
+    echo "   local passwordless sudo: OK"
+
+    # What setup-envir.sh reaches for on the client.
+    miss=""
+    rsh_try "command -v ifconfig >/dev/null" || miss="$miss ifconfig(net-tools)"
+    rsh_try "command -v python   >/dev/null" || miss="$miss python(python-is-python3)"
+    rsh_try "test -f '$DEP_DIR/Understanding-network-stack-overheads-SIGCOMM-2021/network_setup.py'" \
+        || miss="$miss network_setup.py"
+    if [ -n "$miss" ]; then
+        echo >&2
+        echo "ERROR: the client is missing what setup-envir.sh needs:$miss" >&2
+        echo "  On $CLIENT_SSH_IP:" >&2
+        echo "    sudo apt-get install -y net-tools python-is-python3" >&2
+        echo "    git clone https://github.com/Terabit-Ethernet/Understanding-network-stack-overheads-SIGCOMM-2021 \\" >&2
+        echo "        $DEP_DIR/Understanding-network-stack-overheads-SIGCOMM-2021" >&2
+        exit 1
+    fi
+    echo "   remote setup-envir deps: OK"
 }
 rcp_back() {   # rcp_back <remote-path> <local-path>
     if [ -n "${CLIENT_PWD:-}" ]; then
@@ -221,10 +258,31 @@ for ((j = 0; j < num_runs; j++)); do
         s_intf="${SERVER_INTFS[$i]}";  s_ip="${SERVER_NIC_IPS[$i]}"
         c_intf="${CLIENT_INTFS[$i]}";  c_ip="${CLIENT_NIC_IPS[$i]}"
         echo "-- NIC $i: $c_intf($c_ip) -> $s_intf($s_ip)"
-        ( cd "$setup_dir" && sudo bash setup-envir.sh -i "$s_intf" -a "$s_ip" \
-              -m "$mtu" --ring_buffer "$ring_buffer" --buf "$buf" ) >/dev/null 2>&1
-        rsh "cd $setup_dir && sudo bash setup-envir.sh -i $c_intf -a $c_ip \
-             -m $mtu --ring_buffer $ring_buffer --buf $buf" >/dev/null 2>&1
+
+        # Capture rather than discard. Sending this to /dev/null meant a failing
+        # setup-envir.sh -- and rsh's own error message -- vanished, leaving an
+        # abort with no visible cause.
+        log_s=$(mktemp); log_c=$(mktemp)
+        if ! ( cd "$setup_dir" && sudo bash setup-envir.sh -i "$s_intf" -a "$s_ip" \
+                   -m "$mtu" --ring_buffer "$ring_buffer" --buf "$buf" ) >"$log_s" 2>&1; then
+            echo "WARNING: server-side setup-envir.sh for $s_intf returned non-zero:" >&2
+            tail -15 "$log_s" | sed 's/^/    /' >&2
+        fi
+        if ! rsh_try "cd $setup_dir && sudo bash setup-envir.sh -i $c_intf -a $c_ip \
+                      -m $mtu --ring_buffer $ring_buffer --buf $buf" >"$log_c" 2>&1; then
+            echo >&2
+            echo "ERROR: client-side setup-envir.sh for $c_intf failed. Output:" >&2
+            tail -20 "$log_c" | sed 's/^/    /' >&2
+            echo >&2
+            echo "  Common causes on the client:" >&2
+            echo "    - sudo needs a password (there is no TTY over ssh)" >&2
+            echo "    - ifconfig missing        -> sudo apt-get install -y net-tools" >&2
+            echo "    - 'python' missing        -> sudo apt-get install -y python-is-python3" >&2
+            echo "    - network_setup.py missing under $DEP_DIR" >&2
+            rm -f "$log_s" "$log_c"
+            exit 1
+        fi
+        rm -f "$log_s" "$log_c"
     done
     sleep 5
 
