@@ -314,7 +314,28 @@ cleanup() {
     rsh_try "sudo pkill -9 iperf3; screen -wipe" >/dev/null 2>&1 || true
     sudo bash -c 'echo 0 > /sys/kernel/debug/tracing/tracing_on' 2>/dev/null || true
 }
-trap cleanup EXIT INT TERM
+
+# One experiment at a time. Every run kills iperf3 on BOTH hosts before it
+# starts and again when it exits, so a second copy -- a forgotten tmux or nohup
+# sweep -- zeroes the first one's traffic and its own, and both report ~0 Gbps.
+# The lock is taken BEFORE the cleanup trap is armed: otherwise the refused
+# copy's exit would still kill the running copy's iperf3.
+exec 9>>/tmp/dualnic-experiment.lock
+if command -v flock >/dev/null 2>&1 && ! flock -n 9; then
+    echo "ERROR: another dual-NIC experiment is already running on $(hostname):" >&2
+    pgrep -af 'dualnic_flow_swee[p]|dualnic_load_swee[p]|dualnic_ex[p]|run-dualnic-experimen[t]' \
+        | grep -v "^$$ " | sed 's/^/    /' >&2
+    echo "  Wait for it to finish, or stop it first:" >&2
+    echo "    pkill -f 'dualnic_flow_swee[p]'; pkill -f 'run-dualnic-experimen[t]'" >&2
+    exit 1
+fi
+
+# INT/TERM must EXIT, not just clean up: a handler that returns lets the script
+# carry on, so Ctrl-C or pkill killed the traffic and the run then continued,
+# measuring nothing. Exiting fires the EXIT trap, which does the cleanup.
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 echo "=============================================================="
 echo "  experiment : $exp"
@@ -396,7 +417,7 @@ for ((j = 0; j < num_runs; j++)); do
     for i in "${ACTIVE[@]}"; do
         ( cd "$exp_dir" && sudo bash run-netapp-tput.sh -m server \
               -S "$num_servers" -o "$RUN-nic$i" -p "${BASE_PORTS[$i]}" \
-              -c "${SERVER_CORES[$i]}" --no_kill ) &
+              -c "${SERVER_CORES[$i]}" --no_kill ) 9>&- &   # don't hold the lock
     done
     sleep 5
 

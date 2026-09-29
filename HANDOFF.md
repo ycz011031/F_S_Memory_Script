@@ -128,6 +128,18 @@ python3 scripts/dualnic-results.py summary ~/dualnic-flowsweep-*.jsonl
 `cpu_util` covers every active NIC's cores. Before the flow sweep was added it
 covered only NIC 0's, so 2-NIC `cpu_util` from earlier runs is half the picture.
 
+### Stopping a run
+
+```bash
+pkill -f 'dualnic_flow_swee[p]'; pkill -f 'run-dualnic-experimen[t]'
+```
+
+The runner kills iperf3 on both hosts on the way out; it may first finish a
+sleep of up to ~75 s. Ctrl-C in the terminal does the same. Only one
+experiment can run at a time (`/tmp/dualnic-experiment.lock`): every run kills
+iperf3 on both hosts, so two copies zero each other's traffic. A second copy
+refuses to start and lists the one that is running.
+
 ### Diagnostics
 
 ```bash
