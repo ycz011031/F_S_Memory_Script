@@ -172,19 +172,19 @@ def plot_iommu_misses_stats(iommu_on_data, x_labels, title):
     # plot L1, L2, L3 misses
     bar_width = 0.25
 
-    plt.bar(x - bar_width,  l1_miss_page, bar_width, label='L1')
-    plt.bar(x,              l2_miss_page, bar_width, label='L2')
-    plt.bar(x + bar_width,  l3_miss_page, bar_width, label='L3')
+    plt.bar(x - bar_width,  l1_miss_page, bar_width, label='PWC 512G hits')
+    plt.bar(x,              l2_miss_page, bar_width, label='PWC 1G hits')
+    plt.bar(x + bar_width,  l3_miss_page, bar_width, label='PWC 2M hits')
     
     plt.xlabel("# of flows")
 
-    plt.ylabel("Misses per page")
-    plt.title(title + 'L1-L2-L3-miss')
+    plt.ylabel("Page-walk-cache hits per page")
+    plt.title(title + "PWC-hits-by-page-size")
     plt.xticks(x, x_labels)
     plt.legend()
     plt.ylim(0, 0.5)
 
-    file_name = title + 'L1-L2-L3-miss.png'
+    file_name = title + "PWC-hits-by-page-size.png"
     plt.savefig(file_name)
     print('Saved plot to ' + file_name)
     plt.close()

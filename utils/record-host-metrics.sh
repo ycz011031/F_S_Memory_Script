@@ -101,17 +101,75 @@ function dump_pciebw() {
     sudo taskset -c 15 $PCM_DIR/build/bin/pcm-iio 1 -csv=logs/$OUT_DIR/pcie.csv &
 }
 
+# ICX (family 6, model 106) pcm-iio CSV layout, from opCode-6-106.txt:
+#
+#   1 Date  2 Time  3 Socket  4 Name  5 Part
+#   6 IB write        7 IB read       8 OB read   9 OB write
+#  10 IOTLB Lookup   11 IOTLB Miss   12 Ctxt Cache Hit
+#  13 512G Cache Hit 14 1G Cache Hit 15 2M Cache Hit  16 4K Cache Hit
+#  17 IOMMU Mem Access
+#
+# The column OFFSETS below are correct for ICX. The names this function used to
+# write were inherited from the Skylake opCode-85.txt event set and did not
+# match: what was emitted as L1/L2/L3_Miss is really 512G/1G/2M page-walk-cache
+# HITS, CTXT_Miss is really a Ctxt Cache HIT, Mem_Read is really 4K Cache Hit,
+# and IOTLB_hits is really IOTLB Lookup (= hits + misses). Only IOTLB_misses and
+# the two bandwidth columns were ever named correctly.
+#
+# Correct names are written first. The old names are then written as aliases so
+# existing parsers and plot scripts keep working on new runs; they are marked
+# LEGACY and should not be used in new analysis.
+
+_pcie_avg() {   # <column> -> mean over samples, 0 if no rows matched
+    grep "$PCIE_PATTERN" "logs/$OUT_DIR/pcie.csv" 2>/dev/null \
+      | awk -F ',' -v c="$1" \
+            '{ sum += $c; n++ } END { if (n > 0) printf "%.3f", sum/n; else printf "0" }'
+}
+
+_pcie_gbps() {  # <column> -> mean bytes/s converted to Gb/s, 0 if no rows
+    grep "$PCIE_PATTERN" "logs/$OUT_DIR/pcie.csv" 2>/dev/null \
+      | awk -F ',' -v c="$1" \
+            '{ sum += $c/1000000000.0; n++ } END { if (n > 0) printf "%.3f", sum/n*8; else printf "0" }'
+}
+
 function parse_pciebw() {
-    #TODO: make more general, parse PCIe bandwidth for any given socket and IIO stack
-    echo "PCIe_wr_tput: " $(cat logs/$OUT_DIR/pcie.csv | grep "$PCIE_PATTERN" | awk -F ',' '{ sum += $6/1000000000.0; n++ } END { if (n > 0) printf "%.3f", sum / n * 8 ; }') > reports/$OUT_DIR/pcie.rpt
-    echo "PCIe_rd_tput: " $(cat logs/$OUT_DIR/pcie.csv | grep "$PCIE_PATTERN" | awk -F ',' '{ sum += $7/1000000000.0; n++ } END { if (n > 0) printf "%0.3f", sum / n * 8 ; }') >> reports/$OUT_DIR/pcie.rpt
-    echo "IOTLB_hits: " $(cat logs/$OUT_DIR/pcie.csv | grep "$PCIE_PATTERN" | awk -F ',' '{ sum += $10; n++ } END { if (n > 0) printf "%0.3f", sum / n; }') >> reports/$OUT_DIR/pcie.rpt
-    echo "IOTLB_misses: " $(cat logs/$OUT_DIR/pcie.csv | grep "$PCIE_PATTERN" | awk -F ',' '{ sum += $11; n++ } END { if (n > 0) printf "%0.3f", sum / n; }') >> reports/$OUT_DIR/pcie.rpt
-    echo "CTXT_Miss: " $(cat logs/$OUT_DIR/pcie.csv | grep "$PCIE_PATTERN" | awk -F ',' '{ sum += $12; n++ } END { if (n > 0) printf "%0.3f", sum / n; }') >> reports/$OUT_DIR/pcie.rpt
-    echo "L1_Miss: " $(cat logs/$OUT_DIR/pcie.csv | grep "$PCIE_PATTERN" | awk -F ',' '{ sum += $13; n++ } END { if (n > 0) printf "%0.3f", sum / n; }') >> reports/$OUT_DIR/pcie.rpt
-    echo "L2_Miss: " $(cat logs/$OUT_DIR/pcie.csv | grep "$PCIE_PATTERN" | awk -F ',' '{ sum += $14; n++ } END { if (n > 0) printf "%0.3f", sum / n; }') >> reports/$OUT_DIR/pcie.rpt
-    echo "L3_Miss: " $(cat logs/$OUT_DIR/pcie.csv | grep "$PCIE_PATTERN" | awk -F ',' '{ sum += $15; n++ } END { if (n > 0) printf "%0.3f", sum / n; }') >> reports/$OUT_DIR/pcie.rpt
-    echo "Mem_Read: " $(cat logs/$OUT_DIR/pcie.csv | grep "$PCIE_PATTERN" | awk -F ',' '{ sum += $16; n++ } END { if (n > 0) printf "%0.3f", sum / n; }') >> reports/$OUT_DIR/pcie.rpt
+    local R="reports/$OUT_DIR/pcie.rpt"
+
+    if ! grep -q "$PCIE_PATTERN" "logs/$OUT_DIR/pcie.csv" 2>/dev/null; then
+        echo "WARNING: PCIE_PATTERN '$PCIE_PATTERN' matched no rows in pcie.csv." >&2
+        echo "         Every PCIe/IOMMU metric will be 0. Check the pattern with" >&2
+        echo "         utils/discover-pcie-topology.sh (section 3)." >&2
+    fi
+
+    local lookups misses
+    lookups=$(_pcie_avg 10)
+    misses=$(_pcie_avg 11)
+
+    {
+        echo "PCIe_wr_tput: $(_pcie_gbps 6)"
+        echo "PCIe_rd_tput: $(_pcie_gbps 7)"
+
+        # --- correctly named ICX counters ---
+        echo "IOTLB_lookups: $lookups"
+        echo "IOTLB_misses: $misses"
+        # Lookup - Miss. The hardware exposes no direct IOTLB-hit counter here.
+        echo "IOTLB_hits_derived: $(awk -v l="$lookups" -v m="$misses" \
+            'BEGIN{ d=l-m; if (d<0) d=0; printf "%.3f", d }')"
+        echo "CTXT_cache_hits: $(_pcie_avg 12)"
+        echo "PWC_512G_hits: $(_pcie_avg 13)"
+        echo "PWC_1G_hits: $(_pcie_avg 14)"
+        echo "PWC_2M_hits: $(_pcie_avg 15)"
+        echo "PWC_4K_hits: $(_pcie_avg 16)"
+        echo "IOMMU_mem_access: $(_pcie_avg 17)"
+
+        # --- LEGACY aliases: names are wrong, kept only for old consumers ---
+        echo "IOTLB_hits: $lookups"
+        echo "CTXT_Miss: $(_pcie_avg 12)"
+        echo "L1_Miss: $(_pcie_avg 13)"
+        echo "L2_Miss: $(_pcie_avg 14)"
+        echo "L3_Miss: $(_pcie_avg 15)"
+        echo "Mem_Read: $(_pcie_avg 16)"
+    } > "$R"
 }
 
 function dump_membw() {

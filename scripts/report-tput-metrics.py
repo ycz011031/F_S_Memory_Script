@@ -57,11 +57,14 @@ if "drops" in metrics or "all" in metrics:
 if "acks" in metrics or "all" in metrics:
     print(f"Acks per page: {acks_page}")
 if "iommu" in metrics or "all" in metrics:
-    print(f"Misses per page:")
-    print(f"\tIOTLB: {iotlb_miss_page}")
-    print(f"\tL1: {l1_miss_page}")
-    print(f"\tL2: {l2_miss_page}")
-    print(f"\tL3: {l3_miss_page}")
+    # Per page, on ICX (family 6 model 106). Only IOTLB is a miss count; the
+    # other three are page-walk-cache HITS bucketed by page size, not L1/L2/L3
+    # misses. The underlying .dat columns keep their historical names.
+    print(f"Per page:")
+    print(f"\tIOTLB misses    : {iotlb_miss_page}")
+    print(f"\tPWC 512G hits   : {l1_miss_page}")
+    print(f"\tPWC 1G hits     : {l2_miss_page}")
+    print(f"\tPWC 2M hits     : {l3_miss_page}")
 
 if (not results['net_tput_stddev']):
     print("")
@@ -77,9 +80,9 @@ if "drops" in metrics or "all" in metrics:
 if "acks" in metrics or "all" in metrics:
     print(f"Acks per page: {misses_per_page(results['sent_packets_stddev'], tput)}")
 if "iommu" in metrics or "all" in metrics:
-    print(f"Misses per page:")
-    print(f"\tIOTLB: {misses_per_page(results['iotlb_misses_stddev'],tput)}")
-    print(f"\tL1: {misses_per_page(results['l1_misses_stddev'],tput)}")
-    print(f"\tL2: {misses_per_page(results['l2_misses_stddev'],tput)}")
-    print(f"\tL3: {misses_per_page(results['l3_misses_stddev'],tput)}")
+    print(f"Per page:")
+    print(f"\tIOTLB misses    : {misses_per_page(results['iotlb_misses_stddev'],tput)}")
+    print(f"\tPWC 512G hits   : {misses_per_page(results['l1_misses_stddev'],tput)}")
+    print(f"\tPWC 1G hits     : {misses_per_page(results['l2_misses_stddev'],tput)}")
+    print(f"\tPWC 2M hits     : {misses_per_page(results['l3_misses_stddev'],tput)}")
 print("")

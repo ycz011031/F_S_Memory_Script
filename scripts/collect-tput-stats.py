@@ -74,34 +74,51 @@ for i in range(NUM_RUNS):
                     cpu_utils.append(cpu_util)
                 break
     try: 
+        # pcie.rpt now carries each counter twice: the correct ICX name and the
+        # legacy mis-named alias. These flags make sure only the first (correct)
+        # occurrence is recorded, so one run contributes one sample per counter.
+        iotlb_hits_seen = ctxt_seen = l1_seen = l2_seen = l3_seen = False
+        mem_read_seen = False
         with open(FILE_NAME + '-RUN-server-' + str(i) + '/pcie.rpt') as f1:
             for line in f1:
                 line_str = line.split()
-                if (line_str[0] == 'PCIe_wr_tput:'):
+                if not line_str:
+                    continue
+                # Each bucket accepts the correct ICX name first and the legacy
+                # (mis-named) key second, so reports written before the rename
+                # still parse. See parse_pciebw() in record-host-metrics.sh for
+                # what these counters actually are on ICX.
+                key = line_str[0].rstrip(':')
+                if key == 'PCIe_wr_tput':
                     pcie_tput = float(line_str[-1])
                     if (pcie_tput >= 0):
                         pcie_wr_tput.append(pcie_tput)
-                elif (line_str[0] == 'IOTLB_hits:'):
-                    iotlb_hits_ = float(line_str[-1])
-                    iotlb_hits.append(iotlb_hits_)
-                elif (line_str[0] == 'IOTLB_misses:'):
-                    iotlb_misses_ = float(line_str[-1])
-                    iotlb_misses.append(iotlb_misses_)
-                elif (line_str[0] == 'CTXT_Miss:'):
-                    ctxt_misses_ = float(line_str[-1])
-                    ctxt_misses.append(ctxt_misses_)
-                elif (line_str[0] == 'L1_Miss:'):
-                    l1_misses_ = float(line_str[-1])
-                    l1_miss.append(l1_misses_)
-                elif (line_str[0] == 'L2_Miss:'):
-                    l2_misses_ = float(line_str[-1])
-                    l2_miss.append(l2_misses_)
-                elif (line_str[0] == 'L3_Miss:'):
-                    l3_misses_ = float(line_str[-1])
-                    l3_miss.append(l3_misses_)
-                elif (line_str[0] == 'Mem_Read:'):
-                    mem_read_ = float(line_str[-1])
-                    mem_read.append(mem_read_)
+                elif key in ('IOTLB_lookups', 'IOTLB_hits'):
+                    if not iotlb_hits_seen:       # prefer the first (correct) key
+                        iotlb_hits.append(float(line_str[-1]))
+                        iotlb_hits_seen = True
+                elif key == 'IOTLB_misses':
+                    iotlb_misses.append(float(line_str[-1]))
+                elif key in ('CTXT_cache_hits', 'CTXT_Miss'):
+                    if not ctxt_seen:
+                        ctxt_misses.append(float(line_str[-1]))
+                        ctxt_seen = True
+                elif key in ('PWC_512G_hits', 'L1_Miss'):
+                    if not l1_seen:
+                        l1_miss.append(float(line_str[-1]))
+                        l1_seen = True
+                elif key in ('PWC_1G_hits', 'L2_Miss'):
+                    if not l2_seen:
+                        l2_miss.append(float(line_str[-1]))
+                        l2_seen = True
+                elif key in ('PWC_2M_hits', 'L3_Miss'):
+                    if not l3_seen:
+                        l3_miss.append(float(line_str[-1]))
+                        l3_seen = True
+                elif key in ('PWC_4K_hits', 'Mem_Read'):
+                    if not mem_read_seen:
+                        mem_read.append(float(line_str[-1]))
+                        mem_read_seen = True
     except Exception as e:
         pcie_wr_tput.append(0) 
         iotlb_hits.append(0)
@@ -185,8 +202,23 @@ output_list = [("cpu_utils_mean", cpu_utils_mean), ("cpu_utils_stddev", cpu_util
                ("ctxt_misses_stddev", ctxt_misses_stddev), ("l1_misses_mean", l1_misses_mean), ("l1_misses_stddev", l1_misses_stddev), 
                ("l2_misses_mean", l2_misses_mean), ("l2_misses_stddev", l2_misses_stddev), ("l3_misses_mean", l3_misses_mean), 
                ("l3_misses_stddev", l3_misses_stddev), ("mem_read_mean", mem_read_mean), ("mem_read_stddev", mem_read_stddev), 
-               ("mlc_tput_mean", mlc_tput_mean), ("mlc_tput_stddev", mlc_tput_stddev), ("sent_packets_mean", sent_packets_mean), 
+               ("mlc_tput_mean", mlc_tput_mean), ("mlc_tput_stddev", mlc_tput_stddev), ("sent_packets_mean", sent_packets_mean),
                ("sent_packets_stddev", sent_packets_stddev)]
+
+# The column names above are the historical ones and are WRONG for ICX: the
+# l1/l2/l3_misses columns actually hold 512G/1G/2M page-walk-cache HITS, and
+# ctxt_misses holds Ctxt Cache HITS. They are kept so plot.py and plot-pips.py
+# keep working. The same values are duplicated below under accurate names --
+# use these in new analysis.
+output_list += [
+    ("iotlb_lookups_mean", iotlb_hits_mean), ("iotlb_lookups_stddev", iotlb_hits_stddev),
+    ("iotlb_hits_derived_mean", max(iotlb_hits_mean - iotlb_misses_mean, 0)),
+    ("ctxt_cache_hits_mean", ctxt_misses_mean), ("ctxt_cache_hits_stddev", ctxt_misses_stddev),
+    ("pwc_512g_hits_mean", l1_misses_mean), ("pwc_512g_hits_stddev", l1_misses_stddev),
+    ("pwc_1g_hits_mean", l2_misses_mean),   ("pwc_1g_hits_stddev", l2_misses_stddev),
+    ("pwc_2m_hits_mean", l3_misses_mean),   ("pwc_2m_hits_stddev", l3_misses_stddev),
+    ("pwc_4k_hits_mean", mem_read_mean),    ("pwc_4k_hits_stddev", mem_read_stddev),
+]
 
 headers, outputs = zip(*output_list)
 headers = ",".join(headers) 

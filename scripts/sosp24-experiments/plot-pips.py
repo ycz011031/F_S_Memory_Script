@@ -476,9 +476,9 @@ def plot_iommu_misses_stats(iommu_on_data, x_labels, title):
     plt.figure(figsize=(14, 7))
     bar_width = 0.25
 
-    plt.bar(x - bar_width,  l1_miss_page, bar_width, label='L1')
-    plt.bar(x,              l2_miss_page, bar_width, label='L2')
-    plt.bar(x + bar_width,  l3_miss_page, bar_width, label='L3')
+    plt.bar(x - bar_width,  l1_miss_page, bar_width, label='PWC 512G hits')
+    plt.bar(x,              l2_miss_page, bar_width, label='PWC 1G hits')
+    plt.bar(x + bar_width,  l3_miss_page, bar_width, label='PWC 2M hits')
     
     if flow == 1:
         plt.xlabel("# of flows - block size")
