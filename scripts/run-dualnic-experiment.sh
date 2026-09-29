@@ -82,6 +82,23 @@ rsh() {
 # Fail fast on the things that otherwise produce a full run of zeros.
 preflight() {
     echo "-- preflight"
+    echo "   running on: $(hostname) ($(id -un))"
+
+    # This must run on the SERVER/receiver. Running it on the client makes the
+    # runner ssh to the machine it is already on, so both "sides" are the same
+    # host and nothing is measured. Detect that before anything else.
+    for ip in $(hostname -I 2>/dev/null); do
+        if [ "$ip" = "$CLIENT_SSH_IP" ] || [ "$ip" = "${CLIENT_NIC_IPS[0]:-}" ] \
+           || [ "$ip" = "${CLIENT_NIC_IPS[1]:-}" ]; then
+            echo >&2
+            echo "ERROR: this is the CLIENT machine ($(hostname), $ip)." >&2
+            echo "  Run the experiment on the SERVER/receiver instead -- it" >&2
+            echo "  drives the client over ssh. Per setup-server.sh that is:" >&2
+            echo "    ssh $SERVER_USERNAME@$SERVER_SSH_IP" >&2
+            echo "    cd $REPO && ./scripts/sosp24-experiments/dualnic_exp.sh 40g 8" >&2
+            exit 1
+        fi
+    done
     if [ -z "${CLIENT_PWD:-}" ]; then
         echo "   auth: ssh keys (CLIENT_PWD empty)"
     else
