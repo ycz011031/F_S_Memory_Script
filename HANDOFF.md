@@ -923,6 +923,12 @@ Means of 3 runs, iodepth 32 per instance. Mean latency is from Little's law
   or held by md, LVM or dm.
 - **The Gen3 uplink may bind before the IOMMU does.** The summary marks
   LINK BOUND when PCIe write exceeds 85% of the narrowest shared link.
+- **Never use a bare `wait` in a script that logs through
+  `exec > >(tee ...)`.** It also waits for that `tee`, which never exits
+  while the script runs. Reproduced on bash 5.0 and 5.1. This hung every run
+  after the last measurement window on 2026-10-05 (`perf-j8`,
+  `dualssd-sweep-strict-3`); fixed in the runner by waiting on the fio PIDs.
+  Those two runs are incomplete; ignore them.
 - `cpu_util.py` now parses `sar` output in both 12- and 24-hour locales. It
   previously needed the 12-hour format, and bigserver's locale is unchecked.
 

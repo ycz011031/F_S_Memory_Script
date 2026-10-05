@@ -329,7 +329,7 @@ for ((j = 0; j < num_runs; j++)); do
     [ "$num_runs" -gt 1 ] && echo "-- run $((j + 1))/$num_runs"
 
     # ---------------------------------------------------------------- load
-    want=0
+    want=0; fio_pids=()
     for i in "${ACTIVE[@]}"; do
         IFS=',' read -r -a cores <<< "${SSD_CORES[$i]}"
         for ((k = 0; k < jobs; k++)); do
@@ -342,6 +342,7 @@ for ((j = 0; j < num_runs; j++)); do
                 --time_based --ramp_time="$warm" --runtime="$fio_runtime" \
                 --randrepeat=0 --norandommap --output-format=json \
                 --output="$L/fio-ssd$i-$k.json" > "$L/fio-ssd$i-$k.err" 2>&1 9>&- &
+            fio_pids+=( $! )
             want=$((want + 1))
         done
     done
@@ -372,7 +373,10 @@ for ((j = 0; j < num_runs; j++)); do
         echo "         of the measurement; the drives were under-loaded for part of it." >&2
     fi
     stop_fio
-    wait 2>/dev/null
+    # Wait for these PIDs only. A bare `wait` also waits for the console-log
+    # tee started by `exec > >(tee ...)`, which never exits while this script
+    # runs: the run hangs forever after the last measurement window.
+    wait "${fio_pids[@]}" 2>/dev/null
 
     for i in "${ACTIVE[@]}"; do
         python3 "$HERE/dualssd-results.py" fio-sum --out "$setup_dir/reports/$RUN-ssd$i/fio.rpt" \
