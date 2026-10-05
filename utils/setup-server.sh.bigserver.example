@@ -51,13 +51,14 @@ SSD_SERIALS=( "S7YENJ0Y313233B" "S7U5NJ0Y308972P" )
 # bandwidth and VT-d counters alike -- is a sum over both drives. Per-drive
 # numbers come from fio.
 #
-# Skylake-SP root ports are PCIe Gen3, so the switch uplink runs at 8 GT/s
-# whatever the drives negotiate below it. Its width decides whether both drives
-# fit: x16 ~126 Gbps, x8 ~63 Gbps. The runner measures it (uplink_gbps).
+# Skylake-SP root ports are PCIe Gen3: the switch uplink is 8 GT/s x8, ~63 Gbps
+# (measured 2026-10-05), the same as one drive's own Gen4 x4 link. Both drives
+# together cannot exceed it; 4k reads stay well below, 1 MiB reads would not.
 
 # pcm-iio CSV row for root port b0:00.0, as "Socket<N>,IIO Stack <M> - <name>,Part<P>".
 # Get it from:  sudo bash utils/discover-ssd-pcie.sh
-SSD_PCIE_PATTERN=""
+# Measured 2026-10-05: both drives' traffic and the VT-d counters on this row.
+SSD_PCIE_PATTERN="Socket2,IIO Stack 3 - PCIe2,Part0"
 
 # fio cores, one disjoint group per drive, all on the drives' NUMA node 2
 # (CPUs 36-53). Instances are pinned round-robin over a drive's group.

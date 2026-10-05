@@ -13,7 +13,8 @@ together, [LOCAL-SETUP.md](LOCAL-SETUP.md) for first-time provisioning.
   configuration run so far. Reasons are speculated in §4.1; the experiments
   that would settle them are in §5.
 - **Second testbed (2026-10-05):** the same experiment with two NVMe SSDs and
-  fio on bigserver, a Skylake-SP host. Scripts are ready, not yet run (§7).
+  fio on bigserver, a Skylake-SP host (§7). First strict sweep done (§7,
+  "First result"); the IOMMU-off sweep is next.
 
 ---
 
@@ -629,8 +630,8 @@ In order of what each one decides. Commands run on icx from
 ## 7. bigserver: dual-SSD on Skylake-SP
 
 The same contention experiment with two NVMe SSDs and fio in place of two NICs
-and iperf3. fio runs locally, so there is no client host. Scripts written
-2026-10-05; **not yet run on bigserver.**
+and iperf3. fio runs locally, so there is no client host. Set up and first
+swept (strict) on 2026-10-05.
 
 ### Testbed (survey 2026-10-05)
 
@@ -639,7 +640,7 @@ and iperf3. fio runs locally, so there is no client host. Scripts written
 | Host | **bigserver**, shared with other users who also run PCM and fio |
 | CPU | 4× Xeon Gold 6140, Skylake-SP (family 6, model 85, stepping 4), 18 cores per socket, no SMT. NUMA node N = CPUs 18N–18N+17 |
 | Kernel | `5.15.0-177-generic`, booted `intel_iommu=on iommu.strict=1` (domain type `DMA`). Neither icx's 6.8 nor the paper's 6.0.3 |
-| PCM | installed, `/usr/local/bin/pcm-iio`; version not recorded |
+| PCM | installed, `/usr/local/bin/pcm-iio`. Version unknown: its banner prints an unfilled `$Format:%ci ID=%h$`. Loads `opCode-6-85.txt` without complaint |
 | fio | `fio-3.41-39-g9f87c`, `/usr/local/bin/fio` |
 
 | Index | Drive | Serial | PCI | State |
@@ -658,9 +659,10 @@ and iperf3. fio runs locally, so there is no client host. Scripts written
 The same shape as icx. Both drives share IOMMU unit `dmar7`, one root port, so
 one IIO stack and one Part: every `pcm-iio` number is a sum over both drives,
 and per-drive numbers come from fio. Both are on NUMA node 2 (CPUs 36–53).
-Skylake-SP root ports are Gen3, so the uplink above the switch runs at 8 GT/s:
-~126 Gbps at x16, ~63 Gbps at x8. **Its width is not yet known**;
-`discover-ssd-pcie.sh` prints it, and the runner records it as `uplink_gbps`.
+The uplink above the switch (`b0:00.0` to `b1:00.0`) is **8 GT/s x8, ~63 Gbps**,
+the same as one drive's own Gen4 x4 link. Both drives together cannot exceed
+it. At 4k the full co-run moves ~25 Gbps, so the link does not bind there.
+At 1 MiB it would; the summary marks such rows LINK BOUND.
 
 nvme2–5 (NUMA 3, `dmar11`) are `linux_raid_member` drives: someone's md array.
 
@@ -675,13 +677,21 @@ sudo bash utils/discover-ssd-pcie.sh    # prints SSD_PCIE_PATTERN; paste it into
 The discovery loads each drive alone with read-only fio and reports which
 `pcm-iio` row carries its traffic. It also checks that PCM loaded
 `opCode-6-85.txt` and that the VT-d counters are non-zero. **Do not sweep until
-they are**: with zeros, every IOMMU column of the sweep is zero too.
+they are**: with zeros, every IOMMU column of the sweep is zero too. It keeps
+its output in `utils/logs/discover-ssd-pcie-<date>-<time>/`.
+
+Result on 2026-10-05: `SSD_PCIE_PATTERN="Socket2,IIO Stack 3 - PCIe2,Part0"`,
+both drives on that row. Each drive alone (4 jobs × iodepth 32, 4k) did
+~530K IOPS, with ~1.4 IOTLB misses per I/O. Per IOTLB miss there were
+0.52–0.62 VT-d L1/L2/L3 misses at each level and 3.3–3.4 VT-d memory reads.
+On icx nearly every miss hit the page-walk cache; here walks are deep.
 
 ### Run
 
 ```bash
-# baselines + co-run at 1,2,4,8 fio instances per drive, 4k random reads, 3 repeats
-./scripts/sosp24-experiments/dualssd_sweep.sh                  # [-o name] [instances] [block sizes] [runs] [modes]
+# co-run at 1,2,4,8 fio instances per drive, 4k random reads, 3 repeats
+./scripts/sosp24-experiments/dualssd_sweep.sh                  # [-o name] [--single] [instances] [block sizes] [runs]
+./scripts/sosp24-experiments/dualssd_sweep.sh --single         # also each drive alone (baselines for CONTENTION)
 ./scripts/sosp24-experiments/dualssd_sweep.sh "1 2 4 8" "4k 1m" 3
 
 # single configuration
@@ -693,23 +703,40 @@ python3 scripts/dualssd-results.py summary ~/dualssd-sweep-*.jsonl
 
 | `run-dualssd-experiment.sh` flag | Meaning |
 |---|---|
-| `-E <name>` | experiment name; names the output directories |
-| `--ssds 1\|2`, `--ssd-index N` | how many drives; which one when 1 |
+| `-E <name>` | experiment name; names the output directories. Refused if already used. May contain `/` to group runs in a folder |
+| `--ssds 1\|2`, `--ssd-index N` | how many drives (default 2); which one when 1 |
 | `-J <n>` | fio instances **per drive**, the analogue of iperf3 flows |
 | `--bs`, `--iodepth`, `--rw`, `--ioengine` | default `4k`, `32`, `randread`, `libaio`. `--rw` accepts only `read`/`randread` |
 | `-d`, `--warm` | measurement window (default 20 s) and fio ramp time (10 s) |
-| `--membw 1` | also run `pcm-memory` (adds 30 s + window per run) |
+| `--membw 0\|1` | `pcm-memory` window, on by default (adds 30 s + window per run) |
 | `--runs N`, `--results <file>` | as in the NIC runner |
 
 Each instance is a separate fio process, a single job with `--thread`, pinned
 round-robin over the drive's cores (`SSD_CORES`, 9 per drive). Every run uses
 `--readonly`, `O_DIRECT`, `--randrepeat=0 --norandommap` across the whole drive.
-Reports: `utils/reports/<exp>-RUN-<j>/` (`pcie.rpt`, `cpu_util.rpt`) and
-`<exp>-RUN-<j>-ssd<i>/fio.rpt`; the per-instance fio JSON is in
-`utils/logs/<exp>-RUN-<j>/`. About 70 s per run, so the default sweep (37 runs)
-takes ~45 min per IOMMU mode. Lock: `/tmp/dualssd-experiment.lock`. Stop with
+If any fio output ever reports bytes written or trimmed, `dualssd-results.py`
+stops with FATAL.
+
+**Nothing is overwritten.** The runner refuses an `-E` name that already has
+output. Each sweep takes a fresh name, `dualssd-sweep-<iommu>-<N>`, or the
+`-o` name, which is refused if already used. Where a sweep's output goes:
+
+| Path | Contents |
+|---|---|
+| `~/<sweep>.jsonl`, `~/<sweep>.txt` | one JSON line per configuration; the summary table |
+| `utils/logs/<sweep>/sweep.log` | everything the sweep printed |
+| `utils/logs/<sweep>/<config>.console.log` | one configuration's runner output |
+| `utils/logs/<sweep>/<config>-RUN-<j>/` | raw logs: `pcie.csv` (`pcm-iio`, every stack, every second), `pcm-iio.out` (its banner and warnings), `membw.log` (`pcm-memory`), `pcm.txt` (binary, core, row parsed), the `opCode-6-85.txt` that defines the CSV columns, `cpu_util.log`, `fio-ssd<i>-<k>.json/.err` |
+| `utils/reports/<sweep>/<config>-RUN-<j>[-ssd<i>]/` | parsed `pcie.rpt`, `membw.rpt`, `cpu_util.rpt`, `fio.rpt` |
+| `utils/logs/<sweep>/datapath.jsonl` | the pre-sweep datapath check, kept out of the summary |
+
+About 110 s per run with `pcm-memory`. The default sweep (13 runs) takes ~25 min
+and `--single` (37 runs) ~70 min per IOMMU mode. Lock:
+`/tmp/dualssd-experiment.lock`. Stop with
 `pkill -f 'dualssd_swee[p]'; pkill -f 'run-dualssd-experimen[t]'`. The runner
-stops its own fio on the way out.
+stops its own fio on the way out. The first sweep (2026-10-05) predates this
+layout: its runs are directly under `utils/logs/` and `utils/reports/` as
+`dssd-strict-*`, and a rerun under the old scripts would have overwritten them.
 
 ### Reading the output
 
@@ -717,7 +744,10 @@ stops its own fio on the way out.
 - **CONTENTION** compares the co-run's misses per I/O to each drive's
   single-drive figure, weighted by that drive's share of the co-run's IOPS. A
   plain mean of the two baselines would be wrong because the drives differ
-  (traps below).
+  (traps below). It compares at the same instances *per drive*, so the co-run
+  has twice the total instances. Misses per I/O also rise with total instances
+  on one drive, so check the co-run at J against one drive at 2J too (First
+  result, below).
 - **Strict vs off:** IOPS and `CPU_us/IO` at the same block size and instance
   count. With the IOMMU off the miss columns read 0.
 - **Why this may show what icx did not:** with `O_DIRECT` the NVMe driver maps
@@ -726,6 +756,57 @@ stops its own fio on the way out.
   invalidation queue, which all instances on all cores share. That is the
   per-I/O churn §4.1 B suspects mlx5's page recycling avoids. 4k reads maximise
   it per byte.
+
+### First result: strict, 4k random reads (2026-10-05)
+
+Means of 3 runs, iodepth 32 per instance. Mean latency is from Little's law
+(I/Os in flight ÷ IOPS); fio's own latency is in `fio.rpt`.
+
+| Instances per drive | 9100 PRO alone | 990 EVO Plus alone | Both | Both ÷ sum of alone | Both: CPU µs per I/O | Both: misses per I/O |
+|---|---|---|---|---|---|---|
+| 1 | 225K | 182K | 365K | 90% | 5.7 | 1.36 |
+| 2 | 237K | 368K | 507K | 84% | 8.1 | 1.38 |
+| 4 | 431K | 532K | 669K | 69% | 10.3 | 1.50 |
+| 8 | 603K | 674K | 739K | 58% | 17.2 | 1.71 |
+
+**Observed**
+
+1. **More instances give more IOPS, with diminishing returns.** From 1 to 8
+   instances: ×2.7 on the 9100 PRO, ×3.7 on the 990 EVO Plus, ×2.0 for both
+   together. GB/s is IOPS × 4 KiB. The PCIe link is never the limit: 25 of
+   63 Gbps at most.
+2. **One instance is about one core:** 1.0–1.2 cores busy, ~5.2–5.5 µs of CPU
+   per I/O, ~200K IOPS.
+3. **CPU per I/O roughly doubles from 1 to 8 instances** on either drive, and
+   triples in the 8-instance co-run (5.7 → 17.2 µs). Mean latency rises from
+   ~140–175 µs to ~380–690 µs. Each I/O costs more as concurrency rises.
+4. **The co-run at J instances per drive matches one drive at 2J**, on the 990
+   EVO Plus. IOPS: 365K vs 368K, 507K vs 532K, 669K vs 674K. Misses per I/O
+   and CPU per I/O match too: 1.50 vs 1.54 and 10.3 vs 10.2 µs at J = 4.
+   Throughput follows the total instance count, not the number of drives; the
+   second drive adds nothing a second set of instances on the first would not.
+5. **The 9100 PRO does not scale from 1 to 2 instances** (225K → 237K) while
+   using twice the CPU. The 990 EVO Plus doubles (182K → 368K).
+6. **Misses per I/O rise only modestly with concurrency** (~1.1–1.2 → 1.4–1.7).
+   CPU per I/O rises much faster.
+
+**Speculated reasons (not established)**
+
+- **A host-side limit shared by both drives**, given 3 and 4. They share only
+  `dmar7`: each drive has its own IOMMU domain, IOVA allocator and NVMe
+  queues. In strict mode every unmap waits synchronously for an IOTLB
+  invalidation through `dmar7`'s single invalidation queue, under a lock, so
+  invalidations from every core serialize. The co-run plateaus near
+  740K IOPS, about one invalidation every 1.35 µs. 6 fits: the cost is in
+  keeping translations current, not in translating. **Tests:** the
+  IOMMU-off sweep (it should scale with CPU per I/O roughly flat), lazy mode
+  (`iommu.strict=0`, batched invalidations), and
+  `sudo perf top -C 36-53` during an 8-instance co-run, looking for time in
+  `qi_submit_sync` or spinlocks under the intel-iommu flush path.
+- **9100 PRO queue sharing**, for 5. If the 9100 PRO exposes fewer NVMe I/O
+  queues than there are CPUs, CPUs 36 and 37 may share one hardware queue and
+  one interrupt. Its scaling would then follow distinct queues, not instances.
+  **Check:** `grep -H . /sys/block/nvme0n1/mq/*/cpu_list` against `nvme1n1`.
 
 ### Counters on Skylake
 
@@ -777,8 +858,12 @@ stops its own fio on the way out.
 
 ### Next on bigserver
 
-1. Clone, copy the config, run `discover-ssd-pcie.sh`. Record the uplink
-   width, the `pcm-iio` row, the PCM version and the HMB check here.
-2. Run `dualssd_sweep.sh` booted strict, then reboot with `intel_iommu=off` and
-   run it again. The reboot and the grub change affect everyone on the
-   machine; agree on them with the other users first.
+1. **Check the 9100 PRO's queue mapping** (First result, reason 2) before
+   reading anything into its scaling.
+2. **`perf top` during an 8-instance co-run** while still booted strict: does
+   CPU go to the invalidation path?
+3. **Sweep with the IOMMU off,** then ideally lazy (`iommu.strict=0`), with
+   `--single` so CONTENTION is filled in. Each needs a reboot and a grub
+   change that affect everyone on the machine; agree on them with the other
+   users first.
+4. The HMB check (Traps) is still not done.

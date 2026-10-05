@@ -9,6 +9,13 @@
 # Loads each drive alone for ~14 s of 4k random reads while pcm-iio samples,
 # so the row carrying its traffic identifies it. Prints the SSD_PCIE_PATTERN
 # line for setup-server.sh.
+#
+# Everything is kept, never overwritten, in a new folder per invocation:
+#   utils/logs/discover-ssd-pcie-<date>-<time>/
+#     discover.log            this output
+#     iio-<dev>.csv           pcm-iio CSV while that drive was loaded
+#     pcm-<dev>.out           pcm-iio's own output (banner, warnings)
+#     fio-<dev>.json/.err     the fio load
 set -u
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -22,6 +29,17 @@ if [ ${#SERIALS[@]} -eq 0 ]; then
     exit 2
 fi
 
+# Run under sudo, so hand the folder to the invoking user: the runners write
+# into utils/logs as that user and must not find it root-owned.
+OWNER="${SUDO_USER:-$(id -un)}"
+if [ ! -d "$HERE/logs" ]; then mkdir -p "$HERE/logs" && chown "$OWNER": "$HERE/logs"; fi
+OUT="$HERE/logs/discover-ssd-pcie-$(date +%Y%m%d-%H%M%S)"
+k=1; base="$OUT"; while [ -e "$OUT" ]; do k=$((k + 1)); OUT="$base-$k"; done
+mkdir -p "$OUT"
+trap 'chown -R "$OWNER": "$OUT"' EXIT
+exec > >(tee "$OUT/discover.log") 2>&1
+echo "saving to $OUT/"
+echo
 echo "=============================================================="
 echo "== 1. Drives, PCIe path and IOMMU unit"
 echo "=============================================================="
@@ -90,8 +108,8 @@ else
 fi
 
 modprobe msr 2>/dev/null
-TMP=$(mktemp -d /tmp/ssd-pcie.XXXXXX)
-trap 'pkill -INT -f "^(/[^ ]*/)?fio .*--name=ssd-discove[r]" 2>/dev/null; rm -rf "$TMP"' EXIT
+TMP="$OUT"
+trap 'pkill -INT -f "^(/[^ ]*/)?fio .*--name=ssd-discove[r]" 2>/dev/null; chown -R "$OWNER": "$OUT"' EXIT
 
 PATTERNS=()
 for idx in "${!DEVS[@]}"; do

@@ -107,7 +107,10 @@ function dump_netstat() {
 
 function dump_pciebw() {
     sudo modprobe msr
-    sudo taskset -c $PCM_CORE $PCM_BIN/pcm-iio 1 -csv=logs/$OUT_DIR/pcie.csv &
+    # The CSV holds every stack's counters each second; pcm-iio.out keeps the
+    # version banner and any warning, which otherwise only reach the terminal.
+    sudo taskset -c $PCM_CORE $PCM_BIN/pcm-iio 1 -csv=logs/$OUT_DIR/pcie.csv \
+        > logs/$OUT_DIR/pcm-iio.out 2>&1 &
 }
 
 # ICX (family 6, model 106) pcm-iio CSV layout, from opCode-6-106.txt:
@@ -367,7 +370,7 @@ fi
 
 if [ "$MEMBW_REPORTING" -eq 1 ]; then
   echo "Collecting Memory bandwidth..."
-  dump_membw > logs/$OUT_DIR/membw.log &
+  dump_membw > logs/$OUT_DIR/membw.log 2>&1 &
   sleep 30
   sleep $DURATION_S
   sudo pkill -9 pcm

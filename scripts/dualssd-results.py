@@ -73,6 +73,12 @@ def fio_sum(a):
             for job in doc['jobs']:
                 if job.get('error'):
                     raise ValueError(f"fio job error {job['error']}")
+                # Every fio here runs --readonly. If one ever reports bytes
+                # written or trimmed, something bypassed that: stop loudly.
+                for d in ('write', 'trim'):
+                    if job.get(d, {}).get('io_bytes', 0):
+                        sys.exit(f'FATAL: {path}: fio reports {job[d]["io_bytes"]} bytes '
+                                 f'of {d} on a drive that must only be read.')
                 rd = job['read']
                 iops += rd['iops']
                 bw += rd['bw_bytes']
@@ -198,7 +204,8 @@ def summary(a):
             base.setdefault(group(r), {})[r['mode']] = r['mean'].get('misses_per_io')
 
     hdr = f"{'IOMMU':<7} {'BS':<5} {'INST':>4} {'MODE':<9} {'IOPS_k':>15} {'GB/s':>6} " \
-          f"{'PCIe_wr':>8} {'MISS/IO':>13} {'CPU_%':>11} {'CPU_us/IO':>9} {'CONTENTION':>10}"
+          f"{'LAT_us':>7} {'PCIe_wr':>8} {'MISS/IO':>13} {'CPU_%':>11} {'CPU_us/IO':>9} " \
+          f"{'CONTENTION':>10}"
     print(hdr)
     print('-' * len(hdr))
     for r in sorted(recs, key=key):
@@ -222,22 +229,30 @@ def summary(a):
         ncores = len(str(r.get('cpu_util_cores', '')).split(',')) if r.get('cpu_util_cores') else 0
         if m.get('cpu_util_pct') is not None and iops and ncores:
             cpu_us = m['cpu_util_pct'] / 100 * ncores / iops * 1e6
+        # Mean fio latency, IOPS-weighted across the active drives.
+        lat = None
+        pairs = [(m.get(f'lat_us_ssd{i}'), m.get(f'iops_ssd{i}')) for i in r.get('active_ssds', [])]
+        if pairs and all(l is not None and n for l, n in pairs):
+            lat = sum(l * n for l, n in pairs) / sum(n for _, n in pairs)
         wr, up = m.get('PCIe_wr_tput'), r.get('uplink_gbps') or 0
         flag = '  <-- LINK BOUND' if (up and (wr or 0) > 0.85 * up) else ''
         print(f"{str(r.get('iommu')):<7} {str(r.get('bs')):<5} "
               f"{str(r.get('instances_per_ssd')):>4} {str(r.get('mode')):<9} "
               f"{fmt(iops / 1e3 if iops is not None else None, (s.get('iops_total') or 0) / 1e3, '.1f'):>15} "
               f"{fmt(m.get('gbps_total') / 8 if m.get('gbps_total') is not None else None, None, '.2f'):>6} "
+              f"{fmt(lat, None, '.0f'):>7} "
               f"{fmt(wr, None, '.1f'):>8} "
               f"{fmt(m.get('misses_per_io'), s.get('misses_per_io'), '.3f'):>13} "
               f"{fmt(m.get('cpu_util_pct'), s.get('cpu_util_pct'), '.1f'):>11} "
               f"{fmt(cpu_us, None, '.2f'):>9} "
               f"{cont:>10}{flag}")
     print()
+    print('  LAT_us     = mean fio completion latency per I/O, IOPS-weighted across drives.')
     print('  MISS/IO    = IOTLB misses per second / IOPS (both from the same run).')
     print('  CPU_us/IO  = CPU time on the fio cores per I/O; strict mode\'s cost shows here.')
     print('  CONTENTION = both MISS/IO vs the single-drive MISS/IO of each drive,')
-    print('               weighted by that drive\'s share of the co-run\'s IOPS.')
+    print('               weighted by that drive\'s share of the co-run\'s IOPS. Needs the')
+    print('               single-drive runs (dualssd_sweep.sh --single).')
     print('  IOMMU off/pt has no translation, so compare IOPS and CPU_us/IO across')
     print('  modes at the same BS/INST. LINK BOUND: PCIe write above 85% of the')
     print('  narrowest shared PCIe link, which then caps the run, not the IOMMU.')

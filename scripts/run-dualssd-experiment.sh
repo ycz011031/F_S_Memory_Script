@@ -15,6 +15,17 @@
 #
 # READ-ONLY: fio always runs with --readonly, and only read/randread are
 # accepted. The drives hold data, and this host is shared.
+#
+# Never overwrites: if output for -E <name> already exists the run is refused.
+# Everything lands under utils/logs/ and utils/reports/ (-E may contain a
+# slash, e.g. <sweep>/<config>, to group runs in a folder):
+#   logs/<name>.console.log     this script's full console output
+#   logs/<name>-RUN-<j>/        pcie.csv (pcm-iio, every stack, every second),
+#                               pcm-iio.out, membw.log (pcm-memory), pcm.txt
+#                               (binary, row, core), the opCode file used,
+#                               cpu_util.log, fio-ssd<i>-<k>.json/.err
+#   reports/<name>-RUN-<j>/     pcie.rpt, membw.rpt, cpu_util.rpt
+#   reports/<name>-RUN-<j>-ssd<i>/fio.rpt
 set -u
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -31,7 +42,7 @@ rw=randread
 ioengine=libaio
 dur=20                 # each measurement window (CPU, then PCIe)
 warm=10                # fio ramp_time; excluded from fio's stats
-membw=0                # pcm-memory adds 30 s + dur per run
+membw=1                # pcm-memory; adds 30 s + dur per run, --membw 0 skips it
 num_runs=1
 results_file=""        # JSONL to append to; default ~/<exp>-<N>.jsonl, first unused N
 
@@ -51,7 +62,7 @@ while [ $# -gt 0 ]; do
         --runs)         num_runs="$2"; shift 2 ;;
         --results)      results_file="$2"; shift 2 ;;
         -h|--help)
-            sed -n '2,17p' "$0"; exit 0 ;;
+            sed -n '2,28p' "$0"; exit 0 ;;
         *) echo "unknown option: $1"; exit 2 ;;
     esac
 done
@@ -106,9 +117,9 @@ iommu_units=$(for i in "${ACTIVE[@]}"; do iommu_unit "${BDFS[$i]}"; done | sort 
 FIO_MATCH='^(/[^ ]*/)?fio .*--name=dualssd[_]'
 fio_count() { local n; n=$(pgrep -c -f "$FIO_MATCH" 2>/dev/null); echo "${n:-0}"; }
 stop_fio() {    # SIGINT makes fio stop and still write its JSON
-    sudo pkill -INT -f "$FIO_MATCH" >/dev/null 2>&1 || true
+    sudo -n pkill -INT -f "$FIO_MATCH" >/dev/null 2>&1 || true
     for _ in $(seq 30); do [ "$(fio_count)" -eq 0 ] && return; sleep 1; done
-    sudo pkill -KILL -f "$FIO_MATCH" >/dev/null 2>&1 || true
+    sudo -n pkill -KILL -f "$FIO_MATCH" >/dev/null 2>&1 || true
 }
 
 # Fail fast on the things that otherwise produce a full run of zeros. Collect
@@ -134,6 +145,9 @@ preflight() {
         echo "   pcm-iio: $PCM_BIN/pcm-iio"
     else
         PROBLEMS+=("no pcm-iio at $PCM_BIN/pcm-iio. Set PCM_BIN in utils/setup-server.sh.")
+    fi
+    if [ "$membw" = 1 ] && [ ! -x "$PCM_BIN/pcm-memory" ]; then
+        PROBLEMS+=("no pcm-memory at $PCM_BIN/pcm-memory. Set PCM_BIN, or pass --membw 0.")
     fi
     # pcm-iio loads opCode-<family>-<model>.txt from utils/ (the cwd it runs in).
     if [ ! -f "$setup_dir/opCode-$CPU_FAM-$CPU_MODEL.txt" ]; then
@@ -219,9 +233,9 @@ cleanup() {
     if [ "$aborted" = 1 ]; then
         # Interrupted mid-window: record-host-metrics.sh never got to stop its
         # samplers. Preflight made sure none of these belonged to anyone else.
-        sudo pkill -9 -x pcm-iio >/dev/null 2>&1 || true
-        sudo pkill -9 -x pcm-memory >/dev/null 2>&1 || true
-        sudo pkill -9 -x sar >/dev/null 2>&1 || true
+        sudo -n pkill -9 -x pcm-iio >/dev/null 2>&1 || true
+        sudo -n pkill -9 -x pcm-memory >/dev/null 2>&1 || true
+        sudo -n pkill -9 -x sar >/dev/null 2>&1 || true
     fi
 }
 
@@ -238,6 +252,20 @@ if command -v flock >/dev/null 2>&1 && ! flock -n 9; then
     exit 1
 fi
 
+# Never overwrite earlier output: a name with run data is refused, not reused.
+existing=$(ls -d "$setup_dir/logs/$exp-RUN-"* "$setup_dir/reports/$exp-RUN-"* 2>/dev/null)
+if [ -n "$existing" ]; then
+    echo "ERROR: output for experiment '$exp' already exists; refusing to overwrite:" >&2
+    printf '%s\n' "$existing" | head -5 | sed 's/^/    /' >&2
+    echo "  Pick a new -E name." >&2
+    exit 1
+fi
+# From here on, everything this script prints is also saved. Appended, so a
+# retry after a failed preflight (which writes no run data) keeps the first try.
+console="$setup_dir/logs/$exp.console.log"
+mkdir -p "$(dirname "$console")"
+exec > >(tee -a "$console") 2>&1
+
 # INT/TERM must EXIT, not just clean up, or the script carries on measuring an
 # idle drive. Exiting fires the EXIT trap, which does the cleanup.
 trap cleanup EXIT
@@ -252,7 +280,7 @@ span=$(( 2 * dur + (membw == 1 ? 30 + dur : 0) ))
 fio_runtime=$(( warm + span + 120 ))
 
 echo "=============================================================="
-echo "  experiment : $exp"
+echo "  experiment : $exp   ($(date '+%F %T'))"
 echo "  SSDs       : $ssds  (indices: ${ACTIVE[*]})"
 for i in "${ACTIVE[@]}"; do echo "               $i: ${DEVS[$i]}  cores ${SSD_CORES[$i]}"; done
 echo "  per SSD    : $jobs fio instances x iodepth $iodepth, $rw bs=$bs, $ioengine, O_DIRECT, read-only"
@@ -267,9 +295,20 @@ echo "   narrowest shared PCIe link: ~${uplink_gbps} Gbps"
 for ((j = 0; j < num_runs; j++)); do
     RUN="$exp-RUN-$j"
     L="$setup_dir/logs/$RUN"
-    rm -rf "$setup_dir/reports/$RUN" "$setup_dir/reports/$RUN"-ssd* "$L"
     mkdir -p "$setup_dir/reports/$RUN" "$L"
     for i in "${ACTIVE[@]}"; do mkdir -p "$setup_dir/reports/$RUN-ssd$i"; done
+
+    # What produced pcie.csv: the binary, the row parsed, and the event file
+    # that defines its columns, so the raw log can be re-read on its own.
+    {
+        echo "date:       $(date '+%F %T')"
+        echo "pcm-iio:    $PCM_BIN/pcm-iio  (pinned to CPU ${PCM_CORE:-15})"
+        echo "pcm-memory: $( [ "$membw" = 1 ] && echo "$PCM_BIN/pcm-memory" || echo "not run (--membw 0)")"
+        echo "event file: opCode-$CPU_FAM-$CPU_MODEL.txt (copy alongside)"
+        echo "row parsed: $SSD_PCIE_PATTERN   (VT-d counters from that stack's Part0 row)"
+        echo "IOMMU:      $iommu_mode on $iommu_units"
+    } > "$L/pcm.txt"
+    cp "$setup_dir/opCode-$CPU_FAM-$CPU_MODEL.txt" "$L/" 2>/dev/null
 
     stop_fio; sleep 1
     [ "$num_runs" -gt 1 ] && echo "-- run $((j + 1))/$num_runs"
@@ -410,13 +449,15 @@ if [ -f "$P" ]; then
 fi
 echo
 echo "  reports: $setup_dir/reports/$exp-RUN-*/"
+echo "  raw logs (pcie.csv, pcm-iio.out, membw.log, fio JSON): $setup_dir/logs/$exp-RUN-*/"
+echo "  console: $console"
 
 # Machine-readable copy: config, IOMMU mode, every run, and mean/sd, as one
 # JSON line. The .rpt files above remain the source of truth. Unnamed dumps
 # get a fresh number rather than appending to a previous run's file.
 if [ -z "$results_file" ]; then
-    k=1; while [ -e "$HOME/$exp-$k.jsonl" ]; do k=$((k + 1)); done
-    results_file="$HOME/$exp-$k.jsonl"
+    k=1; while [ -e "$HOME/${exp//\//_}-$k.jsonl" ]; do k=$((k + 1)); done
+    results_file="$HOME/${exp//\//_}-$k.jsonl"
 fi
 python3 "$HERE/dualssd-results.py" dump \
     --reports "$setup_dir/reports" --exp "$exp" --runs "$num_runs" \

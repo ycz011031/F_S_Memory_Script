@@ -1,4 +1,6 @@
 [global]
+# Refuse writes and trims whatever ${RW} is: the target is a raw device.
+readonly=1
 bs=${SIZE}
 ioengine=libaio
 thread=1

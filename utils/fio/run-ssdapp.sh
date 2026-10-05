@@ -145,6 +145,7 @@ for ((idx=0; idx<NUM_THREADS; idx++)); do
   taskset -c "${core}" fio \
     --name="rr${idx}" \
     --filename="${DEVICE}" \
+    --readonly \
     --rw=randread \
     --bs="${BS}" \
     --time_based=1 --runtime="${RUNTIME}" --direct="${DIRECT}" \

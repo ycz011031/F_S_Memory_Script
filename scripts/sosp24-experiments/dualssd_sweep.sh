@@ -3,36 +3,36 @@
 # drive, for the IOMMU mode the host is currently booted in. The SSD
 # counterpart of dualnic_flow_sweep.sh.
 #
-#   ./dualssd_sweep.sh                          # 1,2,4,8 instances/SSD, 4k, 3 runs, both baselines + co-run
-#   ./dualssd_sweep.sh -o skx-strict            # same, results named ~/skx-strict.*
+#   ./dualssd_sweep.sh                          # co-run, 1,2,4,8 instances/SSD, 4k, 3 runs
+#   ./dualssd_sweep.sh --single                 # also each drive alone (baselines)
+#   ./dualssd_sweep.sh -o skx-strict            # name the sweep (must be new)
 #   ./dualssd_sweep.sh "1 2 4 8" "4k 1m" 3      # add 1 MiB reads
-#   ./dualssd_sweep.sh "4 8" 4k 3 both          # co-run only
 #
-# Arguments: instances per SSD, block sizes, repeats, modes (default
-# "ssd0only ssd1only both"). -o NAME anywhere names the result files. Extra
+# Arguments: instances per SSD, block sizes, repeats. Options: --single adds
+# the single-drive runs (ssd0only, ssd1only) at every point; without them the
+# summary's CONTENTION column stays empty. -o NAME names the sweep. Extra
 # runner options go in DUALSSD_ARGS, e.g. DUALSSD_ARGS="--iodepth 64".
-#
-# The baselines are on by default, unlike the NIC sweep: the two drives are
-# different models (9100 PRO, 990 EVO Plus), so the co-run can only be judged
-# against each drive's own single-drive numbers.
 #
 # 4k is the default block size because each 4 KB read is one IOMMU map, one
 # unmap and, in strict mode, one IOTLB invalidation: ~256x as many of each per
 # byte as 1 MiB reads, which map 256 pages per I/O.
 #
-# Before the sweep, one single run of SSD0 alone at the lowest instance count
-# checks the datapath; the sweep stops there if it moves no I/O.
+# Before the sweep, one short run of both drives at the lowest instance count
+# checks the datapath; the sweep stops there if either drive moves no I/O.
 #
 # Run it once per IOMMU setting: boot with the IOMMU on, run; reboot with it
-# off, run again. The mode is read from sysfs (utils/iommu-mode.sh) and put in
-# every experiment name, so the two sweeps never overwrite each other's reports.
+# off, run again. The mode is read from sysfs and put in the sweep's name.
 #
-# Results, in $HOME (override with RESULTS_DIR=...):
-#   <name>.jsonl   one JSON line per configuration
-#   <name>.txt     the summary table printed at the end
-# Without -o, <name> is dualssd-sweep-<iommu>-<N> with N the first unused
-# number. With -o, an existing <name>.jsonl is appended to, which resumes a
-# sweep. Compare on and off side by side afterwards with:
+# Nothing is ever overwritten. Each sweep gets a new name, <name>, which is
+# dualssd-sweep-<iommu>-<N> with N the first number not used by any earlier
+# sweep, or the -o NAME given (refused if already used). It writes:
+#   ~/<name>.jsonl                one JSON line per configuration
+#   ~/<name>.txt                  the summary table printed at the end
+#   utils/logs/<name>/sweep.log   everything printed, start to finish
+#   utils/logs/<name>/            every run's raw logs: pcm-iio CSV and
+#                                 output, pcm-memory, fio JSON, CPU
+#   utils/reports/<name>/         every run's parsed reports
+# Compare on and off side by side afterwards with:
 #   python3 scripts/dualssd-results.py summary ~/dualssd-sweep-*.jsonl
 set -u
 cd "$(dirname "$0")/.."
@@ -40,17 +40,21 @@ cd "$(dirname "$0")/.."
 . ../utils/ssd-lib.sh
 
 NAME=""
+SINGLE=0
 POS=()
 while [ $# -gt 0 ]; do
     case "$1" in
-        -o|--out) NAME="$2"; shift 2 ;;
-        *)        POS+=( "$1" ); shift ;;
+        -o|--out)  NAME="$2"; shift 2 ;;
+        --single)  SINGLE=1; shift ;;
+        -h|--help) sed -n '2,38p' "$0"; exit 0 ;;
+        -*)        echo "unknown option: $1" >&2; exit 2 ;;
+        *)         POS+=( "$1" ); shift ;;
     esac
 done
 INSTANCES="${POS[0]:-1 2 4 8}"
 BSIZES="${POS[1]:-4k}"
 RUNS="${POS[2]:-3}"
-MODES="${POS[3]:-ssd0only ssd1only both}"
+if [ "$SINGLE" = 1 ]; then MODES="ssd0only ssd1only both"; else MODES="both"; fi
 EXTRA=( ${DUALSSD_ARGS:-} )
 
 declare -p SSD_SERIALS >/dev/null 2>&1 || {
@@ -62,29 +66,43 @@ IOMMU=$(for s in "${SSD_SERIALS[@]}"; do
 [ -n "$IOMMU" ] || exit 1
 
 DIR="${RESULTS_DIR:-$HOME}"
+UTILS="$(cd ../utils && pwd)"
+used() {   # <name> -> true if any output of that name exists
+    [ -e "$DIR/$1.jsonl" ] || [ -e "$DIR/$1.txt" ] \
+        || [ -e "$UTILS/logs/$1" ] || [ -e "$UTILS/reports/$1" ]
+}
 if [ -z "$NAME" ]; then
     n=1
-    while [ -e "$DIR/dualssd-sweep-$IOMMU-$n.jsonl" ] \
-          || [ -e "$DIR/dualssd-sweep-$IOMMU-$n.txt" ]; do n=$((n + 1)); done
+    while used "dualssd-sweep-$IOMMU-$n"; do n=$((n + 1)); done
     NAME="dualssd-sweep-$IOMMU-$n"
+elif used "$NAME"; then
+    echo "ERROR: a sweep named '$NAME' already has output; refusing to overwrite it." >&2
+    echo "  Pick another -o NAME, or leave -o out for a fresh numbered name." >&2
+    exit 1
 fi
 JSONL="$DIR/$NAME.jsonl"
 TXT="$DIR/$NAME.txt"
+LOGDIR="$UTILS/logs/$NAME"
+mkdir -p "$LOGDIR"
+# Everything below is also saved to the sweep's log.
+exec > >(tee -a "$LOGDIR/sweep.log") 2>&1
 
-echo "######## dual-SSD sweep: ${INSTANCES} instances/SSD, bs ${BSIZES}, ${RUNS} run(s)"
-echo "######## modes: ${MODES}"
+echo "######## dual-SSD sweep $NAME: ${INSTANCES} instances/SSD, bs ${BSIZES}, ${RUNS} run(s)"
+echo "######## modes: ${MODES}$( [ "$SINGLE" = 0 ] && echo "   (--single adds the single-drive runs)" )"
 [ ${#EXTRA[@]} -gt 0 ] && echo "######## runner args: ${EXTRA[*]}"
 echo "######## IOMMU: ${IOMMU}   kernel $(uname -r)"
 echo "######## cmdline: $(cat /proc/cmdline)"
 echo "######## results: $JSONL"
 echo "########          $TXT"
+echo "######## logs:    $LOGDIR/   (sweep.log = this output)"
+echo "######## reports: $UTILS/reports/$NAME/"
 
 # Written on success AND on abort, so a failure an hour in still leaves the
 # finished configurations summarised.
 summarize() {
     [ -s "$JSONL" ] || { echo "######## no results recorded"; return; }
     {
-        echo "dual-SSD sweep  $(date '+%F %T')  host $(hostname)"
+        echo "dual-SSD sweep $NAME  $(date '+%F %T')  host $(hostname)"
         echo "IOMMU $IOMMU  kernel $(uname -r)"
         echo "cmdline: $(cat /proc/cmdline)"
         echo "instances/SSD: $INSTANCES   bs: $BSIZES   runs: $RUNS   modes: $MODES"
@@ -94,30 +112,34 @@ summarize() {
     } | tee "$TXT"
 }
 
-run() {   # <exp> <runner args...>
-    bash ./run-dualssd-experiment.sh -E "$@" ${EXTRA[@]+"${EXTRA[@]}"} --results "$JSONL"
+run() {   # <config name> <results file> <runner args...>
+    local cfg="$1" out="$2"; shift 2
+    bash ./run-dualssd-experiment.sh -E "$NAME/$cfg" "$@" \
+        ${EXTRA[@]+"${EXTRA[@]}"} --results "$out"
 }
 
-# Datapath check: one short SSD0-alone run at the lowest instance count. The
-# runner already aborts when fio fails to start; this also catches a drive
-# that is "running" but moving nothing.
+# Datapath check: one short run of both drives at the lowest instance count,
+# kept out of the summary. The runner already aborts when fio fails to start;
+# this also catches a drive that is "running" but moving nothing.
 low=$(printf '%s\n' $INSTANCES | sort -n | head -1)
 b0="${BSIZES%% *}"
-e="dssd-$IOMMU-$b0-j$low-datapath"
+e="datapath-$b0-j$low"
 echo
-echo "######## datapath check: SSD0 alone, $low instance(s), bs $b0, 1 run"
-if ! run "$e" --ssds 1 --ssd-index 0 -J "$low" --bs "$b0" --runs 1; then
+echo "######## datapath check: both drives, $low instance(s) each, bs $b0, 1 run"
+if ! run "$e" "$LOGDIR/datapath.jsonl" --ssds 2 -J "$low" --bs "$b0" --runs 1; then
     echo "######## ABORTING: datapath check failed" >&2
     exit 1
 fi
-got=$(awk '/^IOPS:/{print $2}' "../utils/reports/$e-RUN-0-ssd0/fio.rpt" 2>/dev/null)
-case "${got:-}" in ''|*[!0-9.]*) got=0 ;; esac
-if ! awk -v t="$got" 'BEGIN{exit !(t > 1000)}'; then
-    echo "######## ABORTING: datapath check moved $got IOPS on SSD0." >&2
-    echo "######## See utils/reports/$e-RUN-0-ssd0/ and utils/logs/$e-RUN-0/" >&2
-    exit 1
-fi
-echo "######## datapath OK: $got IOPS on SSD0"
+for i in 0 1; do
+    got=$(awk '/^IOPS:/{print $2}' "$UTILS/reports/$NAME/$e-RUN-0-ssd$i/fio.rpt" 2>/dev/null)
+    case "${got:-}" in ''|*[!0-9.]*) got=0 ;; esac
+    if ! awk -v t="$got" 'BEGIN{exit !(t > 1000)}'; then
+        echo "######## ABORTING: datapath check moved $got IOPS on SSD$i." >&2
+        echo "######## See $UTILS/reports/$NAME/$e-RUN-0-ssd$i/ and $LOGDIR/$e-RUN-0/" >&2
+        exit 1
+    fi
+    echo "######## datapath OK: $got IOPS on SSD$i"
+done
 
 for b in $BSIZES; do
     for j in $INSTANCES; do
@@ -126,11 +148,10 @@ for b in $BSIZES; do
                 ssd0only) args="--ssds 1 --ssd-index 0" ;;
                 ssd1only) args="--ssds 1 --ssd-index 1" ;;
                 both)     args="--ssds 2" ;;
-                *) echo "unknown mode '$mode' (ssd0only|ssd1only|both)" >&2; exit 2 ;;
             esac
             echo
             echo "######## IOMMU $IOMMU  bs $b  $j instance(s)/SSD  $mode"
-            if ! run "dssd-$IOMMU-$b-j$j-$mode" $args -J "$j" --bs "$b" --runs "$RUNS"; then
+            if ! run "$b-j$j-$mode" "$JSONL" $args -J "$j" --bs "$b" --runs "$RUNS"; then
                 echo "######## ABORTING at bs $b / j$j / $mode" >&2
                 summarize
                 exit 1
@@ -144,3 +165,10 @@ echo "=============================================================="
 echo "  DUAL-SSD SWEEP SUMMARY"
 echo "=============================================================="
 summarize
+echo
+echo "  everything for this sweep:"
+echo "    $JSONL"
+echo "    $TXT"
+echo "    $LOGDIR/sweep.log"
+echo "    $LOGDIR/<config>-RUN-<j>/    raw pcm-iio / pcm-memory / fio / CPU logs"
+echo "    $UTILS/reports/$NAME/"
