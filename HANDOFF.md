@@ -802,6 +802,23 @@ Means of 3 runs, iodepth 32 per instance. Mean latency is from Little's law
    | 2 | 1 | 2 |
    | 4 | 1 | 2 |
    | 8 | 2 | 3 |
+8. **In an 8-instance co-run, the interrupt CPUs of the queues in use are at
+   100%; nothing else is.** `mpstat` and `/proc/irq/*/effective_affinity_list`,
+   2026-10-05:
+
+   | Queue (CPUs) | 9100 PRO interrupt CPU | 990 EVO Plus interrupt CPU |
+   |---|---|---|
+   | 36–40 | 38 | 40 |
+   | 41–45 | 43 | 45 |
+   | 46–49 | 47 | 48 |
+   | 50–53 | 51 | 52 |
+
+   The queues in use had interrupt CPUs 38 and 43 (9100 PRO) and 45, 48 and
+   52 (990 EVO Plus): all five at 100%. The interrupt CPUs of unused queues
+   (40, 47, 51) were 60–75% busy, like the other fio cores. The other fio
+   cores sat 23–40% idle, most on the queue serving five instances (CPUs
+   36–40, one interrupt CPU). `%irq` read 0 everywhere: this kernel counts
+   interrupt time as `%sys`.
 
 **Speculated reasons (not established)**
 
@@ -816,15 +833,30 @@ Means of 3 runs, iodepth 32 per instance. Mean latency is from Little's law
   (`iommu.strict=0`, batched invalidations), and
   `sudo perf top -C 36-53` during an 8-instance co-run, looking for time in
   `qi_submit_sync` or spinlocks under the intel-iommu flush path.
+- **A per-queue limit instead (favoured since 8).** Each queue's completions
+  run on its one interrupt CPU. In strict mode that includes every unmap and
+  its synchronous invalidation. At 8 instances those CPUs are saturated, and
+  the fio cores wait on them. The plateau would then be set by how many
+  queues, and so interrupt CPUs, a configuration uses, not by a limit shared
+  through `dmar7`. Observation 4 may be the same effect, since the matched
+  pairs used similar numbers of queues. **Test:** spread each drive's
+  instances over all 4 queues and keep fio off the interrupt CPUs. IOPS
+  rising well past ~740K means a per-queue limit; a ceiling near 740K means a
+  global one. Then the IOMMU-off sweep with the same placement shows how much
+  of the per-completion cost is the IOMMU.
 - **Core placement, for 5 and 7.** The guess that the 9100 PRO has fewer
   queues was wrong (7). But its instances do sit on fewer queues, which fits
   5. A queue is not a hard cap, though: on one queue the 9100 PRO went from
   237K at 2 instances to 431K at 4. Where each queue's interrupt lands
   (`/proc/irq/<n>/effective_affinity_list`) and per-core CPU (`cpu_utils` in
   each `cpu_util.rpt`) should settle it. It also means the two drives'
-  single-drive numbers are not comparable as run. An `SSD_CORES` order that
-  alternates the queue groups gives each drive the same placement:
-  `"36,41,46,50,37,42,47,51,38"` and `"39,43,48,52,40,44,49,53,45"`.
+  single-drive numbers are not comparable as run. With the interrupt CPUs of
+  8, an order that gives each drive all 4 queues from 4 instances up, and
+  keeps fio off every interrupt CPU up to 5 instances per drive, is
+  `"36,41,46,50,37,40,45,48,52"` and `"39,42,49,53,44,38,43,47,51"`. From 6
+  instances up, each drive's extra instances sit on the *other* drive's
+  interrupt CPUs, which are idle in single-drive runs. Interrupt CPUs are
+  assigned at boot and may move after the IOMMU reboot: re-check them first.
 
 ### Counters on Skylake
 
@@ -881,15 +913,13 @@ Means of 3 runs, iodepth 32 per instance. Mean latency is from Little's law
 
 ### Next on bigserver
 
-1. **Where the NVMe interrupts land, and per-core CPU** (First result, core
-   placement), before reading anything into the per-drive scaling. Decide on
-   the `SSD_CORES` order before the next sweep, and use the same order for
-   strict and off.
-2. **Where the CPU goes during an 8-instance co-run,** still booted strict.
-   `perf` is not installed for this kernel (`linux-tools-5.15.0-177-generic`).
-   Without it, `mpstat -P 36-53 5` shows `%irq` per core. With every
-   invalidation waited on in the interrupt-time completion path, a high
-   `%irq` on the cores that take the NVMe interrupts would point there.
+1. **Re-run the strict sweep with the interrupt-aware `SSD_CORES` order**
+   (First result, core placement), `--single` included. That tests per-queue
+   against global (reason "a per-queue limit"). Use the same order for every
+   IOMMU mode afterwards.
+2. **What the interrupt CPUs spend their time on,** if needed: `perf` is not
+   installed for this kernel (`linux-tools-5.15.0-177-generic`). `mpstat`
+   cannot separate it, because interrupt time shows up as `%sys` here.
 3. **Sweep with the IOMMU off,** then ideally lazy (`iommu.strict=0`), with
    `--single` so CONTENTION is filled in. Each needs a reboot and a grub
    change that affect everyone on the machine; agree on them with the other
