@@ -7,7 +7,8 @@ together, [LOCAL-SETUP.md](LOCAL-SETUP.md) for first-time provisioning.
 - **Branch:** `icx-dualnic` on `ycz011031/F_S_Memory_Script`
 - **Upstream:** `host-architecture/Fast-and-Safe-IO-Memory-Protection` (remote `upstream`)
 - `master` is a pristine mirror. `git diff master..icx-dualnic` is the whole delta.
-- **Last updated:** 2026-09-29, after the uncapped flow sweep (§4.1).
+- **Last updated:** 2026-10-04: the uncapped flow sweep (§4.1) and the IOMMU
+  counters checked against Intel's Ice Lake event list (§4.3).
 - **Headline:** IOMMU strict and IOMMU off give the same throughput in every
   configuration run so far. Reasons are speculated in §4.1; the experiments
   that would settle them are in §5.
@@ -80,7 +81,7 @@ git pull                                              # always first
 
 # flow sweep: one NIC0-alone datapath check, then co-run (both NICs) at
 # 5/10/15/30 flows/NIC, uncapped, 3 repeats. Once per IOMMU boot setting.
-./scripts/sosp24-experiments/dualnic_flow_sweep.sh              # [-o name] [flows] [rates] [runs]
+./scripts/sosp24-experiments/dualnic_flow_sweep.sh              # [-o name] [flows] [rates] [runs] [modes]
 
 # single configuration
 ./scripts/run-dualnic-experiment.sh -E mytest --nics 2 --uncapped -S 8 --runs 3
@@ -179,8 +180,8 @@ largely self-healing. These are the exceptions.
 ### Check after a reboot
 
 ```bash
-# 1. IOMMU still on? If this is empty the experiment measures nothing.
-cat /proc/cmdline | tr ' ' '\n' | grep -i iommu
+# 1. IOMMU in the intended mode? "strict" for on runs, "off" for off runs.
+for i in enp153s0f0np0 enp154s0np0; do echo "$i $(bash utils/iommu-mode.sh $i)"; done
 
 # 2. Interface names unchanged? Renaming silently invalidates setup-server.sh.
 ip -br addr | grep -E 'enp153s0f0np0|enp154s0np0'
@@ -261,7 +262,7 @@ ECN on, 20 s measurement window.
 - off: `intel_iommu=off`; two passes
 
 Result files are on icx in `~/`: `dualnic-flowsweep-strict-3`, `-off-1`,
-`-off-2` (`.jsonl` + `.txt`). **`strict-1` and `strict-2` are invalid**: two
+`-off-2` (`.jsonl` + `.txt`). A local copy may sit in the git-ignored `dualnic/`. **`strict-1` and `strict-2` are invalid**: two
 sweeps ran at once and killed each other's traffic. The runner now refuses a
 second copy (§2).
 
@@ -294,7 +295,8 @@ throughput in every configuration (headers, descriptors, completions).
 | 30 | both | 14.4 M | 1.84 M | 12.7% | 9.4 | 1.19 | 1.05 | 0.022 | 5.6 |
 
 PWC is the page-walk cache. "Upper-level" is the 2M, 1G and 512G PWC hits
-combined.
+combined. Lookups are *first* lookups: a transaction can look up the IOTLB more
+than once, and the event counts only the first (§4.3).
 
 **Receiver CPU cost:** cores busy per 100 Gbps, i.e. mean CPU % × active
 cores ÷ throughput.
@@ -374,9 +376,10 @@ keeping them DMA-mapped, which would make unmaps and invalidations rare. That
 is believed, not verified, and it is not known in which kernel it landed.
 Observation 2 fits this: misses are served from the page-walk cache, as if it
 is rarely flushed. **Caveat:** `IOMMU_mem_access` is ~5 per miss (19.9 M/s
-against 3.8 M/s), which does not fit walks ending in cache. Until that
-counter's meaning is checked (§5), this evidence is suggestive only.
-*Test: §5 item 2.*
+against 3.8 M/s), which does not fit walks ending in cache. Intel's description
+of that counter does not settle what it counts (§4.3), so this evidence is
+suggestive only. *Tests: §5 item 2 (hardware invalidation counts) and item 3
+(map/unmap counts).*
 
 **C. The 30-flow cliff is not the IOMMU and not the uplink.** It is identical
 with the IOMMU off, and at ~50 Gbps the uplink is half idle. Both NICs land on
@@ -395,7 +398,7 @@ hiding saturated cores. Or slower flows simply batch worse, with fewer bytes
 per interrupt and per GRO merge, and the cost is an effect of the cliff rather
 than its cause. Per-core CPU separates the two.
 
-*Confidence: low on which one; high that it is not the IOMMU. Test: §5 item 5.*
+*Confidence: low on which one; high that it is not the IOMMU. Test: §5 item 6.*
 
 **D. More flows barely grows the IOMMU working set here.** aRFS steers each
 flow to the receive queue of the core its iperf3 server runs on. With 5 server
@@ -439,8 +442,45 @@ In the `both` breakdown, `PWC_4K_hits` (2,207,682), `CTXT_cache_hits` (2,205,155
 and `IOTLB_misses` (2,167,475) are nearly equal while 512G/1G/2M hits are 3–4
 orders smaller — essentially every miss resolves via a 4K page-walk-cache hit.
 But `IOMMU_mem_access` is 10.3M, 4.7 per miss, which does not obviously fit
-walks terminating in cache. **Verify that counter's semantics against the Ice
-Lake uncore spec before building an argument on it.**
+walks terminating in cache. Intel's event description does not settle what that
+counter measures (§4.3).
+
+### 4.3 What the IOMMU counters can and cannot show
+
+Checked on 2026-09-29 against Intel's Ice Lake-SP event list:
+[`intel/perfmon`, `ICX/events/icelakex_uncore_experimental.json`](https://github.com/intel/perfmon/tree/main/ICX/events).
+Intel marks these events "experimental".
+
+**The 8 events we record are labelled correctly:**
+
+| `pcie.rpt` key | Event / umask | Intel's definition |
+|---|---|---|
+| `IOTLB_lookups` | 0x40 / 0x01 | IOTLB lookups, **first** lookup per transaction only |
+| `IOTLB_misses` | 0x40 / 0x20 | IOTLB fills (= misses); each starts a page walk |
+| `CTXT_cache_hits` | 0x40 / 0x80 | first lookup hits the root/context cache |
+| `PWC_4K_hits` | 0x41 / 0x02 | first lookup hits the second-level page-walk cache at the 4K level |
+| `PWC_2M_hits`, `PWC_1G_hits`, `PWC_512G_hits` | 0x41 / 0x04, 0x08, 0x10 | same, at the 2M / 1G / 512G level |
+| `IOMMU_mem_access` | 0x41 / 0x40 | "IOMMU sends out memory fetches when it misses the cache look up" |
+
+**There are no per-level miss counts on this CPU.** The paper's Cascade Lake
+exposed "VT-d L1/L2/L3 Miss", page-walk-cache misses by walk level. Ice Lake
+exposes hits by level instead. On this machine the old scripts' `L1/L2/L3_Miss`
+were the 512G/1G/2M hits under wrong names (§6).
+
+**Available but not recorded:**
+
+| Event / umask | Counts | Use |
+|---|---|---|
+| `PWT_CACHE_LOOKUPS` 0x41 / 0x01 | page-walk-cache lookups | denominator for a page-walk-cache miss rate |
+| `PWC_CACHE_FILLS` 0x41 / 0x20 | page-walk-cache misses | nearest equivalent of the paper's L-misses (total, not per level). Today these can only be estimated as misses − PWC hits ≈ 0, which is unreliable because PWC hits exceed misses by 2–8% |
+| `NUM_INVAL_GBL` / `_DOMAIN` / `_PAGE` 0x43 / 0x01, 0x02, 0x04 | IOTLB invalidations | hardware-side test of whether strict mode invalidates constantly (§4.1 B) |
+| `CYC_PWT_FULL` 0x41 / 0x80 | cycles the page walker is at its outstanding-walk limit | direct sign that the IOMMU is the bottleneck |
+| `PWT_OCCUPANCY` 0x42 | page walks outstanding | same |
+| `4K_HITS` / `2M_HITS` / `1G_HITS` 0x40 / 0x04, 0x08, 0x10 | IOTLB hits by page size | whether any DMA uses large-page mappings |
+
+`IOMMU_mem_access` stays unexplained. Intel's one-line description does not
+account for ~5 fetches per miss, nor for the 75–138 k/s it reads with the IOMMU
+off. `PWC_CACHE_FILLS` would give an independent count to compare it with.
 
 ---
 
@@ -463,7 +503,15 @@ In order of what each one decides. Commands run on icx from
    Then re-run `discover-pcie-topology.sh`, update `PCIE_PATTERN` (§3), and
    check the new link widths with `sudo lspci -vv -s <addr> | grep -E 'LnkCap:|LnkSta:'`.
 
-2. **Does 6.8 map and unmap per packet? (~5 min, booted strict. Tests §4.1 B.)**
+2. **Record the missing IOMMU events (§4.3) before the next sweep,** at least
+   the invalidation counts and page-walker saturation. Add lines to
+   `utils/opCode-6-106.txt`. Then update the column offsets in
+   `record-host-metrics.sh`, which reads fixed CSV columns that new events
+   shift, and add the new keys to `PCIE_KEYS` in `scripts/dualnic-results.py`.
+   More events mean more time-sharing of `pcm-iio`'s 4 counters per stack, so
+   check one run on icx before a sweep.
+
+3. **Does 6.8 map and unmap per packet? (~5 min, booted strict. Tests §4.1 B.)**
    Needs `linux-tools-$(uname -r)` for `perf`.
    ```bash
    ./scripts/run-dualnic-experiment.sh -E diag-maps --nics 1 --nic-index 0 -S 5 -C 5 --uncapped > ~/diag-maps.log 2>&1 &
@@ -475,20 +523,20 @@ In order of what each one decides. Commands run on icx from
    At ~96 Gbps, receive data arrives at ~3 M 4 KB pages/s. If unmaps run near
    that rate, strict is churning as in the paper, and B is wrong. If they are
    far below it, pages are recycled while still mapped. Then the paper's effect
-   will not reproduce on this kernel: do item 4.
+   will not reproduce on this kernel: do item 5.
 
-3. **Single-NIC flow sweep, strict vs off, at the paper's flow counts. Tests
+4. **Single-NIC flow sweep, strict vs off, at the paper's flow counts. Tests
    §4.1 A.** Removes the shared uplink. Once per IOMMU setting:
    ```bash
    ./scripts/sosp24-experiments/dualnic_flow_sweep.sh "5 10 20 40" uncapped 3 nic0only
    ```
 
-4. **Boot the paper's baseline kernel, stock 6.0.3,** if item 2 shows
+5. **Boot the paper's baseline kernel, stock 6.0.3,** if item 3 shows
    recycling. Build it per `README.md` (no patch is needed for the "IOMMU on"
-   baseline) and re-run item 3. Only then compare against the F&S-patched
+   baseline) and re-run item 4. Only then compare against the F&S-patched
    kernel.
 
-5. **Explain the 30-flow cliff. Tests §4.1 C.** It sits exactly where the
+6. **Explain the 30-flow cliff. Tests §4.1 C.** It sits exactly where the
    paper's effect should appear, so it would hide an IOMMU drop even on the
    right kernel.
    ```bash
@@ -502,7 +550,7 @@ In order of what each one decides. Commands run on icx from
    ./scripts/run-dualnic-experiment.sh -E diag-f30-nic0 --nics 1 --nic-index 0 -S 30 -C 30 --uncapped
    ```
 
-6. **Make the IOMMU the tightest limit,** once 2–5 say it can matter:
+7. **Make the IOMMU the tightest limit,** once items 2–6 say it can matter:
    - **Fewer receiver cores** (1–2 per NIC via `SERVER_CORES`). The CPU becomes
      the limit, so strict's CPU cost (§4.1 observation 3) turns into lost
      throughput.
@@ -514,8 +562,9 @@ In order of what each one decides. Commands run on icx from
 
 **Still open from before**
 
-- **`IOMMU_mem_access` semantics.** ~5 per miss (§4.1 B, §4.2). Check against
-  the Ice Lake uncore spec before building any argument on it.
+- **`IOMMU_mem_access` semantics.** ~5 per miss (§4.1 B, §4.2), and non-zero
+  with the IOMMU off. Intel's description does not explain either (§4.3).
+  Compare it against `PWC_CACHE_FILLS` once that is recorded (item 2).
 - **`Part0` is confirmed live** (non-zero misses that scale with load) but was
   never cross-checked against a traffic-carrying Part in `pcm-iio` directly.
 - **Broadwell ceiling:** ~97 Gbps on one link. Whether it can drive two links
@@ -531,6 +580,8 @@ In order of what each one decides. Commands run on icx from
   but styx never writes one.
 - **`membw.rpt` has no values.** The `pcm-memory` output is not parsed, so the
   JSON has no memory-bandwidth fields.
+- **Several IOMMU events are not programmed:** page-walk-cache lookups and
+  misses, invalidations, and page-walker saturation (§4.3, item 2).
 
 ---
 
@@ -566,5 +617,7 @@ In order of what each one decides. Commands run on icx from
 - **Counter names were wrong before this branch.** `L1/L2/L3_Miss` were really
   512G/1G/2M page-walk-cache *hits* — a sign inversion. `pcie.rpt` now writes
   correct names plus legacy aliases; `collect-tput-stats.py` reads either.
+  Ice Lake has no per-level miss events at all, so the paper's L1–L3 miss
+  numbers have no direct equivalent here (§4.3).
 - **`collect_iio_occ` is Skylake-only** (hardcoded MSRs) and disabled. Its output
   was never parsed by anything.
