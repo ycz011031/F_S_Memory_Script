@@ -1,0 +1,64 @@
+#!/bin/bash
+# Testbed config for bigserver: the dual-SSD IOMMU experiment on Skylake-SP.
+# Sourced by record-host-metrics.sh, run-dualssd-experiment.sh,
+# dualssd_sweep.sh and discover-ssd-pcie.sh.
+#
+#   cp setup-server.sh.bigserver.example setup-server.sh
+#   sudo bash discover-ssd-pcie.sh        # then fill in SSD_PCIE_PATTERN
+#
+# setup-server.sh is git-ignored ON PURPOSE (machine-specific, may hold
+# credentials). This .example file is the tracked template -- no secrets.
+# icx's template is setup-server.sh.example; the two hosts need different files.
+#
+# bigserver (survey 2026-10-05):
+#   4x Xeon Gold 6140, Skylake-SP (family 6, model 85, stepping 4)
+#   18 cores per socket, no SMT, NUMA node N = socket N = CPUs 18N..18N+17
+#   kernel 5.15.0-177-generic, booted intel_iommu=on iommu.strict=1
+#   shared machine: other users run PCM and fio here
+
+# ============================================================ host / paths
+SERVER_USERNAME="yz69"
+DEP_DIR="/home/yz69"
+REPO_NAME="F_S_Memory_Script"
+REPO_DIR="$DEP_DIR/$REPO_NAME"
+
+# PCM is installed system-wide. PCM_BIN is the directory holding pcm-iio and
+# pcm-memory; PCM_DIR is only consulted when PCM_BIN is unset ($PCM_DIR/build/bin).
+PCM_DIR="/usr/local"
+PCM_BIN="/usr/local/bin"
+# Core PCM runs on: NUMA node 0, away from the SSDs' node 2 and their fio cores.
+PCM_CORE=15
+
+# ==================================================================== SSDs
+# By SERIAL, never /dev/nvmeN: numbering follows probe order and can change on
+# the reboots that toggle the IOMMU. nvme2-5 are linux_raid_member drives
+# (someone's md array, dmar11, NUMA 3) -- do not touch them.
+#
+#   index 0  Samsung 9100 PRO 1TB      0000:b3:00.0  ext4 (not mounted), ~784 GB written
+#   index 1  Samsung 990 EVO Plus 1TB  0000:b4:00.0  no filesystem, ~1.6 GB written
+SSD_SERIALS=( "S7YENJ0Y313233B" "S7U5NJ0Y308972P" )
+
+# Topology (survey 2026-10-05):
+#
+#   9100 PRO      pci0000:b0 -> b0:00.0 -> b1:00.0 -> b2:00.0 -> b3:00.0   16GT/s x4
+#   990 EVO Plus  pci0000:b0 -> b0:00.0 -> b1:00.0 -> b2:01.0 -> b4:00.0   16GT/s x4
+#                                ^^^^^^^    ^^^^^^^
+#                                one root   PCIe switch
+#                                port       upstream port
+#
+# Both drives are behind IOMMU unit dmar7 on NUMA node 2. Same shape as icx:
+# one root port means one IIO stack and one Part, so every pcm-iio number --
+# bandwidth and VT-d counters alike -- is a sum over both drives. Per-drive
+# numbers come from fio.
+#
+# Skylake-SP root ports are PCIe Gen3, so the switch uplink runs at 8 GT/s
+# whatever the drives negotiate below it. Its width decides whether both drives
+# fit: x16 ~126 Gbps, x8 ~63 Gbps. The runner measures it (uplink_gbps).
+
+# pcm-iio CSV row for root port b0:00.0, as "Socket<N>,IIO Stack <M> - <name>,Part<P>".
+# Get it from:  sudo bash utils/discover-ssd-pcie.sh
+SSD_PCIE_PATTERN=""
+
+# fio cores, one disjoint group per drive, all on the drives' NUMA node 2
+# (CPUs 36-53). Instances are pinned round-robin over a drive's group.
+SSD_CORES=( "36,37,38,39,40,41,42,43,44"  "45,46,47,48,49,50,51,52,53" )

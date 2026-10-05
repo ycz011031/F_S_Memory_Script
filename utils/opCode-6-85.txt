@@ -1,0 +1,48 @@
+# pcm-iio events for Skylake-SP / Cascade Lake (family 6, model 85).
+#
+# pcm-iio loads opCode-<family>-<model>.txt from the CURRENT directory, so the
+# runners only pick this up because they cd into utils/ first. Run pcm-iio from
+# anywhere else and it falls back to whatever file PCM installed.
+#
+# This is the paper's event set (opCode-85.txt, the old file name), which is
+# also PCM's own SKX file. On this CPU the paper's names are accurate: the VT-d
+# events count misses by walk level, unlike Ice Lake's hits by page size.
+#
+# Keys are limited to those both old and new PCM accept: current PCM rejects
+# `divider` ("Field in -o file not recognized"), and older PCM may not know
+# `unit`. utils/discover-ssd-pcie.sh checks that this host's PCM loads it.
+#
+# CSV columns follow the order each hname first appears below:
+#   6 IB write  7 IB read  8 OB read  9 OB write
+#  10 IOTLB Hit  11 IOTLB Miss  12 VT-d CTXT Miss  13 VT-d L1 Miss
+#  14 VT-d L2 Miss  15 VT-d L3 Miss  16 VT-d Mem Read
+#
+# Inbound (PCIe device DMA into system) payload events
+ctr=0,ev_sel=0x83,umask=0x1,en=1,ch_mask=1,fc_mask=0x7,multiplier=4,hname=IB write,vname=Part0 (1st x16/x8/x4)
+ctr=1,ev_sel=0x83,umask=0x1,en=1,ch_mask=2,fc_mask=0x7,multiplier=4,hname=IB write,vname=Part1 (2nd x4)
+ctr=0,ev_sel=0x83,umask=0x1,en=1,ch_mask=4,fc_mask=0x7,multiplier=4,hname=IB write,vname=Part2 (2nd x8/3rd x4)
+ctr=1,ev_sel=0x83,umask=0x1,en=1,ch_mask=8,fc_mask=0x7,multiplier=4,hname=IB write,vname=Part3 (4th x4)
+ctr=0,ev_sel=0x83,umask=0x4,en=1,ch_mask=1,fc_mask=0x7,multiplier=4,hname=IB read,vname=Part0 (1st x16/x8/x4)
+ctr=1,ev_sel=0x83,umask=0x4,en=1,ch_mask=2,fc_mask=0x7,multiplier=4,hname=IB read,vname=Part1 (2nd x4)
+ctr=0,ev_sel=0x83,umask=0x4,en=1,ch_mask=4,fc_mask=0x7,multiplier=4,hname=IB read,vname=Part2 (2nd x8/3rd x4)
+ctr=1,ev_sel=0x83,umask=0x4,en=1,ch_mask=8,fc_mask=0x7,multiplier=4,hname=IB read,vname=Part3 (4th x4)
+# Outbound (CPU MMIO to the PCIe device) payload events
+ctr=2,ev_sel=0xc0,umask=0x4,en=1,ch_mask=1,fc_mask=0x7,multiplier=4,hname=OB read,vname=Part0 (1st x16/x8/x4)
+ctr=3,ev_sel=0xc0,umask=0x4,en=1,ch_mask=2,fc_mask=0x7,multiplier=4,hname=OB read,vname=Part1 (2nd x4)
+ctr=2,ev_sel=0xc0,umask=0x4,en=1,ch_mask=4,fc_mask=0x7,multiplier=4,hname=OB read,vname=Part2 (2nd x8/3rd x4)
+ctr=3,ev_sel=0xc0,umask=0x4,en=1,ch_mask=8,fc_mask=0x7,multiplier=4,hname=OB read,vname=Part3 (4th x4)
+ctr=2,ev_sel=0xc0,umask=0x1,en=1,ch_mask=1,fc_mask=0x7,multiplier=4,hname=OB write,vname=Part0 (1st x16/x8/x4)
+ctr=3,ev_sel=0xc0,umask=0x1,en=1,ch_mask=2,fc_mask=0x7,multiplier=4,hname=OB write,vname=Part1 (2nd x4)
+ctr=2,ev_sel=0xc0,umask=0x1,en=1,ch_mask=4,fc_mask=0x7,multiplier=4,hname=OB write,vname=Part2 (2nd x8/3rd x4)
+ctr=3,ev_sel=0xc0,umask=0x1,en=1,ch_mask=8,fc_mask=0x7,multiplier=4,hname=OB write,vname=Part3 (4th x4)
+# VT-d events. Per stack (vname=Total): pcm-iio prints them on the stack's
+# Part0 row. "IOTLB Hit" (umask 0x01) is VTD_ACCESS.L4_PAGE_HIT in the
+# authors' collect_iio_occ.c; Intel's public perfmon lists have no SKX VT-d
+# events to settle which name is right.
+ctr=0,ev_sel=0x41,umask=0x1,en=1,ch_mask=1,fc_mask=0x7,multiplier=1,hname=IOTLB Hit,vname=Total
+ctr=1,ev_sel=0x41,umask=0x20,en=1,ch_mask=1,fc_mask=0x7,multiplier=1,hname=IOTLB Miss,vname=Total
+ctr=2,ev_sel=0x41,umask=0x02,en=1,ch_mask=4,fc_mask=0x7,multiplier=1,hname=VT-d CTXT Miss,vname=Total
+ctr=3,ev_sel=0x41,umask=0x04,en=1,ch_mask=4,fc_mask=0x7,multiplier=1,hname=VT-d L1 Miss,vname=Total
+ctr=0,ev_sel=0x41,umask=0x08,en=1,ch_mask=4,fc_mask=0x7,multiplier=1,hname=VT-d L2 Miss,vname=Total
+ctr=1,ev_sel=0x41,umask=0x10,en=1,ch_mask=1,fc_mask=0x7,multiplier=1,hname=VT-d L3 Miss,vname=Total
+ctr=2,ev_sel=0x84,umask=0x04,en=1,ch_mask=0x10,fc_mask=0x7,multiplier=1,hname=VT-d Mem Read,vname=Total

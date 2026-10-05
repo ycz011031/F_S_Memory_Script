@@ -21,6 +21,15 @@ PFC_REPORTING=0
 # INTF=enp8s0
 PCIE_PATTERN="Socket1,IIO Stack 0 - PCIe0,Part0"
 
+# Where pcm-iio / pcm-memory live, and the core they run on. Defaults are icx's
+# (a source build under PCM_DIR, core 15); setup-server.sh can override both,
+# e.g. bigserver uses an installed PCM in /usr/local/bin.
+PCM_BIN="${PCM_BIN:-$PCM_DIR/build/bin}"
+PCM_CORE="${PCM_CORE:-15}"
+
+# Selects the pcm-iio CSV layout parse_pciebw* expects (opCode-6-<model>.txt).
+CPU_MODEL=$(awk -F: '/^model[[:space:]]*:/ { gsub(/ /, "", $2); print $2; exit }' /proc/cpuinfo)
+
 cur_dir=$PWD
 
 help()
@@ -98,7 +107,7 @@ function dump_netstat() {
 
 function dump_pciebw() {
     sudo modprobe msr
-    sudo taskset -c 15 $PCM_DIR/build/bin/pcm-iio 1 -csv=logs/$OUT_DIR/pcie.csv &
+    sudo taskset -c $PCM_CORE $PCM_BIN/pcm-iio 1 -csv=logs/$OUT_DIR/pcie.csv &
 }
 
 # ICX (family 6, model 106) pcm-iio CSV layout, from opCode-6-106.txt:
@@ -172,9 +181,74 @@ function parse_pciebw() {
     } > "$R"
 }
 
+# SKX / CLX (family 6, model 85) pcm-iio CSV layout, from opCode-6-85.txt --
+# the paper's own event set, so on this CPU the paper's names are the right
+# ones and are written as-is:
+#
+#   1 Date  2 Time  3 Socket  4 Name  5 Part
+#   6 IB write   7 IB read   8 OB read   9 OB write
+#  10 IOTLB Hit 11 IOTLB Miss 12 VT-d CTXT Miss
+#  13 VT-d L1 Miss 14 VT-d L2 Miss 15 VT-d L3 Miss 16 VT-d Mem Read
+#
+# Columns are looked up by name in the CSV header, with the positions above as
+# the fallback, so a different event file cannot silently shift them the way
+# the Ice Lake file once did.
+#
+# Bandwidth is per Part, so it comes from PCIE_PATTERN's row. The VT-d events
+# are per stack (vname=Total) and pcm-iio prints them on the stack's Part0 row
+# whatever Part the device is on, so they come from that row.
+
+_skx_col() {    # <event name> <fallback column> -> column number
+    local c
+    c=$(awk -F ',' -v n="$1" '$1 == "Date" {
+            for (i = 1; i <= NF; i++) { f = $i; gsub(/^ +| +$/, "", f); if (f == n) { print i; exit } }
+            exit }' "logs/$OUT_DIR/pcie.csv" 2>/dev/null)
+    if [ -z "$c" ] && grep -q '^Date,' "logs/$OUT_DIR/pcie.csv" 2>/dev/null; then
+        echo "WARNING: pcie.csv header has no '$1' column; assuming column $2." >&2
+    fi
+    echo "${c:-$2}"
+}
+
+_skx_avg() {    # <row pattern> <column> -> mean over samples, 0 if no rows matched
+    grep "$1" "logs/$OUT_DIR/pcie.csv" 2>/dev/null \
+      | awk -F ',' -v c="$2" \
+            '{ sum += $c; n++ } END { if (n > 0) printf "%.3f", sum/n; else printf "0" }'
+}
+
+_skx_gbps() {   # <row pattern> <column> -> mean bytes/s converted to Gb/s
+    grep "$1" "logs/$OUT_DIR/pcie.csv" 2>/dev/null \
+      | awk -F ',' -v c="$2" \
+            '{ sum += $c/1000000000.0; n++ } END { if (n > 0) printf "%.3f", sum/n*8; else printf "0" }'
+}
+
+function parse_pciebw_skx() {
+    local R="reports/$OUT_DIR/pcie.rpt"
+    local vtd
+    vtd=$(printf '%s' "$PCIE_PATTERN" | sed 's/Part[0-9].*$/Part0/')
+
+    if ! grep -q "$PCIE_PATTERN" "logs/$OUT_DIR/pcie.csv" 2>/dev/null; then
+        echo "WARNING: PCIE_PATTERN '$PCIE_PATTERN' matched no rows in pcie.csv." >&2
+        echo "         Every PCIe/IOMMU metric will be 0. Find the right row with" >&2
+        echo "         sudo bash utils/discover-ssd-pcie.sh" >&2
+    fi
+
+    {
+        echo "cpu_model: 85"
+        echo "PCIe_wr_tput: $(_skx_gbps "$PCIE_PATTERN" "$(_skx_col 'IB write' 6)")"
+        echo "PCIe_rd_tput: $(_skx_gbps "$PCIE_PATTERN" "$(_skx_col 'IB read' 7)")"
+        echo "IOTLB_hits: $(_skx_avg "$vtd" "$(_skx_col 'IOTLB Hit' 10)")"
+        echo "IOTLB_misses: $(_skx_avg "$vtd" "$(_skx_col 'IOTLB Miss' 11)")"
+        echo "CTXT_Miss: $(_skx_avg "$vtd" "$(_skx_col 'VT-d CTXT Miss' 12)")"
+        echo "L1_Miss: $(_skx_avg "$vtd" "$(_skx_col 'VT-d L1 Miss' 13)")"
+        echo "L2_Miss: $(_skx_avg "$vtd" "$(_skx_col 'VT-d L2 Miss' 14)")"
+        echo "L3_Miss: $(_skx_avg "$vtd" "$(_skx_col 'VT-d L3 Miss' 15)")"
+        echo "Mem_Read: $(_skx_avg "$vtd" "$(_skx_col 'VT-d Mem Read' 16)")"
+    } > "$R"
+}
+
 function dump_membw() {
     sudo modprobe msr
-    sudo taskset -c 15 $PCM_DIR/build/bin/pcm-memory 1 -columns=5
+    sudo taskset -c $PCM_CORE $PCM_BIN/pcm-memory 1 -columns=5
 }
 
 function parse_membw() {
@@ -288,7 +362,7 @@ if [ "$PCIE_REPORTING" -eq 1 ]; then
   dump_pciebw
   sleep $DURATION_S
   sudo pkill -9 pcm
-  parse_pciebw
+  if [ "$CPU_MODEL" = "85" ]; then parse_pciebw_skx; else parse_pciebw; fi
 fi
 
 if [ "$MEMBW_REPORTING" -eq 1 ]; then

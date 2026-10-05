@@ -12,6 +12,8 @@ together, [LOCAL-SETUP.md](LOCAL-SETUP.md) for first-time provisioning.
 - **Headline:** IOMMU strict and IOMMU off give the same throughput in every
   configuration run so far. Reasons are speculated in §4.1; the experiments
   that would settle them are in §5.
+- **Second testbed (2026-10-05):** the same experiment with two NVMe SSDs and
+  fio on bigserver, a Skylake-SP host. Scripts are ready, not yet run (§7).
 
 ---
 
@@ -621,3 +623,162 @@ In order of what each one decides. Commands run on icx from
   numbers have no direct equivalent here (§4.3).
 - **`collect_iio_occ` is Skylake-only** (hardcoded MSRs) and disabled. Its output
   was never parsed by anything.
+
+---
+
+## 7. bigserver: dual-SSD on Skylake-SP
+
+The same contention experiment with two NVMe SSDs and fio in place of two NICs
+and iperf3. fio runs locally, so there is no client host. Scripts written
+2026-10-05; **not yet run on bigserver.**
+
+### Testbed (survey 2026-10-05)
+
+| | |
+|---|---|
+| Host | **bigserver**, shared with other users who also run PCM and fio |
+| CPU | 4× Xeon Gold 6140, Skylake-SP (family 6, model 85, stepping 4), 18 cores per socket, no SMT. NUMA node N = CPUs 18N–18N+17 |
+| Kernel | `5.15.0-177-generic`, booted `intel_iommu=on iommu.strict=1` (domain type `DMA`). Neither icx's 6.8 nor the paper's 6.0.3 |
+| PCM | installed, `/usr/local/bin/pcm-iio`; version not recorded |
+| fio | `fio-3.41-39-g9f87c`, `/usr/local/bin/fio` |
+
+| Index | Drive | Serial | PCI | State |
+|---|---|---|---|---|
+| 0 | Samsung 9100 PRO 1TB (Gen5 drive, linked Gen4 x4) | `S7YENJ0Y313233B` | `b3:00.0` | ext4, not mounted, ~784 GB written |
+| 1 | Samsung 990 EVO Plus 1TB (Gen4 x4) | `S7U5NJ0Y308972P` | `b4:00.0` | no filesystem, ~1.6 GB written |
+
+```
+9100 PRO      pci0000:b0 -> b0:00.0 -> b1:00.0 -> b2:00.0 -> b3:00.0
+990 EVO Plus  pci0000:b0 -> b0:00.0 -> b1:00.0 -> b2:01.0 -> b4:00.0
+                            ^^^^^^^    ^^^^^^^
+                            one root   PCIe switch
+                            port       upstream port
+```
+
+The same shape as icx. Both drives share IOMMU unit `dmar7`, one root port, so
+one IIO stack and one Part: every `pcm-iio` number is a sum over both drives,
+and per-drive numbers come from fio. Both are on NUMA node 2 (CPUs 36–53).
+Skylake-SP root ports are Gen3, so the uplink above the switch runs at 8 GT/s:
+~126 Gbps at x16, ~63 Gbps at x8. **Its width is not yet known**;
+`discover-ssd-pcie.sh` prints it, and the runner records it as `uplink_gbps`.
+
+nvme2–5 (NUMA 3, `dmar11`) are `linux_raid_member` drives: someone's md array.
+
+### Setup, once
+
+```bash
+git clone <fork> ~/F_S_Memory_Script && cd ~/F_S_Memory_Script && git checkout icx-dualnic
+cp utils/setup-server.sh.bigserver.example utils/setup-server.sh
+sudo bash utils/discover-ssd-pcie.sh    # prints SSD_PCIE_PATTERN; paste it into setup-server.sh
+```
+
+The discovery loads each drive alone with read-only fio and reports which
+`pcm-iio` row carries its traffic. It also checks that PCM loaded
+`opCode-6-85.txt` and that the VT-d counters are non-zero. **Do not sweep until
+they are**: with zeros, every IOMMU column of the sweep is zero too.
+
+### Run
+
+```bash
+# baselines + co-run at 1,2,4,8 fio instances per drive, 4k random reads, 3 repeats
+./scripts/sosp24-experiments/dualssd_sweep.sh                  # [-o name] [instances] [block sizes] [runs] [modes]
+./scripts/sosp24-experiments/dualssd_sweep.sh "1 2 4 8" "4k 1m" 3
+
+# single configuration
+./scripts/run-dualssd-experiment.sh -E mytest --ssds 2 -J 4 --runs 3
+
+# side by side, strict vs off
+python3 scripts/dualssd-results.py summary ~/dualssd-sweep-*.jsonl
+```
+
+| `run-dualssd-experiment.sh` flag | Meaning |
+|---|---|
+| `-E <name>` | experiment name; names the output directories |
+| `--ssds 1\|2`, `--ssd-index N` | how many drives; which one when 1 |
+| `-J <n>` | fio instances **per drive**, the analogue of iperf3 flows |
+| `--bs`, `--iodepth`, `--rw`, `--ioengine` | default `4k`, `32`, `randread`, `libaio`. `--rw` accepts only `read`/`randread` |
+| `-d`, `--warm` | measurement window (default 20 s) and fio ramp time (10 s) |
+| `--membw 1` | also run `pcm-memory` (adds 30 s + window per run) |
+| `--runs N`, `--results <file>` | as in the NIC runner |
+
+Each instance is a separate fio process, a single job with `--thread`, pinned
+round-robin over the drive's cores (`SSD_CORES`, 9 per drive). Every run uses
+`--readonly`, `O_DIRECT`, `--randrepeat=0 --norandommap` across the whole drive.
+Reports: `utils/reports/<exp>-RUN-<j>/` (`pcie.rpt`, `cpu_util.rpt`) and
+`<exp>-RUN-<j>-ssd<i>/fio.rpt`; the per-instance fio JSON is in
+`utils/logs/<exp>-RUN-<j>/`. About 70 s per run, so the default sweep (37 runs)
+takes ~45 min per IOMMU mode. Lock: `/tmp/dualssd-experiment.lock`. Stop with
+`pkill -f 'dualssd_swee[p]'; pkill -f 'run-dualssd-experimen[t]'`. The runner
+stops its own fio on the way out.
+
+### Reading the output
+
+- **Compare IOTLB misses per I/O** (misses/s ÷ IOPS), not raw counts.
+- **CONTENTION** compares the co-run's misses per I/O to each drive's
+  single-drive figure, weighted by that drive's share of the co-run's IOPS. A
+  plain mean of the two baselines would be wrong because the drives differ
+  (traps below).
+- **Strict vs off:** IOPS and `CPU_us/IO` at the same block size and instance
+  count. With the IOMMU off the miss columns read 0.
+- **Why this may show what icx did not:** with `O_DIRECT` the NVMe driver maps
+  every I/O's buffer on submit and unmaps it on completion. In strict mode
+  every completion is a synchronous IOTLB invalidation through `dmar7`'s single
+  invalidation queue, which all instances on all cores share. That is the
+  per-I/O churn §4.1 B suspects mlx5's page recycling avoids. 4k reads maximise
+  it per byte.
+
+### Counters on Skylake
+
+`opCode-6-85.txt` is the paper's own event set (its Cascade Lake is also model
+85), and PCM ships the same events. Here the paper's names are accurate:
+`pcie.rpt` writes `IOTLB_hits`, `IOTLB_misses`, `CTXT_Miss`,
+`L1_Miss`/`L2_Miss`/`L3_Miss` (VT-d misses by walk level) and `Mem_Read`
+(VT-d memory reads), and starts with `cpu_model: 85`.
+
+- **On icx the same keys are legacy aliases with different meanings** (§6).
+  Never compare icx and bigserver `pcie.rpt` files by key name.
+- The VT-d events are per stack and appear on the stack's Part0 row. Bandwidth
+  is per Part, read from the `SSD_PCIE_PATTERN` row. On bigserver both are the
+  Part0 row of the stack holding `b0:00.0`.
+- `IOTLB Hit` (umask 0x01) is called `L4_PAGE_HIT` in `collect_iio_occ.c`.
+  Intel's public perfmon lists have no Skylake VT-d events, so neither name can
+  be checked against Intel's own definitions.
+- Current PCM rejects a `divider` key in event files, and older PCM may not
+  accept `unit`, so the file uses neither. If bigserver's PCM is old enough to
+  need `divider`, the discovery script shows a parse error or no CSV.
+- `record-host-metrics.sh` picks the parser by CPU model, so icx output is
+  unchanged. `PCM_BIN` and `PCM_CORE` in `setup-server.sh` override where PCM
+  lives and the core it runs on (icx defaults: `$PCM_DIR/build/bin`, core 15).
+
+### Traps (bigserver)
+
+- **NVMe numbering is not stable across reboots,** and every strict/off
+  comparison needs one. Drives are configured by serial and resolved at run
+  time. Never put a `/dev/nvmeN` name in the config.
+- **Shared host.** `record-host-metrics.sh` ends each window with `pkill -9 pcm`
+  and `pkill -9 -x sar`, which would kill other users' copies. Two PCMs also
+  corrupt each other's counters. The runner refuses to start while any
+  `pcm*` or `sar` is running, and lists other users' fio.
+- **The two drives are not a matched pair.** Different models, and the 990
+  EVO Plus is DRAM-less, so it probably keeps its mapping tables in host
+  memory (HMB). Check with `sudo nvme id-ctrl /dev/nvme1n1 | grep -i hmpre`
+  (non-zero = HMB). HMB traffic is extra DMA through the same IOMMU on every
+  I/O. The 990 EVO Plus is also nearly empty: reads of never-written blocks
+  return without touching flash, so its IOPS measure the controller, not the
+  NAND. Expect different single-drive misses per I/O; hence the weighted
+  CONTENTION.
+- **Read-only by design.** nvme0 holds an unmounted ext4 filesystem with data.
+  fio always runs `--readonly`, and the runner refuses drives that are mounted
+  or held by md, LVM or dm.
+- **The Gen3 uplink may bind before the IOMMU does.** The summary marks
+  LINK BOUND when PCIe write exceeds 85% of the narrowest shared link.
+- `cpu_util.py` now parses `sar` output in both 12- and 24-hour locales. It
+  previously needed the 12-hour format, and bigserver's locale is unchecked.
+
+### Next on bigserver
+
+1. Clone, copy the config, run `discover-ssd-pcie.sh`. Record the uplink
+   width, the `pcm-iio` row, the PCM version and the HMB check here.
+2. Run `dualssd_sweep.sh` booted strict, then reboot with `intel_iommu=off` and
+   run it again. The reboot and the grub change affect everyone on the
+   machine; agree on them with the other users first.
