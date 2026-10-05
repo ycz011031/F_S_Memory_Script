@@ -6,6 +6,10 @@
 #   ./run-dualssd-experiment.sh -E base-ssd0 --ssds 1 -J 4
 #   ./run-dualssd-experiment.sh -E base-ssd1 --ssds 1 --ssd-index 1 -J 4
 #   ./run-dualssd-experiment.sh -E dual      --ssds 2 -J 4 --runs 3
+#   ./run-dualssd-experiment.sh -E dual2     --ssds 2 -J 4 --tmux   # in tmux instead
+#
+# Runs in this terminal unless --tmux is given; --tmux starts it in a new tmux
+# session (survives a dropped ssh; asks for the sudo password there).
 #
 # -J is fio instances PER DRIVE, the analogue of iperf3 flows per NIC. Each is
 # its own fio process with one job, pinned round-robin over the drive's cores
@@ -29,8 +33,14 @@
 set -u
 
 HERE=$(cd "$(dirname "$0")" && pwd)
+SELF="$HERE/$(basename "$0")"
 . "$HERE/../utils/setup-server.sh"
 . "$HERE/../utils/ssd-lib.sh"
+
+# --tmux: start over inside a tmux session, with the same arguments minus it.
+PASS=(); IN_TMUX=0
+for a in "$@"; do if [ "$a" = --tmux ]; then IN_TMUX=1; else PASS+=( "$a" ); fi; done
+set -- ${PASS[@]+"${PASS[@]}"}
 
 exp="dualssd-test"
 ssds=2                 # how many drives to drive
@@ -62,7 +72,7 @@ while [ $# -gt 0 ]; do
         --runs)         num_runs="$2"; shift 2 ;;
         --results)      results_file="$2"; shift 2 ;;
         -h|--help)
-            sed -n '2,28p' "$0"; exit 0 ;;
+            sed -n '2,32p' "$SELF"; exit 0 ;;
         *) echo "unknown option: $1"; exit 2 ;;
     esac
 done
@@ -74,6 +84,7 @@ esac
 case "$ssds" in 1|2) ;; *) echo "ERROR: --ssds must be 1 or 2" >&2; exit 2 ;; esac
 case "$ssd_index" in 0|1) ;; *) echo "ERROR: --ssd-index must be 0 or 1" >&2; exit 2 ;; esac
 case "$jobs" in ''|*[!0-9]*|0) echo "ERROR: -J must be a positive integer" >&2; exit 2 ;; esac
+[ "$IN_TMUX" = 1 ] && relaunch_in_tmux "$SELF" ${PASS[@]+"${PASS[@]}"}
 
 for v in SSD_SERIALS SSD_CORES; do
     if ! declare -p "$v" >/dev/null 2>&1; then

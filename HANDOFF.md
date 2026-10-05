@@ -689,10 +689,15 @@ On icx nearly every miss hit the page-walk cache; here walks are deep.
 ### Run
 
 ```bash
+sudo -v     # bigserver has no NOPASSWD sudo: cache the password in this terminal first
+
 # co-run at 1,2,4,8 fio instances per drive, 4k random reads, 3 repeats
-./scripts/sosp24-experiments/dualssd_sweep.sh                  # [-o name] [--single] [instances] [block sizes] [runs]
+./scripts/sosp24-experiments/dualssd_sweep.sh                  # [-o name] [--single] [--tmux] [instances] [block sizes] [runs]
 ./scripts/sosp24-experiments/dualssd_sweep.sh --single         # also each drive alone (baselines for CONTENTION)
 ./scripts/sosp24-experiments/dualssd_sweep.sh "1 2 4 8" "4k 1m" 3
+
+# the same in a tmux session instead of this terminal (survives a dropped ssh)
+./scripts/sosp24-experiments/dualssd_sweep.sh --single --tmux
 
 # single configuration
 ./scripts/run-dualssd-experiment.sh -E mytest --ssds 2 -J 4 --runs 3
@@ -729,6 +734,16 @@ output. Each sweep takes a fresh name, `dualssd-sweep-<iommu>-<N>`, or the
 | `utils/logs/<sweep>/<config>-RUN-<j>/` | raw logs: `pcie.csv` (`pcm-iio`, every stack, every second), `pcm-iio.out` (its banner and warnings), `membw.log` (`pcm-memory`), `pcm.txt` (binary, core, row parsed), the `opCode-6-85.txt` that defines the CSV columns, `cpu_util.log`, `fio-ssd<i>-<k>.json/.err` |
 | `utils/reports/<sweep>/<config>-RUN-<j>[-ssd<i>]/` | parsed `pcie.rpt`, `membw.rpt`, `cpu_util.rpt`, `fio.rpt` |
 | `utils/logs/<sweep>/datapath.jsonl` | the pre-sweep datapath check, kept out of the summary |
+
+**Terminal or tmux.** Both scripts run in the current terminal by default.
+`--tmux` (sweep or runner) starts them in a new tmux session named
+`dualssd-sweep-<N>` or `run-dualssd-experiment-<N>` and attaches. The session
+asks for the sudo password itself, because sudo caches it per terminal.
+Detach with Ctrl-b then d, and re-attach with `tmux attach -t <name>`. When
+the script ends, the window stays open on its output. Progress: each sweep
+configuration prints `[k/N]` with the time so far and an estimate of the time
+left. From another terminal, `tail -f utils/logs/<sweep>/sweep.log` follows
+it without attaching.
 
 About 110 s per run with `pcm-memory`. The default sweep (13 runs) takes ~25 min
 and `--single` (37 runs) ~70 min per IOMMU mode. Lock:

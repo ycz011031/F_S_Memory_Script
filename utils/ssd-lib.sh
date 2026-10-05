@@ -35,6 +35,54 @@ iommu_unit() {
     if [ -e "$l" ]; then basename "$(readlink -f "$l")"; else echo none; fi
 }
 
+# relaunch_in_tmux <script> [args...]: run <script> in a new tmux session
+# instead of this terminal, so it survives a dropped ssh connection. Does not
+# return. sudo caches the password per terminal and a tmux pane is a new one,
+# so the session asks for it first, then runs the script, then keeps the
+# window open on its final output.
+relaunch_in_tmux() {
+    local script="$1"; shift
+    command -v tmux >/dev/null 2>&1 || {
+        echo "ERROR: --tmux given, but tmux is not installed. Run without --tmux." >&2; exit 1; }
+    local base name k=1 launcher
+    base=$(basename "$script" .sh); base=${base//_/-}
+    name="$base-1"
+    while tmux has-session -t "=$name" 2>/dev/null; do k=$((k + 1)); name="$base-$k"; done
+
+    launcher=$(mktemp /tmp/dualssd-tmux.XXXXXX)
+    {
+        echo '#!/bin/bash'
+        echo 'rm -f "$0"'
+        printf 'cd %q || exit 1\n' "$PWD"
+        # A running tmux server does not pass this shell's environment on.
+        local v
+        for v in DUALSSD_ARGS RESULTS_DIR; do
+            [ -n "${!v+x}" ] && printf 'export %s=%q\n' "$v" "${!v}"
+        done
+        echo "echo \"== tmux session $name: enter your sudo password to start\""
+        echo 'sudo -v || { echo "sudo failed; nothing was run."; exec bash; }'
+        printf 'bash %q' "$script"; [ $# -gt 0 ] && printf ' %q' "$@"; echo
+        echo 'rc=$?'
+        echo "echo; echo \"[$name finished with status \$rc at \$(date '+%F %T'). This window stays open; type exit to close it.]\""
+        echo 'exec bash'
+    } > "$launcher"
+
+    echo "Starting $(basename "$script") in tmux session '$name'."
+    echo "  It asks for your sudo password first."
+    echo "  Detach, leaving it running:  Ctrl-b, then d"
+    echo "  Re-attach later:             tmux attach -t $name"
+    echo "  Its log path is printed at the top of its output."
+    if [ -n "${TMUX:-}" ]; then
+        tmux new-session -d -s "$name" "bash $launcher" && tmux switch-client -t "=$name"
+    elif [ -t 0 ] && [ -t 1 ]; then
+        tmux new-session -s "$name" "bash $launcher"
+    else
+        tmux new-session -d -s "$name" "bash $launcher" \
+            && echo "  No terminal here: attach with 'tmux attach -t $name' to enter the password."
+    fi
+    exit $?
+}
+
 # PCI functions from the root port down to <bdf>, one per line.
 pci_chain() {
     readlink -f "/sys/bus/pci/devices/$1" | tr '/' '\n' \
