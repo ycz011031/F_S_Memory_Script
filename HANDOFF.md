@@ -848,7 +848,8 @@ Means of 3 runs, iodepth 32 per instance. Mean latency is from Little's law
   (`iommu.strict=0`, batched invalidations), and
   `sudo perf top -C 36-53` during an 8-instance co-run, looking for time in
   `qi_submit_sync` or spinlocks under the intel-iommu flush path.
-- **A per-queue limit instead (favoured since 8).** Each queue's completions
+- **A per-queue limit instead (favoured since 8; refuted by the second
+  result, below).** Each queue's completions
   run on its one interrupt CPU. In strict mode that includes every unmap and
   its synchronous invalidation. At 8 instances those CPUs are saturated, and
   the fio cores wait on them. The plateau would then be set by how many
@@ -872,6 +873,64 @@ Means of 3 runs, iodepth 32 per instance. Mean latency is from Little's law
   instances up, each drive's extra instances sit on the *other* drive's
   interrupt CPUs, which are idle in single-drive runs. Interrupt CPUs are
   assigned at boot and may move after the IOMMU reboot: re-check them first.
+
+### Second result: strict, 4k, interrupt-aware placement (2026-10-05)
+
+`dualssd-sweep-strict-4`, with `SSD_CORES` as recommended above: each drive
+uses all 4 queues from 4 instances up, and fio stays off the interrupt CPUs up
+to 5 instances. Means of 3 runs.
+
+| Instances per drive | 9100 PRO alone | 990 EVO Plus alone | Both | Both ÷ sum of alone | Both: misses per I/O | Both: CPU µs per I/O | Both: latency µs |
+|---|---|---|---|---|---|---|---|
+| 1 | 226K | 227K | 366K | 81% | 1.26 | 6.4 | 175 |
+| 2 | 377K | 374K | 597K | 80% | 1.43 | 7.1 | 214 |
+| 4 | 562K | 589K | 605K | 53% | 1.76 | 13.4 | 422 |
+| 8 | 564K | 596K | 713K | 61% | 1.84 | 20.6 | 718 |
+
+**Expected ceilings at 4 KiB, if only the hardware limited:**
+
+| Limit | 4 KiB IOPS | GB/s | `PCIe_wr` reads |
+|---|---|---|---|
+| Shared uplink, Gen3 x8 | ~1.55–1.7M total | ~6.4–7.0 | ~51–56 Gbps |
+| Each drive's link, Gen4 x4 | ~1.6M per drive | ~6.4–7.0 | ~51–56 Gbps |
+| 990 EVO Plus 1TB, rated | 850K | | |
+| 9100 PRO 1TB, rated (on Gen5) | 1.85M | | |
+
+How the link rows are derived:
+- **Raw rate:** 8 GT/s × 8 lanes × 128/130 = 63 Gbps (7.88 GB/s).
+- **Per-I/O traffic:** a 4 KiB read arrives as 16 PCIe writes of 256 B (32 of 128 B at a smaller max payload), each with ~26 B of header and framing. A command fetch and a completion entry add ~100 B.
+- **Efficiency:** that leaves ~90% of the raw rate with 256 B max payload, ~83% with 128 B. The max payload in use is not yet checked.
+- **`PCIe_wr` column:** it counts payload only, so link saturation reads ~51–56 Gbps there, not 63.
+
+Both drives together should therefore reach ~1.5–1.6M IOPS, limited by the uplink. One drive alone should reach ~850K for the 990 EVO Plus (the drive's limit) and ~1.6M for the 9100 PRO (its link). Observed: 713K at most for both together, about 2.9 GB/s and 23.7 Gbps `PCIe_wr`, which is under half the uplink ceiling. Each drive alone plateaus at 560–600K.
+
+**Observed**
+
+1. **The earlier asymmetry between the drives was placement.** With the same
+   placement, the drives match at 1 and 2 instances (226K/227K, 377K/374K).
+2. **Each drive alone plateaus at ~560–600K from 4 instances.** From 4 to 8,
+   IOPS stay flat while latency doubles (~220 → ~440 µs) and CPU per I/O rises
+   from ~6 to ~10.5 µs.
+3. **Both drives together barely exceed one drive** at 4 instances each:
+   605K vs 562K and 589K, although the co-run has 8 queues and 8 separate
+   interrupt CPUs. This fails the per-queue test set in "First result". The
+   ceiling stays near 600–700K, so it is a limit shared by both drives.
+4. **At equal total instances and IOPS, the co-run costs more than one drive.**
+   Both at 4 each (8 total, 605K) vs one drive at 8 (564K, 596K): misses per
+   I/O 1.76 vs 1.32 and 1.50 (+17–33%). CPU per I/O 13.4 vs 10.5 and 10.2 µs
+   (+28–31%). Latency is about the same. This is the first sign of contention
+   between the two drives in the IOMMU itself. Caveat: the single-drive run at
+   8 puts instances on the other drive's interrupt CPUs, so the placements are
+   not identical.
+
+**Reading (not established).** Below half the link ceiling and below either
+drive's rating, the shared limit is on the host side. The drives share
+`dmar7`: its IOTLB, page walker and invalidation queue. The per-queue
+explanation above is refuted. The IOMMU-off sweep with the same placement
+decides it. If the IOMMU is the limit, the co-run should go well past 713K
+toward the uplink ceiling (~1.5M, LINK BOUND), and the 990 EVO Plus alone
+toward 850K. If the off sweep also stalls near 600–700K, look at the IIO
+stack and the PCIe switch instead.
 
 ### Counters on Skylake
 
@@ -934,15 +993,15 @@ Means of 3 runs, iodepth 32 per instance. Mean latency is from Little's law
 
 ### Next on bigserver
 
-1. **Re-run the strict sweep with the interrupt-aware `SSD_CORES` order**
-   (First result, core placement), `--single` included. That tests per-queue
-   against global (reason "a per-queue limit"). Use the same order for every
-   IOMMU mode afterwards.
-2. **What the interrupt CPUs spend their time on,** if needed: `perf` is not
-   installed for this kernel (`linux-tools-5.15.0-177-generic`). `mpstat`
-   cannot separate it, because interrupt time shows up as `%sys` here.
-3. **Sweep with the IOMMU off,** then ideally lazy (`iommu.strict=0`), with
-   `--single` so CONTENTION is filled in. Each needs a reboot and a grub
-   change that affect everyone on the machine; agree on them with the other
-   users first.
+1. **Check the PCIe max payload size,** which sets the link ceiling (~1.55M
+   IOPS at 128 B, ~1.7M at 256 B):
+   `for d in b0:00.0 b1:00.0 b3:00.0 b4:00.0; do echo "$d $(sudo lspci -vv -s $d | grep -A2 'DevCtl:' | grep -o 'MaxPayload [0-9]* bytes')"; done`
+2. **Sweep with the IOMMU off,** then ideally lazy (`iommu.strict=0`), with
+   the same `SSD_CORES` order and `--single`. It decides whether the
+   ~600–700K ceiling of the second result is the IOMMU. Re-check the
+   interrupt CPUs after the reboot. Each reboot and grub change affects
+   everyone on the machine; agree on them with the other users first.
+3. **What the CPU time goes to,** if needed: `perf` is not installed for this
+   kernel (`linux-tools-5.15.0-177-generic`). `mpstat` cannot separate it,
+   because interrupt time shows up as `%sys` here.
 4. The HMB check (Traps) is still not done.
