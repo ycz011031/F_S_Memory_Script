@@ -789,6 +789,19 @@ Means of 3 runs, iodepth 32 per instance. Mean latency is from Little's law
    using twice the CPU. The 990 EVO Plus doubles (182K → 368K).
 6. **Misses per I/O rise only modestly with concurrency** (~1.1–1.2 → 1.4–1.7).
    CPU per I/O rises much faster.
+7. **Both drives split node 2 into the same 4 NVMe hardware queues**:
+   CPUs 36–40, 41–45, 46–49 and 50–53. Each queue has one interrupt, and in
+   strict mode the unmap and invalidation run in that completion path. The
+   `SSD_CORES` split puts the 9100 PRO's instances on fewer queues: at
+   2 instances its cores 36 and 37 share one queue, while the 990 EVO Plus's
+   45 and 46 use two. Number of queues used:
+
+   | Instances | 9100 PRO (36–44) | 990 EVO Plus (45–53) |
+   |---|---|---|
+   | 1 | 1 | 1 |
+   | 2 | 1 | 2 |
+   | 4 | 1 | 2 |
+   | 8 | 2 | 3 |
 
 **Speculated reasons (not established)**
 
@@ -803,10 +816,15 @@ Means of 3 runs, iodepth 32 per instance. Mean latency is from Little's law
   (`iommu.strict=0`, batched invalidations), and
   `sudo perf top -C 36-53` during an 8-instance co-run, looking for time in
   `qi_submit_sync` or spinlocks under the intel-iommu flush path.
-- **9100 PRO queue sharing**, for 5. If the 9100 PRO exposes fewer NVMe I/O
-  queues than there are CPUs, CPUs 36 and 37 may share one hardware queue and
-  one interrupt. Its scaling would then follow distinct queues, not instances.
-  **Check:** `grep -H . /sys/block/nvme0n1/mq/*/cpu_list` against `nvme1n1`.
+- **Core placement, for 5 and 7.** The guess that the 9100 PRO has fewer
+  queues was wrong (7). But its instances do sit on fewer queues, which fits
+  5. A queue is not a hard cap, though: on one queue the 9100 PRO went from
+  237K at 2 instances to 431K at 4. Where each queue's interrupt lands
+  (`/proc/irq/<n>/effective_affinity_list`) and per-core CPU (`cpu_utils` in
+  each `cpu_util.rpt`) should settle it. It also means the two drives'
+  single-drive numbers are not comparable as run. An `SSD_CORES` order that
+  alternates the queue groups gives each drive the same placement:
+  `"36,41,46,50,37,42,47,51,38"` and `"39,43,48,52,40,44,49,53,45"`.
 
 ### Counters on Skylake
 
@@ -848,6 +866,11 @@ Means of 3 runs, iodepth 32 per instance. Mean latency is from Little's law
   return without touching flash, so its IOPS measure the controller, not the
   NAND. Expect different single-drive misses per I/O; hence the weighted
   CONTENTION.
+- **No passwordless sudo on bigserver.** Everything works only while a recent
+  password entry is cached. Run `sudo -v` in the same terminal (same tmux pane)
+  right before a runner or sweep; their own sudo calls keep the cache alive.
+  Earlier "passwordless" checks passed only because a `sudo` had just been
+  typed. Do not add a NOPASSWD rule on this shared machine without the admins.
 - **Read-only by design.** nvme0 holds an unmounted ext4 filesystem with data.
   fio always runs `--readonly`, and the runner refuses drives that are mounted
   or held by md, LVM or dm.
@@ -858,10 +881,15 @@ Means of 3 runs, iodepth 32 per instance. Mean latency is from Little's law
 
 ### Next on bigserver
 
-1. **Check the 9100 PRO's queue mapping** (First result, reason 2) before
-   reading anything into its scaling.
-2. **`perf top` during an 8-instance co-run** while still booted strict: does
-   CPU go to the invalidation path?
+1. **Where the NVMe interrupts land, and per-core CPU** (First result, core
+   placement), before reading anything into the per-drive scaling. Decide on
+   the `SSD_CORES` order before the next sweep, and use the same order for
+   strict and off.
+2. **Where the CPU goes during an 8-instance co-run,** still booted strict.
+   `perf` is not installed for this kernel (`linux-tools-5.15.0-177-generic`).
+   Without it, `mpstat -P 36-53 5` shows `%irq` per core. With every
+   invalidation waited on in the interrupt-time completion path, a high
+   `%irq` on the cores that take the NVMe interrupts would point there.
 3. **Sweep with the IOMMU off,** then ideally lazy (`iommu.strict=0`), with
    `--single` so CONTENTION is filled in. Each needs a reboot and a grub
    change that affect everyone on the machine; agree on them with the other

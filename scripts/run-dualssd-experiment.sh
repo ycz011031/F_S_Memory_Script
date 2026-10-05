@@ -129,12 +129,16 @@ preflight() {
     echo "   running on: $(hostname) ($(id -un)), CPU family $CPU_FAM model $CPU_MODEL"
     PROBLEMS=()
 
+    # bigserver has no NOPASSWD rule: sudo works here only while a recent
+    # password entry is cached. The runner's own sudo calls keep that cache
+    # alive for the whole run, so caching it once just before starting is enough.
     if sudo -n true >/dev/null 2>&1; then
-        echo "   passwordless sudo: OK"
+        echo "   sudo: OK (no password needed right now)"
     else
-        PROBLEMS+=("passwordless sudo missing on $(hostname). Run once:
-      echo \"\$USER ALL=(ALL) NOPASSWD:ALL\" | sudo tee /etc/sudoers.d/fands
-      sudo chmod 0440 /etc/sudoers.d/fands && sudo visudo -c")
+        PROBLEMS+=("sudo needs a password, and this script cannot answer a prompt mid-run.
+    Enter it once, in this same terminal (in tmux, the same pane), then re-run:
+      sudo -v
+    The runner's own sudo calls keep the cached credentials alive while it runs.")
     fi
 
     miss=""
