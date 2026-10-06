@@ -703,12 +703,27 @@ sudo -v     # bigserver has no NOPASSWD sudo: cache the password in this termina
 ./scripts/sosp24-experiments/dualssd_bs_sweep.sh                # [-o name] [--single] [--tmux] [block sizes] [instances] [runs]
 ./scripts/sosp24-experiments/dualssd_bs_sweep.sh "4k 8k 16k 32k 64k 128k 256k 512k 1m"
 
+# cross sweep, every block size at every instance count: 4k 8k 16k 64k 1m x 1,2,4,8, 1 run
+./scripts/sosp24-experiments/dualssd_cross_sweep.sh             # [-o name] [--single | --single-ssd N] [--tmux] [block sizes] [instances] [runs]
+./scripts/sosp24-experiments/dualssd_cross_sweep.sh --single    # also drive 0 alone; only drive 0, to save time
+DUALSSD_ARGS="--membw 0" ./scripts/sosp24-experiments/dualssd_cross_sweep.sh --single   # ~half the time
+
 # single configuration
 ./scripts/run-dualssd-experiment.sh -E mytest --ssds 2 -J 4 --runs 3
 
 # side by side, strict vs off
 python3 scripts/dualssd-results.py summary ~/dualssd-sweep-*.jsonl
+python3 scripts/dualssd-results.py grid ~/dualssd-xsweep-*.jsonl      # block size x instances tables
 ```
+
+**Single-drive runs.** `--single` on `dualssd_sweep.sh` and
+`dualssd_bs_sweep.sh` runs each drive alone at every point. `--single-ssd N`
+(any of the three sweeps) runs only drive N alone, which halves the
+single-drive time. On `dualssd_cross_sweep.sh`, `--single` means
+`--single-ssd 0`: drive 0, the 9100 PRO (`nvme0`). Drive 1, the 990 EVO Plus
+(`nvme1`), is the one with the host memory buffer (Third result, item 7);
+pick it with `--single-ssd 1`. With one drive alone the summary fills KEPT%
+for that drive but not CONTENTION, which needs both.
 
 | `run-dualssd-experiment.sh` flag | Meaning |
 |---|---|
@@ -769,8 +784,12 @@ configuration prints `[k/N]` with the time so far and an estimate of the time
 left. From another terminal, `tail -f utils/logs/<sweep>/sweep.log` follows
 it without attaching.
 
-About 110 s per run with `pcm-memory`. The default sweep (13 runs) takes ~25 min
-and `--single` (37 runs) ~70 min per IOMMU mode. Lock:
+About 110 s per run with `pcm-memory`, ~60 s with `DUALSSD_ARGS="--membw 0"`.
+The default sweep (13 runs) takes ~25 min and `--single` (37 runs) ~70 min per
+IOMMU mode. The default cross sweep is 21 runs, ~40 min (~20 min without
+`pcm-memory`); `--single` doubles that. Its results are named
+`dualssd-xsweep-<iommu>-<N>`, the block-size sweep's
+`dualssd-bssweep-<iommu>-<N>`. Lock:
 `/tmp/dualssd-experiment.lock`. Stop with
 `pkill -f 'dualssd_swee[p]'; pkill -f 'run-dualssd-experimen[t]'`. The runner
 stops its own fio on the way out. The first sweep (2026-10-05) predates this
@@ -792,6 +811,15 @@ layout: its runs are directly under `utils/logs/` and `utils/reports/` as
   has twice the total instances. Misses per I/O also rise with total instances
   on one drive, so check the co-run at J against one drive at 2J too (First
   result, below).
+- **KEPT%** is each drive's IOPS in the co-run as a share of its IOPS alone at
+  the same block size and instances, e.g. `s0:55` (drive 0 kept 55%). It needs
+  only that drive's single run, and it also means something with the IOMMU off.
+- **Grids** (`dualssd-results.py grid`, printed at the end of a cross sweep):
+  per IOMMU mode, block size down and instances across, for the co-run's total
+  kIOPS (`*` = LINK BOUND), the drive 0 / drive 1 split, GB/s, CPU µs per I/O
+  and misses per 4 KiB, and for each drive run alone, its kIOPS and KEPT%.
+  Where strict mode's per-I/O ceiling (flat kIOPS along a row) turns into the
+  link ceiling (flat GB/s down a column) shows which binds where.
 - **Strict vs off:** IOPS and `CPU_us/IO` at the same block size and instance
   count. With the IOMMU off the miss columns read 0.
 - **Why this may show what icx did not:** with `O_DIRECT` the NVMe driver maps
@@ -1127,7 +1155,8 @@ the invalidation is the cost.
 
 1. **Lazy mode (`iommu.strict=0`):** the block-size sweep, or at least 4k.
    Then the instance sweep with `--single` in each mode, for the full
-   strict / lazy / off comparison below the link (1–2 instances). Re-check
+   strict / lazy / off comparison below the link (1–2 instances).
+   `dualssd_cross_sweep.sh --single` covers both in one run per mode. Re-check
    the interrupt CPUs after each reboot. Each reboot and grub change affects
    everyone on the machine; agree on them with the other users first.
    PCIe max payload size, if still wanted:

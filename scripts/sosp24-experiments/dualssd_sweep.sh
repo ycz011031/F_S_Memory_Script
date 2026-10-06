@@ -5,13 +5,16 @@
 #
 #   ./dualssd_sweep.sh                          # co-run, 1,2,4,8 instances/SSD, 4k, 3 runs
 #   ./dualssd_sweep.sh --single                 # also each drive alone (baselines)
+#   ./dualssd_sweep.sh --single-ssd 0           # also drive 0 alone, not drive 1
 #   ./dualssd_sweep.sh -o skx-strict            # name the sweep (must be new)
 #   ./dualssd_sweep.sh "1 2 4 8" "4k 1m" 3      # add 1 MiB reads
 #   ./dualssd_sweep.sh --single --tmux          # in a tmux session instead
 #
 # Arguments: instances per SSD, block sizes, repeats. Options: --single adds
 # the single-drive runs (ssd0only, ssd1only) at every point; without them the
-# summary's CONTENTION column stays empty. -o NAME names the sweep. --tmux
+# summary's CONTENTION column stays empty. --single-ssd N runs only drive N
+# alone (half the single-drive time; fills KEPT% for that drive, not
+# CONTENTION). -o NAME names the sweep. --tmux
 # runs it in a new tmux session (survives a dropped ssh; asks for the sudo
 # password there) instead of this terminal, which is the default. Extra
 # runner options go in DUALSSD_ARGS, e.g. DUALSSD_ARGS="--iodepth 64".
@@ -34,7 +37,9 @@
 # dualssd-sweep ($SWEEP_PREFIX overrides) and N the first number not used by
 # any earlier sweep. It writes:
 #   ~/<name>.jsonl                one JSON line per configuration
-#   ~/<name>.txt                  the summary table printed at the end
+#   ~/<name>.txt                  the summary table printed at the end (and,
+#                                 for several block sizes AND instance counts,
+#                                 block size x instances grids)
 #   utils/logs/<name>/sweep.log   everything printed, start to finish
 #   utils/logs/<name>/            every run's raw logs: pcm-iio CSV and
 #                                 output, pcm-memory, fio JSON, CPU
@@ -52,12 +57,17 @@ set -- ${PASS[@]+"${PASS[@]}"}
 
 NAME=""
 SINGLE=0
+SINGLE_SSD=""
 POS=()
 while [ $# -gt 0 ]; do
     case "$1" in
         -o|--out)  NAME="$2"; shift 2 ;;
         --single)  SINGLE=1; shift ;;
-        -h|--help) sed -n '2,43p' "$SELF"; exit 0 ;;
+        --single-ssd)
+            case "$2" in 0|1) SINGLE_SSD="$2" ;;
+                *) echo "--single-ssd takes 0 or 1, not '$2'" >&2; exit 2 ;; esac
+            SINGLE=1; shift 2 ;;
+        -h|--help) sed -n '2,48p' "$SELF"; exit 0 ;;
         -*)        echo "unknown option: $1" >&2; exit 2 ;;
         *)         POS+=( "$1" ); shift ;;
     esac
@@ -69,7 +79,9 @@ cd "$(dirname "$SELF")/.."
 INSTANCES="${POS[0]:-1 2 4 8}"
 BSIZES="${POS[1]:-4k}"
 RUNS="${POS[2]:-3}"
-if [ "$SINGLE" = 1 ]; then MODES="ssd0only ssd1only both"; else MODES="both"; fi
+if [ -n "$SINGLE_SSD" ]; then MODES="ssd${SINGLE_SSD}only both"
+elif [ "$SINGLE" = 1 ]; then MODES="ssd0only ssd1only both"
+else MODES="both"; fi
 EXTRA=( ${DUALSSD_ARGS:-} )
 
 declare -p SSD_SERIALS >/dev/null 2>&1 || {
@@ -125,6 +137,11 @@ summarize() {
         [ ${#EXTRA[@]} -gt 0 ] && echo "runner args: ${EXTRA[*]}"
         echo
         python3 ../scripts/dualssd-results.py summary "$JSONL"
+        # A cross sweep also reads as block size x instances tables.
+        if [ "$(echo $BSIZES | wc -w)" -gt 1 ] && [ "$(echo $INSTANCES | wc -w)" -gt 1 ]; then
+            echo
+            python3 ../scripts/dualssd-results.py grid "$JSONL"
+        fi
     } | tee "$TXT"
 }
 

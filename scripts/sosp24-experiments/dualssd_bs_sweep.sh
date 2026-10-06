@@ -11,8 +11,8 @@
 #
 # Arguments: block sizes (default "4k 16k 64k 256k 1m"), instances per drive
 # (default 4), repeats (default 3). Options as for dualssd_sweep.sh: --single,
-# -o NAME, --tmux; DUALSSD_ARGS for runner options (e.g. "--membw 0" to save
-# ~50 s per run).
+# --single-ssd N, -o NAME, --tmux; DUALSSD_ARGS for runner options (e.g.
+# "--membw 0" to save ~50 s per run).
 #
 # 4 instances per drive is the smallest count at which each drive uses all 4
 # of its NVMe queues with fio off the interrupt CPUs (HANDOFF §7).
@@ -32,11 +32,11 @@ SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 OPTS=(); POS=()
 while [ $# -gt 0 ]; do
     case "$1" in
-        -o|--out)         OPTS+=( "$1" "$2" ); shift 2 ;;
-        --single|--tmux)  OPTS+=( "$1" ); shift ;;
-        -h|--help)        sed -n '2,28p' "$SELF"; exit 0 ;;
-        -*)               echo "unknown option: $1" >&2; exit 2 ;;
-        *)                POS+=( "$1" ); shift ;;
+        -o|--out|--single-ssd)  OPTS+=( "$1" "$2" ); shift 2 ;;
+        --single|--tmux)        OPTS+=( "$1" ); shift ;;
+        -h|--help)              sed -n '2,28p' "$SELF"; exit 0 ;;
+        -*)                     echo "unknown option: $1" >&2; exit 2 ;;
+        *)                      POS+=( "$1" ); shift ;;
     esac
 done
 BSIZES="${POS[0]:-4k 16k 64k 256k 1m}"

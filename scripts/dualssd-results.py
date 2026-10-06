@@ -5,6 +5,7 @@
   dump     read one experiment's report directories and append a single JSON
            line (config + every run + mean/sd) to a .jsonl file
   summary  print a comparison table from one or more .jsonl files
+  grid     the same records as block size x instances tables (cross sweeps)
 
     dualssd-results.py fio-sum --out reports/X-RUN-0-ssd0/fio.rpt logs/X-RUN-0/fio-ssd0-*.json
     dualssd-results.py dump --reports DIR --exp NAME --runs 3 --ssds 0,1 \\
@@ -321,30 +322,81 @@ def bs_bytes(bs):
         return 0
 
 
-def summary(a):
+def load(files):
     recs = []
-    for path in a.files:
+    for path in files:
         with open(os.path.expanduser(path)) as f:
             recs += [json.loads(l) for l in f if l.strip()]
     if not recs:
         sys.exit('no records')
+    return recs
 
-    def group(r):
-        return (str(r.get('iommu')), str(r.get('bs')), r.get('instances_per_ssd'))
+
+def group(r):
+    """One measurement point: IOMMU mode, block size, instances per drive."""
+    return (str(r.get('iommu')), str(r.get('bs')), r.get('instances_per_ssd'))
+
+
+def alone_iops(recs):
+    """Each single-drive run's IOPS: {point: {'ssd0only': iops, ...}}."""
+    base = {}
+    for r in recs:
+        if r.get('mode') in ('ssd0only', 'ssd1only'):
+            base.setdefault(group(r), {})[r['mode']] = r['mean'].get('iops_total')
+    return base
+
+
+def kept(r, alone):
+    """Each drive's IOPS in a co-run as % of its IOPS alone at the same point,
+    {drive: pct}, for the drives that have a single-drive run there."""
+    out = {}
+    for i in (0, 1):
+        a, c = alone.get(f'ssd{i}only'), r['mean'].get(f'iops_ssd{i}')
+        if a and c is not None:
+            out[i] = 100 * c / a
+    return out
+
+
+def cpu_us_per_io(r):
+    """CPU time on the fio cores per I/O, from the CPU window, or None."""
+    m = r['mean']
+    ncores = len(str(r.get('cpu_util_cores', '')).split(',')) if r.get('cpu_util_cores') else 0
+    iops_cpu = m.get('iops_cpu_window') or m.get('iops_total')   # same seconds as the CPU sample
+    if m.get('cpu_util_pct') is not None and iops_cpu and ncores:
+        return m['cpu_util_pct'] / 100 * ncores / iops_cpu * 1e6
+    return None
+
+
+def miss_per_4k(r):
+    """IOTLB misses per 4 KiB of data read: comparable across block sizes."""
+    mpio = r['mean'].get('misses_per_io')
+    if mpio is not None and bs_bytes(r.get('bs')):
+        return mpio / (bs_bytes(r.get('bs')) / 4096)
+    return None
+
+
+def link_bound(r):
+    wr, up = r['mean'].get('PCIe_wr_tput'), r.get('uplink_gbps') or 0
+    return bool(up and (wr or 0) > 0.85 * up)
+
+
+def summary(a):
+    recs = load(a.files)
 
     def key(r):
         return (str(r.get('iommu')), bs_bytes(r.get('bs')), r.get('instances_per_ssd') or 0,
                 {'ssd0only': 0, 'ssd1only': 1, 'both': 2}.get(r.get('mode'), 3))
 
-    # Single-drive misses per I/O, per IOMMU mode / block size / instances.
+    # Single-drive misses per I/O and IOPS, per IOMMU mode / block size / instances.
     base = {}
     for r in recs:
         if r.get('mode') in ('ssd0only', 'ssd1only'):
             base.setdefault(group(r), {})[r['mode']] = r['mean'].get('misses_per_io')
+    alone = alone_iops(recs)
 
     hdr = f"{'IOMMU':<7} {'BS':<5} {'INST':>4} {'MODE':<9} {'IOPS_k':>15} {'GB/s':>6} " \
           f"{'LAT_us':>7} {'PCIe_wr':>8} {'MISS/IO':>13} {'MISS/4K':>8} {'CPU_%':>11} " \
-          f"{'CPU_us/IO':>9} {'CONTENTION':>10}"
+          f"{'CPU_us/IO':>9} {'CONTENTION':>10} {'KEPT%':>11}"
     print(hdr)
     print('-' * len(hdr))
     for r in sorted(recs, key=key):
@@ -364,22 +416,20 @@ def summary(a):
                 expect = (m0 * i0 + m1 * i1) / (i0 + i1)
                 if expect > 0:
                     cont = f'{100 * (both / expect - 1):+.1f}%'
-        cpu_us = None
-        ncores = len(str(r.get('cpu_util_cores', '')).split(',')) if r.get('cpu_util_cores') else 0
-        iops_cpu = m.get('iops_cpu_window') or iops   # same seconds as the CPU sample
-        if m.get('cpu_util_pct') is not None and iops_cpu and ncores:
-            cpu_us = m['cpu_util_pct'] / 100 * ncores / iops_cpu * 1e6
-        # Misses per 4 KiB of data read: comparable across block sizes.
-        miss4k = None
-        if m.get('misses_per_io') is not None and bs_bytes(r.get('bs')):
-            miss4k = m['misses_per_io'] / (bs_bytes(r.get('bs')) / 4096)
+        # Unlike CONTENTION this needs only one drive's single run, and it
+        # means something with the IOMMU off too.
+        kept_s = ''
+        if r.get('mode') == 'both':
+            kept_s = ' '.join(f's{i}:{v:.0f}' for i, v in kept(r, alone.get(group(r), {})).items())
+        cpu_us = cpu_us_per_io(r)
+        miss4k = miss_per_4k(r)
         # Mean fio latency, IOPS-weighted across the active drives.
         lat = None
         pairs = [(m.get(f'lat_us_ssd{i}'), m.get(f'iops_ssd{i}')) for i in r.get('active_ssds', [])]
         if pairs and all(l is not None and n for l, n in pairs):
             lat = sum(l * n for l, n in pairs) / sum(n for _, n in pairs)
-        wr, up = m.get('PCIe_wr_tput'), r.get('uplink_gbps') or 0
-        flag = '  <-- LINK BOUND' if (up and (wr or 0) > 0.85 * up) else ''
+        wr = m.get('PCIe_wr_tput')
+        flag = '  <-- LINK BOUND' if link_bound(r) else ''
         if any(run.get('window_covered') == 0 for run in r.get('per_run', [])):
             flag += '  <-- fio DID NOT COVER THE WINDOW'
         print(f"{str(r.get('iommu')):<7} {str(r.get('bs')):<5} "
@@ -392,7 +442,7 @@ def summary(a):
               f"{fmt(miss4k, None, '.3f'):>8} "
               f"{fmt(m.get('cpu_util_pct'), s.get('cpu_util_pct'), '.1f'):>11} "
               f"{fmt(cpu_us, None, '.2f'):>9} "
-              f"{cont:>10}{flag}")
+              f"{cont:>10} {kept_s:>11}{flag}")
     print()
     print('  IOPS, GB/s = fio, averaged over the measurement windows only (no warm-up).')
     print('  LAT_us     = mean fio completion latency per I/O, IOPS-weighted across drives.')
@@ -403,9 +453,76 @@ def summary(a):
     print('  CONTENTION = both MISS/IO vs the single-drive MISS/IO of each drive,')
     print('               weighted by that drive\'s share of the co-run\'s IOPS. Needs the')
     print('               single-drive runs (dualssd_sweep.sh --single).')
+    print('  KEPT%      = each drive\'s IOPS in the co-run as % of its IOPS alone at the')
+    print('               same BS/INST (s0 = drive 0); needs that drive\'s single run.')
     print('  IOMMU off/pt has no translation, so compare IOPS and CPU_us/IO across')
     print('  modes at the same BS/INST. LINK BOUND: PCIe write above 85% of the')
     print('  narrowest shared PCIe link, which then caps the run, not the IOMMU.')
+
+
+def grid(a):
+    """Block size x instances tables, one per IOMMU mode and metric."""
+    recs = load(a.files)
+    alone = alone_iops(recs)
+    # A point measured twice (say, a re-run) shows its last record.
+    pts = {group(r) + (r.get('mode'),): r for r in recs}
+
+    def k(v):
+        return f'{v / 1e3:.1f}'
+
+    def cells_both(r):
+        m = r['mean']
+        return m.get('iops_ssd0'), m.get('iops_ssd1')
+
+    for iommu in sorted({p[0] for p in pts}):
+        here = [p for p in pts if p[0] == iommu]
+        bss = sorted({p[1] for p in here}, key=bs_bytes)
+        js = sorted({p[2] for p in here if p[2] is not None})
+        modes = {p[3] for p in here}
+        # (title, mode, cell function returning a string or None)
+        tables = []
+        if 'both' in modes:
+            tables += [
+                ('both drives, total kIOPS  (* = LINK BOUND)', 'both',
+                 lambda r: None if r['mean'].get('iops_total') is None else
+                 k(r['mean']['iops_total']) + ('*' if link_bound(r) else '')),
+                ('both drives, kIOPS of drive 0 / drive 1', 'both',
+                 lambda r: None if None in cells_both(r) else
+                 '/'.join(k(v) for v in cells_both(r))),
+                ('both drives, GB/s', 'both',
+                 lambda r: None if r['mean'].get('gbps_total') is None else
+                 f"{r['mean']['gbps_total'] / 8:.2f}"),
+                ('both drives, CPU us per I/O', 'both',
+                 lambda r: None if cpu_us_per_io(r) is None else f'{cpu_us_per_io(r):.2f}'),
+            ]
+            if iommu not in ('off', 'pt'):
+                tables.append(('both drives, IOTLB misses per 4 KiB read', 'both',
+                               lambda r: None if miss_per_4k(r) is None else f'{miss_per_4k(r):.3f}'))
+        for i in (0, 1):
+            if f'ssd{i}only' not in modes:
+                continue
+            tables.append((f'drive {i} alone, kIOPS  (* = LINK BOUND)', f'ssd{i}only',
+                           lambda r: None if r['mean'].get('iops_total') is None else
+                           k(r['mean']['iops_total']) + ('*' if link_bound(r) else '')))
+            if 'both' in modes:
+                tables.append((f'drive {i} in the co-run, % of its IOPS alone', 'both',
+                               lambda r, i=i: (lambda v: None if v is None else f'{v:.0f}%')(
+                                   kept(r, alone.get(group(r), {})).get(i))))
+
+        for title, mode, cell in tables:
+            rows = []
+            for b in bss:
+                row = []
+                for j in js:
+                    r = pts.get((iommu, b, j, mode))
+                    row.append((cell(r) if r else None) or '-')
+                rows.append(row)
+            w = max([len(c) for row in rows for c in row] + [len(str(j)) for j in js] + [4])
+            print(f'IOMMU {iommu}: {title}')
+            print(f"  {'BS':<5}" + ''.join(f'  {str(j):>{w}}' for j in js) + '   <- instances per drive')
+            for b, row in zip(bss, rows):
+                print(f'  {b:<5}' + ''.join(f'  {c:>{w}}' for c in row))
+            print()
 
 
 def main():
@@ -426,8 +543,10 @@ def main():
     d.add_argument('--meta', action='append', default=[], metavar='KEY=VALUE')
     s = sub.add_parser('summary')
     s.add_argument('files', nargs='+')
+    g = sub.add_parser('grid')
+    g.add_argument('files', nargs='+')
     a = p.parse_args()
-    {'fio-sum': fio_sum, 'dump': dump, 'summary': summary}[a.cmd](a)
+    {'fio-sum': fio_sum, 'dump': dump, 'summary': summary, 'grid': grid}[a.cmd](a)
 
 
 if __name__ == '__main__':
