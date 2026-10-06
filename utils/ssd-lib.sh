@@ -56,7 +56,7 @@ relaunch_in_tmux() {
         printf 'cd %q || exit 1\n' "$PWD"
         # A running tmux server does not pass this shell's environment on.
         local v
-        for v in DUALSSD_ARGS RESULTS_DIR; do
+        for v in DUALSSD_ARGS RESULTS_DIR SWEEP_PREFIX; do
             [ -n "${!v+x}" ] && printf 'export %s=%q\n' "$v" "${!v}"
         done
         echo "echo \"== tmux session $name: enter your sudo password to start\""

@@ -94,6 +94,11 @@ mkdir -p logs/$OUT_DIR #Directory to store collected logs
 mkdir -p reports #Directory to store parsed metrics
 mkdir -p reports/$OUT_DIR #Directory to store parsed metrics
 
+# Wall-clock bounds of each measurement window, in epoch ms, one
+# "<window>_start|_end <ms>" per line, so a load generator's own per-second
+# log can be averaged over exactly the same seconds (the SSD runner does).
+mark() { echo "$1 $(date +%s%3N)" >> logs/$OUT_DIR/windows.txt; }
+
 function dump_netstat() {
     local SLEEP_TIME=$1
 
@@ -318,7 +323,9 @@ if [ "$TYPE" -eq 0 ]; then
       echo "Collecting CPU utilization for cores $CPU_MASK..." 
       sar -P $CPU_MASK 1 1000 > logs/$OUT_DIR/cpu_util.log &
       echo "Recording for $DURATION_S seconds..."
+      mark cpu_start
       sleep $DURATION_S
+      mark cpu_end
       sudo pkill -9 -x sar
       python3 cpu_util.py logs/$OUT_DIR/cpu_util.log > reports/$OUT_DIR/cpu_util.rpt
     fi
@@ -363,7 +370,9 @@ fi
 if [ "$PCIE_REPORTING" -eq 1 ]; then
   echo "Collecting PCIe bandwidth..."
   dump_pciebw
+  mark pcie_start
   sleep $DURATION_S
+  mark pcie_end
   sudo pkill -9 pcm
   if [ "$CPU_MODEL" = "85" ]; then parse_pciebw_skx; else parse_pciebw; fi
 fi
@@ -371,8 +380,10 @@ fi
 if [ "$MEMBW_REPORTING" -eq 1 ]; then
   echo "Collecting Memory bandwidth..."
   dump_membw > logs/$OUT_DIR/membw.log 2>&1 &
+  mark membw_start
   sleep 30
   sleep $DURATION_S
+  mark membw_end
   sudo pkill -9 pcm
   parse_membw
 fi

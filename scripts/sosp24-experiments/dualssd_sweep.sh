@@ -29,9 +29,10 @@
 # Run it once per IOMMU setting: boot with the IOMMU on, run; reboot with it
 # off, run again. The mode is read from sysfs and put in the sweep's name.
 #
-# Nothing is ever overwritten. Each sweep gets a new name, <name>, which is
-# dualssd-sweep-<iommu>-<N> with N the first number not used by any earlier
-# sweep, or the -o NAME given (refused if already used). It writes:
+# Nothing is ever overwritten. Each sweep gets a new name, <name>: the -o NAME
+# given (refused if already used), or <prefix>-<iommu>-<N> with prefix
+# dualssd-sweep ($SWEEP_PREFIX overrides) and N the first number not used by
+# any earlier sweep. It writes:
 #   ~/<name>.jsonl                one JSON line per configuration
 #   ~/<name>.txt                  the summary table printed at the end
 #   utils/logs/<name>/sweep.log   everything printed, start to finish
@@ -56,7 +57,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         -o|--out)  NAME="$2"; shift 2 ;;
         --single)  SINGLE=1; shift ;;
-        -h|--help) sed -n '2,42p' "$SELF"; exit 0 ;;
+        -h|--help) sed -n '2,43p' "$SELF"; exit 0 ;;
         -*)        echo "unknown option: $1" >&2; exit 2 ;;
         *)         POS+=( "$1" ); shift ;;
     esac
@@ -80,6 +81,7 @@ IOMMU=$(for s in "${SSD_SERIALS[@]}"; do
 [ -n "$IOMMU" ] || exit 1
 
 DIR="${RESULTS_DIR:-$HOME}"
+PREFIX="${SWEEP_PREFIX:-dualssd-sweep}"
 UTILS="$(cd ../utils && pwd)"
 used() {   # <name> -> true if any output of that name exists
     [ -e "$DIR/$1.jsonl" ] || [ -e "$DIR/$1.txt" ] \
@@ -87,8 +89,8 @@ used() {   # <name> -> true if any output of that name exists
 }
 if [ -z "$NAME" ]; then
     n=1
-    while used "dualssd-sweep-$IOMMU-$n"; do n=$((n + 1)); done
-    NAME="dualssd-sweep-$IOMMU-$n"
+    while used "$PREFIX-$IOMMU-$n"; do n=$((n + 1)); done
+    NAME="$PREFIX-$IOMMU-$n"
 elif used "$NAME"; then
     echo "ERROR: a sweep named '$NAME' already has output; refusing to overwrite it." >&2
     echo "  Pick another -o NAME, or leave -o out for a fresh numbered name." >&2

@@ -699,6 +699,10 @@ sudo -v     # bigserver has no NOPASSWD sudo: cache the password in this termina
 # the same in a tmux session instead of this terminal (survives a dropped ssh)
 ./scripts/sosp24-experiments/dualssd_sweep.sh --single --tmux
 
+# block-size sweep: 4 instances per drive, 4k 16k 64k 256k 1m, 3 repeats
+./scripts/sosp24-experiments/dualssd_bs_sweep.sh                # [-o name] [--single] [--tmux] [block sizes] [instances] [runs]
+./scripts/sosp24-experiments/dualssd_bs_sweep.sh "4k 8k 16k 32k 64k 128k 256k 512k 1m"
+
 # single configuration
 ./scripts/run-dualssd-experiment.sh -E mytest --ssds 2 -J 4 --runs 3
 
@@ -722,6 +726,26 @@ round-robin over the drive's cores (`SSD_CORES`, 9 per drive). Every run uses
 If any fio output ever reports bytes written or trimmed, `dualssd-results.py`
 stops with FATAL.
 
+**fio is checked against the measurement windows (since 2026-10-05).**
+- `record-host-metrics.sh` writes each window's start and end (epoch ms) to
+  `windows.txt`: CPU, then `pcm-iio`, then `pcm-memory`.
+- Each fio instance writes a per-second IOPS log stamped in epoch ms. fio logs
+  nothing during `ramp_time`; checked with fio 3.43.
+- `fio-sum --windows` averages each log over exactly those windows. The IOPS
+  and GB/s in the reports and summary therefore cover only the measured
+  seconds.
+- IOTLB misses per I/O divide by the IOPS of the `pcm-iio` window; CPU per I/O
+  divides by the IOPS of the CPU window.
+- It also requires every instance to cover the whole span: in its log (no
+  late start, no early end, no hole over 2 s), and by fio's own `job_start` and
+  runtime.
+- If any instance falls short, or one dies during measurement, the runner
+  prints why and stops. That run is not recorded, and a sweep aborts there.
+
+fio's own summary number starts after `ramp_time` (its `job_start`) and ends at
+the stop, so it never included the cold start. It is kept as
+`fio_IOPS_postramp` for comparison. Sweeps before this change used it for IOPS.
+
 **Nothing is overwritten.** The runner refuses an `-E` name that already has
 output. Each sweep takes a fresh name, `dualssd-sweep-<iommu>-<N>`, or the
 `-o` name, which is refused if already used. Where a sweep's output goes:
@@ -731,7 +755,7 @@ output. Each sweep takes a fresh name, `dualssd-sweep-<iommu>-<N>`, or the
 | `~/<sweep>.jsonl`, `~/<sweep>.txt` | one JSON line per configuration; the summary table |
 | `utils/logs/<sweep>/sweep.log` | everything the sweep printed |
 | `utils/logs/<sweep>/<config>.console.log` | one configuration's runner output |
-| `utils/logs/<sweep>/<config>-RUN-<j>/` | raw logs: `pcie.csv` (`pcm-iio`, every stack, every second), `pcm-iio.out` (its banner and warnings), `membw.log` (`pcm-memory`), `pcm.txt` (binary, core, row parsed), the `opCode-6-85.txt` that defines the CSV columns, `cpu_util.log`, `fio-ssd<i>-<k>.json/.err` |
+| `utils/logs/<sweep>/<config>-RUN-<j>/` | raw logs: `pcie.csv` (`pcm-iio`, every stack, every second), `pcm-iio.out` (its banner and warnings), `membw.log` (`pcm-memory`), `pcm.txt` (binary, core, row parsed), the `opCode-6-85.txt` that defines the CSV columns, `cpu_util.log`, `windows.txt` (window start/end), `fio-ssd<i>-<k>.json/.err` and `fio-ssd<i>-<k>_iops.1.log` (per-second IOPS) |
 | `utils/reports/<sweep>/<config>-RUN-<j>[-ssd<i>]/` | parsed `pcie.rpt`, `membw.rpt`, `cpu_util.rpt`, `fio.rpt` |
 | `utils/logs/<sweep>/datapath.jsonl` | the pre-sweep datapath check, kept out of the summary |
 
@@ -755,7 +779,12 @@ layout: its runs are directly under `utils/logs/` and `utils/reports/` as
 
 ### Reading the output
 
-- **Compare IOTLB misses per I/O** (misses/s ÷ IOPS), not raw counts.
+- **Compare IOTLB misses per I/O** (misses/s ÷ IOPS), not raw counts. Across
+  block sizes compare **MISS/4K**, misses per 4 KiB read.
+- **Block size** (`dualssd_bs_sweep.sh`): a 1 MiB read costs one map, unmap
+  and invalidation, like a 4 KiB read, for 256× the data. If the 4k ceiling
+  is a per-I/O cost, GB/s rises with block size until the uplink binds (LINK
+  BOUND). If GB/s stays near 3 GB/s at every size, the limit is bandwidth.
 - **CONTENTION** compares the co-run's misses per I/O to each drive's
   single-drive figure, weighted by that drive's share of the co-run's IOPS. A
   plain mean of the two baselines would be wrong because the drives differ

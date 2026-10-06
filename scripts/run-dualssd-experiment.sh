@@ -27,7 +27,9 @@
 #   logs/<name>-RUN-<j>/        pcie.csv (pcm-iio, every stack, every second),
 #                               pcm-iio.out, membw.log (pcm-memory), pcm.txt
 #                               (binary, row, core), the opCode file used,
-#                               cpu_util.log, fio-ssd<i>-<k>.json/.err
+#                               cpu_util.log, windows.txt (window start/end),
+#                               fio-ssd<i>-<k>.json/.err and _iops.1.log
+#                               (per-second IOPS, proves fio covered the window)
 #   reports/<name>-RUN-<j>/     pcie.rpt, membw.rpt, cpu_util.rpt
 #   reports/<name>-RUN-<j>-ssd<i>/fio.rpt
 set -u
@@ -72,7 +74,7 @@ while [ $# -gt 0 ]; do
         --runs)         num_runs="$2"; shift 2 ;;
         --results)      results_file="$2"; shift 2 ;;
         -h|--help)
-            sed -n '2,32p' "$SELF"; exit 0 ;;
+            sed -n '2,34p' "$SELF"; exit 0 ;;
         *) echo "unknown option: $1"; exit 2 ;;
     esac
 done
@@ -336,11 +338,16 @@ for ((j = 0; j < num_runs; j++)); do
             core=${cores[$((k % ${#cores[@]}))]}
             # --thread keeps one process per instance, so fio_count counts
             # instances. 9>&- so fio does not hold the experiment lock.
+            # The per-second IOPS log, stamped in epoch ms, is what proves the
+            # instance ran through the measurement windows and gives IOPS for
+            # exactly those seconds (fio-sum --windows). fio logs nothing
+            # during ramp_time.
             sudo fio --name="dualssd_${i}_${k}" --filename="${DEVS[$i]}" --readonly \
                 --rw="$rw" --bs="$bs" --iodepth="$iodepth" --numjobs=1 --thread \
                 --direct=1 --ioengine="$ioengine" --cpus_allowed="$core" \
                 --time_based --ramp_time="$warm" --runtime="$fio_runtime" \
                 --randrepeat=0 --norandommap --output-format=json \
+                --write_iops_log="$L/fio-ssd$i-$k" --log_avg_msec=1000 --log_unix_epoch=1 \
                 --output="$L/fio-ssd$i-$k.json" > "$L/fio-ssd$i-$k.err" 2>&1 9>&- &
             fio_pids+=( $! )
             want=$((want + 1))
@@ -368,9 +375,11 @@ for ((j = 0; j < num_runs; j++)); do
         --cores "$active_cores" --pattern "$SSD_PCIE_PATTERN" -o "$RUN" ) 9>&-
 
     got=$(fio_count)
+    bad_run=0
     if [ "$got" -lt "$want" ]; then
-        echo "WARNING: only $got of $want fio instances were still running at the end" >&2
-        echo "         of the measurement; the drives were under-loaded for part of it." >&2
+        echo "ERROR: only $got of $want fio instances were still running at the end" >&2
+        echo "       of the measurement; the drives were under-loaded for part of it." >&2
+        bad_run=1
     fi
     stop_fio
     # Wait for these PIDs only. A bare `wait` also waits for the console-log
@@ -378,11 +387,31 @@ for ((j = 0; j < num_runs; j++)); do
     # runs: the run hangs forever after the last measurement window.
     wait "${fio_pids[@]}" 2>/dev/null
 
+    # IOPS over exactly the measurement windows, and proof that every instance
+    # ran through them: fio-sum exits 3 if any instance's log or its own
+    # start/stop times do not cover the windows.
+    if [ ! -s "$L/windows.txt" ]; then
+        echo "ERROR: $L/windows.txt is missing; record-host-metrics.sh did not finish." >&2
+        bad_run=1
+    fi
     for i in "${ACTIVE[@]}"; do
-        python3 "$HERE/dualssd-results.py" fio-sum --out "$setup_dir/reports/$RUN-ssd$i/fio.rpt" \
-            "$L"/fio-ssd$i-*.json \
-            || echo "WARNING: no usable fio output for SSD $i in $L" >&2
+        F="$setup_dir/reports/$RUN-ssd$i/fio.rpt"
+        if ! python3 "$HERE/dualssd-results.py" fio-sum --out "$F" \
+                --windows "$L/windows.txt" "$L"/fio-ssd$i-*.json; then
+            echo "ERROR: SSD $i: fio did not cover the measurement window (see above)." >&2
+            bad_run=1
+        fi
+        printf '   SSD %s: %s kIOPS over the %s s measurement window (fio post-ramp: %s), covered: %s\n' \
+            "$i" "$(awk '/^IOPS:/{printf "%.1f", $2/1e3}' "$F" 2>/dev/null)" \
+            "$(awk '/^window_s:/{print $2}' "$F" 2>/dev/null)" \
+            "$(awk '/^fio_IOPS_postramp:/{printf "%.1f", $2/1e3}' "$F" 2>/dev/null)" \
+            "$(awk '/^window_covered:/{print ($2 == 1 ? "yes" : "NO")}' "$F" 2>/dev/null)"
     done
+    if [ "$bad_run" = 1 ]; then
+        echo "ERROR: run $j of '$exp' is not valid; stopping. Its logs and reports are kept:" >&2
+        echo "       $L/   $setup_dir/reports/$RUN*/" >&2
+        exit 1
+    fi
 done
 
 # ------------------------------------------------------------------ report
