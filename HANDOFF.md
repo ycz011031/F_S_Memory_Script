@@ -1018,15 +1018,44 @@ per IOMMU boot setting.
      with block size. At 1 MiB the 9100 PRO completes 133 reads/s; with 128
      in flight, each waits ~1 s.
    - **Some inbound writes are never completed fio data:** 2.1 GB/s at 64k,
-     the same in both IOMMU modes. Not yet known which drive, or whether the
-     counter overcounts for that drive's write pattern.
-   - **Next test:** each drive alone at the same block sizes, where
-     `PCIe_wr` is that drive's alone:
-     `DUALSSD_ARGS="--membw 0" ./scripts/sosp24-experiments/dualssd_bs_sweep.sh --single "16k 64k 1m" 4 1`.
-     Also check `sudo dmesg | grep -iE 'nvme|timeout|aer|pcieport'` for I/O
-     timeouts or link errors.
+     the same in both IOMMU modes.
    - **None of this touches the 4k result.** There fio and `PCIe_wr` agree
      within 2%, and strict runs far below the link.
+
+   **Resolved 2026-10-05 (`dualssd-bssweep-strict-2`, each drive alone,
+   strict):** the extra writes come from the 990 EVO Plus. For each drive
+   alone, `PCIe_wr` is that drive's traffic only:
+
+   | Block | 9100 PRO: fio / `PCIe_wr` GB/s | 990 EVO Plus: fio / `PCIe_wr` GB/s |
+   |---|---|---|
+   | 16k | 4.86 / 4.95 (+2%) | 5.92 / 6.00 (+1%) |
+   | 64k | 6.85 / 6.96 (+2%) | **1.89 / 3.94 (+108%)** |
+   | 1m | 6.94 / 7.05 (+2%) | 6.40 / 6.92 (+8%) |
+
+   `dmesg` at boot: `nvme nvme1: allocated 64 MiB host memory buffer`. The 990
+   EVO Plus is DRAM-less and keeps its working cache in 64 MiB of host RAM. Its
+   reads and writes of that buffer are DMA through the same root port and
+   IOMMU. `PCIe_wr` counts them; fio does not. `dmesg` shows no I/O timeouts
+   or link errors.
+
+   That is the most likely explanation, not a proven one. `PCIe_rd_tput` in
+   the same runs' `pcie.rpt` should show matching reads of host memory if the
+   drive uses the buffer as a staging area.
+   - **fio is the throughput measure.** `PCIe_wr` is the link load, including
+     the 990 EVO Plus's buffer traffic from 64k up. LINK BOUND stays right
+     because it is about the link.
+   - **The 990 EVO Plus alone is slow at 64k:** 1.89 GB/s at 4.4 ms latency,
+     the same with the IOMMU off. That is the drive, not the link or the
+     IOMMU.
+   - **Its buffer traffic is also translated by the IOMMU,** through long-lived
+     mappings with no map/unmap churn, so it adds IOTLB lookups that are not
+     fio's. At 64k its misses per 4 KiB are 1.17 vs the 9100 PRO's 1.10.
+   - **Each drive alone reaches the link at 1 MiB** (6.9 and 6.4 GB/s).
+     Together, the switch starves the 9100 PRO (above). Large-block co-runs
+     show switch arbitration, not the IOMMU.
+   - The buffer can be turned off with the kernel parameter
+     `nvme.max_host_mem_size_mb=0`, which slows that drive. It needs a reboot
+     on a shared machine; not done.
 
 **Reading (not established).** The strict ceiling comes from the per-I/O
 map, unmap and synchronous IOTLB invalidation, not from translating. That is
@@ -1067,10 +1096,11 @@ the invalidation is the cost.
   corrupt each other's counters. The runner refuses to start while any
   `pcm*` or `sar` is running, and lists other users' fio.
 - **The two drives are not a matched pair.** Different models, and the 990
-  EVO Plus is DRAM-less, so it probably keeps its mapping tables in host
-  memory (HMB). Check with `sudo nvme id-ctrl /dev/nvme1n1 | grep -i hmpre`
-  (non-zero = HMB). HMB traffic is extra DMA through the same IOMMU on every
-  I/O. The 990 EVO Plus is also nearly empty: reads of never-written blocks
+  EVO Plus is DRAM-less. It uses a 64 MiB host memory buffer, confirmed at
+  boot: `nvme nvme1: allocated 64 MiB host memory buffer`. Its accesses to
+  that buffer are extra DMA through the same root port and IOMMU. From 64k up
+  they appear in `PCIe_wr` but not in fio (third result, item 7). The 990 EVO
+  Plus is also nearly empty: reads of never-written blocks
   return without touching flash, so its IOPS measure the controller, not the
   NAND. Expect different single-drive misses per I/O; hence the weighted
   CONTENTION.
@@ -1095,17 +1125,16 @@ the invalidation is the cost.
 
 ### Next on bigserver
 
-1. **Explain the fio vs `PCIe_wr` gap from 64k up** (third result, item 7)
-   from the per-window IOPS in the existing `fio.rpt` files, and the drives'
-   thermal counters (`nvme smart-log`).
-2. **Lazy mode (`iommu.strict=0`):** the block-size sweep, or at least 4k.
+1. **Lazy mode (`iommu.strict=0`):** the block-size sweep, or at least 4k.
    Then the instance sweep with `--single` in each mode, for the full
    strict / lazy / off comparison below the link (1–2 instances). Re-check
    the interrupt CPUs after each reboot. Each reboot and grub change affects
    everyone on the machine; agree on them with the other users first.
    PCIe max payload size, if still wanted:
    `for d in b0:00.0 b1:00.0 b3:00.0 b4:00.0; do echo "$d $(sudo lspci -vv -s $d | grep -A2 'DevCtl:' | grep -o 'MaxPayload [0-9]* bytes')"; done`
-3. **What the CPU time goes to,** if needed: `perf` is not installed for this
+2. **What the CPU time goes to,** if needed: `perf` is not installed for this
    kernel (`linux-tools-5.15.0-177-generic`). `mpstat` cannot separate it,
    because interrupt time shows up as `%sys` here.
-4. The HMB check (Traps) is still not done.
+3. **Stay at 4k (or 8k) for IOMMU comparisons.** There the data is clean:
+   fio and `PCIe_wr` agree, there is no buffer traffic from the 990 EVO Plus,
+   and strict runs below the link.
