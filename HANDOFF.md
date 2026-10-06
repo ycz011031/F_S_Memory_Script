@@ -1003,6 +1003,31 @@ per IOMMU boot setting.
    The per-window IOPS in each `fio.rpt` test the first, and the per-second
    logs show throughput over time.
 
+   **Checked 2026-10-05:** not time variation and not heat. Each drive's IOPS
+   are the same in the CPU, PCIe and memory windows within 1%, and match
+   fio's post-ramp figure. Both drives sit at 45–48 °C with zero
+   thermal-throttle events. Split by drive (GB/s, IOMMU off; strict within 3%):
+
+   | Block | 9100 PRO | 990 EVO Plus | fio total | `PCIe_wr` | PCIe − fio |
+   |---|---|---|---|---|---|
+   | 16k | 0.92 | 5.93 | 6.86 | 6.96 | +0.10 (+1%) |
+   | 64k | 2.70 | 1.88 | 4.58 | 6.66 | +2.08 (+45%) |
+   | 1m | 0.14 | 6.30 | 6.44 | 6.95 | +0.51 (+8%) |
+
+   - **The saturated uplink is shared very unevenly,** and the split flips
+     with block size. At 1 MiB the 9100 PRO completes 133 reads/s; with 128
+     in flight, each waits ~1 s.
+   - **Some inbound writes are never completed fio data:** 2.1 GB/s at 64k,
+     the same in both IOMMU modes. Not yet known which drive, or whether the
+     counter overcounts for that drive's write pattern.
+   - **Next test:** each drive alone at the same block sizes, where
+     `PCIe_wr` is that drive's alone:
+     `DUALSSD_ARGS="--membw 0" ./scripts/sosp24-experiments/dualssd_bs_sweep.sh --single "16k 64k 1m" 4 1`.
+     Also check `sudo dmesg | grep -iE 'nvme|timeout|aer|pcieport'` for I/O
+     timeouts or link errors.
+   - **None of this touches the 4k result.** There fio and `PCIe_wr` agree
+     within 2%, and strict runs far below the link.
+
 **Reading (not established).** The strict ceiling comes from the per-I/O
 map, unmap and synchronous IOTLB invalidation, not from translating. That is
 the cost F&S ideas 2 and 3 (§2.1 of KNOWLEDGE-MAP) target. **Test:** lazy mode
