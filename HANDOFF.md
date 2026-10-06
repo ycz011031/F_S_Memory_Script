@@ -13,8 +13,8 @@ together, [LOCAL-SETUP.md](LOCAL-SETUP.md) for first-time provisioning.
   configuration run so far. Reasons are speculated in §4.1; the experiments
   that would settle them are in §5.
 - **Second testbed (2026-10-05):** the same experiment with two NVMe SSDs and
-  fio on bigserver, a Skylake-SP host (§7). First strict sweep done (§7,
-  "First result"); the IOMMU-off sweep is next.
+  fio on bigserver, a Skylake-SP host (§7). Strict vs off block-size sweep
+  done: strict caps 4k reads at 40% of off (§7, "Third result").
 
 ---
 
@@ -961,6 +961,54 @@ toward the uplink ceiling (~1.5M, LINK BOUND), and the 990 EVO Plus alone
 toward 850K. If the off sweep also stalls near 600–700K, look at the IIO
 stack and the PCIe switch instead.
 
+### Third result: block-size sweep, strict vs IOMMU off (2026-10-05)
+
+`dualssd_bs_sweep.sh`: both drives, 4 instances each, means of 3 runs, once
+per IOMMU boot setting.
+
+| Block | Off: IOPS | Off: GB/s (fio) | Off: `PCIe_wr` | Strict: IOPS | Strict: GB/s | Strict: `PCIe_wr` | Strict ÷ off | Strict: misses per 4 KiB | CPU µs per I/O, off → strict |
+|---|---|---|---|---|---|---|---|---|---|
+| 4k | 1,644K | 6.73 | 54.8 | 652K | 2.67 | 22.1 | 40% | 1.63 | 4.35 → 12.69 |
+| 16k | 418K | 6.86 | 55.7 | 400K | 6.56 | 53.3 | 96% | 1.40 | 9.82 → 10.23 |
+| 64k | 69.8K | 4.58 | 53.2 | 69.1K | 4.53 | 52.8 | 99% | 1.21 | 25.0 → 27.9 |
+| 256k | 20.8K | 5.46 | 54.4 | 20.8K | 5.44 | 54.3 | 100% | 1.15 | 46.5 → 53.5 |
+| 1m | 6.1K | 6.44 | 55.6 | 6.1K | 6.43 | 55.6 | 100% | 1.10 | 129.6 → 161.4 |
+
+**Observed**
+
+1. **IOMMU off, 4k: 1.64M IOPS at 54.8 Gbps `PCIe_wr`,** the shared uplink's
+   ceiling as predicted (1.55–1.7M IOPS, 51–56 Gbps). The link estimate holds.
+2. **Strict, 4k: 652K, 40% of off.** Latency is 392 vs 156 µs, and CPU per
+   I/O 2.9× (12.7 vs 4.35 µs). The ~600–700K ceiling of the earlier strict
+   sweeps is the strict IOMMU.
+3. **From 16k up, both modes sit at the link** (53–56 Gbps `PCIe_wr`) and
+   match within 4%.
+4. **The strict cost is per I/O, not per IOTLB miss.** At 16k, strict serves
+   2.24M misses/s (400K × 5.6) at full link rate. At 4k it stops at
+   1.06M misses/s (652K × 1.63). Misses per 4 KiB fall only slightly with block
+   size, from 1.63 to 1.10.
+5. **Strict's extra CPU per I/O grows with block size,** from +8 µs at 4k to
+   +32 µs at 1 MiB, as more pages are unmapped per I/O. It no longer limits
+   throughput above 4k.
+6. **With the IOMMU off, `IOTLB Miss` still reads ~0.06–0.13 per I/O.** On icx
+   it read 0. Treat it as this counter's floor on Skylake.
+7. **Open: fio and `PCIe_wr` disagree from 64k up.** fio reports 4.5–6.4 GB/s
+   where `PCIe_wr` says 6.6–6.95 GB/s, in both modes, with almost no
+   run-to-run spread. Up to 16k they agree within 2%. Candidate causes:
+   - throughput changing across the windows: fio's IOPS average all windows,
+     while `PCIe_wr` covers only its own
+   - thermal throttling of a drive
+   - inbound writes that are not fio data
+
+   The per-window IOPS in each `fio.rpt` test the first, and the per-second
+   logs show throughput over time.
+
+**Reading (not established).** The strict ceiling comes from the per-I/O
+map, unmap and synchronous IOTLB invalidation, not from translating. That is
+the cost F&S ideas 2 and 3 (§2.1 of KNOWLEDGE-MAP) target. **Test:** lazy mode
+(`iommu.strict=0`, batched invalidations) at 4k. If lazy comes close to off,
+the invalidation is the cost.
+
 ### Counters on Skylake
 
 `opCode-6-85.txt` is the paper's own event set (its Cascade Lake is also model
@@ -1022,14 +1070,16 @@ stack and the PCIe switch instead.
 
 ### Next on bigserver
 
-1. **Check the PCIe max payload size,** which sets the link ceiling (~1.55M
-   IOPS at 128 B, ~1.7M at 256 B):
-   `for d in b0:00.0 b1:00.0 b3:00.0 b4:00.0; do echo "$d $(sudo lspci -vv -s $d | grep -A2 'DevCtl:' | grep -o 'MaxPayload [0-9]* bytes')"; done`
-2. **Sweep with the IOMMU off,** then ideally lazy (`iommu.strict=0`), with
-   the same `SSD_CORES` order and `--single`. It decides whether the
-   ~600–700K ceiling of the second result is the IOMMU. Re-check the
-   interrupt CPUs after the reboot. Each reboot and grub change affects
+1. **Explain the fio vs `PCIe_wr` gap from 64k up** (third result, item 7)
+   from the per-window IOPS in the existing `fio.rpt` files, and the drives'
+   thermal counters (`nvme smart-log`).
+2. **Lazy mode (`iommu.strict=0`):** the block-size sweep, or at least 4k.
+   Then the instance sweep with `--single` in each mode, for the full
+   strict / lazy / off comparison below the link (1–2 instances). Re-check
+   the interrupt CPUs after each reboot. Each reboot and grub change affects
    everyone on the machine; agree on them with the other users first.
+   PCIe max payload size, if still wanted:
+   `for d in b0:00.0 b1:00.0 b3:00.0 b4:00.0; do echo "$d $(sudo lspci -vv -s $d | grep -A2 'DevCtl:' | grep -o 'MaxPayload [0-9]* bytes')"; done`
 3. **What the CPU time goes to,** if needed: `perf` is not installed for this
    kernel (`linux-tools-5.15.0-177-generic`). `mpstat` cannot separate it,
    because interrupt time shows up as `%sys` here.
