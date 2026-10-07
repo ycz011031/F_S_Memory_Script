@@ -1,7 +1,8 @@
 # Handoff — dual-NIC IOMMU contention on icx
 
 Everything needed to run this testbed, plus what is known, unknown and broken.
-Companion docs: [KNOWLEDGE-MAP.md](KNOWLEDGE-MAP.md) for how the repo fits
+Companion docs: [FILE-MAP.md](FILE-MAP.md) for which script does what and
+calls what, [KNOWLEDGE-MAP.md](KNOWLEDGE-MAP.md) for how the repo fits
 together, [LOCAL-SETUP.md](LOCAL-SETUP.md) for first-time provisioning.
 
 - **Branch:** `icx-dualnic` on `ycz011031/F_S_Memory_Script`

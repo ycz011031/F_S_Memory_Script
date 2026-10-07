@@ -23,6 +23,7 @@ each other, what was added on top, and where the traps are.
 
 | I want to... | Go to |
 |---|---|
+| Find a script, what calls it, where its output goes | [FILE-MAP.md](FILE-MAP.md) — every tracked file, including the dual-NIC and dual-SSD tooling |
 | Just get packets moving | [scripts/local/](scripts/local/) — no PCM, no kernel patch |
 | Reproduce a paper figure | [scripts/sosp24-experiments/](scripts/sosp24-experiments/) |
 | Change IPs, cores, paths | [scripts/local/config.sh](scripts/local/config.sh) (new) or the hardcoded blocks in the upstream drivers |
