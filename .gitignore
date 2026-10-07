@@ -173,6 +173,7 @@ linux-6.0.3.tar.gz
 utils/logs/
 utils/reports/
 /dualnic/
+/dualssd/
 utils/collect_iio_occ
 pcie-topology.csv
 pcie-topology.txt

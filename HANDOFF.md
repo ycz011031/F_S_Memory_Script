@@ -1091,6 +1091,51 @@ the cost F&S ideas 2 and 3 (§2.1 of KNOWLEDGE-MAP) target. **Test:** lazy mode
 (`iommu.strict=0`, batched invalidations) at 4k. If lazy comes close to off,
 the invalidation is the cost.
 
+### Fourth result: cross sweeps on three switch designs (2026-10-06)
+
+`dualssd_cross_sweep.sh --single` with `--membw 0`, one run per point: 4k–1m
+× 1/2/4/8 instances, both drives and drive 0 alone. Six sweeps, three switch
+designs (RTL), each strict and off. Full report with figures and every value:
+https://claude.ai/artifact/AcYH8Ff2Drt5kon44un3gX (private; local copy and the
+results in `dualssd/1006/`, which git ignores). **Do not pool sweeps across
+designs.**
+
+| Design | strict | off |
+|---|---|---|
+| A | `dualssd-xsweep-strict-1` (00:07–00:42) | `dualssd-xsweep-off-1` (00:55–01:30) |
+| B | `dualssd-xsweep-strict-2` (12:48–13:24) | `dualssd-xsweep-off-2` (10:23–10:58) |
+| C | `dualssd-xsweep-strict-4` (14:11–14:46) | `dualssd-xsweep-off-3` (15:19–15:54) |
+
+The mapping is inferred from order and numbering, not recorded; to be
+confirmed. The data supports it for A and B (a design's strict and off sweeps
+share the same link split from 16k up). For C it doesn't fully agree:
+`off-3` matches `off-1` within 4.4% everywhere.
+
+1. **Link sharing is the design difference.** With the link full, B splits it
+   43–53% (drive 0 50% at 16k, 53% at 1m; 75% at 64k). A and C starve drive 0:
+   12–18% at 16k, 2% at 1m on A (237 ms mean latency vs 9.4 ms on B), 1% at 8k
+   off.
+2. **B moves more at large blocks:** 5.26 vs 4.48–4.58 GB/s at 64k (+15%),
+   6.70 vs 6.44–6.50 at 1m, in both IOMMU modes. It gives the 990 EVO Plus
+   less of the link, and that drive's host-buffer traffic costs ~1.1 extra link
+   bytes per byte read at 64k (~0.1 at 1m).
+3. **The IOMMU ceiling does not depend on the design:** strict 724–735K IOPS
+   at 4k/8 instances on all three, 44–45% of off (1,645K, link-bound). CPU/IO
+   2.4–3.0×. p99 267–296 ms strict vs 0.5–1.8 ms off.
+4. **C strict only:** at 4k/4–8 instances, 15.6/20.6 Gbps more inbound writes
+   than read data (7.9/14.8 with drive 0 alone) and ~2× misses per 4 KiB
+   (2.80/3.17 vs 1.58–1.89); drive 0 alone slower at J=1 (183K vs 227–236K at
+   4k) and at 64k (97–99K vs 104–105K). Hypothesis: address width. With the
+   IOMMU on, Linux gives the drives IOVAs below 4 GiB (3-DW TLP headers); off,
+   physical addresses above 4 GiB (4-DW). Test: strict with `iommu.forcedac=1`.
+   Repeat first (the four points ran back to back, 14:15–14:18).
+5. Strict sweeps differ by up to 26% below the link limit (4k, 1–2 instances;
+   B fastest, C slowest). Not attributed to the switch until repeated: one run,
+   shared host.
+6. The 990 EVO Plus has 1.6 GB written, so most of its random reads hit
+   unwritten blocks (1.48M IOPS at 4k, above its 850K rating). It acts as a
+   fast DMA source, not a loaded SSD.
+
 ### Counters on Skylake
 
 `opCode-6-85.txt` is the paper's own event set (its Cascade Lake is also model
