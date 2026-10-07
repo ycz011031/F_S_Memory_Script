@@ -3,11 +3,11 @@
 # drive, for the IOMMU mode the host is currently booted in. The SSD
 # counterpart of dualnic_flow_sweep.sh.
 #
-#   ./dualssd_sweep.sh                          # co-run, 1,2,4,8 instances/SSD, 4k, 3 runs
+#   ./dualssd_sweep.sh                          # co-run, 1,2,4,8,16,32 instances/SSD, 4k, 3 runs
 #   ./dualssd_sweep.sh --single                 # also each drive alone (baselines)
 #   ./dualssd_sweep.sh --single-ssd 0           # also drive 0 alone, not drive 1
 #   ./dualssd_sweep.sh -o skx-strict            # name the sweep (must be new)
-#   ./dualssd_sweep.sh "1 2 4 8" "4k 1m" 3      # add 1 MiB reads
+#   ./dualssd_sweep.sh "1 2 4 8" "4k 1m" 3      # up to 8 instances, 4k and 1 MiB reads
 #   ./dualssd_sweep.sh --single --tmux          # in a tmux session instead
 #
 # Arguments: instances per SSD, block sizes, repeats. Options: --single adds
@@ -25,6 +25,9 @@
 # 4k is the default block size because each 4 KB read is one IOMMU map, one
 # unmap and, in strict mode, one IOTLB invalidation: ~256x as many of each per
 # byte as 1 MiB reads, which map 256 pages per I/O.
+#
+# Instances default to 1-32 per drive. SSD_CORES has 9 cores per drive, so
+# from 10 instances up cores run several each (3-4 at 32).
 #
 # Before the sweep, one short run of both drives at the lowest instance count
 # checks the datapath; the sweep stops there if either drive moves no I/O.
@@ -67,7 +70,7 @@ while [ $# -gt 0 ]; do
             case "$2" in 0|1) SINGLE_SSD="$2" ;;
                 *) echo "--single-ssd takes 0 or 1, not '$2'" >&2; exit 2 ;; esac
             SINGLE=1; shift 2 ;;
-        -h|--help) sed -n '2,48p' "$SELF"; exit 0 ;;
+        -h|--help) sed -n '2,51p' "$SELF"; exit 0 ;;
         -*)        echo "unknown option: $1" >&2; exit 2 ;;
         *)         POS+=( "$1" ); shift ;;
     esac
@@ -76,7 +79,7 @@ done
 
 cd "$(dirname "$SELF")/.."
 . ../utils/setup-server.sh
-INSTANCES="${POS[0]:-1 2 4 8}"
+INSTANCES="${POS[0]:-1 2 4 8 16 32}"
 BSIZES="${POS[1]:-4k}"
 RUNS="${POS[2]:-3}"
 if [ -n "$SINGLE_SSD" ]; then MODES="ssd${SINGLE_SSD}only both"

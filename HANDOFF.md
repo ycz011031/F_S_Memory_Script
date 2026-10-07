@@ -692,10 +692,10 @@ On icx nearly every miss hit the page-walk cache; here walks are deep.
 ```bash
 sudo -v     # bigserver has no NOPASSWD sudo: cache the password in this terminal first
 
-# co-run at 1,2,4,8 fio instances per drive, 4k random reads, 3 repeats
+# co-run at 1,2,4,8,16,32 fio instances per drive, 4k random reads, 3 repeats
 ./scripts/sosp24-experiments/dualssd_sweep.sh                  # [-o name] [--single] [--tmux] [instances] [block sizes] [runs]
 ./scripts/sosp24-experiments/dualssd_sweep.sh --single         # also each drive alone (baselines for CONTENTION)
-./scripts/sosp24-experiments/dualssd_sweep.sh "1 2 4 8" "4k 1m" 3
+./scripts/sosp24-experiments/dualssd_sweep.sh "1 2 4 8" "4k 1m" 3   # up to 8 instances, 4k and 1 MiB
 
 # the same in a tmux session instead of this terminal (survives a dropped ssh)
 ./scripts/sosp24-experiments/dualssd_sweep.sh --single --tmux
@@ -704,7 +704,7 @@ sudo -v     # bigserver has no NOPASSWD sudo: cache the password in this termina
 ./scripts/sosp24-experiments/dualssd_bs_sweep.sh                # [-o name] [--single] [--tmux] [block sizes] [instances] [runs]
 ./scripts/sosp24-experiments/dualssd_bs_sweep.sh "4k 8k 16k 32k 64k 128k 256k 512k 1m"
 
-# cross sweep, every block size at every instance count: 4k 8k 16k 64k 1m x 1,2,4,8, 1 run
+# cross sweep, every block size at every instance count: 4k 8k 16k 64k 1m x 1,2,4,8,16,32, 1 run
 ./scripts/sosp24-experiments/dualssd_cross_sweep.sh             # [-o name] [--single | --single-ssd N] [--tmux] [block sizes] [instances] [runs]
 ./scripts/sosp24-experiments/dualssd_cross_sweep.sh --single    # also drive 0 alone; only drive 0, to save time
 DUALSSD_ARGS="--membw 0" ./scripts/sosp24-experiments/dualssd_cross_sweep.sh --single   # ~half the time
@@ -737,7 +737,9 @@ for that drive but not CONTENTION, which needs both.
 | `--runs N`, `--results <file>` | as in the NIC runner |
 
 Each instance is a separate fio process, a single job with `--thread`, pinned
-round-robin over the drive's cores (`SSD_CORES`, 9 per drive). Every run uses
+round-robin over the drive's cores (`SSD_CORES`, 9 per drive). From 10
+instances per drive up, cores run several each (3–4 at 32). The warm-up starts
+once every instance is running (since 2026-10-07). Every run uses
 `--readonly`, `O_DIRECT`, `--randrepeat=0 --norandommap` across the whole drive.
 If any fio output ever reports bytes written or trimmed, `dualssd-results.py`
 stops with FATAL.
@@ -786,9 +788,10 @@ left. From another terminal, `tail -f utils/logs/<sweep>/sweep.log` follows
 it without attaching.
 
 About 110 s per run with `pcm-memory`, ~60 s with `DUALSSD_ARGS="--membw 0"`.
-The default sweep (13 runs) takes ~25 min and `--single` (37 runs) ~70 min per
-IOMMU mode. The default cross sweep is 21 runs, ~40 min (~20 min without
-`pcm-memory`); `--single` doubles that. Its results are named
+Both sweeps default to 1, 2, 4, 8, 16 and 32 instances per drive (since
+2026-10-07; 1–8 before). The default sweep (19 runs) takes ~35 min and
+`--single` (55 runs) ~100 min per IOMMU mode. The default cross sweep is 31
+runs, ~1 h (~30 min without `pcm-memory`); `--single` doubles that. Its results are named
 `dualssd-xsweep-<iommu>-<N>`, the block-size sweep's
 `dualssd-bssweep-<iommu>-<N>`. Lock:
 `/tmp/dualssd-experiment.lock`. Stop with
@@ -1188,6 +1191,11 @@ share the same link split from 16k up). For C it doesn't fully agree:
   or held by md, LVM or dm.
 - **The Gen3 uplink may bind before the IOMMU does.** The summary marks
   LINK BOUND when PCIe write exceeds 85% of the narrowest shared link.
+- **1 MiB at 32 instances puts 1 GiB in flight per drive** (1024 reads). On
+  switch designs that starve drive 0 at 1m, its reads waited ~1 s at 4
+  instances, so expect several seconds at 32, against a 30 s NVMe timeout.
+  Not yet run; check `dmesg` for nvme timeouts after the first cross sweep
+  that includes it.
 - **Never use a bare `wait` in a script that logs through
   `exec > >(tee ...)`.** It also waits for that `tee`, which never exits
   while the script runs. Reproduced on bash 5.0 and 5.1. This hung every run
@@ -1207,10 +1215,11 @@ share the same link split from 16k up). For C it doesn't fully agree:
      during measurements): their width, spread and reuse distance, which
      should drive the miss rate. Then strict with `iommu.forcedac=1` (IOVAs
      above 4 GiB, 64-bit TLPs as with the IOMMU off) on C, with A as control.
-   - **More instances.** `dualssd_cross_sweep.sh --single "4k 8k" "8 12 16 24"`:
-     where strict stops gaining (4k is near its ceiling at 8; 8k is still
-     rising). Past 9 instances per drive, two share a core; `--iodepth 64` is
-     the other way to add load.
+   - **More instances.** Where strict stops gaining (4k is near its ceiling
+     at 8; 8k is still rising). The default cross sweep now goes to 32 per
+     drive; for finer steps, `dualssd_cross_sweep.sh --single "4k 8k" "8 12 16 24 32"`.
+     Past 9 instances per drive, cores run several; `--iodepth 64` is the
+     other way to add load.
 1. **Lazy mode (`iommu.strict=0`):** the block-size sweep, or at least 4k.
    Then the instance sweep with `--single` in each mode, for the full
    strict / lazy / off comparison below the link (1–2 instances).

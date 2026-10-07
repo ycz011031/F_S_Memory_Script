@@ -356,6 +356,10 @@ for ((j = 0; j < num_runs; j++)); do
     [ "$jobs" -gt "${#cores[@]}" ] && [ "$j" -eq 0 ] && \
         echo "   NOTE: $jobs instances on ${#cores[@]} cores per drive; some cores run more than one"
 
+    # Start the warm-up clock once every instance is running. With 64 of them
+    # (32 per drive, co-run) the last sudo + fio launch may lag the first; its
+    # ramp would then end inside the window, and fio-sum rejects a late start.
+    for _ in $(seq 100); do [ "$(fio_count)" -ge "$want" ] && break; sleep 0.2; done
     echo "warming up ${warm}s..."; sleep "$warm"; sleep 1
 
     # An instance that died on startup leaves its drive under-loaded, and the
