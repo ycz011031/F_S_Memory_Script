@@ -1198,6 +1198,18 @@ share the same link split from 16k up). For C it doesn't fully agree:
 
 ### Next on bigserver
 
+0. **After the cross sweeps (2026-10-06), in this order** (commands in the
+   report's "Next runs"):
+   - **Address pattern.** Repeat design C strict at 4k, 4/8 instances, 3 runs.
+     Record the IOVAs the drives get with the `iommu:map`/`iommu:unmap`
+     tracepoints (about 0.5 s per point; tracing perturbs the run, so not
+     during measurements): their width, spread and reuse distance, which
+     should drive the miss rate. Then strict with `iommu.forcedac=1` (IOVAs
+     above 4 GiB, 64-bit TLPs as with the IOMMU off) on C, with A as control.
+   - **More instances.** `dualssd_cross_sweep.sh --single "4k 8k" "8 12 16 24"`:
+     where strict stops gaining (4k is near its ceiling at 8; 8k is still
+     rising). Past 9 instances per drive, two share a core; `--iodepth 64` is
+     the other way to add load.
 1. **Lazy mode (`iommu.strict=0`):** the block-size sweep, or at least 4k.
    Then the instance sweep with `--single` in each mode, for the full
    strict / lazy / off comparison below the link (1–2 instances).
