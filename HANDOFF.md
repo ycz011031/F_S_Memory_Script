@@ -711,8 +711,12 @@ sudo -v     # bigserver has no NOPASSWD sudo: cache the password in this termina
 ./scripts/sosp24-experiments/dualssd_cross_sweep.sh --single    # also drive 0 alone; only drive 0, to save time
 DUALSSD_ARGS="--membw 0" ./scripts/sosp24-experiments/dualssd_cross_sweep.sh --single   # ~half the time
 
+# uneven co-runs too: one drive 2/4/8 instances, the other 16/32, both ways round
+./scripts/sosp24-experiments/dualssd_cross_sweep.sh --single --asy     # [--asy-low "2 4 8"] [--asy-high "16 32"] [--no-swap]
+
 # single configuration
 ./scripts/run-dualssd-experiment.sh -E mytest --ssds 2 -J 4 --runs 3
+./scripts/run-dualssd-experiment.sh -E myasym --ssds 2 -J 4,32         # 4 on drive 0, 32 on drive 1
 
 # side by side, strict vs off
 python3 scripts/dualssd-results.py summary ~/dualssd-sweep-*.jsonl
@@ -740,8 +744,12 @@ for that drive but not CONTENTION, which needs both.
 
 Each instance is a separate fio process, a single job with `--thread`, pinned
 round-robin over the drive's cores (`SSD_CORES`, 9 per drive). From 10
-instances per drive up, cores run several each (3–4 at 32). The warm-up starts
-once every instance is running (since 2026-10-07). Every run uses
+instances per drive up, cores run several each (3–4 at 32). The 9 is a
+choice, not a limit of the drive: node 2 has 18 cores (36–53), split between
+the two drives so a co-run never puts both drives' instances on one core. The
+warm-up starts once every instance is running (since 2026-10-07), and the
+window opens 1 s after the ramp plus 1 s per 16 instances (since 2026-10-10).
+Every run uses
 `--readonly`, `O_DIRECT`, `--randrepeat=0 --norandommap` across the whole drive.
 If any fio output ever reports bytes written or trimmed, `dualssd-results.py`
 stops with FATAL.
@@ -760,7 +768,41 @@ stops with FATAL.
   late start, no early end, no hole over 2 s), and by fio's own `job_start` and
   runtime.
 - If any instance falls short, or one dies during measurement, the runner
-  prints why and stops. That run is not recorded, and a sweep aborts there.
+  prints why and stops with exit status 3. So does a run where `pcm-iio`
+  logged no rows for the SSD row, whose PCIe and IOMMU values would all read 0.
+  That run is not recorded.
+- **A sweep never aborts on a failed point (since 2026-10-10).** Whatever the
+  failure, including the datapath check, the sweep logs the point with the
+  runner's first error and moves on. It writes them to
+  `utils/logs/<sweep>/failed.txt` and lists them at the top of the `.txt`;
+  they show as `-` in the grids. Only a stop by hand ends it early (Ctrl-C or
+  the pkill below), and it still writes the summary of what finished. Before
+  this, the first failure ended the sweep: `dualssd-xsweep-strict-8` stopped
+  at 4k / 32 per drive / both, where the 64-instance co-run had two late
+  starts, a 4 s stall and no `pcm-iio` rows, so 8k–1m never ran.
+
+**Uneven co-runs (`--asy`, since 2026-10-10).**
+- One drive runs LOW instances and the other HIGH: LOW from `--asy-low`
+  (default `2 4 8`), HIGH from `--asy-high` (default `16 32`), at every block
+  size. The even points of the sweep, including 32+32, still run.
+- **Both ways round by default:** drive 0 LOW, then drive 1 LOW. The two
+  orientations should agree; if they don't, the drives or their slots differ,
+  not the load. `--no-swap` runs drive 0 LOW only.
+- **Cores are split in proportion** to the two counts, from both drives'
+  `SSD_CORES` together, so every core runs about as many instances. The
+  lighter drive keeps the head of its own list (fio off the interrupt CPUs).
+  With 18 cores: 4+32 → 2 and 16 cores; 8+16 → 6 and 12; 2+16 → 2 and 16.
+  Even co-runs keep the 9 + 9 split. Each record stores `instances_ssd<i>` and
+  `cores_ssd<i>`; `instances_per_ssd` is `"n0+n1"`.
+- **The summary adds an "uneven co-runs" table.** It shows both orientations
+  side by side, with the even co-runs at LOW and at HIGH. `vsLOW` is the LOW
+  drive's IOPS as % of its own IOPS when both drives ran LOW: what a heavier
+  neighbour costs it.
+- KEPT% and CONTENTION compare each drive with its own single-drive run at
+  its own count. Drive 1's KEPT% needs drive 1 alone, which the cross sweep's
+  `--single` does not run (drive 0 only).
+- With the defaults that is 12 points per block size: 60 more runs on the
+  cross sweep, 12 × 3 on the instance sweep.
 
 fio's own summary number starts after `ramp_time` (its `job_start`) and ends at
 the stop, so it never included the cold start. It is kept as
@@ -778,6 +820,7 @@ output. Each sweep takes a fresh name, `dualssd-sweep-<iommu>-<N>`, or the
 | `utils/logs/<sweep>/<config>-RUN-<j>/` | raw logs: `pcie.csv` (`pcm-iio`, every stack, every second), `pcm-iio.out` (its banner and warnings), `membw.log` (`pcm-memory`), `pcm.txt` (binary, core, row parsed), the `opCode-6-85.txt` that defines the CSV columns, `cpu_util.log`, `windows.txt` (window start/end), `fio-ssd<i>-<k>.json/.err` and `fio-ssd<i>-<k>_iops.1.log` (per-second IOPS) |
 | `utils/reports/<sweep>/<config>-RUN-<j>[-ssd<i>]/` | parsed `pcie.rpt`, `membw.rpt`, `cpu_util.rpt`, `fio.rpt` |
 | `utils/logs/<sweep>/datapath.jsonl` | the pre-sweep datapath check, kept out of the summary |
+| `utils/logs/<sweep>/failed.txt` | each failed point: config, exit status, the runner's first error |
 
 **Terminal or tmux.** Both scripts run in the current terminal by default.
 `--tmux` (sweep or runner) starts them in a new tmux session named

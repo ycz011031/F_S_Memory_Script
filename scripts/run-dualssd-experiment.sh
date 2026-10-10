@@ -7,13 +7,17 @@
 #   ./run-dualssd-experiment.sh -E base-ssd1 --ssds 1 --ssd-index 1 -J 4
 #   ./run-dualssd-experiment.sh -E dual      --ssds 2 -J 4 --runs 3
 #   ./run-dualssd-experiment.sh -E dual2     --ssds 2 -J 4 --tmux   # in tmux instead
+#   ./run-dualssd-experiment.sh -E asym      --ssds 2 -J 4,32       # 4 on drive 0, 32 on drive 1
 #
 # Runs in this terminal unless --tmux is given; --tmux starts it in a new tmux
 # session (survives a dropped ssh; asks for the sudo password there).
 #
-# -J is fio instances PER DRIVE, the analogue of iperf3 flows per NIC. Each is
-# its own fio process with one job, pinned round-robin over the drive's cores
-# (SSD_CORES), so each submits on its own NVMe queue. I/O is O_DIRECT: the
+# -J is fio instances PER DRIVE, the analogue of iperf3 flows per NIC; -J n0,n1
+# gives the two drives of a co-run different counts. Each instance is its own
+# fio process with one job, pinned round-robin over the drive's cores
+# (SSD_CORES), so each submits on its own NVMe queue. When the counts differ,
+# both drives' cores together are split in proportion to them instead, so
+# every core runs about as many instances. I/O is O_DIRECT: the
 # NVMe driver maps every buffer through the IOMMU on submit and unmaps it on
 # completion, so in strict mode every completed I/O is an IOTLB invalidation.
 #
@@ -32,6 +36,9 @@
 #                               (per-second IOPS, proves fio covered the window)
 #   reports/<name>-RUN-<j>/     pcie.rpt, membw.rpt, cpu_util.rpt
 #   reports/<name>-RUN-<j>-ssd<i>/fio.rpt
+#
+# Exit status 3: this configuration could not be measured (fio instances died,
+# stalled or missed the window, or pcm-iio logged nothing); sweeps skip it.
 set -u
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -74,7 +81,7 @@ while [ $# -gt 0 ]; do
         --runs)         num_runs="$2"; shift 2 ;;
         --results)      results_file="$2"; shift 2 ;;
         -h|--help)
-            sed -n '2,34p' "$SELF"; exit 0 ;;
+            sed -n '2,41p' "$SELF"; exit 0 ;;
         *) echo "unknown option: $1"; exit 2 ;;
     esac
 done
@@ -85,7 +92,16 @@ case "$rw" in
 esac
 case "$ssds" in 1|2) ;; *) echo "ERROR: --ssds must be 1 or 2" >&2; exit 2 ;; esac
 case "$ssd_index" in 0|1) ;; *) echo "ERROR: --ssd-index must be 0 or 1" >&2; exit 2 ;; esac
-case "$jobs" in ''|*[!0-9]*|0) echo "ERROR: -J must be a positive integer" >&2; exit 2 ;; esac
+# JOBS[i]: instances on drive i. -J n0,n1 sets them separately (co-run only).
+IFS=',' read -r -a JOBS <<< "$jobs"
+case "${#JOBS[@]}" in
+    1) JOBS=( "${JOBS[0]}" "${JOBS[0]}" ) ;;
+    2) [ "$ssds" -eq 2 ] || { echo "ERROR: -J n0,n1 needs --ssds 2" >&2; exit 2; } ;;
+    *) echo "ERROR: -J takes n, or n0,n1 for a co-run" >&2; exit 2 ;;
+esac
+for v in "${JOBS[@]}"; do
+    case "$v" in ''|*[!0-9]*|0) echo "ERROR: -J must be a positive integer, or two separated by a comma" >&2; exit 2 ;; esac
+done
 [ "$IN_TMUX" = 1 ] && relaunch_in_tmux "$SELF" ${PASS[@]+"${PASS[@]}"}
 
 for v in SSD_SERIALS SSD_CORES; do
@@ -112,9 +128,31 @@ for i in "${ACTIVE[@]}"; do
     DEVS[$i]=$SSD_DEV; BDFS[$i]=$SSD_BDF
 done
 
+# CORES[i]: the cores drive i's instances run on, round-robin. Normally
+# SSD_CORES[i]. A co-run with different counts splits both lists' cores in
+# proportion to the counts instead, so each core runs about as many
+# instances: the lighter drive keeps the head of its own list (fio off the
+# interrupt CPUs), the heavier one takes its own list plus the rest. With 18
+# cores, 4+32 gives 2 and 16 cores (2 instances each); 8+16 gives 6 and 12.
+CORES=()
+for i in "${ACTIVE[@]}"; do CORES[$i]=${SSD_CORES[$i]}; done
+if [ "$ssds" -eq 2 ] && [ "${JOBS[0]}" != "${JOBS[1]}" ]; then
+    lo=$(( JOBS[0] < JOBS[1] ? 0 : 1 )); hi=$(( 1 - lo ))
+    IFS=',' read -r -a mine <<< "${SSD_CORES[$lo]}"
+    IFS=',' read -r -a other <<< "${SSD_CORES[$hi]}"
+    C=$(( ${#mine[@]} + ${#other[@]} )); n=$(( JOBS[0] + JOBS[1] ))
+    c=$(( (2 * C * JOBS[lo] + n) / (2 * n) ))          # its share, rounded
+    [ "$c" -lt 1 ] && c=1
+    [ "$c" -gt "${JOBS[$lo]}" ] && c=${JOBS[$lo]}
+    [ "$c" -gt "${#mine[@]}" ] && c=${#mine[@]}
+    rest=( "${other[@]}" "${mine[@]:c}" )
+    CORES[$lo]=$(IFS=,; echo "${mine[*]:0:c}")
+    CORES[$hi]=$(IFS=,; echo "${rest[*]}")
+fi
+
 # CPU utilisation is recorded over every active drive's cores.
 active_cores=""
-for i in "${ACTIVE[@]}"; do active_cores="${active_cores:+$active_cores,}${SSD_CORES[$i]}"; done
+for i in "${ACTIVE[@]}"; do active_cores="${active_cores:+$active_cores,}${CORES[$i]}"; done
 ncores=$(printf '%s' "$active_cores" | tr ',' '\n' | grep -c .)
 
 # What the kernel actually did, from sysfs, per drive. Both drives sit behind
@@ -299,8 +337,8 @@ fio_runtime=$(( warm + span + 120 ))
 echo "=============================================================="
 echo "  experiment : $exp   ($(date '+%F %T'))"
 echo "  SSDs       : $ssds  (indices: ${ACTIVE[*]})"
-for i in "${ACTIVE[@]}"; do echo "               $i: ${DEVS[$i]}  cores ${SSD_CORES[$i]}"; done
-echo "  per SSD    : $jobs fio instances x iodepth $iodepth, $rw bs=$bs, $ioengine, O_DIRECT, read-only"
+for i in "${ACTIVE[@]}"; do echo "               $i: ${DEVS[$i]}  ${JOBS[$i]} instance(s) on cores ${CORES[$i]}"; done
+echo "  per instance: iodepth $iodepth, $rw bs=$bs, $ioengine, O_DIRECT, read-only"
 echo "  windows    : ramp ${warm}s, CPU ${dur}s, PCIe ${dur}s$( [ "$membw" = 1 ] && echo ", memory $((30 + dur))s" )"
 echo "  IOMMU      : $iommu_mode on $iommu_units   (kernel $(uname -r))"
 echo "=============================================================="
@@ -333,8 +371,10 @@ for ((j = 0; j < num_runs; j++)); do
     # ---------------------------------------------------------------- load
     want=0; fio_pids=()
     for i in "${ACTIVE[@]}"; do
-        IFS=',' read -r -a cores <<< "${SSD_CORES[$i]}"
-        for ((k = 0; k < jobs; k++)); do
+        IFS=',' read -r -a cores <<< "${CORES[$i]}"
+        [ "${JOBS[$i]}" -gt "${#cores[@]}" ] && [ "$j" -eq 0 ] && \
+            echo "   NOTE: SSD $i: ${JOBS[$i]} instances on ${#cores[@]} cores; some cores run more than one"
+        for ((k = 0; k < JOBS[i]; k++)); do
             core=${cores[$((k % ${#cores[@]}))]}
             # --thread keeps one process per instance, so fio_count counts
             # instances. 9>&- so fio does not hold the experiment lock.
@@ -353,14 +393,14 @@ for ((j = 0; j < num_runs; j++)); do
             want=$((want + 1))
         done
     done
-    [ "$jobs" -gt "${#cores[@]}" ] && [ "$j" -eq 0 ] && \
-        echo "   NOTE: $jobs instances on ${#cores[@]} cores per drive; some cores run more than one"
 
     # Start the warm-up clock once every instance is running. With 64 of them
     # (32 per drive, co-run) the last sudo + fio launch may lag the first; its
     # ramp would then end inside the window, and fio-sum rejects a late start.
     for _ in $(seq 100); do [ "$(fio_count)" -ge "$want" ] && break; sleep 0.2; done
-    echo "warming up ${warm}s..."; sleep "$warm"; sleep 1
+    # The window then opens 1 s after the ramp, plus 1 s per 16 instances: on
+    # oversubscribed cores some instances' ramps start late (0.5-0.7 s at 64).
+    echo "warming up ${warm}s..."; sleep "$warm"; sleep $((1 + want / 16))
 
     # An instance that died on startup leaves its drive under-loaded, and the
     # run would otherwise measure that without a word.
@@ -369,7 +409,7 @@ for ((j = 0; j < num_runs; j++)); do
     if [ "$got" -lt "$want" ]; then
         echo "ERROR: only $got of $want fio instances are running. First errors:" >&2
         cat "$L"/fio-ssd*.err 2>/dev/null | grep -v '^$' | head -10 | sed 's/^/    /' >&2
-        exit 1
+        exit 3
     fi
 
     # -------------------------------------------------------------- measure
@@ -398,6 +438,13 @@ for ((j = 0; j < num_runs; j++)); do
         echo "ERROR: $L/windows.txt is missing; record-host-metrics.sh did not finish." >&2
         bad_run=1
     fi
+    # Without pcm-iio rows every PCIe and IOMMU value of the run reads 0.
+    # (pcie_samples is written by the Skylake parser only.)
+    n=$(awk '/^pcie_samples:/{print $2}' "$setup_dir/reports/$RUN/pcie.rpt" 2>/dev/null)
+    if [ "${n:-1}" = 0 ]; then
+        echo "ERROR: pcm-iio logged no rows for '$SSD_PCIE_PATTERN'; see $L/pcm-iio.out" >&2
+        bad_run=1
+    fi
     for i in "${ACTIVE[@]}"; do
         F="$setup_dir/reports/$RUN-ssd$i/fio.rpt"
         if ! python3 "$HERE/dualssd-results.py" fio-sum --out "$F" \
@@ -414,7 +461,7 @@ for ((j = 0; j < num_runs; j++)); do
     if [ "$bad_run" = 1 ]; then
         echo "ERROR: run $j of '$exp' is not valid; stopping. Its logs and reports are kept:" >&2
         echo "       $L/   $setup_dir/reports/$RUN*/" >&2
-        exit 1
+        exit 3
     fi
 done
 
@@ -511,12 +558,21 @@ if [ -z "$results_file" ]; then
     k=1; while [ -e "$HOME/${exp//\//_}-$k.jsonl" ]; do k=$((k + 1)); done
     results_file="$HOME/${exp//\//_}-$k.jsonl"
 fi
+# instances_per_ssd stays a number for a single drive or an even co-run, so
+# old and new records group alike; an uneven co-run is "n0+n1". Per drive,
+# instances_ssd<i> and cores_ssd<i> say exactly what ran where.
+inst=${JOBS[${ACTIVE[0]}]}
+[ "$ssds" -eq 2 ] && [ "${JOBS[0]}" != "${JOBS[1]}" ] && inst="${JOBS[0]}+${JOBS[1]}"
+per_drive=()
+for i in "${ACTIVE[@]}"; do
+    per_drive+=( --meta "instances_ssd$i=${JOBS[$i]}" --meta "cores_ssd$i=${CORES[$i]}" )
+done
 python3 "$HERE/dualssd-results.py" dump \
     --reports "$setup_dir/reports" --exp "$exp" --runs "$num_runs" \
     --ssds "$(IFS=,; echo "${ACTIVE[*]}")" --out "$results_file" \
     --meta mode="$( [ "$ssds" -eq 2 ] && echo both || echo "ssd${ssd_index}only" )" \
     --meta iommu="$iommu_mode" --meta iommu_units="$iommu_units" \
-    --meta instances_per_ssd="$jobs" --meta bs="$bs" --meta iodepth="$iodepth" \
+    --meta instances_per_ssd="$inst" "${per_drive[@]}" --meta bs="$bs" --meta iodepth="$iodepth" \
     --meta rw="$rw" --meta ioengine="$ioengine" \
     --meta devices="$(for i in "${ACTIVE[@]}"; do printf '%s ' "${DEVS[$i]}"; done | xargs | tr ' ' ',')" \
     --meta serials="$(for i in "${ACTIVE[@]}"; do printf '%s ' "${SSD_SERIALS[$i]}"; done | xargs | tr ' ' ',')" \

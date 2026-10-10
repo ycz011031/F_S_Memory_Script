@@ -341,8 +341,23 @@ def load(files):
 
 
 def group(r):
-    """One measurement point: IOMMU mode, block size, instances per drive."""
+    """One measurement point: IOMMU mode, block size, instances per drive
+    ("n0+n1" for a co-run whose drives had different counts)."""
     return (str(r.get('iommu')), str(r.get('bs')), r.get('instances_per_ssd'))
+
+
+def n_of(r, i):
+    """Instances drive i ran in record r (older records: instances_per_ssd)."""
+    return r.get(f'instances_ssd{i}', r.get('instances_per_ssd'))
+
+
+def is_asym(r):
+    return r.get('mode') == 'both' and n_of(r, 0) != n_of(r, 1)
+
+
+def point(r, i):
+    """The single-drive point that matches drive i's share of record r."""
+    return (str(r.get('iommu')), str(r.get('bs')), n_of(r, i))
 
 
 def alone_iops(recs):
@@ -355,11 +370,13 @@ def alone_iops(recs):
 
 
 def kept(r, alone):
-    """Each drive's IOPS in a co-run as % of its IOPS alone at the same point,
-    {drive: pct}, for the drives that have a single-drive run there."""
+    """Each drive's IOPS in a co-run as % of its IOPS alone at the same block
+    size and its own instance count, {drive: pct}, for the drives that have a
+    single-drive run there. alone: alone_iops() of all records."""
     out = {}
     for i in (0, 1):
-        a, c = alone.get(f'ssd{i}only'), r['mean'].get(f'iops_ssd{i}')
+        a = alone.get(point(r, i), {}).get(f'ssd{i}only')
+        c = r['mean'].get(f'iops_ssd{i}')
         if a and c is not None:
             out[i] = 100 * c / a
     return out
@@ -389,7 +406,12 @@ def link_bound(r):
 
 
 def sort_key(r):
-    return (str(r.get('iommu')), bs_bytes(r.get('bs')), r.get('instances_per_ssd') or 0,
+    """IOMMU, block size; even runs by instances, then uneven co-runs by
+    (low, high) count, the drive-0-low orientation first."""
+    def num(v):
+        return v if isinstance(v, (int, float)) else 0
+    a, b = num(n_of(r, 0)), num(n_of(r, 1))
+    return (str(r.get('iommu')), bs_bytes(r.get('bs')), a != b, min(a, b), max(a, b), a > b,
             {'ssd0only': 0, 'ssd1only': 1, 'both': 2}.get(r.get('mode'), 3))
 
 
@@ -447,17 +469,70 @@ def pcm_tables(recs):
         cols = [(k, label(k)) for k in ks]
         rows = [[cell(k, r['mean'].get(k)) for k, _ in cols] for r in sorted(recs, key=sort_key)]
         ws = [max([len(l)] + [len(row[c]) for row in rows]) for c, (_, l) in enumerate(cols)]
-        hdr = f"{'IOMMU':<7} {'BS':<5} {'INST':>4} {'MODE':<9}" + \
+        hdr = f"{'IOMMU':<7} {'BS':<5} {'INST':>5} {'MODE':<9}" + \
               ''.join(f' {l:>{w}}' for (_, l), w in zip(cols, ws))
         print(f'{tool}, means over runs (sd of each in the .jsonl)')
         print(hdr)
         print('-' * len(hdr))
         for r, row in zip(sorted(recs, key=sort_key), rows):
             print(f"{str(r.get('iommu')):<7} {str(r.get('bs')):<5} "
-                  f"{str(r.get('instances_per_ssd')):>4} {str(r.get('mode')):<9}" +
+                  f"{str(r.get('instances_per_ssd')):>5} {str(r.get('mode')):<9}" +
                   ''.join(f' {c:>{w}}' for c, w in zip(row, ws)))
         print()
         print('\n'.join(legends[tool]))
+
+
+def asym_table(recs):
+    """Uneven co-runs (dualssd_sweep.sh --asy): both orientations of each
+    LOW+HIGH pair side by side, with the even co-runs at LOW and at HIGH."""
+    co = {}
+    for r in recs:
+        if r.get('mode') == 'both':
+            co[(str(r.get('iommu')), str(r.get('bs')), n_of(r, 0), n_of(r, 1))] = r
+    pairs = sorted({(k[0], k[1], min(k[2], k[3]), max(k[2], k[3])) for k in co if k[2] != k[3]},
+                   key=lambda p: (p[0], bs_bytes(p[1]), p[2], p[3]))
+    if not pairs:
+        return
+
+    def ki(r, i):
+        v = r['mean'].get(f'iops_ssd{i}') if r else None
+        return None if v is None else v / 1e3
+
+    def two(a, b):
+        return '-' if None in (a, b) else f'{a:.1f}/{b:.1f}'
+
+    def pct(a, b):
+        return '-' if None in (a, b) or not b else f'{100 * a / b:.0f}%'
+
+    rows = []
+    for io, bs, lo, hi in pairs:
+        a = co.get((io, bs, lo, hi))        # drive 0 LOW, drive 1 HIGH
+        b = co.get((io, bs, hi, lo))        # drive 1 LOW, drive 0 HIGH
+        sl, sh = co.get((io, bs, lo, lo)), co.get((io, bs, hi, hi))
+        rows.append([io, bs, f'{lo}+{hi}',
+                     two(ki(a, 0), ki(a, 1)), pct(ki(a, 0), ki(sl, 0)),
+                     two(ki(b, 1), ki(b, 0)), pct(ki(b, 1), ki(sl, 1)),
+                     two(ki(sl, 0), ki(sl, 1)), two(ki(sh, 0), ki(sh, 1))])
+    hdr = ['IOMMU', 'BS', 'LOW+HIGH', 'd0 LOW: low/high', 'vsLOW',
+           'd1 LOW: low/high', 'vsLOW', 'both LOW: d0/d1', 'both HIGH: d0/d1']
+    ws = [max([len(h)] + [len(row[c]) for row in rows]) for c, h in enumerate(hdr)]
+
+    def line(cells):
+        return '  '.join(f'{v:<{w}}' if c < 3 else f'{v:>{w}}'
+                         for c, (v, w) in enumerate(zip(cells, ws)))
+    print()
+    print('uneven co-runs, kIOPS (dualssd_sweep.sh --asy)')
+    print(line(hdr))
+    print('-' * len(line(hdr)))
+    for row in rows:
+        print(line(row))
+    print()
+    print('  d0 LOW    = drive 0 ran LOW instances and drive 1 HIGH: kIOPS of the LOW')
+    print('              drive / the HIGH drive. d1 LOW = the same with the drives swapped;')
+    print('              the two agree unless the drives or their slots differ.')
+    print('  vsLOW     = the LOW drive\'s IOPS as % of its own IOPS when both drives ran')
+    print('              LOW: what a heavier neighbour costs it.')
+    print('  both LOW, both HIGH = the even co-runs at either count, drive 0 / drive 1.')
 
 
 def summary(a):
@@ -471,7 +546,7 @@ def summary(a):
             base.setdefault(group(r), {})[r['mode']] = r['mean'].get('misses_per_io')
     alone = alone_iops(recs)
 
-    hdr = f"{'IOMMU':<7} {'BS':<5} {'INST':>4} {'MODE':<9} {'IOPS_k':>15} {'GB/s':>6} " \
+    hdr = f"{'IOMMU':<7} {'BS':<5} {'INST':>5} {'MODE':<9} {'IOPS_k':>15} {'GB/s':>6} " \
           f"{'LAT_us':>7} {'PCIe_wr':>8} {'MISS/IO':>13} {'MISS/4K':>8} {'CPU_%':>11} " \
           f"{'CPU_us/IO':>9} {'CONTENTION':>10} {'KEPT%':>11}"
     print(hdr)
@@ -482,8 +557,8 @@ def summary(a):
         cont = ''
         # Without translation there are no misses to contend over.
         if r.get('mode') == 'both' and r.get('iommu') not in ('off', 'pt'):
-            b = base.get(group(r), {})
-            m0, m1 = b.get('ssd0only'), b.get('ssd1only')
+            m0 = base.get(point(r, 0), {}).get('ssd0only')
+            m1 = base.get(point(r, 1), {}).get('ssd1only')
             i0, i1 = m.get('iops_ssd0'), m.get('iops_ssd1')
             both = m.get('misses_per_io')
             # The drives are different models at different IOPS, so the
@@ -497,7 +572,7 @@ def summary(a):
         # means something with the IOMMU off too.
         kept_s = ''
         if r.get('mode') == 'both':
-            kept_s = ' '.join(f's{i}:{v:.0f}' for i, v in kept(r, alone.get(group(r), {})).items())
+            kept_s = ' '.join(f's{i}:{v:.0f}' for i, v in kept(r, alone).items())
         cpu_us = cpu_us_per_io(r)
         miss4k = miss_per_4k(r)
         # Mean fio latency, IOPS-weighted across the active drives.
@@ -510,7 +585,7 @@ def summary(a):
         if any(run.get('window_covered') == 0 for run in r.get('per_run', [])):
             flag += '  <-- fio DID NOT COVER THE WINDOW'
         print(f"{str(r.get('iommu')):<7} {str(r.get('bs')):<5} "
-              f"{str(r.get('instances_per_ssd')):>4} {str(r.get('mode')):<9} "
+              f"{str(r.get('instances_per_ssd')):>5} {str(r.get('mode')):<9} "
               f"{fmt(iops / 1e3 if iops is not None else None, (s.get('iops_total') or 0) / 1e3, '.1f'):>15} "
               f"{fmt(m.get('gbps_total') / 8 if m.get('gbps_total') is not None else None, None, '.2f'):>6} "
               f"{fmt(lat, None, '.0f'):>7} "
@@ -532,9 +607,13 @@ def summary(a):
     print('               single-drive runs (dualssd_sweep.sh --single).')
     print('  KEPT%      = each drive\'s IOPS in the co-run as % of its IOPS alone at the')
     print('               same BS/INST (s0 = drive 0); needs that drive\'s single run.')
+    print('  INST n0+n1 = an uneven co-run: n0 instances on drive 0, n1 on drive 1, cores')
+    print('               split in proportion. CONTENTION and KEPT% then compare each')
+    print('               drive with its own single-drive run at its own count.')
     print('  IOMMU off/pt has no translation, so compare IOPS and CPU_us/IO across')
     print('  modes at the same BS/INST. LINK BOUND: PCIe write above 85% of the')
     print('  narrowest shared PCIe link, which then caps the run, not the IOMMU.')
+    asym_table(recs)
     pcm_tables(recs)
 
 
@@ -543,7 +622,7 @@ def grid(a):
     recs = load(a.files)
     alone = alone_iops(recs)
     # A point measured twice (say, a re-run) shows its last record.
-    pts = {group(r) + (r.get('mode'),): r for r in recs}
+    pts = {group(r) + (r.get('mode'),): r for r in recs if not is_asym(r)}
 
     def k(v):
         return f'{v / 1e3:.1f}'
@@ -585,7 +664,7 @@ def grid(a):
             if 'both' in modes:
                 tables.append((f'drive {i} in the co-run, % of its IOPS alone', 'both',
                                lambda r, i=i: (lambda v: None if v is None else f'{v:.0f}%')(
-                                   kept(r, alone.get(group(r), {})).get(i))))
+                                   kept(r, alone).get(i))))
 
         for title, mode, cell in tables:
             rows = []

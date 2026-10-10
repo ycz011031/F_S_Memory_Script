@@ -10,6 +10,7 @@
 #   ./dualssd_cross_sweep.sh --single-ssd 1      # drive 1 (990 EVO Plus, nvme1) alone instead
 #   ./dualssd_cross_sweep.sh "4k 8k" "8 12 16 24 32" 3
 #   ./dualssd_cross_sweep.sh --single --tmux     # in a tmux session instead
+#   ./dualssd_cross_sweep.sh --single --asy      # also uneven co-runs at every block size
 #
 # Arguments: block sizes (default "4k 8k 16k 64k 1m"), instances per drive
 # (default "1 2 4 8 16 32"; from 10 up, cores run several each, since
@@ -23,14 +24,21 @@
 #   --single-ssd N    the drive to run alone, 0 or 1; implies --single.
 #                     Drive 1, the 990 EVO Plus, is the one whose host memory
 #                     buffer adds PCIe traffic fio does not see (HANDOFF §7).
+#   --asy             also uneven co-runs: one drive LOW instances, the other
+#                     HIGH, both ways round (dualssd_sweep.sh -h). With
+#                     --asy-low "2 4 8" / --asy-high "16 32" (the defaults),
+#                     12 more points per block size. --no-swap: drive 0 LOW
+#                     only, 6. KEPT% of drive 1 needs --single-ssd 1.
 #   -o NAME           name the sweep (must be new)
 #   --tmux            run it in a new tmux session instead of this terminal
 # Runner options go in DUALSSD_ARGS, e.g. DUALSSD_ARGS="--membw 0" skips
 # pcm-memory and saves ~50 s per run.
 #
 # Time: ~1 min per run with --membw 0, ~2 min with pcm-memory. The default
-# grid is 30 points: ~30 min (~1 h with pcm-memory); --single doubles it.
+# grid is 30 points: ~30 min (~1 h with pcm-memory); --single doubles it,
+# and --asy adds 60 points (~1-2 h).
 # Every point prints "[k/N]" with the time so far and an estimate of the rest.
+# A point that fails is logged and skipped; only Ctrl-C or pkill stops it.
 #
 # 8k is in the default list because it is where strict mode's 4k ceiling
 # (~650K IOPS, ~2.7 GB/s) and the Gen3 x8 uplink (~6.4-7 GB/s) should meet:
@@ -49,11 +57,11 @@ SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 OPTS=(); POS=(); SINGLE_SSD=""
 while [ $# -gt 0 ]; do
     case "$1" in
-        -o|--out)      OPTS+=( "$1" "$2" ); shift 2 ;;
-        --tmux)        OPTS+=( "$1" ); shift ;;
+        -o|--out|--asy-low|--asy-high)  OPTS+=( "$1" "$2" ); shift 2 ;;
+        --tmux|--asy|--no-swap)         OPTS+=( "$1" ); shift ;;
         --single)      SINGLE_SSD="${SINGLE_SSD:-0}"; shift ;;
         --single-ssd)  SINGLE_SSD="$2"; shift 2 ;;
-        -h|--help)     sed -n '2,45p' "$SELF"; exit 0 ;;
+        -h|--help)     sed -n '2,53p' "$SELF"; exit 0 ;;
         -*)            echo "unknown option: $1" >&2; exit 2 ;;
         *)             POS+=( "$1" ); shift ;;
     esac

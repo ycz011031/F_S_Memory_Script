@@ -25,6 +25,7 @@ run by hand when needed · **orphan** = no caller and superseded · **data** /
 | Dual-SSD: sweep fio instances per drive | `scripts/sosp24-experiments/dualssd_sweep.sh` | bigserver |
 | Dual-SSD: sweep block size | `scripts/sosp24-experiments/dualssd_bs_sweep.sh` | bigserver |
 | Dual-SSD: block size × instances | `scripts/sosp24-experiments/dualssd_cross_sweep.sh` | bigserver |
+| Dual-SSD: uneven co-runs (one drive LOW, the other HIGH instances) | `--asy` on either sweep above, or `run-dualssd-experiment.sh -J n0,n1` | bigserver |
 | Dual-SSD: one configuration | `scripts/run-dualssd-experiment.sh` | bigserver |
 | Dual-SSD: find the pcm-iio row, check VT-d counters | `sudo bash utils/discover-ssd-pcie.sh` | bigserver |
 | Dual-SSD: tables from results | `python3 scripts/dualssd-results.py summary\|grid ~/<sweep>.jsonl` | any |
@@ -288,7 +289,7 @@ falls back to default events and every column shifts.
 |---|---|---|
 | `utils/logs/<exp>-RUN-<j>/` | `record-host-metrics.sh` and the drivers: raw `pcie.csv`, `pcm-iio.out`, `membw.log`, `cpu_util.log`, `windows.txt`, fio JSON and per-second IOPS logs | no |
 | `utils/reports/<exp>-RUN-<j>[-ssd<i>]/` | parsed `pcie.rpt`, `membw.rpt`, `cpu_util.rpt`, `fio.rpt`, `iperf.bw.rpt`, `retx.rpt` | no |
-| `utils/logs/<sweep>/`, `utils/reports/<sweep>/` | sweeps group their runs here (`-E <sweep>/<config>`), plus `sweep.log` and `datapath.jsonl` | no |
+| `utils/logs/<sweep>/`, `utils/reports/<sweep>/` | sweeps group their runs here (`-E <sweep>/<config>`), plus `sweep.log`, `datapath.jsonl` and, for the dual-SSD sweeps, `failed.txt` | no |
 | `utils/logs/<exp>.console.log` | `run-dualssd-experiment.sh`: its full console output | no |
 | `~/<sweep>.jsonl`, `~/<sweep>.txt` | `*-results.py dump` / the sweeps' summary step, on the host that ran them | no |
 | `/dualssd/`, `/dualnic/` | copies of `~/*.jsonl` / `.txt` brought back for analysis | no (ignored) |
