@@ -522,4 +522,5 @@ python3 "$HERE/dualssd-results.py" dump \
     --meta serials="$(for i in "${ACTIVE[@]}"; do printf '%s ' "${SSD_SERIALS[$i]}"; done | xargs | tr ' ' ',')" \
     --meta dur_s="$dur" --meta warm_s="$warm" --meta cpu_util_cores="$active_cores" \
     --meta uplink_gbps="$uplink_gbps" --meta cpu_model="$CPU_MODEL" \
+    --meta pcm_row="$SSD_PCIE_PATTERN" --meta membw="$membw" \
     || echo "WARNING: could not write $results_file; the .rpt files are intact." >&2

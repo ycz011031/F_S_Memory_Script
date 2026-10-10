@@ -4,7 +4,8 @@
   fio-sum  sum one drive's fio JSON outputs (one per instance) into fio.rpt
   dump     read one experiment's report directories and append a single JSON
            line (config + every run + mean/sd) to a .jsonl file
-  summary  print a comparison table from one or more .jsonl files
+  summary  print a comparison table from one or more .jsonl files, then every
+           pcm-iio and pcm-memory value
   grid     the same records as block size x instances tables (cross sweeps)
 
     dualssd-results.py fio-sum --out reports/X-RUN-0-ssd0/fio.rpt logs/X-RUN-0/fio-ssd0-*.json
@@ -21,6 +22,7 @@ import glob
 import json
 import os
 import platform
+import re
 import socket
 import statistics
 import sys
@@ -268,14 +270,20 @@ def one_run(reports, exp, j, ssds):
     r['misses_per_gb'] = miss / (wr / 8) if (miss is not None and wr) else None
 
     r['cpu_util_pct'] = read_kv(os.path.join(base, 'cpu_util.rpt')).get('avg_cpu_util')
-    r.update({k: v for k, v in read_kv(os.path.join(base, 'membw.rpt')).items()
-              if k.startswith('Node')})
+    # Everything pcm-memory gave: per-socket and system read / write / total
+    # MB/s and the sample count (utils/parse_membw.py).
+    r.update(read_kv(os.path.join(base, 'membw.rpt')))
     return r
 
 
 def dump(a):
     ssds = [int(x) for x in a.ssds.split(',') if x != '']
     runs = [one_run(a.reports, a.exp, j, ssds) for j in range(a.runs)]
+    # Which keys came from each PCM tool, in report order, so the summary can
+    # print every PCM value without a fixed list (the set depends on the CPU).
+    base0 = os.path.join(a.reports, f'{a.exp}-RUN-0')
+    pcm = {'pcm-iio': [k for k in read_kv(os.path.join(base0, 'pcie.rpt')) if k != 'cpu_model'],
+           'pcm-memory': list(read_kv(os.path.join(base0, 'membw.rpt')))}
 
     mean, sd = {}, {}
     for k in runs[0]:
@@ -299,7 +307,7 @@ def dump(a):
         'active_ssds': ssds,
     }
     rec.update(parse_meta(a.meta))
-    rec.update({'runs': a.runs, 'mean': mean, 'sd': sd, 'per_run': runs})
+    rec.update({'pcm_keys': pcm, 'runs': a.runs, 'mean': mean, 'sd': sd, 'per_run': runs})
 
     out = os.path.expanduser(a.out)
     with open(out, 'a') as f:
@@ -380,12 +388,81 @@ def link_bound(r):
     return bool(up and (wr or 0) > 0.85 * up)
 
 
+def sort_key(r):
+    return (str(r.get('iommu')), bs_bytes(r.get('bs')), r.get('instances_per_ssd') or 0,
+            {'ssd0only': 0, 'ssd1only': 1, 'both': 2}.get(r.get('mode'), 3))
+
+
+# pcm-iio keys of Skylake records written before dump stored 'pcm_keys'.
+OLD_PCIE_KEYS = ['PCIe_wr_tput', 'PCIe_rd_tput', 'IOTLB_hits', 'IOTLB_misses',
+                 'CTXT_Miss', 'L1_Miss', 'L2_Miss', 'L3_Miss', 'Mem_Read']
+
+
+def pcm_keys(recs, tool):
+    """Every key any record took from one PCM tool's report, in report order."""
+    out = []
+    for r in recs:
+        ks = (r.get('pcm_keys') or {}).get(tool)
+        if ks is None:
+            ks = OLD_PCIE_KEYS if tool == 'pcm-iio' else \
+                [k for k in r['mean'] if k.startswith(('Node', 'System'))]
+        out += [k for k in ks if k in r['mean'] and k not in out]
+    return out
+
+
+def pcm_tables(recs):
+    """Every pcm-iio and pcm-memory value, one row per configuration."""
+    def label(k):
+        m = re.match(r'(?:Node(\d+)|System)_(\w+)_bw$', k)
+        if m:
+            return (f'N{m.group(1)}' if m.group(1) else 'Sys') + '_' + m.group(2)
+        return 'n' if k.endswith('_samples') else k.replace('PCIe_ob_', 'OB_').replace('_tput', '')
+
+    def cell(k, v):
+        if v is None:
+            return 'n/a'
+        if k.endswith('_samples'):
+            return f'{v:.0f}'
+        if k.endswith('_tput'):
+            return f'{v:.3f}'                  # Gbps
+        if k.endswith('_bw'):
+            return f'{v:.0f}'                  # MB/s
+        return f'{v / 1e6:.3f}'                # events/s -> M/s
+
+    legends = {
+        'pcm-iio': ['  pcm-iio, the shared stack: PCIe_wr / PCIe_rd = device DMA writes into /',
+                    '  reads from memory, OB_rd / OB_wr = CPU MMIO to the devices (doorbells),',
+                    '  in Gbps; every other column is VT-d events, millions per second;',
+                    '  n = one-second samples averaged.'],
+        'pcm-memory': ['  pcm-memory: MB/s per socket (N<socket>) and system-wide (Sys);',
+                       '  n = samples averaged.'],
+    }
+    for tool in ('pcm-iio', 'pcm-memory'):
+        ks = pcm_keys(recs, tool)
+        print()
+        if not ks:
+            print(f'  {tool}: no values in these records' +
+                  (' (--membw 0, or recorded before 2026-10-10)' if tool == 'pcm-memory' else ''))
+            continue
+        cols = [(k, label(k)) for k in ks]
+        rows = [[cell(k, r['mean'].get(k)) for k, _ in cols] for r in sorted(recs, key=sort_key)]
+        ws = [max([len(l)] + [len(row[c]) for row in rows]) for c, (_, l) in enumerate(cols)]
+        hdr = f"{'IOMMU':<7} {'BS':<5} {'INST':>4} {'MODE':<9}" + \
+              ''.join(f' {l:>{w}}' for (_, l), w in zip(cols, ws))
+        print(f'{tool}, means over runs (sd of each in the .jsonl)')
+        print(hdr)
+        print('-' * len(hdr))
+        for r, row in zip(sorted(recs, key=sort_key), rows):
+            print(f"{str(r.get('iommu')):<7} {str(r.get('bs')):<5} "
+                  f"{str(r.get('instances_per_ssd')):>4} {str(r.get('mode')):<9}" +
+                  ''.join(f' {c:>{w}}' for c, w in zip(row, ws)))
+        print()
+        print('\n'.join(legends[tool]))
+
+
 def summary(a):
     recs = load(a.files)
-
-    def key(r):
-        return (str(r.get('iommu')), bs_bytes(r.get('bs')), r.get('instances_per_ssd') or 0,
-                {'ssd0only': 0, 'ssd1only': 1, 'both': 2}.get(r.get('mode'), 3))
+    key = sort_key
 
     # Single-drive misses per I/O and IOPS, per IOMMU mode / block size / instances.
     base = {}
@@ -458,6 +535,7 @@ def summary(a):
     print('  IOMMU off/pt has no translation, so compare IOPS and CPU_us/IO across')
     print('  modes at the same BS/INST. LINK BOUND: PCIe write above 85% of the')
     print('  narrowest shared PCIe link, which then caps the run, not the IOMMU.')
+    pcm_tables(recs)
 
 
 def grid(a):

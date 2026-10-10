@@ -1,7 +1,7 @@
 # File map
 
 Which file does what, and which file calls, sources or reads which. Read this
-instead of scanning the repo. It covers every tracked file (as of 2026-10-07,
+instead of scanning the repo. It covers every tracked file (as of 2026-10-10,
 branch `icx-dualnic`).
 
 - Testbed state, results and how to run: [HANDOFF.md](HANDOFF.md)
@@ -72,7 +72,7 @@ scripts/run-dualssd-experiment.sh            one configuration × --runs
  │    ─ sar            → utils/cpu_util.py           → cpu_util.rpt
  │    ─ pcm-iio        reads utils/opCode-6-85.txt from cwd → pcie.csv
  │                     → parse_pciebw_skx (CPU model 85)    → pcie.rpt
- │    ─ pcm-memory     → membw.log → parse_membw            → membw.rpt
+ │    ─ pcm-memory     → membw.log → utils/parse_membw.py   → membw.rpt
  │    writes windows.txt (start/end of each measurement window)
  ─ scripts/dualssd-results.py fio-sum --windows   → reports/<exp>-RUN-<j>-ssd<i>/fio.rpt
  ─ scripts/dualssd-results.py dump                → ~/<sweep>.jsonl (or --results)
@@ -140,7 +140,7 @@ pips_corun_mtu.sh, pips_corun_randread_client.sh ─ sosp24-experiments/count_in
 utils/record-host-metrics.sh, depending on its flags:
   ─ utils/cpu_util.py (--cpu-util)   ─ utils/print_retx_rate.py (--retx)
   ─ utils/parse_tcplog.py (--tcplog) ─ utils/collect_iio_occ.c, compiled on first use (--iio, Skylake only)
-  ─ pcm-iio (--pcie) ─ pcm-memory (--membw) ─ perf (-f)
+  ─ pcm-iio (--pcie) ─ pcm-memory (--membw) ─ utils/parse_membw.py (--membw) ─ perf (-f)
 ```
 
 Called but missing from the repo: `sosp24-experiments/clean_logs.sh` and
@@ -168,7 +168,7 @@ scripts/local/run-traffic.sh · _common.sh · config.sh
 | `utils/iommu-mode.sh` | Prints off / pt / strict / lazy / on for an interface, block device or BDF | `run-dual{nic,ssd}-experiment.sh`, `dualnic_flow_sweep.sh`, `dualssd_sweep.sh`, `discover-ssd-pcie.sh` |
 | `utils/opCode-6-85.txt` | pcm-iio events, Skylake / Cascade Lake (model 85): paper's VT-d set | pcm-iio, run from `utils/` on bigserver |
 | `utils/opCode-6-106.txt` | pcm-iio events, Ice Lake-SP (model 106) | pcm-iio, run from `utils/` on icx |
-| `scripts/dualssd-results.py` | `fio-sum`, `dump`, `summary`, `grid` | `run-dualssd-experiment.sh`, `dualssd_sweep.sh`, `discover-ssd-pcie.sh` |
+| `scripts/dualssd-results.py` | `fio-sum`, `dump`, `summary` (plus every PCM value), `grid` | `run-dualssd-experiment.sh`, `dualssd_sweep.sh`, `discover-ssd-pcie.sh` |
 | `scripts/dualnic-results.py` | `dump`, `summary` | `run-dualnic-experiment.sh`, `dualnic_flow_sweep.sh` |
 | `utils/setup-envir.sh` | MTU, ring, socket buffers, ECN, DDIO, prefetch, PFC | All NIC drivers, locally and over ssh |
 | `utils/tcp/run-netapp-tput.sh` | Starts iperf3 servers or clients | All NIC drivers |
@@ -264,6 +264,7 @@ falls back to default events and every column shifts.
 | `setup-host.sh`, `setup-bare-metal.sh` | manual: older host setup variants, no caller |
 | `setup-server.sh.example`, `setup-server.sh.bigserver.example` | data: config templates (§3) |
 | `cpu_util.py` | called: `sar` log → average busy % (12- and 24-hour formats) |
+| `parse_membw.py` | called: `pcm-memory` log → per-socket and system MB/s (`NODE n` and `SKT n` formats) |
 | `print_retx_rate.py` | called: netstat before/after → retransmit % |
 | `print_netperf_lat_stats.py` | called: netperf log → percentiles |
 | `parse_tcplog.py` | called: ftrace tcp_probe → CSV |

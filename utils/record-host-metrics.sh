@@ -198,6 +198,9 @@ function parse_pciebw() {
 #  10 IOTLB Hit 11 IOTLB Miss 12 VT-d CTXT Miss
 #  13 VT-d L1 Miss 14 VT-d L2 Miss 15 VT-d L3 Miss 16 VT-d Mem Read
 #
+# Every one of these columns goes into pcie.rpt, plus pcie_samples: how many
+# one-second rows were averaged.
+#
 # Columns are looked up by name in the CSV header, with the positions above as
 # the fallback, so a different event file cannot silently shift them the way
 # the Ice Lake file once did.
@@ -240,10 +243,16 @@ function parse_pciebw_skx() {
         echo "         sudo bash utils/discover-ssd-pcie.sh" >&2
     fi
 
+    local n
+    n=$(grep -c "$PCIE_PATTERN" "logs/$OUT_DIR/pcie.csv" 2>/dev/null)
     {
         echo "cpu_model: 85"
+        echo "pcie_samples: ${n:-0}"
         echo "PCIe_wr_tput: $(_skx_gbps "$PCIE_PATTERN" "$(_skx_col 'IB write' 6)")"
         echo "PCIe_rd_tput: $(_skx_gbps "$PCIE_PATTERN" "$(_skx_col 'IB read' 7)")"
+        # Outbound: the CPU's MMIO to the devices (NVMe doorbells), not data.
+        echo "PCIe_ob_rd_tput: $(_skx_gbps "$PCIE_PATTERN" "$(_skx_col 'OB read' 8)")"
+        echo "PCIe_ob_wr_tput: $(_skx_gbps "$PCIE_PATTERN" "$(_skx_col 'OB write' 9)")"
         echo "IOTLB_hits: $(_skx_avg "$vtd" "$(_skx_col 'IOTLB Hit' 10)")"
         echo "IOTLB_misses: $(_skx_avg "$vtd" "$(_skx_col 'IOTLB Miss' 11)")"
         echo "CTXT_Miss: $(_skx_avg "$vtd" "$(_skx_col 'VT-d CTXT Miss' 12)")"
@@ -260,19 +269,10 @@ function dump_membw() {
 }
 
 function parse_membw() {
-    #TODO: make more general, parse memory bandwidth for any given number of sockets
-    echo "Node0_rd_bw: " $(cat logs/$OUT_DIR/membw.log | grep "NODE 0 Mem Read" | awk '{ sum += $8; n++ } END { if (n > 0) printf "%f\n", sum / n; }') > reports/$OUT_DIR/membw.rpt
-    echo "Node0_wr_bw: " $(cat logs/$OUT_DIR/membw.log | grep "NODE 0 Mem Write" | awk '{ sum += $7; n++ } END { if (n > 0) printf "%f\n", sum / n; }') >> reports/$OUT_DIR/membw.rpt
-    echo "Node0_total_bw: " $(cat logs/$OUT_DIR/membw.log | grep "NODE 0 Memory" | awk '{ sum += $6; n++ } END { if (n > 0) printf "%f\n", sum / n; }') >> reports/$OUT_DIR/membw.rpt
-    echo "Node1_rd_bw: " $(cat logs/$OUT_DIR/membw.log | grep "NODE 1 Mem Read" | awk '{ sum += $16; n++ } END { if (n > 0) printf "%f\n", sum / n; }') >> reports/$OUT_DIR/membw.rpt
-    echo "Node1_wr_bw: " $(cat logs/$OUT_DIR/membw.log | grep "NODE 1 Mem Write" | awk '{ sum += $14; n++ } END { if (n > 0) printf "%f\n", sum / n; }') >> reports/$OUT_DIR/membw.rpt
-    echo "Node1_total_bw: " $(cat logs/$OUT_DIR/membw.log | grep "NODE 1 Memory" | awk '{ sum += $12; n++ } END { if (n > 0) printf "%f\n", sum / n; }') >> reports/$OUT_DIR/membw.rpt
-    echo "Node2_rd_bw: " $(cat logs/$OUT_DIR/membw.log | grep "NODE 2 Mem Read" | awk '{ sum += $24; n++ } END { if (n > 0) printf "%f\n", sum / n; }')  >> reports/$OUT_DIR/membw.rpt
-    echo "Node2_wr_bw: " $(cat logs/$OUT_DIR/membw.log | grep "NODE 2 Mem Write" | awk '{ sum += $21; n++ } END { if (n > 0) printf "%f\n", sum / n; }')  >> reports/$OUT_DIR/membw.rpt
-    echo "Node2_total_bw: " $(cat logs/$OUT_DIR/membw.log | grep "NODE 2 Memory" | awk '{ sum += $18; n++ } END { if (n > 0) printf "%f\n", sum / n; }')  >> reports/$OUT_DIR/membw.rpt
-    echo "Node3_rd_bw: " $(cat logs/$OUT_DIR/membw.log | grep "NODE 3 Mem Read" | awk '{ sum += $32; n++ } END { if (n > 0) printf "%f\n", sum / n; }')  >> reports/$OUT_DIR/membw.rpt
-    echo "Node3_wr_bw: " $(cat logs/$OUT_DIR/membw.log | grep "NODE 3 Mem Write" | awk '{ sum += $28; n++ } END { if (n > 0) printf "%f\n", sum / n; }')  >> reports/$OUT_DIR/membw.rpt
-    echo "Node3_total_bw: " $(cat logs/$OUT_DIR/membw.log | grep "NODE 3 Memory" | awk '{ sum += $24; n++ } END { if (n > 0) printf "%f\n", sum / n; }')  >> reports/$OUT_DIR/membw.rpt
+    # The old awk parser here matched only older PCM's "NODE n Mem Read" lines
+    # by fixed field number; current PCM prints "SKT  n", so every value came
+    # out empty. parse_membw.py reads both, for any number of sockets.
+    python3 parse_membw.py logs/$OUT_DIR/membw.log > reports/$OUT_DIR/membw.rpt
 }
 
 function collect_pfc() {

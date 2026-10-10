@@ -179,7 +179,7 @@ Every number in the paper traces back through this chain. Reports live under
 | `sar -P` | `cpu_util.log` | `cpu_util.py` | `cpu_util.rpt` | `collect-tput-stats.py` |
 | `netstat -s` before/after (**sender**) | `retx.log` | `print_retx_rate.py` | `retx.rpt` | scp'd back, then `collect-tput-stats.py` |
 | `pcm-iio` | `pcie.csv` | `parse_pciebw()`, awk by **column index** | `pcie.rpt` | `collect-tput-stats.py` |
-| `pcm-memory` | `membw.log` | `parse_membw()`, greps NODE 0–3 | `membw.rpt` | `collect-tput-stats.py` |
+| `pcm-memory` | `membw.log` | `parse_membw.py` (on this branch; upstream greps NODE 0–3) | `membw.rpt` | `collect-tput-stats.py` |
 | `collect_iio_occ` | `iio.log` | — | — | **nothing. Never parsed.** |
 | netperf (patched) | `netperf-<size>.lat.log` | `print_netperf_lat_stats.py` | `netperf-<size>.lat.rpt` | `collect-lat-stats.py` |
 | ftrace `tcp_probe` | `tcp.trace.log` | `parse_tcplog.py` | `tcp.trace.csv` | manual inspection only |
@@ -372,8 +372,9 @@ read as "the IOMMU is free" when the regime under test was never reached.
 
 ### 4.8 Smaller traps
 
-- **`parse_membw` assumes 4 sockets** (greps NODE 0–3). Survivable: only
-  `Node0_total_bw` is consumed.
+- **`parse_membw` assumes 4 sockets** (greps NODE 0–3) and older PCM's `NODE n`
+  labels. Fixed on this branch by `utils/parse_membw.py` (2026-10-10), which
+  reads any socket count and current PCM's `SKT n` too.
 - **`num_runs=1`** everywhere, so every stddev is 0 and the stddev block is skipped.
 - **Throughput grep is positional** — `collect_stats()` greps `30.*-60.*` against
   an iperf3 log with `-i 30`. Change the interval and it silently yields nothing.

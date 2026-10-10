@@ -582,8 +582,10 @@ In order of what each one decides. Commands run on icx from
 - **Per-core CPU is only in `cpu_util.rpt`,** not in the JSON.
 - **Retransmits are never collected.** The runner copies `retx.rpt` from styx,
   but styx never writes one.
-- **`membw.rpt` has no values.** The `pcm-memory` output is not parsed, so the
-  JSON has no memory-bandwidth fields.
+- **`membw.rpt` had no values.** The old awk parser matched only older PCM's
+  `NODE n` lines. `utils/parse_membw.py` (2026-10-10) also reads current PCM's
+  `SKT n`, which should fill the `Node<N>_*_bw` fields in the dual-NIC JSON
+  too. Not yet checked on icx.
 - **Several IOMMU events are not programmed:** page-walk-cache lookups and
   misses, invalidations, and page-walker saturation (§4.3, item 2).
 
@@ -770,7 +772,7 @@ output. Each sweep takes a fresh name, `dualssd-sweep-<iommu>-<N>`, or the
 
 | Path | Contents |
 |---|---|
-| `~/<sweep>.jsonl`, `~/<sweep>.txt` | one JSON line per configuration; the summary table |
+| `~/<sweep>.jsonl`, `~/<sweep>.txt` | one JSON line per configuration; the summary table, then every `pcm-iio` and `pcm-memory` value |
 | `utils/logs/<sweep>/sweep.log` | everything the sweep printed |
 | `utils/logs/<sweep>/<config>.console.log` | one configuration's runner output |
 | `utils/logs/<sweep>/<config>-RUN-<j>/` | raw logs: `pcie.csv` (`pcm-iio`, every stack, every second), `pcm-iio.out` (its banner and warnings), `membw.log` (`pcm-memory`), `pcm.txt` (binary, core, row parsed), the `opCode-6-85.txt` that defines the CSV columns, `cpu_util.log`, `windows.txt` (window start/end), `fio-ssd<i>-<k>.json/.err` and `fio-ssd<i>-<k>_iops.1.log` (per-second IOPS) |
@@ -804,6 +806,26 @@ layout: its runs are directly under `utils/logs/` and `utils/reports/` as
 
 - **Compare IOTLB misses per I/O** (misses/s ÷ IOPS), not raw counts. Across
   block sizes compare **MISS/4K**, misses per 4 KiB read.
+- **Every PCM value is in the JSONL and the `.txt` (since 2026-10-10).**
+  - From `pcm-iio`, on the SSD row:
+    - inbound write and read (`PCIe_wr_tput`, `PCIe_rd_tput`)
+    - outbound read and write (`PCIe_ob_*`: the CPU's MMIO, i.e. NVMe doorbells)
+    - all 7 VT-d events
+    - `pcie_samples`
+  - From `pcm-memory`:
+    - read, write and total MB/s per socket (`Node<N>_*_bw`) and system-wide
+      (`System_*_bw`)
+    - `membw_samples`
+  - Each record lists these keys under `pcm_keys`, and also stores `pcm_row`
+    and `membw` (on/off). The `.txt` prints two more tables after the summary.
+  - **Earlier records lack the outbound and all `pcm-memory` values.** The old
+    awk parser wrote empty values on bigserver: it matched only older PCM's
+    `NODE n Mem Read` lines, and current PCM prints `SKT  n`. Not yet checked
+    against a real bigserver `membw.log`; the first run shows values or prints
+    a warning with the log's first lines. The raw logs still hold the data:
+    `python3 utils/parse_membw.py utils/logs/<sweep>/<config>-RUN-<j>/membw.log`.
+  - Per-channel memory bandwidth and the other `pcm-iio` stacks stay in the
+    raw logs only.
 - **Block size** (`dualssd_bs_sweep.sh`): a 1 MiB read costs one map, unmap
   and invalidation, like a 4 KiB read, for 256× the data. If the 4k ceiling
   is a per-I/O cost, GB/s rises with block size until the uplink binds (LINK

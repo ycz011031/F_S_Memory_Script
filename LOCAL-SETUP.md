@@ -257,7 +257,7 @@ script. This table is what it will contain; it is here so you can sanity-check i
    [collect_iio_occ.c:22-30](utils/collect_iio_occ.c#L22-L30), so it reads garbage on
    Ice Lake. Harmless to remove: `iio.log` is never parsed
    ([record-host-metrics.sh:322](utils/record-host-metrics.sh#L322) has the TODO).
-7. **Guard `parse_membw`** for a 2-socket box (upstream greps NODE 0 through 3).
+7. ~~**Guard `parse_membw`** for a 2-socket box~~ (done 2026-10-10: `utils/parse_membw.py`).
 8. **Interface name out of the wrappers** — `ens2f1np1` is repeated in all five.
 9. **Sender-saturation preflight** — a check that the Broadwell can actually fill
    the link, so a slow sender is not mistaken for "the IOMMU is free".
