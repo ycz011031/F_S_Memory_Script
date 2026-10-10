@@ -49,9 +49,11 @@
 # off, run again. The mode is read from sysfs and put in the sweep's name.
 #
 # Nothing is ever overwritten. Each sweep gets a new name, <name>: the -o NAME
-# given (refused if already used), or <prefix>-<iommu>-<N> with prefix
-# dualssd-sweep ($SWEEP_PREFIX overrides) and N the first number not used by
-# any earlier sweep. It writes:
+# given (refused if ~/<name>.jsonl or .txt exists), or <prefix>-<iommu>-<N>
+# with prefix dualssd-sweep ($SWEEP_PREFIX overrides) and N the first number
+# with no ~/<name>.jsonl or .txt, so clearing those out of ~ restarts N at 1.
+# Logs or reports still in utils/ under that name are moved aside to
+# <name>.old-<date>-<time>, not deleted. It writes:
 #   ~/<name>.jsonl                one JSON line per configuration
 #   ~/<name>.txt                  the summary table printed at the end (and,
 #                                 for several block sizes AND instance counts,
@@ -92,7 +94,7 @@ while [ $# -gt 0 ]; do
         --asy-low)   ASY=1; ASY_LOW="$2"; shift 2 ;;
         --asy-high)  ASY=1; ASY_HIGH="$2"; shift 2 ;;
         --no-swap)   SWAP=0; shift ;;
-        -h|--help) sed -n '2,65p' "$SELF"; exit 0 ;;
+        -h|--help) sed -n '2,67p' "$SELF"; exit 0 ;;
         -*)        echo "unknown option: $1" >&2; exit 2 ;;
         *)         POS+=( "$1" ); shift ;;
     esac
@@ -135,22 +137,30 @@ IOMMU=$(for s in "${SSD_SERIALS[@]}"; do
 DIR="${RESULTS_DIR:-$HOME}"
 PREFIX="${SWEEP_PREFIX:-dualssd-sweep}"
 UTILS="$(cd ../utils && pwd)"
-used() {   # <name> -> true if any output of that name exists
-    [ -e "$DIR/$1.jsonl" ] || [ -e "$DIR/$1.txt" ] \
-        || [ -e "$UTILS/logs/$1" ] || [ -e "$UTILS/reports/$1" ]
+used() {   # <name> -> true if that sweep's results are in $DIR
+    [ -e "$DIR/$1.jsonl" ] || [ -e "$DIR/$1.txt" ]
 }
 if [ -z "$NAME" ]; then
     n=1
     while used "$PREFIX-$IOMMU-$n"; do n=$((n + 1)); done
     NAME="$PREFIX-$IOMMU-$n"
 elif used "$NAME"; then
-    echo "ERROR: a sweep named '$NAME' already has output; refusing to overwrite it." >&2
+    echo "ERROR: a sweep named '$NAME' already has results in $DIR; refusing to overwrite them." >&2
     echo "  Pick another -o NAME, or leave -o out for a fresh numbered name." >&2
     exit 1
 fi
 JSONL="$DIR/$NAME.jsonl"
 TXT="$DIR/$NAME.txt"
 LOGDIR="$UTILS/logs/$NAME"
+# Logs and reports of an earlier sweep of this name, whose results have since
+# been cleared from $DIR, are moved aside: the runner refuses to reuse them.
+MOVED=()
+stamp=$(date +%Y%m%d-%H%M%S)
+for d in "$LOGDIR" "$UTILS/reports/$NAME"; do
+    [ -e "$d" ] || continue
+    mv "$d" "$d.old-$stamp" || { echo "ERROR: could not move aside $d" >&2; exit 1; }
+    MOVED+=( "$d.old-$stamp" )
+done
 mkdir -p "$LOGDIR"
 # Everything below is also saved to the sweep's log. The tee ignores Ctrl-C,
 # so a sweep stopped by hand can still print and save its summary.
@@ -167,6 +177,7 @@ echo "######## results: $JSONL"
 echo "########          $TXT"
 echo "######## logs:    $LOGDIR/   (sweep.log = this output)"
 echo "######## reports: $UTILS/reports/$NAME/"
+for d in ${MOVED[@]+"${MOVED[@]}"}; do echo "######## old output of this name moved to $d/"; done
 
 FAILED=()   # "<config>  exit <status>: <first error>", also in failed.txt
 
