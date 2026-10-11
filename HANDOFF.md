@@ -8,14 +8,17 @@ together, [LOCAL-SETUP.md](LOCAL-SETUP.md) for first-time provisioning.
 - **Branch:** `icx-dualnic` on `ycz011031/F_S_Memory_Script`
 - **Upstream:** `host-architecture/Fast-and-Safe-IO-Memory-Protection` (remote `upstream`)
 - `master` is a pristine mirror. `git diff master..icx-dualnic` is the whole delta.
-- **Last updated:** 2026-10-04: the uncapped flow sweep (§4.1) and the IOMMU
-  counters checked against Intel's Ice Lake event list (§4.3).
+- **Last updated:** 2026-10-11: dual-SSD sweeps on switch design D (§7, "Fifth
+  result"). icx last updated 2026-10-04: the uncapped flow sweep (§4.1) and
+  the IOMMU counters checked against Intel's Ice Lake event list (§4.3).
 - **Headline:** IOMMU strict and IOMMU off give the same throughput in every
   configuration run so far. Reasons are speculated in §4.1; the experiments
   that would settle them are in §5.
 - **Second testbed (2026-10-05):** the same experiment with two NVMe SSDs and
   fio on bigserver, a Skylake-SP host (§7). Strict vs off block-size sweep
-  done: strict caps 4k reads at 40% of off (§7, "Third result").
+  done: strict caps 4k reads at 40% of off (§7, "Third result"). Switch
+  design D (2026-10-10) shares the uplink evenly where A and C starved
+  drive 0; use it for IOMMU work (§7, "Fifth result").
 
 ---
 
@@ -775,7 +778,9 @@ stops with FATAL.
   are the comparison there. Its PCIe and IOMMU values are recorded as missing
   (`n/a`, `pcie_samples: 0`), not as 0. The off sweeps of 2026-10-05/06 all
   had `pcm-iio` rows: bandwidth as usual, VT-d counters near 0. So no rows
-  with the IOMMU off is still worth a look at `pcm-iio.out`.
+  with the IOMMU off is still worth a look at `pcm-iio.out`. On 2026-10-10 it
+  happened in 3 strict runs (4k, 40 and 64 instances in total) and 3 off
+  co-runs (4k at 1 and 2 per drive, 8k at 1); cause not yet looked at.
 - **A sweep never aborts on a failed point (since 2026-10-10).** Whatever the
   failure, including the datapath check, the sweep logs the point with the
   runner's first error and moves on. It writes them to
@@ -796,9 +801,15 @@ stops with FATAL.
 - **Cores are split in proportion** to the two counts, from both drives'
   `SSD_CORES` together, so every core runs about as many instances. The
   lighter drive keeps the head of its own list (fio off the interrupt CPUs).
-  With 18 cores: 4+32 → 2 and 16 cores; 8+16 → 6 and 12; 2+16 → 2 and 16.
-  Even co-runs keep the 9 + 9 split. Each record stores `instances_ssd<i>` and
-  `cores_ssd<i>`; `instances_per_ssd` is `"n0+n1"`.
+  With 18 cores: 2+32 → 1 and 17 cores; 4+32 → 2 and 16; 8+16 → 6 and 12;
+  2+16 → 2 and 16. Even co-runs keep the 9 + 9 split. Each record stores
+  `instances_ssd<i>` and `cores_ssd<i>`; `instances_per_ssd` is `"n0+n1"`.
+- **Against 32, the split halves the light drive's cores** (2 instances per
+  core, against 1 in the even run `vsLOW` compares with). At 4–8k that alone
+  costs it about half its IOPS, so `vsLOW` there mixes the neighbour's cost
+  with the core loss (Fifth result, item 3). Against 16 the light drive keeps
+  about one core per instance (8+16: 6 cores). To separate the two, the light drive needs one core
+  per instance; the runner has no option for that yet.
 - **The summary adds an "uneven co-runs" table.** It shows both orientations
   side by side, with the even co-runs at LOW and at HIGH. `vsLOW` is the LOW
   drive's IOPS as % of its own IOPS when both drives ran LOW: what a heavier
@@ -1169,10 +1180,11 @@ the invalidation is the cost.
 
 `dualssd_cross_sweep.sh --single` with `--membw 0`, one run per point: 4k–1m
 × 1/2/4/8 instances, both drives and drive 0 alone. Six sweeps, three switch
-designs (RTL), each strict and off. Full report with figures and every value:
-https://claude.ai/artifact/AcYH8Ff2Drt5kon44un3gX (private; local copy and the
-results in `dualssd/1006/`, which git ignores). **Do not pool sweeps across
-designs.**
+designs (RTL), each strict and off. Full report with figures and every value,
+now including design D (Fifth result):
+https://claude.ai/artifact/AcYH8Ff2Drt5kon44un3gX (private; local copy
+`dualssd/dualssd-xsweeps-report.html`, results in `dualssd/1006/`, both
+ignored by git). **Do not pool sweeps across designs.**
 
 | Design | strict | off |
 |---|---|---|
@@ -1202,13 +1214,96 @@ share the same link split from 16k up). For C it doesn't fully agree:
    4k) and at 64k (97–99K vs 104–105K). Hypothesis: address width. With the
    IOMMU on, Linux gives the drives IOVAs below 4 GiB (3-DW TLP headers); off,
    physical addresses above 4 GiB (4-DW). Test: strict with `iommu.forcedac=1`.
-   Repeat first (the four points ran back to back, 14:15–14:18).
+   Repeat first (the four points ran back to back, 14:15–14:18). **Repeated
+   on design D (Fifth result, item 4):** the extra writes come back, larger,
+   on another day; the 64k slowness does not.
 5. Strict sweeps differ by up to 26% below the link limit (4k, 1–2 instances;
    B fastest, C slowest). Not attributed to the switch until repeated: one run,
    shared host.
 6. The 990 EVO Plus has 1.6 GB written, so most of its random reads hit
    unwritten blocks (1.48M IOPS at 4k, above its 850K rating). It acts as a
    fast DMA source, not a loaded SSD.
+
+### Fifth result: design D shares the link fairly (2026-10-10)
+
+`dualssd_cross_sweep.sh --single --asy`, one run per point: 4k–1m × 1–32
+instances per drive, drive 0 alone, and uneven co-runs (2/4/8 against 16/32,
+both ways round). One switch design, D: the RTL in use on 2026-10-10. What
+changed from A–C is not recorded here. Results in `dualssd/1010/`; the report
+above now covers D too. The sweeps reuse the names `strict-1` and `off-2`, so
+keep them apart from the 10-06 files of the same name.
+
+| Design | strict | off |
+|---|---|---|
+| D | `dualssd-xsweep-strict-1` (10-10 18:48–22:19) | `dualssd-xsweep-off-2` (10-10 23:43 – 10-11 03:14) |
+
+`dualssd-xsweep-off-1` stopped at the datapath check (no `pcm-iio` rows),
+before `a268b81f7` kept such runs with the IOMMU off; `off-2` is the rerun.
+
+1. **The starvation of A and C is gone.** Drive 0's share of the fio bytes,
+   8 instances per drive:
+
+   | Block | A off | C off | B off | D off | D strict |
+   |---|---|---|---|---|---|
+   | 4k | 10% | 10% | 52% | 48% | 55% (IOMMU-bound, link not full) |
+   | 8k | 1% | 1% | 43% | 43% | 49% |
+   | 16k | 13% | 14% | 50% | 51% | 47% |
+   | 64k | 59% | 59% | 75% | 69% | 68% |
+   | 1m | 2% | 2% | 53% | 49% | 49% |
+
+   - It holds at 16 and 32 per drive (16k 47–51%, 1m 49%), in both IOMMU
+     modes. Per-drive p99 at 1m, 8 instances: 119 / 123 ms on D, against
+     2.9 s / 66 ms on A.
+   - 8k at 43% is drive 0's own ceiling: alone it tops out at 360K at 8k
+     (KEPT% 100).
+   - 64k at 68–69% of fio bytes is about 50/50 on the link. `PCIe_wr` is
+     53.8 Gbps (6.7 GB/s) against 4.97 GB/s of fio data; the extra ~1.7 GB/s is
+     the 990 EVO Plus's host memory buffer. Each drive uses ~3.3–3.5 GB/s of
+     the link.
+2. **Uneven co-runs: fair from 16k up.** With the IOMMU off, the light drive
+   keeps 91–100% of its even-run IOPS (`vsLOW`) at 16k and 100% at 64k and
+   1m. Both orientations agree within a few percent.
+3. **At 4–8k against 32 instances the light drive loses about half, from the
+   core split, not the switch.**
+   - 2+32 gives the light drive 1 core (1+17) and 4+32 gives it 2 (2+16):
+     2 instances per core, against 1 in the even run `vsLOW` compares with.
+   - Its IOPS match what that many cores give alone. Off, 4k: 252K on 1 core
+     against 288K for 1 instance alone; 500K on 2 cores against 545K for 2.
+     Against 16 it keeps its cores and 92–102% of its IOPS.
+   - The link is not always full there. Off, 8k, 32+2 halves drive 1 (232K
+     against 464K) at 39.6 Gbps `PCIe_wr`; off, 4k, 32+2 runs at 50.4.
+   - Strict, 4k: the light drive also loses against 16 (`vsLOW` 70–89%). That
+     is the shared IOMMU, the contention under study. The even run at 4 per
+     drive is itself uneven (476K / 210K), so `vsLOW` over 100% there
+     (120–123%) means nothing.
+4. **Below the link, D strict matches design C.** This repeats C's 4k
+   anomaly (Fourth result, item 4) on another day and another design.
+   - Drive 0 / drive 1 at 4k: 159K / 203K at 1 instance (C: 158 / 208),
+     476K / 210K at 4 (C: 469 / 218), 410K / 334K at 8 (C: 403 / 329).
+   - Drive 0 alone at 1 instance: 186.5K (C: 183K; A, B: 227–236K).
+   - Extra inbound writes at 4k: 22.3 / 27.9 / 23.8 Gbps with both drives at
+     4 / 8 / 16 (C: 15.6 / 20.6), and 7.6 / 10.5 / 16.9 / 12.7 Gbps with
+     drive 0 alone at 4 / 8 / 16 / 32. IOMMU off: 0.9–1.4 Gbps.
+   - Misses per 4 KiB at 4 and 8 instances: 2.65 and 3.60 (C: 2.80 and 3.17).
+   - C's slow 64k with drive 0 alone (97–99K) does not recur: 103–105K.
+   - **LINK BOUND misfires here.** The summary flags the 4k strict uneven rows
+     4+16, 32+4 and 8+16 (`PCIe_wr` 54–60 Gbps) while fio moves ~3.07 GB/s
+     (~25 Gbps). On C and D in strict mode at 4k, judge the link by fio's GB/s.
+5. **The strict ceiling does not move with more instances.** 4k: 744K at 8 per
+   drive, 753K at 16 (45% of off's 1,648K). 8k: 5.98 GB/s at 8, 5.92–5.96 at
+   16–32. CPU per I/O at 4k rises from 18.2 to 20.1 µs and p99 at 16 per drive
+   reaches 1.67 s / 1.08 s. The miss rate peaks at 8.6% at 8 and falls to 7.0%
+   at 16.
+6. **Missing points.** Strict, 4k: 32+32, 8+32 and 32+8 failed (`pcm-iio`
+   logged no rows; exit 3, not recorded), so there is no strict 4k co-run at
+   32 per drive. Off: the 4k co-runs at 1 and 2 per drive and the 8k co-run at
+   1 were kept with `PCIe_wr` and IOMMU values `n/a`. 1m at 32 per drive ran in
+   both modes, p99 ~0.45 s per drive; `dmesg` was not checked.
+
+**Reading.** The switch fairness problem of A and C is fixed in D, and D is
+the design to use for IOMMU work: its link split does not depend on the IOMMU
+mode or the load. Its strict 4k anomaly is C's, so the address-width test
+(Next, item 0) can run on D.
 
 ### Counters on Skylake
 
@@ -1260,12 +1355,14 @@ share the same link split from 16k up). For C it doesn't fully agree:
   fio always runs `--readonly`, and the runner refuses drives that are mounted
   or held by md, LVM or dm.
 - **The Gen3 uplink may bind before the IOMMU does.** The summary marks
-  LINK BOUND when PCIe write exceeds 85% of the narrowest shared link.
+  LINK BOUND when PCIe write exceeds 85% of the narrowest shared link. On
+  designs C and D in strict mode at 4k, the extra inbound writes trip it while
+  fio moves only ~25 Gbps (Fifth result, item 4): check fio's GB/s there.
 - **1 MiB at 32 instances puts 1 GiB in flight per drive** (1024 reads). On
   switch designs that starve drive 0 at 1m, its reads waited ~1 s at 4
   instances, so expect several seconds at 32, against a 30 s NVMe timeout.
-  Not yet run; check `dmesg` for nvme timeouts after the first cross sweep
-  that includes it.
+  Ran on design D (2026-10-10), which shares the link fairly: p99 ~0.45 s per
+  drive, no failed point. `dmesg` not checked; still untested on A or C.
 - **Never use a bare `wait` in a script that logs through
   `exec > >(tee ...)`.** It also waits for that `tee`, which never exits
   while the script runs. Reproduced on bash 5.0 and 5.1. This hung every run
@@ -1277,19 +1374,26 @@ share the same link split from 16k up). For C it doesn't fully agree:
 
 ### Next on bigserver
 
-0. **After the cross sweeps (2026-10-06), in this order** (commands in the
-   report's "Next runs"):
-   - **Address pattern.** Repeat design C strict at 4k, 4/8 instances, 3 runs.
-     Record the IOVAs the drives get with the `iommu:map`/`iommu:unmap`
-     tracepoints (about 0.5 s per point; tracing perturbs the run, so not
-     during measurements): their width, spread and reuse distance, which
-     should drive the miss rate. Then strict with `iommu.forcedac=1` (IOVAs
-     above 4 GiB, 64-bit TLPs as with the IOMMU off) on C, with A as control.
-   - **More instances.** Where strict stops gaining (4k is near its ceiling
-     at 8; 8k is still rising). The default cross sweep now goes to 32 per
-     drive; for finer steps, `dualssd_cross_sweep.sh --single "4k 8k" "8 12 16 24 32"`.
-     Past 9 instances per drive, cores run several; `--iodepth 64` is the
-     other way to add load.
+0. **After the cross sweeps (2026-10-06 and 10-10), in this order** (commands
+   in the report's "Next runs"):
+   - **Address pattern, on design D.** D repeats C's strict 4k anomaly
+     (Fifth result, item 4), so C's planned repeat can run on D: strict at
+     4k, 4/8 instances, 3 runs, for the run-to-run spread. Record the IOVAs
+     the drives get with the `iommu:map`/`iommu:unmap` tracepoints (about
+     0.5 s per point; tracing perturbs the run, so not during measurements):
+     their width, spread and reuse distance, which should drive the miss
+     rate. Then strict with `iommu.forcedac=1` (IOVAs above 4 GiB, 64-bit
+     TLPs as with the IOMMU off) on D, with A or B as control.
+   - **Uneven co-runs with the light drive at one core per instance.** The
+     x+32 points at 4k/8k lose half the light drive's IOPS to the core split
+     (Fifth result, item 3). Needs a change to the runner's split in
+     `run-dualssd-experiment.sh`.
+   - **More instances: done on D.** Strict stops gaining at 8 per drive at
+     both 4k (744K, 753K at 16) and 8k (5.98 GB/s). `--iodepth 64` is the
+     remaining way to add load.
+   - **Why `pcm-iio` logged no rows** in 6 runs on 2026-10-10 (listed under
+     "fio is checked against the measurement windows" above): look at those
+     runs' `pcm-iio.out`.
 1. **Lazy mode (`iommu.strict=0`):** the block-size sweep, or at least 4k.
    Then the instance sweep with `--single` in each mode, for the full
    strict / lazy / off comparison below the link (1–2 instances).

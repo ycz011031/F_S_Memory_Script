@@ -72,22 +72,72 @@ blk_bdf() {
 
 # One line from `lspci -vv` of a function: link (and its capability), MPS/MRRS
 # in use, and error bits that are set. Needs root for the capabilities.
+#
+# A link trains to the lower of its two ends, so it is DEGRADED only when it
+# is below what both ends can do: a Gen4 switch port on a Gen3 root port, or
+# an x8 port with an x4 drive, is normal. Error bits are sticky: set at any
+# time since boot or since software last cleared them, not necessarily now.
 lspci_brief() {
-    lspci -vv -s "$1" 2>/dev/null | awk '
-        function grab(line,   i, n, f) { n = split(line, f, /[ \t,]+/)
-            s = ""; w = ""; for (i = 1; i < n; i++) { if (f[i] == "Speed") s = f[i+1]; if (f[i] == "Width") w = f[i+1] }
-            return s " " w }
+    local partner pcap=""
+    partner=$(link_partner "$1")
+    [ -n "$partner" ] && pcap=$(lspci -vv -s "$partner" 2>/dev/null | awk "$LSPCI_LINK_AWK"'
+        /LnkCap:/ { print grab($0); exit }')
+    lspci -vv -s "$1" 2>/dev/null | awk -v pcap="$pcap" "$LSPCI_LINK_AWK"'
+        function num(s) { gsub(/[^0-9.]/, "", s); return s + 0 }
         /LnkCap:/ { cap = grab($0) }
-        /LnkSta:/ { sta = grab($0); if ($0 ~ /downgraded/) dg = 1 }
+        /LnkSta:/ { sta = grab($0) }
         /^[ \t]+MaxPayload [0-9]+ bytes, MaxReadReq/ { mps = $2; mrrs = $5 }
         /DevSta:|UESta:|CESta:/ { tag = $1; for (i = 2; i <= NF; i++)
             if ($i ~ /\+$/ && $i !~ /^(AuxPwr|TransPend)/) err = err " " tag $i }
         END {
-            if (sta != "") printf "link %s (cap %s)%s", sta, cap, (dg || (sta != cap && cap != "")) ? " DOWNGRADED" : ""
-            else printf "link ?"
+            if (sta == "") printf "link ?"
+            else {
+                split(sta, a, " "); split(cap, c, " "); ms = num(c[1]); mw = num(c[2])
+                if (pcap != "") { split(pcap, p, " ")
+                    if (num(p[1]) < ms) ms = num(p[1]); if (num(p[2]) < mw) mw = num(p[2]) }
+                printf "link %s", sta
+                if (num(a[1]) < ms || num(a[2]) < mw)
+                    printf " DEGRADED: both ends can do %gGT/s x%d", ms, mw
+                else if (sta != cap)
+                    printf " (this end can do %s%s)", cap, pcap != "" ? ", the other end cannot" : ""
+            }
             printf "  MPS %s MRRS %s", mps == "" ? "?" : mps, mrrs == "" ? "?" : mrrs
-            printf "  errors:%s\n", err == "" ? " none" : err
+            printf "  error bits (sticky):%s\n", err == "" ? " none" : err
         }'
+}
+LSPCI_LINK_AWK='
+    function grab(line,   i, n, f, s, w) { n = split(line, f, /[ \t,]+/)
+        for (i = 1; i < n; i++) { if (f[i] == "Speed") s = f[i+1]; if (f[i] == "Width") w = f[i+1] }
+        return s " " w }'
+
+# The function at the other end of a function's link: below a root or
+# downstream port, the device on its secondary bus; above anything else, the
+# port it hangs off. Empty if there is none or lspci cannot tell (not root).
+link_partner() {
+    local d
+    case "$(lspci -vv -s "$1" 2>/dev/null | grep -oE 'Express \(v[0-9]\) [A-Za-z ]+' | head -1)" in
+        *"Root Port"*|*"Downstream Port"*)
+            for d in /sys/bus/pci/devices/"$1"/????:??:??.0; do
+                [ -e "$d" ] && { basename "$d"; return 0; }
+            done ;;
+        *)
+            d=$(basename "$(dirname "$(readlink -f "/sys/bus/pci/devices/$1")")")
+            [[ $d =~ ^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]$ ]] && echo "$d" ;;
+    esac
+    return 0
+}
+
+# Kernel log lines that report a PCIe, IOMMU or NVMe problem. Not the boot-time
+# "_OSC: platform does not support [... AER ... DPC]" lines.
+PIPS_KERNEL_ERR_RE='AER: |DPC: |DMAR: \[DMA|DMAR:.*[Ff]ault|pciehp.*(Link Down|Card not present)|nvme.*(timeout|[Rr]eset|I/O error|failed)'
+
+# BAR0 of a function as the kernel holds it: prints "<start> <bytes>" (hex
+# start, decimal size), start 0 when the BAR is not assigned.
+bar0_of() {
+    local s e
+    read -r s e _ < "/sys/bus/pci/devices/$1/resource" 2>/dev/null || return 1
+    [ $((e)) -gt 0 ] || return 1
+    printf '%s %d\n' "$s" $(( e - s + 1 ))
 }
 
 # Make utils/logs/<name>/ (or $PIPS_LOGS/<name>/) for this run and print its

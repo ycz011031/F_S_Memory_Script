@@ -336,7 +336,7 @@ falls back to default events and every column shifts.
 | `utils/logs/<sweep>/`, `utils/reports/<sweep>/` | sweeps group their runs here (`-E <sweep>/<config>`), plus `sweep.log`, `datapath.jsonl` and, for the dual-SSD sweeps, `failed.txt` | no |
 | `utils/logs/<exp>.console.log` | `run-dualssd-experiment.sh`: its full console output | no |
 | `~/<sweep>.jsonl`, `~/<sweep>.txt` | `*-results.py dump` / the sweeps' summary step, on the host that ran them | no |
-| `/dualssd/`, `/dualnic/` | copies of `~/*.jsonl` / `.txt` brought back for analysis | no (ignored) |
+| `/dualssd/`, `/dualnic/` | copies of `~/*.jsonl` / `.txt` brought back for analysis; `dualssd/` keeps one folder per batch (`1006/`, `1010/`; sweep names repeat across batches) and `dualssd-xsweeps-report.html`, the local copy of the cross-sweep report (HANDOFF §7) | no (ignored) |
 | `/tmp/dualssd-experiment.lock` | `run-dualssd-experiment.sh`: one run at a time | no |
 | `utils/logs/pips-bringup-<date>-<time>/`, `utils/logs/pips-fio-<date>-<time>/` (or `-o` / `-E` name) | `pips-bringup.sh`, `pips-fio-log.sh`: lspci, dmesg, register readouts, `hwtest.txt`, fio JSON, `log.bin` + its decode | no |
 | `/tmp/pips-run.lock`, `/tmp/pips-bar0.lock` | the PIPS scripts (one at a time) and the `pips` tool (one BAR0 user at a time) | no |

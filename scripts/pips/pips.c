@@ -218,22 +218,35 @@ static void open_bar(void)
     snprintf(g_bdf, sizeof g_bdf, "sim");
     sim_open();
 #else
+    unsigned long long start = 0, end = 0;
     char path[512];
-    struct stat st;
     uint16_t cmd;
+    FILE *f;
     void *p;
     int fd;
 
     find_usp();
-    snprintf(path, sizeof path, "/sys/bus/pci/devices/%s/resource0", g_bdf);
-    if (stat(path, &st))
+    /* BAR0 as the kernel holds it: first line of `resource`, "start end flags".
+     * Unassigned: start 0. Not implemented by the bitstream: all zero. */
+    snprintf(path, sizeof path, "/sys/bus/pci/devices/%s/resource", g_bdf);
+    if (!(f = fopen(path, "r")))
         die("%s: %s (wrong BDF?)", path, strerror(errno));
+    if (fscanf(f, "%llx %llx", &start, &end) != 2)
+        start = end = 0;
+    fclose(f);
+    if (!end)
+        die("%s has no BAR0: this bitstream's upstream port has none", g_bdf);
+    if (end - start + 1 != PIPS_BAR0_SIZE)
+        die("%s: BAR0 is %llu bytes. PIPS with the host register block (map v2) has a 32 KB "
+            "BAR0, so this bitstream predates it (FPGA repo af165d6) or was built with another "
+            "upstream-port BAR size. Not touching it: without the PIO, BAR0 accesses are "
+            "forwarded to the device on downstream port one", g_bdf, end - start + 1);
+    if (!start)
+        die("%s: BAR0 has no address (Region 0 <unassigned>): boot with pci=realloc", g_bdf);
     if (cfg_space(4, &cmd, 2) == 0 && !(cmd & 2))
         die("%s: memory space is disabled (Mem-). Enable it: setpci -s %s COMMAND=0x02:0x02",
             g_bdf, g_bdf);
-    if (st.st_size < PIPS_BAR0_SIZE)
-        die("%s is %lld bytes, expected %u: BAR0 not assigned? (boot with pci=realloc)",
-            path, (long long)st.st_size, PIPS_BAR0_SIZE);
+    snprintf(path, sizeof path, "/sys/bus/pci/devices/%s/resource0", g_bdf);
     if ((fd = open(path, O_RDWR | O_SYNC)) < 0)
         die("open %s: %s%s", path, strerror(errno), errno == EACCES ? " (run as root)" : "");
     p = mmap(NULL, PIPS_BAR0_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);

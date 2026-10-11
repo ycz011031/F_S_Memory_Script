@@ -246,7 +246,7 @@ for r in CQ_SPLIT MWR_COUNT MRD_COUNT PIO_STATUS WIN_STATUS; do
         "$(awk -v r="$r" '$1 == r { $1 = ""; print substr($0, 2) }' "$OUT/info-before.txt")" \
         "$(awk -v r="$r" '$1 == r { $1 = ""; print substr($0, 2) }' "$OUT/info-after.txt")"
 done
-echo "  kernel log: $(wc -l < "$OUT/dmesg.txt") new lines$(grep -qiE 'AER|DPC|DMAR|nvme.*(timeout|reset)' "$OUT/dmesg.txt" && echo ', AER/DMAR/NVMe errors among them: see dmesg.txt')"
+echo "  kernel log: $(wc -l < "$OUT/dmesg.txt") new lines$(grep -qE "$PIPS_KERNEL_ERR_RE" "$OUT/dmesg.txt" && echo ', PCIe/IOMMU/NVMe errors among them: see dmesg.txt')"
 diff <(grep -E 'LnkSta:|UESta:|CESta:|DevSta:' "$OUT/lspci-before.txt") \
      <(grep -E 'LnkSta:|UESta:|CESta:|DevSta:' "$OUT/lspci-after.txt") > /dev/null ||
     echo "  link or error status changed during the run: diff lspci-before.txt lspci-after.txt"

@@ -19,7 +19,8 @@
 #   bringup.log            this output
 #   lspci-tree.txt         lspci -tvnn
 #   lspci-<BDF>.txt        lspci -vvv of the root port and every PIPS function
-#   dmesg.txt              kernel log; dmesg-pips.txt: lines about PIPS, AER, DMAR
+#   dmesg.txt              kernel log; dmesg-pips.txt: lines naming a PIPS function
+#                          or reporting an error; dmesg-errors.txt: the errors only
 #   info.txt cfg.txt dma.txt   pips readouts before the tests
 #   hwtest.txt             pips hwtest
 #   log-smoke.bin/.txt     the empty recording hwtest made, and its decode
@@ -38,7 +39,7 @@ while [ $# -gt 0 ]; do
         --ddr-addr) DDR_ADDR="$2"; shift 2 ;;
         --enable-mem) ENABLE_MEM=1; shift ;;
         -o) NAME="$2"; shift 2 ;;
-        -h|--help) sed -n '2,27p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
         *) echo "unknown option: $1 (-h for help)" >&2; exit 2 ;;
     esac
 done
@@ -77,9 +78,23 @@ if [ -n "$cmd" ] && [ $((0x$cmd & 2)) -eq 0 ]; then
         RESULT[enum]=FAIL
     fi
 fi
-size=$(stat -c %s "$D/resource0" 2>/dev/null)
-if [ "${size:-0}" -lt 32768 ]; then
-    echo "  resource0 is ${size:-missing} bytes, expected 32768: BAR0 not assigned (boot with pci=realloc)"
+BAR_OK=0
+read -r bar_start bar_size < <(bar0_of "$BDF")
+if [ -n "${bar_size:-}" ] && [ "$bar_size" -eq 32768 ] && [ $((bar_start)) -ne 0 ]; then
+    BAR_OK=1
+    echo "  BAR0 $bar_start, 32 KB"
+elif [ -z "${bar_size:-}" ]; then
+    echo "  BAR0 does not exist: this bitstream has no BAR0 on the upstream port"
+    RESULT[enum]=FAIL
+elif [ "$bar_size" -ne 32768 ]; then
+    echo "  BAR0 is $bar_size bytes. PIPS with the host register block (BAR0 map v2) has"
+    echo "  32 KB, so this bitstream predates it (FPGA repo af165d6) or was built with another"
+    echo "  upstream-port BAR size. Program a build of the current pips.tcl, then rescan."
+    echo "  BAR0 is left alone: in builds without the PIO, BAR0 accesses are forwarded to"
+    echo "  the device on downstream port one (PIO_KNOWLEDGE_MAP D6)."
+    RESULT[enum]=FAIL
+elif [ $((bar_start)) -eq 0 ]; then
+    echo "  BAR0 is not assigned an address (Region 0 <unassigned>): boot with pci=realloc"
     RESULT[enum]=FAIL
 fi
 
@@ -104,8 +119,10 @@ for b in $(pips_below "$BDF"); do
     printf '    %-14s %s:%s %s  driver %s\n' "$b" "${ven#0x}" "${dev#0x}" "$role" "${drv:-none}"
     printf '    %-14s %s\n' "" "$(lspci_brief "$b")"
     case "$ven" in 0x10ee) ;; *)
-        grp=$(basename "$(readlink -f "/sys/bus/pci/devices/$b/iommu_group" 2>/dev/null)" 2>/dev/null)
-        printf '    %-14s IOMMU group %s, unit %s, mode %s, NUMA %s\n' "" "${grp:-none}" \
+        grp=none
+        [ -e "/sys/bus/pci/devices/$b/iommu_group" ] &&
+            grp=$(basename "$(readlink -f "/sys/bus/pci/devices/$b/iommu_group")")
+        printf '    %-14s IOMMU group %s, unit %s, mode %s, NUMA %s\n' "" "$grp" \
             "$(l=/sys/bus/pci/devices/$b/iommu; [ -e "$l" ] && basename "$(readlink -f "$l")" || echo none)" \
             "$(bash "$PIPS_REPO/utils/iommu-mode.sh" "$b" 2>/dev/null)" \
             "$(cat "/sys/bus/pci/devices/$b/numa_node" 2>/dev/null)" ;;
@@ -127,11 +144,17 @@ RESULT[enum]=${RESULT[enum]:-ok}
 # ---------------------------------------------------------------------------
 section "2. Kernel log"
 if dmesg > "$OUT/dmesg.txt" 2>/dev/null; then
-    pat="$(for b in $BDF $(pips_below "$BDF"); do printf '%s|' "$b"; done)AER|DMAR|DPC|pciehp"
+    pat="$(for b in $BDF $(pips_below "$BDF"); do printf '%s|' "$b"; done)$PIPS_KERNEL_ERR_RE"
     grep -E "$pat" "$OUT/dmesg.txt" > "$OUT/dmesg-pips.txt"
-    echo "  $(wc -l < "$OUT/dmesg-pips.txt") lines about PIPS, AER, DMAR (dmesg-pips.txt); the last 15:"
-    tail -15 "$OUT/dmesg-pips.txt" | sed 's/^/    /'
-    grep -qiE 'AER|DPC' "$OUT/dmesg-pips.txt" && echo "  NOTE: AER/DPC lines present: check them"
+    grep -E "$PIPS_KERNEL_ERR_RE" "$OUT/dmesg.txt" > "$OUT/dmesg-errors.txt"
+    echo "  $(wc -l < "$OUT/dmesg-pips.txt") lines name a PIPS function or report an error (dmesg-pips.txt); the last 10:"
+    tail -10 "$OUT/dmesg-pips.txt" | sed 's/^/    /'
+    if [ -s "$OUT/dmesg-errors.txt" ]; then
+        echo "  $(wc -l < "$OUT/dmesg-errors.txt") PCIe/IOMMU/NVMe error lines since boot (dmesg-errors.txt); the last 5:"
+        tail -5 "$OUT/dmesg-errors.txt" | sed 's/^/    /'
+    else
+        echo "  no AER, DPC, DMAR fault or NVMe error lines since boot"
+    fi
 else
     echo "  dmesg not readable (needs root)"
 fi
@@ -139,7 +162,10 @@ fi
 # ---------------------------------------------------------------------------
 section "3. Registers before the tests"
 P() { "$PIPS" -s "$BDF" "$@"; }
-if P info > "$OUT/info.txt" 2>&1; then
+if [ "$BAR_OK" = 0 ]; then
+    echo "  skipped: BAR0 is not the 32 KB PIPS register BAR (section 1)"
+    RESULT[regs]=skipped
+elif P info > "$OUT/info.txt" 2>&1; then
     sed 's/^/  /' "$OUT/info.txt"
     P cfg > "$OUT/cfg.txt" 2>&1; sed 's/^/  /' "$OUT/cfg.txt"
     P dma > "$OUT/dma.txt" 2>&1; sed 's/^/  /' "$OUT/dma.txt"
@@ -157,7 +183,7 @@ if [ "${RESULT[regs]}" = ok ]; then
     sed 's/^/  /' "$OUT/hwtest.txt"
     [ $rc -eq 0 ] && RESULT[hwtest]=ok || RESULT[hwtest]=FAIL
 else
-    echo "  skipped: BAR0 does not answer"
+    echo "  skipped: no BAR0 registers"
     RESULT[hwtest]=skipped
 fi
 
@@ -188,9 +214,11 @@ if [ "$SOAK" -gt 0 ] 2>/dev/null; then
 fi
 
 # ---------------------------------------------------------------------------
-section "Registers after"
-P info > "$OUT/info-after.txt" 2>&1
-grep -E '^(CQ_SPLIT|MWR_COUNT|MRD_COUNT|PIO_STATUS|WIN_STATUS)' "$OUT/info-after.txt" | sed 's/^/  /'
+if [ "${RESULT[regs]}" = ok ]; then
+    section "Registers after"
+    P info > "$OUT/info-after.txt" 2>&1
+    grep -E '^(CQ_SPLIT|MWR_COUNT|MRD_COUNT|PIO_STATUS|WIN_STATUS)' "$OUT/info-after.txt" | sed 's/^/  /'
+fi
 
 section "Summary"
 fail=0

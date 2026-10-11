@@ -10,10 +10,27 @@ None of this has run on hardware yet. It is tested against a software model
 of BAR0 (`make check`, below), so the first hardware run is also the first
 check of the model's assumptions.
 
+## Which bitstream
+
+These tests need a build that has the host register block: FPGA repo
+`pips_batch` at `af165d6` or later, built from its `pips.tcl`. Its upstream
+port has a 32 KB BAR0. Check before anything else:
+
+```bash
+lspci -vv -d 10ee:b048 | grep 'Region 0'     # must end in [size=32K]
+```
+
+Any other size means an older image. The image on bigserver on 2026-10-11 had
+`[size=1K]`, and the `.pdi` in the FPGA repo is from 2026-10-04, before the
+block existed. The tools refuse such a BAR without touching it. In builds
+without the PIO, BAR0 accesses are forwarded to the device on downstream port
+one (PIO_KNOWLEDGE_MAP D6), which on bigserver is the 9100 PRO with data on
+it. Do not poke it with `pci_mem` either.
+
 ## Order of work
 
 ```bash
-# 0. FPGA programmed, then rescan so the switch enumerates
+# 0. FPGA programmed with that build, then rescan so the switch enumerates
 echo 1 | sudo tee /sys/bus/pci/rescan
 
 # 1. Bring-up: enumeration, links, registers, BRAM, regfile, DMA, DDR, error path, empty log
@@ -38,7 +55,7 @@ overwrite one. Only one runs at a time (`/tmp/pips-run.lock`).
 
 | # | Test point | Command | Pass means |
 |---|---|---|---|
-| 1 | Enumeration | `pips-bringup.sh` §1 | USP `10ee:b048` with BAR0 32 KB and Mem+; both downstream ports (`b148`, `b348`); links at their capability; one MaxPayload across the tree; no AER bits |
+| 1 | Enumeration | `pips-bringup.sh` §1 | USP `10ee:b048` with BAR0 32 KB and Mem+; both downstream ports (`b148`, `b348`); no link DEGRADED, i.e. below what both of its ends support (a Gen4 switch on a Gen3 root port is normal); one MaxPayload across the tree. Error bits are sticky since boot: compare before and after, as `pips-fio-log.sh` does |
 | 2 | BAR0 registers | `pips hwtest regs` | `ID` = `0x50495053`, `VERSION` = `0x00020001`, `PIO_STATUS` 0, `SCRATCH` round trips, `MWR_COUNT`/`MRD_COUNT` count exactly, `BUS_NUM` matches config space |
 | 3 | BAR0 BRAM | `pips hwtest bram`, `pips soak N` | 4/8/1-byte round trips at the PIO's known-bad offsets, aliases, unmapped reads 0; soak: no mismatch |
 | 4 | Regfile R/W | `pips hwtest regfile`, `pips cfg [set ...]` | `WIN_BASE` round trip; reg0 at `0xA4000000` reads what XSCT `mrd 0xA4000000` reads; two patterns over every field write and read back, original restored; `0xA4000004` gives a decode error |
