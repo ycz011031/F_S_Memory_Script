@@ -38,6 +38,11 @@ run by hand when needed · **orphan** = no caller and superseded · **data** /
 | Reproduce a SOSP'24 figure | `scripts/sosp24-experiments/{flows_exp,ringbuffer_exp,latency_fig7,no_hcc_fig8,hcc_fig8}.sh` | receiver |
 | Just move packets, no PCM | `scripts/local/run-traffic.sh` (check first: `preflight.sh`) | icx |
 | Survey a machine | `bash scripts/collect-setup-info.sh` | any |
+| PIPS switch: bring-up (enumeration, BAR0, regfile, DMA, DDR, empty log) | `sudo bash scripts/pips/pips-bringup.sh` | PIPS host |
+| PIPS switch: one fio run with the TLP log collected from FPGA DDR | `sudo bash scripts/pips/pips-fio-log.sh` | PIPS host |
+| PIPS switch: one register / test point / log by hand | `sudo scripts/pips/pips <command>` ([scripts/pips/README.md](scripts/pips/README.md)) | PIPS host |
+| PIPS switch: same over JTAG | `source scripts/pips/pips-xsct.tcl` in XSCT | XSCT host |
+| PIPS tools: test without hardware | `make -C scripts/pips check` | any Linux |
 
 Per-host config lives in `utils/setup-server.sh`, which is **git-ignored**.
 Create it from `utils/setup-server.sh.example` (upstream / icx) or
@@ -155,6 +160,29 @@ scripts/local/run-traffic.sh · _common.sh · config.sh
                              ─ SSH scripts/local/_remote-client.sh · _common.sh
 ```
 
+### 2.5 PIPS switch bring-up (`scripts/pips/`)
+
+Test points and the order to run them: [scripts/pips/README.md](scripts/pips/README.md).
+
+```
+scripts/pips/pips-bringup.sh                 enumeration, then the test points
+ · scripts/pips/pips-lib.sh       pips_build, pips_find_usp, pips_below, lspci_brief, pips_outdir, pips_lock
+ ─ make → scripts/pips/pips       built from pips.c + pips_regs.h on first use
+ ─ pips info / cfg / dma / hwtest / log-dump / soak
+ ─ scripts/pips/pips-log-decode.py           the smoke recording
+ ─ utils/iommu-mode.sh <BDF>                 devices behind the switch
+
+scripts/pips/pips-fio-log.sh                 one fio run with a TLP log
+ · scripts/pips/pips-lib.sh       also pips_nvme_below, blk_bdf
+ ─ pips info / cfg / dma, log-clear, log-start, log-wait | log-stop, log-dump
+ ─ fio (system binary, --readonly)
+ ─ scripts/pips/pips-log-decode.py           → log-summary.txt/.json, log.csv
+ ─ utils/iommu-mode.sh <dev>
+
+scripts/pips/Makefile  check ─ pips-sim (pips.c + pips_sim.c) ─ scripts/pips/test-sim.sh
+                                 ─ pips-log-decode.py, pips-fio-log.sh with a stand-in fio
+```
+
 ---
 
 ## 3. Shared pieces and who uses them
@@ -251,6 +279,22 @@ falls back to default events and every column shifts.
 | `_remote-client.sh` | called over ssh by `run-traffic.sh` |
 | `README.md` | doc |
 
+### `scripts/pips/`
+
+| File | Role |
+|---|---|
+| `pips-bringup.sh` | entry: enumeration, links, `pips hwtest`, smoke recording, optional soak |
+| `pips-fio-log.sh` | entry: one read-only fio run on the NVMe behind PIPS, with the TLP log |
+| `pips-lib.sh` | lib: tool build, device discovery below the switch, lspci summary, output folder, run lock |
+| `pips.c` | called/entry: the BAR0 tool (`pips`): registers, window, regfile, DMA, log, DDR dumps, `hwtest`, `soak` |
+| `pips_regs.h` | data: register map, verbatim from the FPGA repo's `sw_handoff/` |
+| `pips-log-decode.py` | called/entry: TLP log → per-port summary, CSV, JSON |
+| `pips-xsct.tcl` | manual: config register, DMA and log over JTAG (XSCT) |
+| `pips_sim.c` | data: BAR0 model for `make check`; never on a testbed |
+| `test-sim.sh` | called: by `make check` |
+| `Makefile` | builds `pips`; `check` builds `pips-sim` and runs `test-sim.sh` |
+| `README.md` | doc: test points, order, expected values |
+
 ### `utils/`
 
 | File | Role |
@@ -294,6 +338,9 @@ falls back to default events and every column shifts.
 | `~/<sweep>.jsonl`, `~/<sweep>.txt` | `*-results.py dump` / the sweeps' summary step, on the host that ran them | no |
 | `/dualssd/`, `/dualnic/` | copies of `~/*.jsonl` / `.txt` brought back for analysis | no (ignored) |
 | `/tmp/dualssd-experiment.lock` | `run-dualssd-experiment.sh`: one run at a time | no |
+| `utils/logs/pips-bringup-<date>-<time>/`, `utils/logs/pips-fio-<date>-<time>/` (or `-o` / `-E` name) | `pips-bringup.sh`, `pips-fio-log.sh`: lspci, dmesg, register readouts, `hwtest.txt`, fio JSON, `log.bin` + its decode | no |
+| `/tmp/pips-run.lock`, `/tmp/pips-bar0.lock` | the PIPS scripts (one at a time) and the `pips` tool (one BAR0 user at a time) | no |
+| `scripts/pips/pips`, `scripts/pips/pips-sim` | `make` in `scripts/pips/` | no (ignored) |
 
 Sweep names never repeat: `<prefix>-<iommu>-<N>` with the first unused `N`
 (prefixes `dualssd-sweep`, `dualssd-bssweep`, `dualssd-xsweep`,

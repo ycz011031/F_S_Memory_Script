@@ -260,6 +260,11 @@ def one_run(reports, exp, j, ssds):
     # parse_pciebw_skx in record-host-metrics.sh for Skylake's).
     pcie = read_kv(os.path.join(base, 'pcie.rpt'))
     pcie.pop('cpu_model', None)
+    # No pcm-iio rows: the parser wrote 0 for every value, but nothing was
+    # measured (the runner keeps such runs only with the IOMMU off or pt).
+    # Keep just the sample count, so the values read as missing, not as 0.
+    if pcie.get('pcie_samples') == 0:
+        pcie = {'pcie_samples': 0.0}
     r.update(pcie)
     miss, wr = pcie.get('IOTLB_misses'), pcie.get('PCIe_wr_tput')
     # The comparison metrics. pcm-iio samples once a second, so counters are

@@ -38,7 +38,8 @@
 #   reports/<name>-RUN-<j>-ssd<i>/fio.rpt
 #
 # Exit status 3: this configuration could not be measured (fio instances died,
-# stalled or missed the window, or pcm-iio logged nothing); sweeps skip it.
+# stalled or missed the window, or pcm-iio logged nothing with the IOMMU on;
+# with it off or pt such a run is kept); sweeps log it and go on.
 set -u
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -81,7 +82,7 @@ while [ $# -gt 0 ]; do
         --runs)         num_runs="$2"; shift 2 ;;
         --results)      results_file="$2"; shift 2 ;;
         -h|--help)
-            sed -n '2,41p' "$SELF"; exit 0 ;;
+            sed -n '2,42p' "$SELF"; exit 0 ;;
         *) echo "unknown option: $1"; exit 2 ;;
     esac
 done
@@ -161,6 +162,13 @@ iommu_mode=$(for i in "${ACTIVE[@]}"; do
                  bash "$HERE/../utils/iommu-mode.sh" "${BDFS[$i]}"
              done | sort -u | paste -sd+)
 iommu_units=$(for i in "${ACTIVE[@]}"; do iommu_unit "${BDFS[$i]}"; done | sort -u | paste -sd+)
+translating() {   # true unless every active drive's IOMMU is off or passthrough
+    local m
+    for m in $(printf '%s' "$iommu_mode" | tr '+' ' '); do
+        case "$m" in off|pt) ;; *) return 0 ;; esac
+    done
+    return 1
+}
 
 # fio processes are found by job name. The [_] keeps the pattern from matching
 # the pkill/pgrep command line itself, and the anchored fio from matching the
@@ -438,12 +446,21 @@ for ((j = 0; j < num_runs; j++)); do
         echo "ERROR: $L/windows.txt is missing; record-host-metrics.sh did not finish." >&2
         bad_run=1
     fi
-    # Without pcm-iio rows every PCIe and IOMMU value of the run reads 0.
-    # (pcie_samples is written by the Skylake parser only.)
+    # No pcm-iio rows means no PCIe or IOMMU values for this run
+    # (pcie_samples is written by the Skylake parser only). With the IOMMU on,
+    # those counters are what the run is for, so it is not valid. With it off
+    # or in passthrough they have nothing to count, and fio's IOPS and the CPU
+    # cost are the comparison: the run is kept, and dualssd-results.py records
+    # its PCIe values as missing rather than 0.
     n=$(awk '/^pcie_samples:/{print $2}' "$setup_dir/reports/$RUN/pcie.rpt" 2>/dev/null)
     if [ "${n:-1}" = 0 ]; then
-        echo "ERROR: pcm-iio logged no rows for '$SSD_PCIE_PATTERN'; see $L/pcm-iio.out" >&2
-        bad_run=1
+        if translating; then
+            echo "ERROR: pcm-iio logged no rows for '$SSD_PCIE_PATTERN'; see $L/pcm-iio.out" >&2
+            bad_run=1
+        else
+            echo "WARNING: pcm-iio logged no rows for '$SSD_PCIE_PATTERN' (see $L/pcm-iio.out)." >&2
+            echo "         IOMMU $iommu_mode: run kept, PCIe values recorded as missing." >&2
+        fi
     fi
     for i in "${ACTIVE[@]}"; do
         F="$setup_dir/reports/$RUN-ssd$i/fio.rpt"
@@ -522,7 +539,12 @@ if [ "$num_runs" -gt 1 ] && [ -f "$P0" ]; then
 else
     P="$P0"
 fi
-if [ -f "$P" ]; then
+# A kept run without pcm-iio rows (IOMMU off or pt) has no counters to show.
+if [ -f "$P" ] && grep -q '^pcie_samples:' "$P" \
+        && awk '/^pcie_samples:/{exit !($2 == 0)}' "$P"; then
+    echo
+    echo "  pcm-iio logged no rows: no PCIe or IOMMU counters for this experiment."
+elif [ -f "$P" ]; then
     echo
     echo "  shared IIO stack counters (sum over ALL active drives), per second:"
     grep -v '^cpu_model:' "$P" | sed 's/^/    /'

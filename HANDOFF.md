@@ -768,9 +768,14 @@ stops with FATAL.
   late start, no early end, no hole over 2 s), and by fio's own `job_start` and
   runtime.
 - If any instance falls short, or one dies during measurement, the runner
-  prints why and stops with exit status 3. So does a run where `pcm-iio`
-  logged no rows for the SSD row, whose PCIe and IOMMU values would all read 0.
-  That run is not recorded.
+  prints why and stops with exit status 3. That run is not recorded.
+- **A run where `pcm-iio` logged no rows for the SSD row** fails the same way
+  when the IOMMU is on: its counters are what the run is for. With the IOMMU
+  off or `pt`, it is kept with a warning, since fio's IOPS and the CPU cost
+  are the comparison there. Its PCIe and IOMMU values are recorded as missing
+  (`n/a`, `pcie_samples: 0`), not as 0. The off sweeps of 2026-10-05/06 all
+  had `pcm-iio` rows: bandwidth as usual, VT-d counters near 0. So no rows
+  with the IOMMU off is still worth a look at `pcm-iio.out`.
 - **A sweep never aborts on a failed point (since 2026-10-10).** Whatever the
   failure, including the datapath check, the sweep logs the point with the
   runner's first error and moves on. It writes them to

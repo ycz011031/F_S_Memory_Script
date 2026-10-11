@@ -1,0 +1,1356 @@
+/*
+ * pips - host-side bring-up tool for PIPS, the FPGA PCIe switch (VCK190).
+ *
+ * Maps the switch's upstream port BAR0 (10ee:b048) through sysfs resource0
+ * and reaches, through it: the BAR0 registers and BRAM, the AXI window, and
+ * behind the window the batcher/logger config register (0xA4000000), the log
+ * DMA (0xA4010000) and the FPGA DDR the DMA writes the TLP log into.
+ *
+ *   sudo ./pips [-s BDF] [-f] <command> [args]
+ *
+ *   info                       identity, status, window and log registers
+ *   rd OFF [N]                 read N 32-bit BAR0 words at OFF
+ *   wr OFF VAL                 write one 32-bit BAR0 word
+ *   axi-rd ADDR [N]            read N 32-bit words at AXI address ADDR
+ *   axi-wr ADDR VAL            write one 32-bit word at AXI address ADDR
+ *   cfg                        batcher/logger config register, decoded
+ *   cfg set K=V...             read-modify-write it: depth= time= mrd= log= raw=
+ *   dma                        log DMA (S2MM) registers, decoded
+ *   dma-reset                  soft-reset the log DMA
+ *   log-clear                  zero the log region in DDR
+ *   log-start                  arm the DMA on the log region, start a recording
+ *   log-stop [MS]              end the recording, wait for the DMA (2000 ms)
+ *   log-wait [MS]              wait for the DMA, recording left on (region full)
+ *   log-dump FILE [BYTES]      copy the recording (default: what the DMA wrote)
+ *   ddr-dump ADDR BYTES FILE   copy any DDR range
+ *   hwtest [--ddr-addr A] [STEP...]   bring-up checks; stops at the first
+ *                              failing step. Steps, in order: regs bram
+ *                              regfile dma ddr err split log (default: all)
+ *   soak [N]                   N random 4/8-byte BRAM write/read pairs (1e6)
+ *
+ *   -s BDF   upstream port (default $PIPS_BDF, else the only 10ee:b048)
+ *   -f       skip the ID/VERSION check (rd and wr never check)
+ *
+ * Exit status: 0 ok, 1 failure, 2 usage, 3 timeout (log-stop, log-wait).
+ * Output lines of the form key=value are for scripts; lines starting with #
+ * are notes. Register map: pips_regs.h. Access rules (single aligned 4/8-byte
+ * accesses, never memcpy on the mapping): README.md in this folder.
+ */
+#define _GNU_SOURCE
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <inttypes.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/file.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+
+#include "pips_regs.h"
+
+#ifdef PIPS_SIM
+#define LOCK_FILE       "/tmp/pips-sim-bar0.lock"
+#else
+#define LOCK_FILE       "/tmp/pips-bar0.lock"
+#endif
+#define USER_CLK_HZ     250e6       /* upstream user_clk, the logger's clock (pips.tcl) */
+#define DEFAULT_DDR_TEST 0x10000000ull
+#define UNMAPPED_AXI    0xB0000000ull
+#define CFG_RESERVED    0xFEFE0000u
+#define DMA_SR_SG_INCLD (1u << 3)
+#define DMA_SR_DLY_IRQ  (1u << 13)
+#define DMA_SR_ERRS     (PIPS_DMA_SR_INT_ERR | PIPS_DMA_SR_SLV_ERR | PIPS_DMA_SR_DEC_ERR)
+#define DMA_SR_IRQS     (PIPS_DMA_SR_IOC | DMA_SR_DLY_IRQ | PIPS_DMA_SR_ERR_IRQ)
+#define TRAILER_INFO    0x88
+
+/* ------------------------------------------------------------ BAR0 access */
+#ifdef PIPS_SIM
+/* pips_sim.c: a software model of BAR0, for testing without hardware */
+uint32_t sim_rd32(uint32_t off);
+void sim_wr32(uint32_t off, uint32_t v);
+uint64_t sim_rd64(uint32_t off);
+void sim_wr64(uint32_t off, uint64_t v);
+void sim_wr8(uint32_t off, uint8_t v);
+void sim_open(void);
+int sim_cfg_read(unsigned off, void *buf, size_t n);
+#define bar_rd32 sim_rd32
+#define bar_wr32 sim_wr32
+#define bar_rd64 sim_rd64
+#define bar_wr64 sim_wr64
+#define bar_wr8  sim_wr8
+#else
+static volatile uint8_t *g_bar;
+static uint32_t bar_rd32(uint32_t off) { return pips_rd32(g_bar, off); }
+static void bar_wr32(uint32_t off, uint32_t v) { pips_wr32(g_bar, off, v); }
+static uint64_t bar_rd64(uint32_t off) { return *(volatile uint64_t *)(g_bar + off); }
+static void bar_wr64(uint32_t off, uint64_t v) { *(volatile uint64_t *)(g_bar + off) = v; }
+static void bar_wr8(uint32_t off, uint8_t v) { *(volatile uint8_t *)(g_bar + off) = v; }
+#endif
+
+static char g_bdf[64];
+
+static void die(const char *fmt, ...) __attribute__((noreturn, format(printf, 1, 2)));
+static void die(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    fputs("pips: ", stderr);
+    vfprintf(stderr, fmt, ap);
+    fputc('\n', stderr);
+    va_end(ap);
+    exit(1);
+}
+
+static double now_s(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec + t.tv_nsec * 1e-9;
+}
+
+static void sleep_ms(unsigned ms)
+{
+    struct timespec t = { ms / 1000, (long)(ms % 1000) * 1000000L };
+    while (nanosleep(&t, &t) && errno == EINTR)
+        ;
+}
+
+static uint64_t parse_num(const char *s, const char *what)
+{
+    char *end;
+    unsigned long long v;
+
+    errno = 0;
+    v = strtoull(s, &end, 0);
+    if (errno || end == s || *s == '-')
+        die("bad %s: '%s'", what, s);
+    switch (*end) {
+    case 'k': case 'K': v <<= 10; end++; break;
+    case 'm': case 'M': v <<= 20; end++; break;
+    case 'g': case 'G': v <<= 30; end++; break;
+    }
+    if (*end)
+        die("bad %s: '%s'", what, s);
+    return v;
+}
+
+/* ------------------------------------------------------------ device */
+#ifndef PIPS_SIM
+static int sysfs_hex(const char *dir, const char *name, unsigned *v)
+{
+    char p[512];
+    FILE *f;
+    int ok;
+
+    snprintf(p, sizeof p, "/sys/bus/pci/devices/%s/%s", dir, name);
+    if (!(f = fopen(p, "r")))
+        return -1;
+    ok = fscanf(f, "%x", v) == 1;
+    fclose(f);
+    return ok ? 0 : -1;
+}
+
+static void find_usp(void)
+{
+    const char *env = getenv("PIPS_BDF");
+    char found[8][64];
+    struct dirent *e;
+    unsigned ven, dev;
+    int n = 0;
+    DIR *d;
+
+    if (!g_bdf[0] && env && *env)
+        snprintf(g_bdf, sizeof g_bdf, "%s", env);
+    if (g_bdf[0]) {
+        if (strlen(g_bdf) == 7) {               /* 97:00.0 -> 0000:97:00.0 */
+            char t[16];
+            snprintf(t, sizeof t, "0000:%.7s", g_bdf);
+            snprintf(g_bdf, sizeof g_bdf, "%s", t);
+        }
+        return;
+    }
+    if (!(d = opendir("/sys/bus/pci/devices")))
+        die("/sys/bus/pci/devices: %s", strerror(errno));
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.' || sysfs_hex(e->d_name, "vendor", &ven) ||
+            sysfs_hex(e->d_name, "device", &dev))
+            continue;
+        if (ven == PIPS_VENDOR_ID && dev == PIPS_USP_DEVICE_ID && n < 8)
+            snprintf(found[n++], sizeof found[0], "%.63s", e->d_name);
+    }
+    closedir(d);
+    if (n == 0)
+        die("no PIPS upstream port (10ee:b048): FPGA not programmed, or not rescanned "
+            "(echo 1 > /sys/bus/pci/rescan)");
+    if (n > 1)
+        die("%d PIPS upstream ports (%s, %s, ...): pick one with -s", n, found[0], found[1]);
+    snprintf(g_bdf, sizeof g_bdf, "%s", found[0]);
+}
+#endif
+
+/* Read the upstream port's PCI config space (0 = ok). */
+static int cfg_space(unsigned off, void *buf, size_t n)
+{
+#ifdef PIPS_SIM
+    return sim_cfg_read(off, buf, n);
+#else
+    char p[512];
+    ssize_t r;
+    int fd;
+
+    snprintf(p, sizeof p, "/sys/bus/pci/devices/%s/config", g_bdf);
+    if ((fd = open(p, O_RDONLY)) < 0)
+        return -1;
+    r = pread(fd, buf, n, off);
+    close(fd);
+    return r == (ssize_t)n ? 0 : -1;
+#endif
+}
+
+static void open_bar(void)
+{
+#ifdef PIPS_SIM
+    snprintf(g_bdf, sizeof g_bdf, "sim");
+    sim_open();
+#else
+    char path[512];
+    struct stat st;
+    uint16_t cmd;
+    void *p;
+    int fd;
+
+    find_usp();
+    snprintf(path, sizeof path, "/sys/bus/pci/devices/%s/resource0", g_bdf);
+    if (stat(path, &st))
+        die("%s: %s (wrong BDF?)", path, strerror(errno));
+    if (cfg_space(4, &cmd, 2) == 0 && !(cmd & 2))
+        die("%s: memory space is disabled (Mem-). Enable it: setpci -s %s COMMAND=0x02:0x02",
+            g_bdf, g_bdf);
+    if (st.st_size < PIPS_BAR0_SIZE)
+        die("%s is %lld bytes, expected %u: BAR0 not assigned? (boot with pci=realloc)",
+            path, (long long)st.st_size, PIPS_BAR0_SIZE);
+    if ((fd = open(path, O_RDWR | O_SYNC)) < 0)
+        die("open %s: %s%s", path, strerror(errno), errno == EACCES ? " (run as root)" : "");
+    p = mmap(NULL, PIPS_BAR0_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (p == MAP_FAILED)
+        die("mmap %s: %s", path, strerror(errno));
+    close(fd);
+    g_bar = p;
+#endif
+}
+
+/* WIN_BASE is shared state: one pips at a time. The file is opened without
+ * O_CREAT when it exists: with fs.protected_regular, even root may not
+ * O_CREAT-open another user's file in /tmp. */
+static void take_lock(void)
+{
+    int fd = open(LOCK_FILE, O_RDONLY);
+
+    if (fd < 0 && errno == ENOENT && (fd = open(LOCK_FILE, O_RDONLY | O_CREAT, 0666)) >= 0)
+        fchmod(fd, 0666);
+    if (fd < 0)
+        die("%s: %s", LOCK_FILE, strerror(errno));
+    for (int i = 0; flock(fd, LOCK_EX | LOCK_NB); i++) {
+        if (i == 50)
+            die("another pips has held %s for 5 s", LOCK_FILE);
+        sleep_ms(100);
+    }
+}
+
+static void check_id(void)
+{
+    uint32_t id = bar_rd32(PIPS_REG_ID), ver = bar_rd32(PIPS_REG_VERSION);
+
+    if (id != PIPS_ID_VALUE)
+        die("%s: ID reads 0x%08x, expected 0x%08x%s", g_bdf, id, PIPS_ID_VALUE,
+            id == 0xFFFFFFFFu ? ": no completion (FPGA not programmed, link down, or BAR "
+                                "moved: remove + rescan)"
+                              : ": not a PIPS bitstream with the PIO");
+    if (PIPS_VERSION_MAJOR(ver) != 2)
+        die("register map v%u.%u; this tool is for v2.x", PIPS_VERSION_MAJOR(ver),
+            PIPS_VERSION_MINOR(ver));
+}
+
+/* ------------------------------------------------------------ AXI window */
+static uint64_t g_page = UINT64_MAX;    /* AXI page WIN_BASE holds, as far as we know */
+
+static uint32_t win_off(uint64_t addr)
+{
+    uint64_t page = addr & ~(uint64_t)(PIPS_WIN_SIZE - 1u);
+
+    if (addr & 3u)
+        die("AXI address 0x%" PRIx64 " is not 4-byte aligned", addr);
+    if (page != g_page) {
+        bar_wr32(PIPS_REG_WIN_BASE_LO, (uint32_t)page);
+        bar_wr32(PIPS_REG_WIN_BASE_HI, (uint32_t)(page >> 32));
+        g_page = page;
+    }
+    return PIPS_WIN_OFF + (uint32_t)(addr & (PIPS_WIN_SIZE - 1u));
+}
+
+static uint32_t axi_rd(uint64_t a) { return bar_rd32(win_off(a)); }
+static void axi_wr(uint64_t a, uint32_t v) { bar_wr32(win_off(a), v); }
+
+static uint64_t win_err_addr(void)
+{
+    return bar_rd32(PIPS_REG_WIN_ERR_LO) | (uint64_t)bar_rd32(PIPS_REG_WIN_ERR_HI) << 32;
+}
+
+static const char *win_flags(uint32_t st)
+{
+    static const char *names[] = { "rd_err", "wr_err", "timeout", "rd_past_64B", "dropped" };
+    static char b[96];
+
+    b[0] = 0;
+    for (int i = 0; i < 5; i++)
+        if (st & (1u << i))
+            snprintf(b + strlen(b), sizeof b - strlen(b), "%s%s", b[0] ? " " : "", names[i]);
+    if (st & PIPS_WIN_ST_BUSY)
+        snprintf(b + strlen(b), sizeof b - strlen(b), "%sbusy", b[0] ? " " : "");
+    return b[0] ? b : "ok";
+}
+
+/* Sticky window status since the last check, cleared. Printed with `what` when set. */
+static uint32_t win_check(const char *what)
+{
+    uint32_t st = bar_rd32(PIPS_REG_WIN_STATUS);
+
+    if (st & PIPS_WIN_ST_STICKY) {
+        uint64_t ea = win_err_addr();
+        if (what)
+            fprintf(stderr, "pips: %s: WIN_STATUS 0x%08x (%s), last failed AXI address 0x%" PRIx64
+                    "\n", what, st, win_flags(st), ea);
+        bar_wr32(PIPS_REG_WIN_STATUS, PIPS_WIN_ST_STICKY);
+    }
+    return st & PIPS_WIN_ST_STICKY;
+}
+
+/* Before window work: report and clear what earlier accesses left behind. */
+static void win_start(void)
+{
+    uint32_t st = bar_rd32(PIPS_REG_WIN_STATUS);
+
+    if (st & PIPS_WIN_ST_STICKY) {
+        printf("# WIN_STATUS 0x%08x (%s) left by an earlier access to 0x%" PRIx64 "; cleared\n",
+               st, win_flags(st), win_err_addr());
+        bar_wr32(PIPS_REG_WIN_STATUS, PIPS_WIN_ST_STICKY);
+    }
+    if (st & PIPS_WIN_ST_BUSY)
+        printf("# AXI busy since an earlier timeout: window accesses are dropped until the late "
+               "response arrives\n");
+}
+
+static uint32_t axi_rd_ok(uint64_t a, const char *what)
+{
+    uint32_t v = axi_rd(a);
+
+    if (win_check(what))
+        die("%s failed (AXI 0x%" PRIx64 ")", what, a);
+    return v;
+}
+
+static void axi_wr_ok(uint64_t a, uint32_t v, const char *what)
+{
+    axi_wr(a, v);
+    if (win_check(what))
+        die("%s failed (AXI 0x%" PRIx64 ")", what, a);
+}
+
+/* ------------------------------------------------------------ config register */
+static uint32_t cfg_rd(void)
+{
+    return axi_rd_ok(PIPS_AXI_REGFILE + PIPS_BATCH_CFG_OFF, "config register read");
+}
+
+static void cfg_wr(uint32_t v)
+{
+    axi_wr_ok(PIPS_AXI_REGFILE + PIPS_BATCH_CFG_OFF, v, "config register write");
+}
+
+static void cfg_print(uint32_t v)
+{
+    printf("cfg=0x%08x depth_threshold=%u time_threshold=%u batch_mrd=%u log_enable=%u\n", v,
+           (v & PIPS_BATCH_DEPTH_MASK) >> PIPS_BATCH_DEPTH_SHIFT,
+           (v & PIPS_BATCH_TIME_MASK) >> PIPS_BATCH_TIME_SHIFT, !!(v & PIPS_BATCH_MRD),
+           !!(v & PIPS_BATCH_LOG_ENABLE));
+    if (v & CFG_RESERVED)
+        printf("# reserved bits set (0x%08x): written with the old XSCT layout? "
+               "Old 0x1608 is 0x01001608 now\n", v & CFG_RESERVED);
+}
+
+static int cmd_cfg(int argc, char **argv)
+{
+    uint32_t old, v, rb;
+
+    win_start();
+    old = cfg_rd();
+    if (argc == 0) {
+        cfg_print(old);
+        return 0;
+    }
+    if (strcmp(argv[0], "set") || argc < 2)
+        die("usage: pips cfg [set depth=N time=N mrd=0|1 log=0|1 raw=VAL ...]");
+    v = old;
+    for (int i = 1; i < argc; i++) {
+        char *eq = strchr(argv[i], '=');
+        uint64_t n;
+
+        if (!eq)
+            die("expected K=V, got '%s'", argv[i]);
+        *eq = 0;
+        n = parse_num(eq + 1, argv[i]);
+        if (!strcmp(argv[i], "raw")) {
+            if (n > 0xFFFFFFFFu) die("raw: 32 bits");
+            v = (uint32_t)n;
+        } else if (!strcmp(argv[i], "depth")) {
+            if (n > 255) die("depth: 0..255");
+            v = (v & ~PIPS_BATCH_DEPTH_MASK) | (uint32_t)n << PIPS_BATCH_DEPTH_SHIFT;
+        } else if (!strcmp(argv[i], "time")) {
+            if (n > 255) die("time: 0..255");
+            v = (v & ~PIPS_BATCH_TIME_MASK) | (uint32_t)n << PIPS_BATCH_TIME_SHIFT;
+        } else if (!strcmp(argv[i], "mrd") || !strcmp(argv[i], "log")) {
+            uint32_t bit = argv[i][0] == 'm' ? PIPS_BATCH_MRD : PIPS_BATCH_LOG_ENABLE;
+            if (n > 1) die("%s: 0 or 1", argv[i]);
+            v = n ? v | bit : v & ~bit;
+        } else {
+            die("unknown field '%s' (depth time mrd log raw)", argv[i]);
+        }
+    }
+    cfg_wr(v);
+    rb = cfg_rd();
+    printf("# was 0x%08x\n", old);
+    cfg_print(rb);
+    if (rb != v) {
+        fprintf(stderr, "pips: wrote 0x%08x, read back 0x%08x\n", v, rb);
+        return 1;
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------ log DMA */
+static uint32_t dma_rd(uint32_t reg) { return axi_rd_ok(PIPS_AXI_DMA_LOG + reg, "DMA register read"); }
+static void dma_wr(uint32_t reg, uint32_t v) { axi_wr_ok(PIPS_AXI_DMA_LOG + reg, v, "DMA register write"); }
+
+static const char *dmasr_flags(uint32_t sr)
+{
+    static const struct { uint32_t bit; const char *name; } f[] = {
+        { PIPS_DMA_SR_HALTED, "halted" }, { PIPS_DMA_SR_IDLE, "idle" },
+        { DMA_SR_SG_INCLD, "sg_included" }, { PIPS_DMA_SR_INT_ERR, "int_err" },
+        { PIPS_DMA_SR_SLV_ERR, "slv_err" }, { PIPS_DMA_SR_DEC_ERR, "dec_err" },
+        { PIPS_DMA_SR_IOC, "ioc" }, { DMA_SR_DLY_IRQ, "dly_irq" },
+        { PIPS_DMA_SR_ERR_IRQ, "err_irq" },
+    };
+    static char b[128];
+
+    b[0] = 0;
+    for (size_t i = 0; i < sizeof f / sizeof f[0]; i++)
+        if (sr & f[i].bit)
+            snprintf(b + strlen(b), sizeof b - strlen(b), "%s%s", b[0] ? " " : "", f[i].name);
+    return b[0] ? b : "running";
+}
+
+static const char *dma_state(uint32_t sr)
+{
+    if (sr & DMA_SR_ERRS)
+        return "error (log-start resets it)";
+    if (sr & PIPS_DMA_SR_HALTED)
+        return "halted: reset state, or stopped";
+    if (sr & PIPS_DMA_SR_IDLE)
+        return "running, idle: the last transfer is done";
+    return "running, transfer programmed: waiting for log data";
+}
+
+static void dma_print(void)
+{
+    uint32_t cr = dma_rd(PIPS_DMA_S2MM_DMACR), sr = dma_rd(PIPS_DMA_S2MM_DMASR);
+    uint32_t da = dma_rd(PIPS_DMA_S2MM_DA), len = dma_rd(PIPS_DMA_S2MM_LENGTH);
+
+    printf("dmacr=0x%08x run=%u\n", cr, !!(cr & PIPS_DMA_CR_RS));
+    printf("dmasr=0x%08x %s\n", sr, dmasr_flags(sr));
+    printf("da=0x%08x\n", da);
+    printf("length=%u\n", len);
+    printf("# %s; length is %s\n", dma_state(sr),
+           (sr & PIPS_DMA_SR_IDLE) ? "the bytes the last transfer wrote" : "as programmed");
+}
+
+static void dma_reset(void)
+{
+    dma_wr(PIPS_DMA_S2MM_DMACR, PIPS_DMA_CR_RESET);
+    for (int i = 0; i < 100; i++) {
+        if (!(dma_rd(PIPS_DMA_S2MM_DMACR) & PIPS_DMA_CR_RESET))
+            return;
+        sleep_ms(1);
+    }
+    die("DMA soft reset did not complete in 100 ms (DMACR bit 2 still set)");
+}
+
+/* ------------------------------------------------------------ log recording */
+struct region { uint32_t base, bytes; };
+
+static struct region log_region(void)
+{
+    uint32_t ver = bar_rd32(PIPS_REG_VERSION), hi;
+    struct region r;
+
+    if (PIPS_VERSION_MINOR(ver) < 1)
+        die("register map v2.%u has no LOG_* registers (needs v2.1)", PIPS_VERSION_MINOR(ver));
+    r.base = bar_rd32(PIPS_REG_LOG_BASE_LO);
+    hi = bar_rd32(PIPS_REG_LOG_BASE_HI);
+    r.bytes = bar_rd32(PIPS_REG_LOG_BYTES);
+    if (!r.bytes)
+        die("LOG_BYTES is 0: this bitstream has no log region");
+    if (hi)
+        die("LOG_BASE is above 4 GB (0x%08x_%08x); the DMA has 32-bit addresses", hi, r.base);
+    if ((r.base | r.bytes) & 15u)
+        die("log region 0x%08x + %u is not 16-byte aligned", r.base, r.bytes);
+    return r;
+}
+
+/* Smallest power of two >= the region and >= 4 KB: the DMA's aperture (pips.tcl). */
+static uint64_t log_range(struct region r)
+{
+    uint64_t n = 4096;
+
+    while (n < r.bytes)
+        n <<= 1;
+    return n;
+}
+
+/* Steps 1-3 of the recording sequence (README, telemetry_dma_format.md §7). */
+static void log_start(int quiet)
+{
+    struct region r = log_region();
+    uint32_t cfg = cfg_rd(), sr;
+    int i;
+
+    if (cfg & PIPS_BATCH_LOG_ENABLE) {
+        if (!quiet)
+            printf("# log_enable was 1 (an open or region-full recording): clearing it\n");
+        cfg_wr(cfg & ~PIPS_BATCH_LOG_ENABLE);
+        sleep_ms(1);
+    }
+    sr = dma_rd(PIPS_DMA_S2MM_DMASR);
+    /* A programmed transfer may still be taking the tail of the previous recording. */
+    for (i = 0; i < 100 && !(sr & (PIPS_DMA_SR_HALTED | PIPS_DMA_SR_IDLE | DMA_SR_ERRS)); i++) {
+        sleep_ms(1);
+        sr = dma_rd(PIPS_DMA_S2MM_DMASR);
+    }
+    if (sr & DMA_SR_ERRS || !(sr & (PIPS_DMA_SR_HALTED | PIPS_DMA_SR_IDLE))) {
+        printf("# DMA %s (DMASR 0x%08x %s): resetting it\n",
+               sr & DMA_SR_ERRS ? "has errors" : "still waits for data from an earlier arm",
+               sr, dmasr_flags(sr));
+        dma_reset();
+    }
+    dma_wr(PIPS_DMA_S2MM_DMASR, DMA_SR_IRQS);
+    dma_wr(PIPS_DMA_S2MM_DMACR, PIPS_DMA_CR_RS);
+    for (i = 0; (sr = dma_rd(PIPS_DMA_S2MM_DMASR)) & PIPS_DMA_SR_HALTED; i++) {
+        if (i == 10)
+            die("the DMA stays halted after RS=1 (DMASR 0x%08x): check the S2MM register "
+                "offsets (PG021) and the DMA's clock and reset", sr);
+        sleep_ms(1);
+    }
+    for (i = 0;; i++) {
+        uint32_t stale;
+
+        dma_wr(PIPS_DMA_S2MM_DA, r.base);
+        dma_wr(PIPS_DMA_S2MM_LENGTH, r.bytes);
+        sleep_ms(2);
+        sr = dma_rd(PIPS_DMA_S2MM_DMASR);
+        if (sr & DMA_SR_ERRS)
+            die("DMA error right after arming: DMASR 0x%08x (%s)%s", sr, dmasr_flags(sr),
+                sr & PIPS_DMA_SR_DEC_ERR ? ": S2MM_DA outside the DMA's aperture?" : "");
+        if (!(sr & (PIPS_DMA_SR_IDLE | PIPS_DMA_SR_IOC)))
+            break;
+        /* The logger still held the end of an earlier recording; the DMA took it at once. */
+        stale = dma_rd(PIPS_DMA_S2MM_LENGTH);
+        printf("# the DMA took %u stale bytes (the end of an earlier recording); re-arming\n",
+               stale);
+        dma_wr(PIPS_DMA_S2MM_DMASR, DMA_SR_IRQS);
+        if (i == 2)
+            die("the DMA keeps completing at once (DMASR 0x%08x)", sr);
+    }
+    cfg = cfg_rd();
+    cfg_wr(cfg | PIPS_BATCH_LOG_ENABLE);
+    if (!quiet)
+        printf("log_base=0x%08x\nlog_bytes=%u\nrecording=started\n", r.base, r.bytes);
+}
+
+struct logres {
+    uint32_t dmasr, bytes, n_records, n_dropped, duration;
+    uint8_t reason;
+};
+
+static const char *stop_name(uint8_t reason)
+{
+    return reason == 1 ? "enable_low" : reason == 2 ? "region_full" : "unknown";
+}
+
+/* Step 5 of the sequence: wait for the DMA, read the byte count and the trailer.
+ * 0 ok, 1 error, 3 timeout. Messages go to stderr; *res is filled as far as known.
+ * Polls every 1 ms for 100 ms, then every 10 ms: each poll is a few BAR0 TLPs,
+ * and those briefly hold up the switch's host-to-device requests (D7). */
+static int log_finish(unsigned timeout_ms, struct logres *res)
+{
+    struct region r = log_region();
+    double t0 = now_s();
+    uint32_t t[4];
+
+    memset(res, 0, sizeof *res);
+    for (;;) {
+        res->dmasr = dma_rd(PIPS_DMA_S2MM_DMASR);
+        if (res->dmasr & (PIPS_DMA_SR_IDLE | PIPS_DMA_SR_IOC | DMA_SR_ERRS | PIPS_DMA_SR_HALTED))
+            break;
+        if ((now_s() - t0) * 1000 >= timeout_ms) {
+            fprintf(stderr, "pips: the DMA still waits for log data after %u ms: the recording "
+                    "is open (log-stop ends it), or the logger never sent its trailer\n",
+                    timeout_ms);
+            return 3;
+        }
+        sleep_ms(now_s() - t0 < 0.1 ? 1 : 10);
+    }
+    if (res->dmasr & DMA_SR_ERRS) {
+        fprintf(stderr, "pips: DMA error: DMASR 0x%08x (%s)\n", res->dmasr,
+                dmasr_flags(res->dmasr));
+        return 1;
+    }
+    if (!(res->dmasr & (PIPS_DMA_SR_IDLE | PIPS_DMA_SR_IOC))) {
+        fprintf(stderr, "pips: the DMA is halted, not armed: no recording (log-start)\n");
+        return 1;
+    }
+    res->bytes = dma_rd(PIPS_DMA_S2MM_LENGTH);
+    if (res->bytes < 16 || res->bytes % 16 || res->bytes > r.bytes) {
+        fprintf(stderr, "pips: the DMA reports %u bytes written (region %u)\n", res->bytes,
+                r.bytes);
+        return 1;
+    }
+    for (int i = 0; i < 4; i++)
+        t[i] = axi_rd(r.base + res->bytes - 16 + 4u * i);
+    if (win_check("trailer read"))
+        return 1;
+    if (((t[3] >> 16) & 0xFF) != TRAILER_INFO) {
+        fprintf(stderr, "pips: the last record is not a trailer (info byte 0x%02x)\n",
+                (t[3] >> 16) & 0xFF);
+        return 1;
+    }
+    res->n_records = t[0];
+    res->n_dropped = t[1];
+    res->duration = t[2];
+    res->reason = t[3] & 0xFF;
+    return 0;
+}
+
+static void logres_print(const struct logres *res, int rc)
+{
+    printf("dmasr=0x%08x %s\n", res->dmasr, dmasr_flags(res->dmasr));
+    if (rc == 3)
+        printf("status=timeout\n");
+    if (rc)
+        return;
+    printf("bytes_written=%u\nn_records=%u\nn_dropped=%u\nduration_cycles=%u\n"
+           "duration_us=%.1f\nstop_reason=%s\n", res->bytes, res->n_records, res->n_dropped,
+           res->duration, res->duration / USER_CLK_HZ * 1e6, stop_name(res->reason));
+    if ((uint64_t)res->n_records * 16 + 16 != res->bytes)
+        printf("# %u records + trailer = %" PRIu64 " bytes, the DMA wrote %u (pad records?)\n",
+               res->n_records, (uint64_t)res->n_records * 16 + 16, res->bytes);
+}
+
+static int cmd_log_finish(unsigned timeout_ms, int stop)
+{
+    struct logres res;
+    uint32_t cfg;
+    int rc;
+
+    win_start();
+    if (stop && ((cfg = cfg_rd()) & PIPS_BATCH_LOG_ENABLE))
+        cfg_wr(cfg & ~PIPS_BATCH_LOG_ENABLE);
+    rc = log_finish(timeout_ms, &res);
+    logres_print(&res, rc);
+    return rc;
+}
+
+/* ------------------------------------------------------------ DDR dumps */
+static void ddr_dump(uint64_t addr, uint64_t bytes, const char *file)
+{
+    static uint32_t buf[PIPS_WIN_SIZE / 4];
+    double t0 = now_s(), dt;
+    FILE *f;
+
+    if ((addr | bytes) & 3u)
+        die("address and size must be multiples of 4");
+    if (addr + bytes > PIPS_AXI_DDR_SIZE)
+        die("0x%" PRIx64 " + %" PRIu64 " runs past the end of DDR (2 GB)", addr, bytes);
+    if (!(f = fopen(file, "wb")))
+        die("%s: %s", file, strerror(errno));
+    for (uint64_t done = 0; done < bytes;) {
+        uint64_t a = addr + done;
+        uint64_t chunk = PIPS_WIN_SIZE - (a & (PIPS_WIN_SIZE - 1u));
+
+        if (chunk > bytes - done)
+            chunk = bytes - done;
+        for (uint64_t i = 0; i < chunk / 4; i++)
+            buf[i] = axi_rd(a + 4 * i);
+        if (win_check("DDR read"))
+            die("DDR read failed in [0x%" PRIx64 ", 0x%" PRIx64 ")", a, a + chunk);
+        if (fwrite(buf, 1, chunk, f) != chunk)
+            die("%s: %s", file, strerror(errno));
+        done += chunk;
+    }
+    if (fclose(f))
+        die("%s: %s", file, strerror(errno));
+    dt = now_s() - t0;
+    printf("dumped=%" PRIu64 "\nfile=%s\n# DDR 0x%" PRIx64 ", %.2f s, %.2f us per 32-bit read\n",
+           bytes, file, addr, dt, bytes ? dt / (bytes / 4) * 1e6 : 0.0);
+}
+
+static int cmd_log_dump(int argc, char **argv)
+{
+    struct region r;
+    uint64_t bytes;
+    uint32_t sr;
+
+    if (argc < 1 || argc > 2)
+        die("usage: pips log-dump FILE [BYTES]");
+    win_start();
+    r = log_region();
+    if (argc == 2) {
+        bytes = parse_num(argv[1], "BYTES");
+        if (bytes > r.bytes)
+            die("BYTES %" PRIu64 " is larger than the log region (%u)", bytes, r.bytes);
+    } else {
+        sr = dma_rd(PIPS_DMA_S2MM_DMASR);
+        if (!(sr & (PIPS_DMA_SR_IDLE | PIPS_DMA_SR_IOC)) || (sr & DMA_SR_ERRS))
+            die("the DMA has not finished a transfer (DMASR 0x%08x %s): log-stop first, or give "
+                "BYTES to dump the region as it is", sr, dmasr_flags(sr));
+        bytes = dma_rd(PIPS_DMA_S2MM_LENGTH);
+        if (bytes > r.bytes)
+            die("S2MM_LENGTH %" PRIu64 " is larger than the log region", bytes);
+    }
+    ddr_dump(r.base, bytes, argv[0]);
+    return 0;
+}
+
+static int cmd_log_clear(void)
+{
+    struct region r;
+    double t0;
+    uint32_t sr;
+
+    win_start();
+    r = log_region();
+    sr = dma_rd(PIPS_DMA_S2MM_DMASR);
+    if (!(sr & (PIPS_DMA_SR_HALTED | PIPS_DMA_SR_IDLE | DMA_SR_ERRS)))
+        die("the DMA has a transfer programmed (DMASR 0x%08x): log-stop or dma-reset first", sr);
+    t0 = now_s();
+    for (uint64_t a = r.base; a < (uint64_t)r.base + r.bytes; a += 4)
+        axi_wr(a, 0);
+    if (win_check("log-clear"))
+        die("log-clear failed");
+    printf("# zeroed DDR 0x%08x + %u bytes in %.2f s\n", r.base, r.bytes, now_s() - t0);
+    return 0;
+}
+
+/* ------------------------------------------------------------ info */
+static int cmd_info(void)
+{
+    uint32_t v[0x80 / 4];
+    uint8_t bus[3];
+
+    for (uint32_t i = 0; i < 0x80 / 4; i++)
+        v[i] = bar_rd32(PIPS_REG_BLOCK_OFF + 4 * i);
+#define R(name) v[((name) - PIPS_REG_BLOCK_OFF) / 4]
+    printf("PIPS upstream port %s, BAR0 32 KB\n", g_bdf);
+    printf("ID           0x%08x  %s\n", R(PIPS_REG_ID),
+           R(PIPS_REG_ID) == PIPS_ID_VALUE ? "\"PIPS\"" : "WRONG");
+    printf("VERSION      0x%08x  map v%u.%u\n", R(PIPS_REG_VERSION),
+           PIPS_VERSION_MAJOR(R(PIPS_REG_VERSION)), PIPS_VERSION_MINOR(R(PIPS_REG_VERSION)));
+    printf("SCRATCH      0x%08x\n", R(PIPS_REG_SCRATCH));
+    printf("BUS_NUM      0x%08x  primary %02x secondary %02x subordinate %02x",
+           R(PIPS_REG_BUS_NUM), PIPS_BUS_PRIMARY(R(PIPS_REG_BUS_NUM)),
+           PIPS_BUS_SECONDARY(R(PIPS_REG_BUS_NUM)), PIPS_BUS_SUBORDINATE(R(PIPS_REG_BUS_NUM)));
+    if (cfg_space(0x18, bus, 3) == 0)
+        printf("  (config space %02x %02x %02x: %s)", bus[0], bus[1], bus[2],
+               bus[0] == PIPS_BUS_PRIMARY(R(PIPS_REG_BUS_NUM)) &&
+               bus[1] == PIPS_BUS_SECONDARY(R(PIPS_REG_BUS_NUM)) &&
+               bus[2] == PIPS_BUS_SUBORDINATE(R(PIPS_REG_BUS_NUM)) ? "match" : "MISMATCH");
+    putchar('\n');
+    printf("CQ_SPLIT     0x%08x  PIO: ", R(PIPS_REG_CQ_SPLIT));
+    if (R(PIPS_REG_CQ_SPLIT) & PIPS_SPLIT_PIO_SEEN)
+        printf("BAR ID %u aperture %u", PIPS_SPLIT_PIO_BAR_ID(R(PIPS_REG_CQ_SPLIT)),
+               PIPS_SPLIT_PIO_APERTURE(R(PIPS_REG_CQ_SPLIT)));
+    else
+        printf("none seen");
+    printf("   switch: ");
+    if (R(PIPS_REG_CQ_SPLIT) & PIPS_SPLIT_SW_SEEN)
+        printf("BAR ID %u aperture %u\n", PIPS_SPLIT_SW_BAR_ID(R(PIPS_REG_CQ_SPLIT)),
+               PIPS_SPLIT_SW_APERTURE(R(PIPS_REG_CQ_SPLIT)));
+    else
+        printf("none seen\n");
+    printf("MWR_COUNT    %u\n", R(PIPS_REG_MWR_COUNT));
+    printf("MRD_COUNT    %u\n", R(PIPS_REG_MRD_COUNT));
+    printf("PIO_STATUS   0x%08x  %s\n", R(PIPS_REG_PIO_STATUS),
+           R(PIPS_REG_PIO_STATUS) & PIPS_PIO_ST_CC_OVERFLOW ? "CC FIFO OVERFLOW" : "ok");
+    printf("MEM_BASE     0x%08x  MEM_LIMIT 0x%08x  (downstream port 1 windows)\n",
+           R(PIPS_REG_MEM_BASE), R(PIPS_REG_MEM_LIMIT));
+    printf("PF_BASE      0x%08x_%08x  PF_LIMIT 0x%08x_%08x\n", R(PIPS_REG_PF_BASE_HI),
+           R(PIPS_REG_PF_BASE_LO), R(PIPS_REG_PF_LIMIT_HI), R(PIPS_REG_PF_LIMIT_LO));
+    printf("CTRL0-7     ");
+    for (int i = 0; i < 8; i++)
+        printf(" %08x", R(PIPS_REG_CTRL(i)));
+    putchar('\n');
+    printf("WIN_BASE     0x%08x_%08x\n", R(PIPS_REG_WIN_BASE_HI), R(PIPS_REG_WIN_BASE_LO));
+    printf("WIN_STATUS   0x%08x  %s\n", R(PIPS_REG_WIN_STATUS), win_flags(R(PIPS_REG_WIN_STATUS)));
+    printf("WIN_ERR      0x%08x_%08x\n", R(PIPS_REG_WIN_ERR_HI), R(PIPS_REG_WIN_ERR_LO));
+    printf("LOG_BASE     0x%08x_%08x\n", R(PIPS_REG_LOG_BASE_HI), R(PIPS_REG_LOG_BASE_LO));
+    printf("LOG_BYTES    0x%08x  %u KiB, %u records + trailer\n", R(PIPS_REG_LOG_BYTES),
+           R(PIPS_REG_LOG_BYTES) >> 10,
+           R(PIPS_REG_LOG_BYTES) ? R(PIPS_REG_LOG_BYTES) / 16 - 1 : 0);
+#undef R
+    return 0;
+}
+
+/* ------------------------------------------------------------ hwtest */
+static unsigned g_checks, g_fails, g_warns;
+
+static int check(int ok, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static int check(int ok, const char *fmt, ...)
+{
+    va_list ap;
+
+    va_start(ap, fmt);
+    printf("  %s ", ok ? "ok  " : "FAIL");
+    vprintf(fmt, ap);
+    putchar('\n');
+    va_end(ap);
+    g_checks++;
+    g_fails += !ok;
+    return ok;
+}
+
+static void note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void note(const char *fmt, ...)
+{
+    va_list ap;
+
+    va_start(ap, fmt);
+    printf("       ");
+    vprintf(fmt, ap);
+    putchar('\n');
+    va_end(ap);
+}
+
+static void warnx(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void warnx(const char *fmt, ...)
+{
+    va_list ap;
+
+    va_start(ap, fmt);
+    printf("  WARN ");
+    vprintf(fmt, ap);
+    putchar('\n');
+    va_end(ap);
+    g_warns++;
+}
+
+static void t_regs(void)
+{
+    static const uint32_t pats[] = { 0x55AA55AA, 0xA55AA55A, 0x00000000, 0xFFFFFFFF, 0x12345678 };
+    uint32_t id = bar_rd32(PIPS_REG_ID), ver = bar_rd32(PIPS_REG_VERSION);
+    uint32_t st = bar_rd32(PIPS_REG_PIO_STATUS), save, v, a, b, bn;
+    uint8_t bus[3];
+
+    check(id == PIPS_ID_VALUE, "ID 0x%08x (expect 0x%08x \"PIPS\")", id, PIPS_ID_VALUE);
+    check(PIPS_VERSION_MAJOR(ver) == 2, "VERSION 0x%08x: map v%u.%u (expect v2.x)", ver,
+          PIPS_VERSION_MAJOR(ver), PIPS_VERSION_MINOR(ver));
+    if (PIPS_VERSION_MINOR(ver) < 1)
+        warnx("map v2.%u has no LOG_* registers: the log commands need v2.1",
+              PIPS_VERSION_MINOR(ver));
+    check(st == 0, "PIO_STATUS 0x%08x (expect 0; bit 0 = CC FIFO overflow)", st);
+    save = bar_rd32(PIPS_REG_SCRATCH);
+    for (size_t i = 0; i < sizeof pats / sizeof pats[0]; i++) {
+        bar_wr32(PIPS_REG_SCRATCH, pats[i]);
+        v = bar_rd32(PIPS_REG_SCRATCH);
+        check(v == pats[i], "SCRATCH wrote 0x%08x read 0x%08x", pats[i], v);
+    }
+    a = bar_rd32(PIPS_REG_MWR_COUNT);
+    for (int i = 0; i < 3; i++)
+        bar_wr32(PIPS_REG_SCRATCH, save);
+    b = bar_rd32(PIPS_REG_MWR_COUNT);
+    check(b - a == 3, "MWR_COUNT advances by 3 over 3 writes (%u -> %u)", a, b);
+    a = bar_rd32(PIPS_REG_MRD_COUNT);
+    b = bar_rd32(PIPS_REG_MRD_COUNT);
+    check(b - a == 1, "MRD_COUNT advances by 1 per read (%u -> %u)", a, b);
+    bn = bar_rd32(PIPS_REG_BUS_NUM);
+    if (cfg_space(0x18, bus, 3))
+        note("BUS_NUM 0x%08x (config space not readable here)", bn);
+    else if (bus[0] == PIPS_BUS_PRIMARY(bn) && bus[1] == PIPS_BUS_SECONDARY(bn) &&
+             bus[2] == PIPS_BUS_SUBORDINATE(bn))
+        check(1, "BUS_NUM %02x/%02x/%02x matches the upstream port's config space",
+              bus[0], bus[1], bus[2]);
+    else
+        warnx("BUS_NUM primary/secondary/subordinate %02x/%02x/%02x, config space %02x/%02x/%02x",
+              PIPS_BUS_PRIMARY(bn), PIPS_BUS_SECONDARY(bn), PIPS_BUS_SUBORDINATE(bn),
+              bus[0], bus[1], bus[2]);
+    if (PIPS_VERSION_MINOR(ver) >= 1) {
+        uint32_t base = bar_rd32(PIPS_REG_LOG_BASE_LO), bytes = bar_rd32(PIPS_REG_LOG_BYTES);
+        if (bytes)
+            note("LOG_BASE 0x%08x_%08x LOG_BYTES 0x%08x (as built: 0x0 / 0x00400000)",
+                 bar_rd32(PIPS_REG_LOG_BASE_HI), base, bytes);
+        else
+            warnx("LOG_BYTES is 0: no log region in this bitstream");
+    }
+}
+
+static void t_bram(void)
+{
+    static const uint32_t o32[] = { 0x000, 0x014, 0x03C, 0x7FC };
+    static const uint32_t o64[] = { 0x038, 0x040, 0x7F8 };
+    uint32_t v, bad = 0;
+    uint64_t p, q;
+
+    for (size_t i = 0; i < sizeof o32 / sizeof o32[0]; i++) {
+        uint32_t pat = 0xA5A50000u | (o32[i] * 0x11u);
+        bar_wr32(o32[i], pat);
+        v = bar_rd32(o32[i]);
+        check(v == pat, "BRAM 4-byte at 0x%03x: wrote 0x%08x read 0x%08x", o32[i], pat, v);
+    }
+    for (size_t i = 0; i < sizeof o64 / sizeof o64[0]; i++) {
+        p = 0xFEEDFACE00000000ull | 0xCAFE0000u | o64[i];
+        bar_wr64(o64[i], p);
+        q = bar_rd64(o64[i]);
+        check(q == p, "BRAM 8-byte at 0x%03x: wrote 0x%016" PRIx64 " read 0x%016" PRIx64,
+              o64[i], p, q);
+    }
+    bar_wr64(0x038, 0x1111111122222222ull);
+    bar_wr32(0x03C, 0x33333333);
+    check(bar_rd32(0x038) == 0x22222222 && bar_rd32(0x03C) == 0x33333333,
+          "4-byte write at 0x03C leaves 0x038 alone");
+    bar_wr32(0x100, 0xA5A50001);
+    bar_wr8(0x101, 0x77);
+    v = bar_rd32(0x100);
+    check(v == 0xA5A57701, "byte write 0x77 at 0x101: 0x100 reads 0x%08x (expect 0xa5a57701)", v);
+    for (uint32_t i = 0; i < 16; i++)
+        bar_wr32(0x200 + 4 * i, 0xB0B00000u + i * 0x0101u);
+    for (uint32_t i = 0; i < 16; i++)
+        bad += bar_rd32(0x200 + 4 * i) != 0xB0B00000u + i * 0x0101u;
+    check(bad == 0, "16 words at 0x200, written one by one and read back: %u wrong", bad);
+    v = bar_rd32(0x000);
+    check(bar_rd32(0x1000) == v, "0x1000 aliases 0x000 (0x%08x)", v);
+    check(bar_rd32(0x880) == 0 && bar_rd32(0xFFC) == 0, "0x880 and 0xFFC (no register) read 0");
+    v = bar_rd32(PIPS_REG_PIO_STATUS);
+    check(v == 0, "PIO_STATUS 0x%08x after BRAM traffic", v);
+}
+
+static void t_regfile(void)
+{
+    const uint64_t a = PIPS_AXI_REGFILE + PIPS_BATCH_CFG_OFF;
+    uint32_t lo, hi, orig, v, st, pats[3];
+    uint64_t ea;
+
+    win_start();
+    bar_wr32(PIPS_REG_WIN_BASE_LO, (uint32_t)PIPS_AXI_REGFILE | 3u);
+    bar_wr32(PIPS_REG_WIN_BASE_HI, 0);
+    lo = bar_rd32(PIPS_REG_WIN_BASE_LO);
+    hi = bar_rd32(PIPS_REG_WIN_BASE_HI);
+    check(lo == (uint32_t)PIPS_AXI_REGFILE && hi == 0,
+          "WIN_BASE wrote 0x00000000_a4000003, read 0x%08x_%08x (bits [1:0] read 0)", hi, lo);
+    g_page = UINT64_MAX;
+    orig = axi_rd(a);
+    st = win_check(NULL);
+    if (!check(st == 0, "regfile reg0 at 0x%08" PRIx64 " answers: 0x%08x (WIN_STATUS %s)", a,
+               orig, win_flags(st)))
+        return;
+    note("depth %u, time %u, batch_mrd %u, log_enable %u. XSCT \"mrd 0xA4000000\" should match",
+         orig & 0xFF, (orig >> 8) & 0xFF, !!(orig & PIPS_BATCH_MRD),
+         !!(orig & PIPS_BATCH_LOG_ENABLE));
+    if (orig & CFG_RESERVED)
+        warnx("reserved bits set (0x%08x): old XSCT layout? old 0x1608 = new 0x01001608",
+              orig & CFG_RESERVED);
+    /* log_enable kept as is: no edge, no recording started or ended */
+    pats[0] = (orig & PIPS_BATCH_LOG_ENABLE) | 0x5Au | 0xA5u << 8 | ((orig & PIPS_BATCH_MRD) ^ PIPS_BATCH_MRD);
+    pats[1] = (orig & PIPS_BATCH_LOG_ENABLE) | 0xA5u | 0x5Au << 8 | (orig & PIPS_BATCH_MRD);
+    pats[2] = orig;
+    for (int i = 0; i < 3; i++) {
+        axi_wr(a, pats[i]);
+        v = axi_rd(a);
+        st = win_check(NULL);
+        check(v == pats[i] && !st, "reg0 wrote 0x%08x read 0x%08x%s", pats[i], v,
+              i == 2 ? " (restored)" : "");
+    }
+    v = axi_rd(a + 4);
+    st = bar_rd32(PIPS_REG_WIN_STATUS);
+    ea = win_err_addr();
+    if (v == 0xFFFFFFFFu && (st & PIPS_WIN_ST_RD_ERR) && ea == a + 4)
+        check(1, "0x%08" PRIx64 " (no register): 0xffffffff, WIN_STATUS rd_err, WIN_ERR right",
+              a + 4);
+    else
+        warnx("0x%08" PRIx64 " (no register) read 0x%08x, WIN_STATUS 0x%08x, WIN_ERR 0x%" PRIx64
+              ": expected a decode error", a + 4, v, st, ea);
+    bar_wr32(PIPS_REG_WIN_STATUS, PIPS_WIN_ST_STICKY);
+}
+
+static void t_dma(void)
+{
+    const uint64_t d = PIPS_AXI_DMA_LOG;
+    uint32_t cr, sr, da, len, st, v, p;
+
+    win_start();
+    cr = axi_rd(d + PIPS_DMA_S2MM_DMACR);
+    sr = axi_rd(d + PIPS_DMA_S2MM_DMASR);
+    da = axi_rd(d + PIPS_DMA_S2MM_DA);
+    len = axi_rd(d + PIPS_DMA_S2MM_LENGTH);
+    st = win_check(NULL);
+    if (!check(st == 0, "log DMA registers at 0x%08" PRIx64 " answer (WIN_STATUS %s)", d,
+               win_flags(st)))
+        return;
+    note("S2MM_DMACR 0x%08x  S2MM_DMASR 0x%08x (%s)", cr, sr, dmasr_flags(sr));
+    note("S2MM_DA 0x%08x  S2MM_LENGTH 0x%08x", da, len);
+    note("%s", dma_state(sr));
+    check(!(sr & DMA_SR_SG_INCLD), "DMASR SGIncld = 0 (direct register mode, as built)");
+    check(!!(sr & PIPS_DMA_SR_HALTED) == !(cr & PIPS_DMA_CR_RS),
+          "DMASR halted (%u) agrees with DMACR run/stop (%u)", !!(sr & PIPS_DMA_SR_HALTED),
+          !!(cr & PIPS_DMA_CR_RS));
+    if (sr & DMA_SR_ERRS)
+        warnx("error bits from an earlier transfer: %s (log-start resets the DMA)",
+              dmasr_flags(sr));
+    if (sr & (PIPS_DMA_SR_HALTED | PIPS_DMA_SR_IDLE)) {
+        p = (PIPS_VERSION_MINOR(bar_rd32(PIPS_REG_VERSION)) >= 1 ?
+             bar_rd32(PIPS_REG_LOG_BASE_LO) : 0) + 0x100;
+        axi_wr(d + PIPS_DMA_S2MM_DA, p);
+        v = axi_rd(d + PIPS_DMA_S2MM_DA);
+        axi_wr(d + PIPS_DMA_S2MM_DA, da);
+        st = win_check(NULL);
+        check(v == p && !st, "S2MM_DA (0x48) round trip: wrote 0x%08x read 0x%08x (PG021 "
+              "offsets)", p, v);
+    } else {
+        note("S2MM_DA round trip skipped: a transfer is programmed");
+    }
+}
+
+static void t_ddr(uint64_t t)
+{
+    uint32_t seed = (uint32_t)time(NULL) * 2654435761u, bad = 0, v, st;
+    double t0, tw, tr;
+
+    if (PIPS_VERSION_MINOR(bar_rd32(PIPS_REG_VERSION)) >= 1 && bar_rd32(PIPS_REG_LOG_BYTES)) {
+        struct region r = log_region();
+        uint64_t end = r.base + log_range(r);
+        if (!check(t + 0x4040 <= r.base || t >= end, "test page 0x%" PRIx64 " is outside the "
+                   "log region [0x%08x, 0x%" PRIx64 ")", t, r.base, end))
+            return;
+    }
+    if (!check((t & 3) == 0 && t + 0x4040 <= PIPS_AXI_DDR_SIZE, "test page 0x%" PRIx64
+               " is aligned and inside DDR", t))
+        return;
+#define PAT(i) (seed ^ ((uint32_t)(i) * 0x9E3779B9u) ^ (uint32_t)(t + 4 * (i)))
+    win_start();
+    t0 = now_s();
+    for (uint32_t i = 0; i < 1024; i++)
+        axi_wr(t + 4 * i, PAT(i));
+    tw = now_s() - t0;
+    t0 = now_s();
+    for (uint32_t i = 0; i < 1024; i++) {
+        v = axi_rd(t + 4 * i);
+        if (v != PAT(i) && bad++ < 4)
+            note("0x%" PRIx64 ": wrote 0x%08x read 0x%08x", t + 4 * i, PAT(i), v);
+    }
+    tr = now_s() - t0;
+    st = win_check(NULL);
+    check(bad == 0 && !st, "DDR 4 KB at 0x%" PRIx64 ": %u of 1024 words wrong, WIN_STATUS %s",
+          t, bad, win_flags(st));
+    note("%.2f us per 32-bit write, %.2f us per 32-bit read", tw / 1024 * 1e6, tr / 1024 * 1e6);
+    /* the next 16 KB window page, then alternate pages: WIN_BASE moves every access */
+    for (uint32_t i = 0; i < 16; i++)
+        axi_wr(t + 0x4000 + 4 * i, ~PAT(i));
+    bad = 0;
+    for (uint32_t i = 0; i < 16; i++) {
+        bad += axi_rd(t + 4 * i) != PAT(i);
+        bad += axi_rd(t + 0x4000 + 4 * i) != ~PAT(i);
+    }
+    st = win_check(NULL);
+    check(bad == 0 && !st, "alternating window pages 0x%" PRIx64 " / 0x%" PRIx64 ": %u wrong",
+          t, t + 0x4000, bad);
+#undef PAT
+}
+
+static void t_err(void)
+{
+    uint32_t v, st;
+    uint64_t ea;
+
+    win_start();
+    v = axi_rd(UNMAPPED_AXI);
+    st = bar_rd32(PIPS_REG_WIN_STATUS);
+    ea = win_err_addr();
+    check(v == 0xFFFFFFFFu && (st & PIPS_WIN_ST_RD_ERR) && !(st & PIPS_WIN_ST_TIMEOUT) &&
+          ea == UNMAPPED_AXI, "read of unmapped 0x%08llx: 0x%08x, WIN_STATUS 0x%08x (%s), "
+          "WIN_ERR 0x%" PRIx64, (unsigned long long)UNMAPPED_AXI, v, st, win_flags(st), ea);
+    if (st & PIPS_WIN_ST_TIMEOUT)
+        note("timeout: no AXI slave answered within ~33 us (expected a fast DECERR)");
+    bar_wr32(PIPS_REG_WIN_STATUS, PIPS_WIN_ST_STICKY);
+    st = bar_rd32(PIPS_REG_WIN_STATUS);
+    check(!(st & PIPS_WIN_ST_STICKY), "WIN_STATUS clears with 0x1f (now 0x%08x)", st);
+    axi_wr(UNMAPPED_AXI, 0x12345678);
+    st = bar_rd32(PIPS_REG_WIN_STATUS);
+    ea = win_err_addr();
+    check((st & PIPS_WIN_ST_WR_ERR) && ea == UNMAPPED_AXI,
+          "write to unmapped 0x%08llx: WIN_STATUS 0x%08x (%s), WIN_ERR 0x%" PRIx64,
+          (unsigned long long)UNMAPPED_AXI, st, win_flags(st), ea);
+    bar_wr32(PIPS_REG_WIN_STATUS, PIPS_WIN_ST_STICKY);
+    v = axi_rd(PIPS_AXI_REGFILE);
+    st = win_check(NULL);
+    check(!st, "window works again afterwards (regfile reads 0x%08x)", v);
+}
+
+static void t_split(void)
+{
+    uint32_t v = bar_rd32(PIPS_REG_CQ_SPLIT);
+
+    note("CQ_SPLIT 0x%08x", v);
+    if (check(!!(v & PIPS_SPLIT_PIO_SEEN), "CQ_SPLIT has recorded a BAR0 TLP")) {
+        if (PIPS_SPLIT_PIO_BAR_ID(v) == 0 && PIPS_SPLIT_PIO_APERTURE(v) == 15)
+            check(1, "BAR0 hits: BAR ID 0, aperture 15 (as PG343 predicts)");
+        else
+            warnx("BAR0 hits: BAR ID %u, aperture %u (PG343 predicts 0 / 15): report to the "
+                  "FPGA side", PIPS_SPLIT_PIO_BAR_ID(v), PIPS_SPLIT_PIO_APERTURE(v));
+    }
+    if (v & PIPS_SPLIT_SW_SEEN)
+        note("last memory TLP forwarded downstream: BAR ID %u, aperture %u (FPGA side wants "
+             "this, D4)", PIPS_SPLIT_SW_BAR_ID(v), PIPS_SPLIT_SW_APERTURE(v));
+    else
+        note("no memory TLP forwarded downstream yet: after traffic, see `pips info`");
+}
+
+static void t_log(void)
+{
+    struct logres res;
+    uint32_t cfg;
+    int rc;
+
+    if (PIPS_VERSION_MINOR(bar_rd32(PIPS_REG_VERSION)) < 1 || !bar_rd32(PIPS_REG_LOG_BYTES)) {
+        warnx("no log region: skipped");
+        return;
+    }
+    note("an empty recording: log-start, 1 ms, log-stop");
+    win_start();
+    log_start(1);
+    sleep_ms(1);
+    cfg = cfg_rd();
+    cfg_wr(cfg & ~PIPS_BATCH_LOG_ENABLE);
+    rc = log_finish(1000, &res);
+    if (!check(rc == 0, "DMA finished: DMASR 0x%08x (%s), %u bytes written", res.dmasr,
+               dmasr_flags(res.dmasr), res.bytes))
+        return;
+    check((uint64_t)res.n_records * 16 + 16 == res.bytes, "trailer: %u records, %u dropped, "
+          "stop %s, %u cycles", res.n_records, res.n_dropped, stop_name(res.reason),
+          res.duration);
+    if (res.n_dropped)
+        warnx("%u records dropped: the DMA or DDR could not keep up", res.n_dropped);
+    if (res.reason != 1)
+        note("stop reason %s: traffic filled the region within 1 ms", stop_name(res.reason));
+    note("pips log-dump FILE saves it; pips-log-decode.py FILE decodes it");
+}
+
+static int cmd_hwtest(int argc, char **argv)
+{
+    static const char *steps[] = { "regs", "bram", "regfile", "dma", "ddr", "err", "split", "log" };
+    static const char *titles[] = {
+        "BAR0 registers", "BAR0 BRAM", "regfile (batcher/logger config) through the window",
+        "log DMA registers through the window", "DDR through the window",
+        "window error path", "CQ split debug register", "log smoke test (DMA -> DDR)",
+    };
+    enum { NSTEPS = sizeof steps / sizeof steps[0] };
+    uint64_t ddr = DEFAULT_DDR_TEST;
+    int want[NSTEPS] = { 0 }, any = 0;
+
+    for (int i = 0; i < argc; i++) {
+        int k;
+        if (!strcmp(argv[i], "--ddr-addr") && i + 1 < argc) {
+            ddr = parse_num(argv[++i], "--ddr-addr");
+            continue;
+        }
+        for (k = 0; k < NSTEPS && strcmp(argv[i], steps[k]); k++)
+            ;
+        if (k == NSTEPS)
+            die("unknown hwtest step '%s' (regs bram regfile dma ddr err split log)", argv[i]);
+        want[k] = any = 1;
+    }
+    printf("hwtest on %s\n", g_bdf);
+    for (int k = 0; k < NSTEPS; k++) {
+        if (any && !want[k])
+            continue;
+        printf("\n[%s] %s\n", steps[k], titles[k]);
+        switch (k) {
+        case 0: t_regs(); break;
+        case 1: t_bram(); break;
+        case 2: t_regfile(); break;
+        case 3: t_dma(); break;
+        case 4: t_ddr(ddr); break;
+        case 5: t_err(); break;
+        case 6: t_split(); break;
+        case 7: t_log(); break;
+        }
+        if (g_fails) {
+            printf("\nhwtest: FAIL in step %s (%u of %u checks failed, warnings: %u); later "
+                   "steps not run\n", steps[k], g_fails, g_checks, g_warns);
+            return 1;
+        }
+    }
+    printf("\nhwtest: PASS (%u checks, warnings: %u)\n", g_checks, g_warns);
+    return 0;
+}
+
+/* ------------------------------------------------------------ soak */
+static uint64_t xorshift(uint64_t *s)
+{
+    *s ^= *s << 13;
+    *s ^= *s >> 7;
+    *s ^= *s << 17;
+    return *s;
+}
+
+static int cmd_soak(uint64_t n)
+{
+    uint64_t s = (uint64_t)time(NULL) * 0x9E3779B97F4A7C15ull | 1, bad = 0, i;
+    double t0 = now_s(), dt;
+    uint32_t st;
+
+    printf("soak: %" PRIu64 " random 4/8-byte BRAM write/read pairs\n", n);
+    for (i = 0; i < n && bad < 10; i++) {
+        uint64_t r = xorshift(&s);
+        if (r & 1) {
+            uint32_t off = (uint32_t)((r >> 8) % (PIPS_BRAM_SIZE / 8)) * 8;
+            uint64_t p = xorshift(&s), q;
+            bar_wr64(off, p);
+            if ((q = bar_rd64(off)) != p && bad++ < 10)
+                printf("  0x%03x: wrote 0x%016" PRIx64 " read 0x%016" PRIx64 "\n", off, p, q);
+        } else {
+            uint32_t off = (uint32_t)((r >> 8) % (PIPS_BRAM_SIZE / 4)) * 4, p = (uint32_t)(r >> 32), q;
+            bar_wr32(off, p);
+            if ((q = bar_rd32(off)) != p && bad++ < 10)
+                printf("  0x%03x: wrote 0x%08x read 0x%08x\n", off, p, q);
+        }
+        if (n >= 10 && (i + 1) % (n / 10) == 0)
+            printf("  %" PRIu64 " / %" PRIu64 ", %" PRIu64 " mismatches, %.1f s\n", i + 1, n,
+                   bad, now_s() - t0);
+    }
+    dt = now_s() - t0;
+    st = bar_rd32(PIPS_REG_PIO_STATUS);
+    printf("soak: %s: %" PRIu64 " pairs, %" PRIu64 " mismatches%s, PIO_STATUS 0x%08x, "
+           "%.2f us per pair\n", bad || st ? "FAIL" : "PASS", i, bad,
+           bad >= 10 ? " (stopped at 10)" : "", st, i ? dt / i * 1e6 : 0.0);
+    return bad || st ? 1 : 0;
+}
+
+/* ------------------------------------------------------------ main */
+static void usage(void)
+{
+    fputs("usage: pips [-s BDF] [-f] <command> [args]\n"
+          "  info | rd OFF [N] | wr OFF VAL | axi-rd ADDR [N] | axi-wr ADDR VAL\n"
+          "  cfg | cfg set depth=N time=N mrd=0|1 log=0|1 raw=VAL ...\n"
+          "  dma | dma-reset\n"
+          "  log-clear | log-start | log-stop [MS] | log-wait [MS] | log-dump FILE [BYTES]\n"
+          "  ddr-dump ADDR BYTES FILE\n"
+          "  hwtest [--ddr-addr ADDR] [regs bram regfile dma ddr err split log]\n"
+          "  soak [N]\n"
+          "Header of pips.c has the details.\n", stderr);
+    exit(2);
+}
+
+int main(int argc, char **argv)
+{
+    const char *cmd;
+    int opt, force = 0, raw;
+
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    while ((opt = getopt(argc, argv, "+s:fh")) != -1) {
+        switch (opt) {
+        case 's': snprintf(g_bdf, sizeof g_bdf, "%s", optarg); break;
+        case 'f': force = 1; break;
+        default: usage();
+        }
+    }
+    if (optind >= argc)
+        usage();
+    cmd = argv[optind++];
+    argc -= optind;
+    argv += optind;
+    raw = !strcmp(cmd, "rd") || !strcmp(cmd, "wr");
+
+    take_lock();
+    open_bar();
+    if (!raw && !force)
+        check_id();
+
+    if (!strcmp(cmd, "info") && argc == 0)
+        return cmd_info();
+    if (!strcmp(cmd, "rd") && (argc == 1 || argc == 2)) {
+        uint64_t off = parse_num(argv[0], "OFF"), n = argc == 2 ? parse_num(argv[1], "N") : 1;
+        if (off % 4 || off + 4 * n > PIPS_BAR0_SIZE)
+            die("OFF must be 4-byte aligned and OFF + 4*N <= 0x8000");
+        for (uint64_t i = 0; i < n; i++)
+            printf("0x%04" PRIx64 ": 0x%08x\n", off + 4 * i, bar_rd32((uint32_t)(off + 4 * i)));
+        return 0;
+    }
+    if (!strcmp(cmd, "wr") && argc == 2) {
+        uint64_t off = parse_num(argv[0], "OFF"), v = parse_num(argv[1], "VAL");
+        if (off % 4 || off + 4 > PIPS_BAR0_SIZE || v > 0xFFFFFFFFu)
+            die("OFF must be 4-byte aligned below 0x8000, VAL 32 bits");
+        bar_wr32((uint32_t)off, (uint32_t)v);
+        return 0;
+    }
+    if (!strcmp(cmd, "axi-rd") && (argc == 1 || argc == 2)) {
+        uint64_t a = parse_num(argv[0], "ADDR"), n = argc == 2 ? parse_num(argv[1], "N") : 1;
+        win_start();
+        for (uint64_t i = 0; i < n; i++)
+            printf("0x%08" PRIx64 ": 0x%08x\n", a + 4 * i, axi_rd(a + 4 * i));
+        return win_check("axi-rd") ? 1 : 0;
+    }
+    if (!strcmp(cmd, "axi-wr") && argc == 2) {
+        uint64_t a = parse_num(argv[0], "ADDR"), v = parse_num(argv[1], "VAL");
+        if (v > 0xFFFFFFFFu)
+            die("VAL: 32 bits");
+        win_start();
+        axi_wr(a, (uint32_t)v);
+        return win_check("axi-wr") ? 1 : 0;
+    }
+    if (!strcmp(cmd, "cfg"))
+        return cmd_cfg(argc, argv);
+    if (!strcmp(cmd, "dma") && argc == 0) {
+        win_start();
+        dma_print();
+        return 0;
+    }
+    if (!strcmp(cmd, "dma-reset") && argc == 0) {
+        win_start();
+        dma_reset();
+        dma_print();
+        return 0;
+    }
+    if (!strcmp(cmd, "log-clear") && argc == 0)
+        return cmd_log_clear();
+    if (!strcmp(cmd, "log-start") && argc == 0) {
+        win_start();
+        log_start(0);
+        return 0;
+    }
+    if ((!strcmp(cmd, "log-stop") || !strcmp(cmd, "log-wait")) && argc <= 1)
+        return cmd_log_finish(argc ? (unsigned)parse_num(argv[0], "MS") : 2000,
+                              !strcmp(cmd, "log-stop"));
+    if (!strcmp(cmd, "log-dump"))
+        return cmd_log_dump(argc, argv);
+    if (!strcmp(cmd, "ddr-dump") && argc == 3) {
+        win_start();
+        ddr_dump(parse_num(argv[0], "ADDR"), parse_num(argv[1], "BYTES"), argv[2]);
+        return 0;
+    }
+    if (!strcmp(cmd, "hwtest"))
+        return cmd_hwtest(argc, argv);
+    if (!strcmp(cmd, "soak") && argc <= 1)
+        return cmd_soak(argc ? parse_num(argv[0], "N") : 1000000);
+    usage();
+}

@@ -175,5 +175,7 @@ utils/reports/
 /dualnic/
 /dualssd/
 utils/collect_iio_occ
+scripts/pips/pips
+scripts/pips/pips-sim
 pcie-topology.csv
 pcie-topology.txt
