@@ -87,11 +87,12 @@ elif [ -z "${bar_size:-}" ]; then
     echo "  BAR0 does not exist: this bitstream has no BAR0 on the upstream port"
     RESULT[enum]=FAIL
 elif [ "$bar_size" -ne 32768 ]; then
-    echo "  BAR0 is $bar_size bytes. PIPS with the host register block (BAR0 map v2) has"
-    echo "  32 KB, so this bitstream predates it (FPGA repo af165d6) or was built with another"
-    echo "  upstream-port BAR size. Program a build of the current pips.tcl, then rescan."
-    echo "  BAR0 is left alone: in builds without the PIO, BAR0 accesses are forwarded to"
-    echo "  the device on downstream port one (PIO_KNOWLEDGE_MAP D6)."
+    echo "  BAR0 is $bar_size bytes; the PIO needs 32 KB (registers at 0x800, window at 0x4000)."
+    echo "  pips.tcl's pf0_bar0_size 32 (Kilobytes) gives 1 KB on this Type 1 port, because the"
+    echo "  IP encodes it as for an endpoint: build with 1 Megabytes (README, \"BAR0 size\")."
+    echo "  The kernel sized it at (host booted $(uptime -s 2>/dev/null)):"
+    dmesg 2>/dev/null | grep -E "$BDF: (\[10ee|reg 0x1[04]|BAR 0)" | tail -4 | sed 's/^/    /'
+    echo "  BAR0 is left alone."
     RESULT[enum]=FAIL
 elif [ $((bar_start)) -eq 0 ]; then
     echo "  BAR0 is not assigned an address (Region 0 <unassigned>): boot with pci=realloc"

@@ -121,6 +121,7 @@ P info > "$OUT/info-before.txt" 2>&1 || { cat "$OUT/info-before.txt"; die "pips 
 P cfg > "$OUT/cfg-before.txt" 2>&1 || die "cannot read the batcher config: $(cat "$OUT/cfg-before.txt")"
 P dma > "$OUT/dma-before.txt" 2>&1
 CFG0=$(sed -n 's/^cfg=\(0x[0-9a-f]*\).*/\1/p' "$OUT/cfg-before.txt")
+echo "  FPGA design ID: $(sed -n 's/^design_id=//p' "$OUT/cfg-before.txt")"
 echo "  batcher config before: $(grep '^cfg=' "$OUT/cfg-before.txt")"
 for b in $BDF $(pips_below "$BDF"); do echo "### $b"; lspci -vv -s "$b" 2>&1; done > "$OUT/lspci-before.txt"
 DMESG0=$(dmesg 2>/dev/null | wc -l)

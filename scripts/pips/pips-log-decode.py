@@ -4,10 +4,16 @@
 
     pips-log-decode.py log.bin                         summary to stdout
     pips-log-decode.py log.bin --csv log.csv --json log-summary.json
+    pips-log-decode.py log.bin.gz --region-bytes 0x400000 --rpt pips-log.rpt
     pips-log-decode.py region.bin --scan               the DMA never finished:
                                                        no trailer, so walk the
                                                        records until one was
                                                        never written
+
+The first line says whether the recording is whole: FULL (it ran until the
+region filled), CUT (ended before), either with +DROPS (TLPs lost to logger
+FIFO overflow), NO_TRAILER (it never closed), or BAD (file and trailer
+disagree; exit status 1). See classify().
 
 The file holds exactly the bytes the DMA wrote, so the trailer is its last
 16 bytes. Record format: telemetry_dma_format.md §4 (AXI4-switch repo); field
@@ -25,6 +31,7 @@ cycles: the running sum of gap + length (stalls inside a packet are not seen).
 import argparse
 import collections
 import csv
+import gzip
 import json
 import struct
 import sys
@@ -49,14 +56,27 @@ def fail(msg):
 
 
 def load(path, scan):
-    """(records, trailer dict or None, pad count, file size). Records are
-    tuples: (addr, length, gap, type, payload_dw, tag, at, info, reserved)."""
-    with open(path, "rb") as f:
+    """(records, trailer dict or None, pad count, file size, problem or None).
+    Records are tuples: (addr, length, gap, type, payload_dw, tag, at, info,
+    reserved). Without --scan a file whose last record is no trailer is a
+    problem; its records are then walked as --scan does."""
+    opener = gzip.open if path.endswith(".gz") else open
+    with opener(path, "rb") as f:
         buf = f.read()
     if len(buf) < 16 or len(buf) % 16:
         fail(f"{path}: {len(buf)} bytes, expected a non-zero multiple of 16")
     nslots = len(buf) // 16
-    trailer = None
+    trailer, problem = None, None
+    if not scan:
+        trailer = TRL.unpack_from(buf, len(buf) - 16)
+        if trailer[5] != 0x88:
+            problem = f"the last record is not a trailer (info 0x{trailer[5]:02x})"
+        elif trailer[0] > nslots - 1:
+            problem = f"the trailer says {trailer[0]} records, the file has room for {nslots - 1}"
+        if problem:
+            trailer, scan = None, True
+        else:
+            nbody, end = trailer[0], nslots - 1
     if scan:
         n = 0
         while n < nslots:
@@ -68,21 +88,59 @@ def load(path, scan):
                 break
             n += 1
         nbody, end = n, n
-    else:
-        trailer = TRL.unpack_from(buf, len(buf) - 16)
-        if trailer[5] != 0x88:
-            fail(f"{path}: the last record is not a trailer (info 0x{trailer[5]:02x}). "
-                 "Did the DMA finish? --scan walks the records without one")
-        nbody, end = trailer[0], nslots - 1
-        if nbody > end:
-            fail(f"trailer says {nbody} records, the file has room for {end}")
     recs = [REC.unpack_from(buf, 16 * i) for i in range(nbody)]
     pads = sum(1 for i in range(nbody, end) if buf[16 * i + 14] == 0x8C)
     if trailer:
         trailer = dict(n_records=trailer[0], n_dropped=trailer[1],
                        duration_cycles=trailer[2],
                        stop_reason=STOP.get(trailer[3], f"unknown({trailer[3]})"))
-    return recs, trailer, pads, len(buf)
+    return recs, trailer, pads, len(buf), problem
+
+
+def classify(sm, problem, region_bytes):
+    """Whether the recording is whole: (status, why).
+      FULL        it ran until the region filled: region_bytes of records + trailer
+      CUT         it was ended (log_enable low) before the region filled
+      +DROPS      some TLPs were lost to logger FIFO overflow (holes, per port)
+      NO_TRAILER  the recording never closed: the DMA did not finish
+      BAD         the file and its trailer disagree"""
+    t = sm["trailer"]
+    if problem:
+        return "BAD", problem
+    if not t:
+        return "NO_TRAILER", "no trailer: the recording did not close (DMA not finished)"
+    if sm["bad_records"]:
+        return "BAD", f"unexpected records: {sm['bad_records']}"
+    if t["stop_reason"] == "region_full":
+        if region_bytes and sm["bytes"] != region_bytes:
+            return "BAD", f"region full, but {sm['bytes']} bytes, not {region_bytes}"
+        status, why = "FULL", "ran until the region filled"
+    elif t["stop_reason"] == "enable_low":
+        status, why = "CUT", "ended (log_enable low) before the region filled"
+    else:
+        return "BAD", f"stop reason {t['stop_reason']}"
+    if t["n_dropped"]:
+        status += "+DROPS"
+        why += f"; {t['n_dropped']} TLP records dropped (logger FIFO overflow)"
+    return status, why
+
+
+def write_rpt(path, sm):
+    """key: value lines for run-dualssd-experiment.sh's reports. The status is
+    text; every other value is a number, which dualssd-results.py collects."""
+    t = sm["trailer"] or {}
+    lines = [f"status: {sm['status']}",
+             f"pips_full: {int(sm['status'].startswith('FULL'))}",
+             f"pips_bytes: {sm['bytes']}",
+             f"pips_records: {sm['records']}",
+             f"pips_dropped: {t.get('n_dropped', 0)}",
+             f"pips_duration_us: {sm['duration_us'] or 0:.1f}"]
+    for name, p in sm["ports"].items():
+        lines += [f"pips_{name}_tlp: {p['tlp']}",
+                  f"pips_{name}_mwr_gbps: {p['mwr_gbps'] or 0:.3f}",
+                  f"pips_{name}_gap_mean: {p['gap_mean'] if p['gap_mean'] is not None else 0:.2f}"]
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
 
 
 def pct(sorted_vals, p):
@@ -212,21 +270,29 @@ def print_summary(sm):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("log", help="the dump: pips log-dump FILE")
+    ap.add_argument("log", help="the dump: pips log-dump FILE (.gz is read too)")
     ap.add_argument("--scan", action="store_true",
                     help="no trailer: walk records until one was never written")
+    ap.add_argument("--region-bytes", type=lambda s: int(s, 0),
+                    help="the log region's size (pips info LOG_BYTES): a FULL log must be "
+                         "exactly this long")
     ap.add_argument("--csv", help="one line per record")
     ap.add_argument("--json", help="the summary as JSON")
+    ap.add_argument("--rpt", help="status and key numbers as 'key: value' lines")
     a = ap.parse_args()
 
-    recs, trailer, pads, nbytes = load(a.log, a.scan)
+    recs, trailer, pads, nbytes, problem = load(a.log, a.scan)
     ports, bad, rows = analyse(recs)
     sm = summarise(a.log, nbytes, recs, trailer, pads, ports, bad)
     if trailer:
         drops = sum(p["dropped"] for p in sm["ports"].values())
         if drops != trailer["n_dropped"]:
             sm["bad_records"]["dropped_count_mismatch"] = f"{drops} vs trailer {trailer['n_dropped']}"
+    sm["status"], sm["status_why"] = classify(sm, problem, a.region_bytes)
+    print(f"status: {sm['status']}: {sm['status_why']}")
     print_summary(sm)
+    if a.rpt:
+        write_rpt(a.rpt, sm)
     if a.csv:
         with open(a.csv, "w", newline="") as f:
             w = csv.writer(f)
@@ -237,7 +303,7 @@ def main():
         with open(a.json, "w") as f:
             json.dump(sm, f, indent=1)
             f.write("\n")
-    return 1 if sm["bad_records"] else 0
+    return 1 if sm["status"] == "BAD" else 0
 
 
 if __name__ == "__main__":

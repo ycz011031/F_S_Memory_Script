@@ -17,6 +17,7 @@ The .rpt files stay the source of truth; this only collects them, so a run
 whose reports are missing shows up as null rather than as zero.
 """
 import argparse
+import collections
 import datetime
 import glob
 import json
@@ -278,6 +279,9 @@ def one_run(reports, exp, j, ssds):
     # Everything pcm-memory gave: per-socket and system read / write / total
     # MB/s and the sample count (utils/parse_membw.py).
     r.update(read_kv(os.path.join(base, 'membw.rpt')))
+    # The PIPS TLP log's numbers (--pips-log 1), pips_*: full or not, records,
+    # drops, per-port TLPs and MWr Gbps. Its text status goes in 'pips_log'.
+    r.update(read_kv(os.path.join(base, 'pips-log.rpt')))
     return r
 
 
@@ -345,10 +349,22 @@ def load(files):
     return recs
 
 
+def tag(r):
+    """The IOMMU mode, plus the PIPS batcher setting when the record has one
+    (run-dualssd-experiment.sh --pips-log 1), e.g. 'off d8t22'. Records with
+    different settings are different points and never mix."""
+    b = r.get('pips_batch')
+    return f"{r.get('iommu')} {b}" if b else str(r.get('iommu'))
+
+
+def tag_w(recs):
+    return max([7] + [len(tag(r)) for r in recs])
+
+
 def group(r):
-    """One measurement point: IOMMU mode, block size, instances per drive
-    ("n0+n1" for a co-run whose drives had different counts)."""
-    return (str(r.get('iommu')), str(r.get('bs')), r.get('instances_per_ssd'))
+    """One measurement point: IOMMU mode (and batcher setting), block size,
+    instances per drive ("n0+n1" for a co-run whose drives had different counts)."""
+    return (tag(r), str(r.get('bs')), r.get('instances_per_ssd'))
 
 
 def n_of(r, i):
@@ -362,7 +378,7 @@ def is_asym(r):
 
 def point(r, i):
     """The single-drive point that matches drive i's share of record r."""
-    return (str(r.get('iommu')), str(r.get('bs')), n_of(r, i))
+    return (tag(r), str(r.get('bs')), n_of(r, i))
 
 
 def alone_iops(recs):
@@ -416,7 +432,7 @@ def sort_key(r):
     def num(v):
         return v if isinstance(v, (int, float)) else 0
     a, b = num(n_of(r, 0)), num(n_of(r, 1))
-    return (str(r.get('iommu')), bs_bytes(r.get('bs')), a != b, min(a, b), max(a, b), a > b,
+    return (tag(r), bs_bytes(r.get('bs')), a != b, min(a, b), max(a, b), a > b,
             {'ssd0only': 0, 'ssd1only': 1, 'both': 2}.get(r.get('mode'), 3))
 
 
@@ -474,13 +490,14 @@ def pcm_tables(recs):
         cols = [(k, label(k)) for k in ks]
         rows = [[cell(k, r['mean'].get(k)) for k, _ in cols] for r in sorted(recs, key=sort_key)]
         ws = [max([len(l)] + [len(row[c]) for row in rows]) for c, (_, l) in enumerate(cols)]
-        hdr = f"{'IOMMU':<7} {'BS':<5} {'INST':>5} {'MODE':<9}" + \
+        tw = tag_w(recs)
+        hdr = f"{'IOMMU':<{tw}} {'BS':<5} {'INST':>5} {'MODE':<9}" + \
               ''.join(f' {l:>{w}}' for (_, l), w in zip(cols, ws))
         print(f'{tool}, means over runs (sd of each in the .jsonl)')
         print(hdr)
         print('-' * len(hdr))
         for r, row in zip(sorted(recs, key=sort_key), rows):
-            print(f"{str(r.get('iommu')):<7} {str(r.get('bs')):<5} "
+            print(f"{tag(r):<{tw}} {str(r.get('bs')):<5} "
                   f"{str(r.get('instances_per_ssd')):>5} {str(r.get('mode')):<9}" +
                   ''.join(f' {c:>{w}}' for c, w in zip(row, ws)))
         print()
@@ -493,7 +510,7 @@ def asym_table(recs):
     co = {}
     for r in recs:
         if r.get('mode') == 'both':
-            co[(str(r.get('iommu')), str(r.get('bs')), n_of(r, 0), n_of(r, 1))] = r
+            co[(tag(r), str(r.get('bs')), n_of(r, 0), n_of(r, 1))] = r
     pairs = sorted({(k[0], k[1], min(k[2], k[3]), max(k[2], k[3])) for k in co if k[2] != k[3]},
                    key=lambda p: (p[0], bs_bytes(p[1]), p[2], p[3]))
     if not pairs:
@@ -540,6 +557,47 @@ def asym_table(recs):
     print('  both LOW, both HIGH = the even co-runs at either count, drive 0 / drive 1.')
 
 
+def pips_table(recs):
+    """Each configuration's PIPS TLP log (--pips-log 1): whether every run's
+    recording is whole, and what it saw per port."""
+    rs = [r for r in recs if r.get('pips_log') is not None]
+    if not rs:
+        return
+    tw = tag_w(rs)
+    sw = max([13] + [len(str(r['pips_log'])) for r in rs])
+    hdr = (f"{'IOMMU':<{tw}} {'BS':<5} {'INST':>5} {'MODE':<9} {'LOG, per run':<{sw}} "
+           f"{'RECORDS':>8} {'DROP':>5} {'SPAN_us':>8} {'in0_TLP':>8} {'in1_TLP':>8} "
+           f"{'out_TLP':>8} {'out_MWr_Gbps':>12}")
+    print()
+    print('PIPS TLP log per configuration (numbers: means over runs)')
+    print(hdr)
+    print('-' * len(hdr))
+    counts = collections.Counter()
+    for r in sorted(rs, key=sort_key):
+        m = r['mean']
+        st = str(r['pips_log']) or 'none'
+        counts.update(st.split(','))
+        flag = '' if set(st.split(',')) == {'FULL'} else '  <-- NOT ALL FULL'
+        print(f"{tag(r):<{tw}} {str(r.get('bs')):<5} {str(r.get('instances_per_ssd')):>5} "
+              f"{str(r.get('mode')):<9} {st:<{sw}} "
+              f"{fmt(m.get('pips_records'), None, '.0f'):>8} "
+              f"{fmt(m.get('pips_dropped'), None, '.0f'):>5} "
+              f"{fmt(m.get('pips_duration_us'), None, '.0f'):>8} "
+              f"{fmt(m.get('pips_in0_tlp'), None, '.0f'):>8} "
+              f"{fmt(m.get('pips_in1_tlp'), None, '.0f'):>8} "
+              f"{fmt(m.get('pips_out_tlp'), None, '.0f'):>8} "
+              f"{fmt(m.get('pips_out_mwr_gbps'), None, '.2f'):>12}{flag}")
+    print()
+    print('  logs: ' + ', '.join(f'{n} {s}' for s, n in counts.most_common()))
+    print('  FULL       = it ran until the log region (4 MiB, 262,143 TLPs) filled.')
+    print('  CUT        = it was ended first: the traffic did not fill the region in 5 s.')
+    print('  +DROPS     = TLP records lost to logger FIFO overflow: holes in the log.')
+    print('  NO_TRAILER = the recording never closed; BAD = the dump and its trailer')
+    print('               disagree; FAILED = no log. SPAN_us = the recording\'s length.')
+    print('  in0 = from downstream port one (b348), in1 = from downstream port zero')
+    print('  (b148), out = the batched stream to the host.')
+
+
 def summary(a):
     recs = load(a.files)
     key = sort_key
@@ -551,7 +609,8 @@ def summary(a):
             base.setdefault(group(r), {})[r['mode']] = r['mean'].get('misses_per_io')
     alone = alone_iops(recs)
 
-    hdr = f"{'IOMMU':<7} {'BS':<5} {'INST':>5} {'MODE':<9} {'IOPS_k':>15} {'GB/s':>6} " \
+    tw = tag_w(recs)
+    hdr = f"{'IOMMU':<{tw}} {'BS':<5} {'INST':>5} {'MODE':<9} {'IOPS_k':>15} {'GB/s':>6} " \
           f"{'LAT_us':>7} {'PCIe_wr':>8} {'MISS/IO':>13} {'MISS/4K':>8} {'CPU_%':>11} " \
           f"{'CPU_us/IO':>9} {'CONTENTION':>10} {'KEPT%':>11}"
     print(hdr)
@@ -589,7 +648,7 @@ def summary(a):
         flag = '  <-- LINK BOUND' if link_bound(r) else ''
         if any(run.get('window_covered') == 0 for run in r.get('per_run', [])):
             flag += '  <-- fio DID NOT COVER THE WINDOW'
-        print(f"{str(r.get('iommu')):<7} {str(r.get('bs')):<5} "
+        print(f"{tag(r):<{tw}} {str(r.get('bs')):<5} "
               f"{str(r.get('instances_per_ssd')):>5} {str(r.get('mode')):<9} "
               f"{fmt(iops / 1e3 if iops is not None else None, (s.get('iops_total') or 0) / 1e3, '.1f'):>15} "
               f"{fmt(m.get('gbps_total') / 8 if m.get('gbps_total') is not None else None, None, '.2f'):>6} "
@@ -618,7 +677,11 @@ def summary(a):
     print('  IOMMU off/pt has no translation, so compare IOPS and CPU_us/IO across')
     print('  modes at the same BS/INST. LINK BOUND: PCIe write above 85% of the')
     print('  narrowest shared PCIe link, which then caps the run, not the IOMMU.')
+    if any(r.get('pips_batch') for r in recs):
+        print('  IOMMU <mode> d<D>t<T>[m1] = run through PIPS with batcher depth D, time T')
+        print('               (and batch_mrd on); see the PIPS log table below.')
     asym_table(recs)
+    pips_table(recs)
     pcm_tables(recs)
 
 
@@ -657,7 +720,7 @@ def grid(a):
                 ('both drives, CPU us per I/O', 'both',
                  lambda r: None if cpu_us_per_io(r) is None else f'{cpu_us_per_io(r):.2f}'),
             ]
-            if iommu not in ('off', 'pt'):
+            if iommu.split()[0] not in ('off', 'pt'):
                 tables.append(('both drives, IOTLB misses per 4 KiB read', 'both',
                                lambda r: None if miss_per_4k(r) is None else f'{miss_per_4k(r):.3f}'))
         for i in (0, 1):

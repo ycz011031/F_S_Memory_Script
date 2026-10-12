@@ -30,7 +30,10 @@ has() {
 echo "-- registers, BRAM, window"
 run 0 "info" "$P" info;                          has '"PIPS"'; has 'match'
 run 0 "hwtest, every step" "$P" hwtest;          has 'hwtest: PASS'
-run 0 "hwtest regfile alone" "$P" hwtest regfile; has 'restored'
+run 0 "hwtest regfile alone" "$P" hwtest regfile; has 'restored'; has 'DESIGN_ID 0x0a02'
+    has 'reserved registers 0x04-0x1c and 0x24-0x3c read 0 (0 do not'; has 'repeats reg0'
+run 0 "cfg shows the design ID" "$P" cfg; has 'design_id=0x0a02'
+run 0 "hwtest split" "$P" hwtest split; has 'CQ_SPLIT has recorded a BAR0 TLP'
 run 1 "hwtest refuses a DDR test page inside the log region" "$P" hwtest ddr --ddr-addr 0x1000
 run 0 "soak" "$P" soak 20000;                    has 'soak: PASS'
 run 0 "cfg set fields" "$P" cfg set depth=8 time=0x16 mrd=1; has 'cfg=0x00011608'
@@ -65,6 +68,67 @@ run 0 "log-dump" "$P" log-dump "$T/b.bin"
 run 0 "decode" python3 "$DEC" "$T/b.bin"; has '262143 records'
 run 0 "log-start clears log_enable first" "$P" log-start; has 'log_enable was 1'
 run 0 "log-stop" "$P" log-stop
+
+echo "-- log status: whole or cut"
+run 0 "region full with drops" python3 "$DEC" "$T/b.bin" --region-bytes 0x400000; has 'status: FULL+DROPS'
+run 0 "an early stop" python3 "$DEC" "$T/a.bin"; has 'status: CUT+DROPS'
+export PIPS_SIM_RECORDS=300000 PIPS_SIM_DROP_EVERY=0
+run 0 "log-start, no drops" "$P" log-start
+run 0 "log-wait" "$P" log-wait 100
+run 0 "log-dump" bash -c "'$P' cfg set log=0 >/dev/null && '$P' log-dump '$T/f.bin' && gzip -k '$T/f.bin'"
+run 0 "decode a .gz, write the .rpt" python3 "$DEC" "$T/f.bin.gz" --region-bytes 0x400000 --rpt "$T/f.rpt"
+has 'status: FULL: ran until the region filled'
+grep -qx 'status: FULL' "$T/f.rpt" && grep -qx 'pips_records: 262143' "$T/f.rpt" &&
+    grep -qx 'pips_full: 1' "$T/f.rpt" && ok "  rpt: status FULL, 262143 records" || bad "  rpt: $(cat "$T/f.rpt")"
+run 1 "region full but the wrong size is BAD" python3 "$DEC" "$T/f.bin" --region-bytes 0x800000; has 'status: BAD'
+head -c -16 "$T/f.bin" > "$T/t.bin"
+run 1 "a dump missing its trailer is BAD" python3 "$DEC" "$T/t.bin"; has 'status: BAD: the last record is not a trailer'
+unset PIPS_SIM_DROP_EVERY
+
+echo "-- run-dualssd-experiment.sh: pips_record, pips_collect"
+# The runner's own two functions, run against the model.
+runner_pips() {   # <want status> <records> [fail]
+    (
+        eval "$(sed -n '/^pips_record() {/,/^}/p; /^pips_collect() {/,/^}/p' "$HERE/../run-dualssd-experiment.sh")"
+        if [ "${3:-}" = fail ]; then pipsc() { return 1; }; else pipsc() { "$P" "$@"; }; fi
+        sudo() { [ "$1" = -n ] && shift; "$@"; }
+        HERE="$HERE/.."; setup_dir="$T/u$1"; RUN=r0; L="$setup_dir/logs/r0"
+        pips_region=0x400000; pips_gzip=1; PIPS_STATUS=()
+        mkdir -p "$L" "$setup_dir/reports/$RUN"
+        export PIPS_SIM_RECORDS="$2" PIPS_SIM_DROP_EVERY=0
+        "$P" log-clear > /dev/null
+        pips_record
+        pips_collect
+        echo "STATUS=${PIPS_STATUS[*]}"
+        "$P" cfg
+    )
+}
+run 0 "FULL" runner_pips FULL 300000;  has 'STATUS=FULL$'; has 'log_enable=0'
+[ -s "$T/uFULL/logs/r0/pips-log.bin.gz" ] && grep -qx 'status: FULL' "$T/uFULL/reports/r0/pips-log.rpt" &&
+    ok "  pips-log.bin.gz and pips-log.rpt" || bad "  missing pips-log.bin.gz or rpt"
+run 0 "CUT: the region did not fill in 5 s" runner_pips CUT 1000; has 'STATUS=CUT$'; has 'log_enable=0'
+run 0 "FAILED: the switch does not answer" runner_pips FAILED 1000 fail; has 'STATUS=FAILED$'
+
+echo "-- dualssd-results.py: records of several batcher settings"
+mkrec() {   # <setting> <bs> <instances> <log status>
+    local e="x-$1-$2-$3" d="$T/rep"
+    mkdir -p "$d/$e-RUN-0" "$d/$e-RUN-0-ssd0" "$d/$e-RUN-0-ssd1"
+    for i in 0 1; do printf 'IOPS: 400000\nread_Gbps: 13.1\nlat_mean_us: 150\n' > "$d/$e-RUN-0-ssd$i/fio.rpt"; done
+    printf 'avg_cpu_util: 50\n' > "$d/$e-RUN-0/cpu_util.rpt"
+    printf 'status: %s\npips_full: 1\npips_records: 262143\npips_dropped: 0\npips_duration_us: 4368.0\npips_in0_tlp: 65932\npips_in1_tlp: 65142\npips_out_tlp: 131069\npips_out_mwr_gbps: 53.88\n' \
+        "$4" > "$d/$e-RUN-0/pips-log.rpt"
+    python3 "$HERE/../dualssd-results.py" dump --reports "$d" --exp "$e" --runs 1 --ssds 0,1 \
+        --out "$T/res-$1.jsonl" --meta mode=both --meta iommu=off --meta instances_per_ssd="$3" \
+        --meta instances_ssd0="$3" --meta instances_ssd1="$3" --meta bs="$2" \
+        --meta cpu_util_cores=36,37 --meta pips_batch="$1" --meta pips_log="$4" > /dev/null
+}
+for s in d1t0 d8t22; do for b in 4k 1m; do for j in 1 4; do mkrec $s $b $j FULL; done; done; done
+mkrec d8t22 4k 8 FULL,CUT
+run 0 "summary" python3 "$HERE/../dualssd-results.py" summary "$T"/res-*.jsonl
+has '^off d1t0 '; has '^off d8t22 4k        8'; has 'PIPS TLP log per configuration'
+has 'FULL,CUT .* <-- NOT ALL FULL'; has 'logs: 9 FULL, 1 CUT'
+run 0 "grid" python3 "$HERE/../dualssd-results.py" grid "$T"/res-*.jsonl
+has 'IOMMU off d1t0: both drives, total kIOPS'; has 'IOMMU off d8t22: both drives, total kIOPS'
 
 echo "-- recovery"
 export PIPS_SIM_RECORDS=1000

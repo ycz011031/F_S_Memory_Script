@@ -3,8 +3,9 @@
  * and the scripts without hardware: `make check`. Not used on a testbed.
  *
  * Models what the tool relies on: BAR0 registers and counters, BRAM and its
- * aliases, the AXI window with its error reporting, the regfile (reg0 only,
- * DECERR past it), the AXI DMA S2MM registers in direct register mode, 2 GB
+ * aliases, the AXI window with its error reporting, the regfile (reg0,
+ * DESIGN_ID, reserved registers, repeating every 0x40), the AXI DMA S2MM
+ * registers in direct register mode, 2 GB
  * of DDR, and a logger that writes TLP records and a trailer on log_enable
  * edges. Timing, AXI timeouts and the PIO's limits (F2) are not modelled.
  *
@@ -12,7 +13,8 @@
  * hardware does: $PIPS_SIM_STATE (default /tmp/pips-sim.state) and a sparse
  * 2 GB DDR image next to it ($PIPS_SIM_STATE.ddr). Delete both to "power
  * cycle". $PIPS_SIM_RECORDS (default 1000) is how many TLPs a recording sees;
- * 262143 or more fills the 4 MiB region.
+ * 262143 or more fills the 4 MiB region. Every $PIPS_SIM_DROP_EVERY-th
+ * record (default 500, 0 for none) is a dropped-TLP record.
  */
 #define _GNU_SOURCE
 #include <fcntl.h>
@@ -28,6 +30,7 @@
 #define LOG_BYTES       4194304u            /* pips.tcl pips_log_region_bytes, base 0 */
 #define DMACR_RESET_VAL 0x00010002u
 #define BUS_NUM_VAL     0x009a9897u         /* primary 97, secondary 98, subordinate 9a */
+#define DESIGN_ID       PIPS_DESIGN_ID_FIRST
 
 struct state {
     uint32_t magic;
@@ -115,8 +118,11 @@ static void make_rec(uint32_t i, uint8_t r[16])
     uint64_t addr = 0x100000000ull + 64ull * i;
     int mwr = port == 2 || (i & 4);
 
+    const char *e = getenv("PIPS_SIM_DROP_EVERY");
+    uint32_t every = e ? (uint32_t)strtoul(e, NULL, 0) : 500;
+
     memset(r, 0, 16);
-    if (i % 500 == 499) {               /* every 500th: a dropped-TLP record */
+    if (every && i % every == every - 1) {   /* a dropped-TLP record (0: none) */
         r[14] = 0x84 | port;
         S->ndrop++;
         return;
@@ -182,8 +188,11 @@ static void log_edge(uint32_t old, uint32_t now)
 static uint32_t axi_read(uint64_t a, int *err)
 {
     if (a >= PIPS_AXI_REGFILE && a < PIPS_AXI_REGFILE + 0x10000) {
-        if ((a & 0xFFF) == 0)
-            return S->cfg;
+        switch (a & 0x3F) {             /* 16 registers, repeating every 0x40 */
+        case PIPS_BATCH_CFG_OFF: return S->cfg;
+        case PIPS_DESIGN_ID_OFF: return DESIGN_ID;
+        default: return 0;
+        }
     } else if (a >= PIPS_AXI_DMA_LOG && a < PIPS_AXI_DMA_LOG + 0x10000) {
         switch (a & 0xFFFF) {
         case PIPS_DMA_S2MM_DMACR: return S->dmacr;
@@ -205,8 +214,8 @@ static int axi_write(uint64_t a, uint32_t v)
 {
     if (a >= PIPS_AXI_REGFILE && a < PIPS_AXI_REGFILE + 0x10000) {
         uint32_t old = S->cfg;
-        if (a & 0xFFF)
-            return 1;
+        if (a & 0x3F)
+            return 0;                   /* read-only registers: ignored, OKAY */
         S->cfg = v;
         log_edge(old, v);
         return 0;

@@ -127,9 +127,18 @@ link_partner() {
     return 0
 }
 
+# Batcher setting from `pips cfg`: cfg_of <file> -> 0x..., pips_tag <cfg> ->
+# d<depth>t<time>, plus m1 with batch_mrd (names results and sweeps).
+cfg_of() { sed -n 's/^cfg=\(0x[0-9a-f]*\).*/\1/p' "$1"; }
+pips_tag() {
+    local v=$(( $1 ))
+    printf 'd%dt%d%s\n' $(( v & 0xFF )) $(( (v >> 8) & 0xFF )) "$( (( (v >> 16) & 1 )) && echo m1)"
+}
+
 # Kernel log lines that report a PCIe, IOMMU or NVMe problem. Not the boot-time
-# "_OSC: platform does not support [... AER ... DPC]" lines.
-PIPS_KERNEL_ERR_RE='AER: |DPC: |DMAR: \[DMA|DMAR:.*[Ff]ault|pciehp.*(Link Down|Card not present)|nvme.*(timeout|[Rr]eset|I/O error|failed)'
+# "_OSC: platform does not support [... AER ... DPC]" or "nvme ...: Shutdown
+# timeout set to 10 seconds" lines.
+PIPS_KERNEL_ERR_RE='AER: |DPC: |DMAR: \[DMA|DMAR:.*[Ff]ault|pciehp.*(Link Down|Card not present)|nvme.*(timeout, |controller is down|[Rr]eset(ting)? controller|I/O error|failed|Removing)'
 
 # BAR0 of a function as the kernel holds it: prints "<start> <bytes>" (hex
 # start, decimal size), start 0 when the BAR is not assigned.

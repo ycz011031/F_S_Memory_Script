@@ -83,7 +83,7 @@
 #define PIPS_WIN_ST_BUSY        (1u << 8)     /* read-only */
 
 /* ------------------------------------------------------------------ AXI map (through the window) */
-#define PIPS_AXI_REGFILE        0xA4000000ull /* axil4_regfile_0, 64 KB, NUM_REGS = 1 */
+#define PIPS_AXI_REGFILE        0xA4000000ull /* axil4_regfile_0, 64 KB segment, 16 regs (64 B, repeats every 0x40) */
 #define PIPS_AXI_DMA_LOG        0xA4010000ull /* axi_dma_log register space, 64 KB */
 #define PIPS_AXI_DDR_BASE       0x00000000ull /* DDR4 through axi_noc_0 */
 #define PIPS_AXI_DDR_SIZE       0x80000000ull /* 2 GB */
@@ -98,6 +98,18 @@
 #define PIPS_BATCH_MRD          (1u << 16)              /* batch_mrd */
 #define PIPS_BATCH_LOG_ENABLE   (1u << 24)              /* log_enable, rising edge arms a recording */
 #define PIPS_BATCH_CFG_RESET    0x00000001u             /* depth 1, everything else 0 */
+
+/* axil4_regfile_0 layout (pips.tcl, comment above axil4_regfile_0):
+ *   0x00        batcher config, RW (above)
+ *   0x04 - 0x1C reserved, read 0
+ *   0x20 - 0x3F read-only range; writes are ignored (OKAY, WIN_STATUS stays 0)
+ *     0x20      DESIGN_ID: [15:0] build identifier (pips.tcl pips_design_id), [31:16] 0
+ *     0x24-0x3C reserved, read 0
+ * The design ID goes up by one with every FPGA design update: compare it with the build you expect. */
+#define PIPS_REGFILE_RO_OFF     0x20u
+#define PIPS_DESIGN_ID_OFF      0x20u
+#define PIPS_DESIGN_ID(v)       ((uint32_t)(v) & 0xFFFFu)
+#define PIPS_DESIGN_ID_FIRST    0x0A02u       /* first build that has the field; older builds read DECERR (0xFFFFFFFF) */
 
 /* AXI DMA S2MM registers at PIPS_AXI_DMA_LOG (PG021 layout).
  * NOT YET CONFIRMED against PG021 for axi_dma 7.1 / on hardware - check before use. */

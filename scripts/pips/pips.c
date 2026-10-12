@@ -13,7 +13,8 @@
  *   wr OFF VAL                 write one 32-bit BAR0 word
  *   axi-rd ADDR [N]            read N 32-bit words at AXI address ADDR
  *   axi-wr ADDR VAL            write one 32-bit word at AXI address ADDR
- *   cfg                        batcher/logger config register, decoded
+ *   cfg                        batcher/logger config register, decoded, and
+ *                              the build's DESIGN_ID
  *   cfg set K=V...             read-modify-write it: depth= time= mrd= log= raw=
  *   dma                        log DMA (S2MM) registers, decoded
  *   dma-reset                  soft-reset the log DMA
@@ -237,10 +238,10 @@ static void open_bar(void)
     if (!end)
         die("%s has no BAR0: this bitstream's upstream port has none", g_bdf);
     if (end - start + 1 != PIPS_BAR0_SIZE)
-        die("%s: BAR0 is %llu bytes. PIPS with the host register block (map v2) has a 32 KB "
-            "BAR0, so this bitstream predates it (FPGA repo af165d6) or was built with another "
-            "upstream-port BAR size. Not touching it: without the PIO, BAR0 accesses are "
-            "forwarded to the device on downstream port one", g_bdf, end - start + 1);
+        die("%s: BAR0 is %llu bytes; the PIO needs 32 KB, and its registers at 0x800 are "
+            "outside a smaller BAR. 1 KB is what pips.tcl's pf0_bar0_size 32 (Kilobytes) gives "
+            "on this Type 1 port: the IP encodes it as for an endpoint. Build with 1 Megabytes "
+            "(scripts/pips/README.md, \"BAR0 size\")", g_bdf, end - start + 1);
     if (!start)
         die("%s: BAR0 has no address (Region 0 <unassigned>): boot with pci=realloc", g_bdf);
     if (cfg_space(4, &cmd, 2) == 0 && !(cmd & 2))
@@ -403,7 +404,14 @@ static int cmd_cfg(int argc, char **argv)
     win_start();
     old = cfg_rd();
     if (argc == 0) {
+        uint32_t id = axi_rd(PIPS_AXI_REGFILE + PIPS_DESIGN_ID_OFF);
+
         cfg_print(old);
+        if (win_check(NULL))
+            printf("design_id=none\n# no DESIGN_ID register: a build older than design 0x%04x\n",
+                   PIPS_DESIGN_ID_FIRST);
+        else
+            printf("design_id=0x%04x\n", PIPS_DESIGN_ID(id));
         return 0;
     }
     if (strcmp(argv[0], "set") || argc < 2)
@@ -961,8 +969,7 @@ static void t_bram(void)
 static void t_regfile(void)
 {
     const uint64_t a = PIPS_AXI_REGFILE + PIPS_BATCH_CFG_OFF;
-    uint32_t lo, hi, orig, v, st, pats[3];
-    uint64_t ea;
+    uint32_t lo, hi, orig, v, st, id, bad, pats[3];
 
     win_start();
     bar_wr32(PIPS_REG_WIN_BASE_LO, (uint32_t)PIPS_AXI_REGFILE | 3u);
@@ -994,16 +1001,34 @@ static void t_regfile(void)
         check(v == pats[i] && !st, "reg0 wrote 0x%08x read 0x%08x%s", pats[i], v,
               i == 2 ? " (restored)" : "");
     }
-    v = axi_rd(a + 4);
-    st = bar_rd32(PIPS_REG_WIN_STATUS);
-    ea = win_err_addr();
-    if (v == 0xFFFFFFFFu && (st & PIPS_WIN_ST_RD_ERR) && ea == a + 4)
-        check(1, "0x%08" PRIx64 " (no register): 0xffffffff, WIN_STATUS rd_err, WIN_ERR right",
-              a + 4);
-    else
-        warnx("0x%08" PRIx64 " (no register) read 0x%08x, WIN_STATUS 0x%08x, WIN_ERR 0x%" PRIx64
-              ": expected a decode error", a + 4, v, st, ea);
-    bar_wr32(PIPS_REG_WIN_STATUS, PIPS_WIN_ST_STICKY);
+    /* The rest of the 64-byte aperture (pips.tcl, above axil4_regfile_0): DESIGN_ID at 0x20,
+     * read-only; every other register reads 0; the 64 bytes repeat through the segment. */
+    id = axi_rd(a + PIPS_DESIGN_ID_OFF);
+    st = win_check(NULL);
+    if (st & PIPS_WIN_ST_RD_ERR) {
+        warnx("no DESIGN_ID (decode error at 0x%08" PRIx64 "): a build older than design 0x%04x, "
+              "with reg0 only; layout checks skipped", a + PIPS_DESIGN_ID_OFF,
+              PIPS_DESIGN_ID_FIRST);
+        return;
+    }
+    check(!st && !(id >> 16) && PIPS_DESIGN_ID(id) >= PIPS_DESIGN_ID_FIRST,
+          "DESIGN_ID 0x%04x at 0x%08" PRIx64 " (pips.tcl pips_design_id; bits [31:16] 0x%04x)",
+          PIPS_DESIGN_ID(id), a + PIPS_DESIGN_ID_OFF, id >> 16);
+    axi_wr(a + PIPS_DESIGN_ID_OFF, ~id);
+    v = axi_rd(a + PIPS_DESIGN_ID_OFF);
+    st = win_check(NULL);
+    check(v == id && !st, "a write to DESIGN_ID is ignored: still 0x%08x, WIN_STATUS %s", v,
+          win_flags(st));
+    bad = 0;
+    for (uint32_t off = 4; off < 0x40; off += 4)
+        if (off != PIPS_DESIGN_ID_OFF)
+            bad += axi_rd(a + off) != 0;
+    st = win_check(NULL);
+    check(!bad && !st, "reserved registers 0x04-0x1c and 0x24-0x3c read 0 (%u do not, WIN_STATUS "
+          "%s)", bad, win_flags(st));
+    v = axi_rd(a + 0x40);
+    st = win_check(NULL);
+    check(v == orig && !st, "0x%08" PRIx64 " repeats reg0: 0x%08x", a + 0x40, v);
 }
 
 static void t_dma(void)
@@ -1124,18 +1149,21 @@ static void t_split(void)
     uint32_t v = bar_rd32(PIPS_REG_CQ_SPLIT);
 
     note("CQ_SPLIT 0x%08x", v);
-    if (check(!!(v & PIPS_SPLIT_PIO_SEEN), "CQ_SPLIT has recorded a BAR0 TLP")) {
-        if (PIPS_SPLIT_PIO_BAR_ID(v) == 0 && PIPS_SPLIT_PIO_APERTURE(v) == 15)
-            check(1, "BAR0 hits: BAR ID 0, aperture 15 (as PG343 predicts)");
-        else
-            warnx("BAR0 hits: BAR ID %u, aperture %u (PG343 predicts 0 / 15): report to the "
-                  "FPGA side", PIPS_SPLIT_PIO_BAR_ID(v), PIPS_SPLIT_PIO_APERTURE(v));
-    }
-    if (v & PIPS_SPLIT_SW_SEEN)
-        note("last memory TLP forwarded downstream: BAR ID %u, aperture %u (FPGA side wants "
-             "this, D4)", PIPS_SPLIT_SW_BAR_ID(v), PIPS_SPLIT_SW_APERTURE(v));
-    else
+    if (!check(!!(v & PIPS_SPLIT_PIO_SEEN), "CQ_SPLIT has recorded a BAR0 TLP"))
+        return;
+    /* The aperture is log2 of the BAR size as the IP is set (1 MB), not the 32 KB on the wire. */
+    note("BAR0 hits report BAR ID %u, aperture %u", PIPS_SPLIT_PIO_BAR_ID(v),
+         PIPS_SPLIT_PIO_APERTURE(v));
+    if (!(v & PIPS_SPLIT_SW_SEEN))
         note("no memory TLP forwarded downstream yet: after traffic, see `pips info`");
+    else if (PIPS_SPLIT_SW_BAR_ID(v) == PIPS_SPLIT_PIO_BAR_ID(v) &&
+             PIPS_SPLIT_SW_APERTURE(v) == PIPS_SPLIT_PIO_APERTURE(v))
+        note("forwarded TLPs report the same: the descriptor cannot tell them from BAR0 hits, so "
+             "the split by address stays (PIO_KNOWLEDGE_MAP D4)");
+    else
+        note("forwarded TLPs report BAR ID %u, aperture %u: unlike BAR0 hits, so the descriptor "
+             "could replace the cfg_mgmt BAR poll (D4)", PIPS_SPLIT_SW_BAR_ID(v),
+             PIPS_SPLIT_SW_APERTURE(v));
 }
 
 static void t_log(void)
