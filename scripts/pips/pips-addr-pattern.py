@@ -132,6 +132,71 @@ def pct(vals, p):
     return s[min(len(s) - 1, int(p / 100 * len(s)))]
 
 
+def tlp_events(recs):
+    """Every TLP record in log order as (index, port, class, addr, payload_dw,
+    drive, drive's record index). For in0/in1 the drive is the port. For out it
+    is the channel whose oldest pending TLP of the same class (memory reads have
+    their own FIFO) has the same address, type, size and tag; None when no
+    channel matches, e.g. a TLP sent before the log started. Also returns
+    counts: drops per port, matched, ambiguous, unmatched, lost."""
+    pending = [{"w": collections.deque(), "r": collections.deque()} for _ in CH]
+    in_holes = [0, 0]
+    out_holes = 0
+    st = dict(drops=[0, 0, 0], matched=0, ambiguous=0, unmatched=0, lost=0)
+    events = []
+    for i, (addr, length, _gap, typ, pdw, tag, _at, info, _r) in enumerate(recs):
+        kind, port = (info >> 2) & 3, info & 3
+        if kind == dec.KIND_DROP:
+            st["drops"][port] += 1
+            if port < 2:
+                in_holes[port] += 1
+            elif port == 2:
+                out_holes += 1
+            continue
+        if kind != dec.KIND_TLP or port > 2:
+            continue
+        c = classify(typ, addr, pdw)
+        q = "r" if c == "mrd" else "w"
+        key = (addr, typ & 0xF, pdw, length, tag)
+        if port < 2:
+            pending[port][q].append(key + (i,))
+            events.append((i, port, c, addr, pdw, port, i))
+            continue
+        src, src_i = None, None
+        heads = [ch for ch in (0, 1) if pending[ch][q] and pending[ch][q][0][:5] == key]
+        if heads:
+            if len(heads) == 2:
+                st["ambiguous"] += 1
+                heads.sort(key=lambda ch: pending[ch][q][0][5])
+            src = heads[0]
+            src_i = pending[src][q].popleft()[5]
+            st["matched"] += 1
+        else:
+            # an out record was dropped: its TLP is still at the head
+            for ch in (0, 1):
+                dq = pending[ch][q]
+                for j in range(1, min(out_holes, len(dq) - 1) + 1):
+                    if dq[j][:5] == key:
+                        for _ in range(j):
+                            dq.popleft()
+                        out_holes -= j
+                        st["lost"] += j
+                        src, src_i = ch, dq.popleft()[5]
+                        st["matched"] += 1
+                        break
+                if src is not None:
+                    break
+            if src is None:
+                holes = [ch for ch in (0, 1) if in_holes[ch]]
+                if len(holes) == 1:                    # its in record was dropped
+                    src = holes[0]
+                    in_holes[src] -= 1
+                else:
+                    st["unmatched"] += 1
+        events.append((i, 2, c, addr, pdw, src, src_i))
+    return events, st
+
+
 def analyse(path):
     recs, trailer, _pads, _nbytes, problem = dec.load(path, False)
     n = len(recs)
@@ -149,12 +214,7 @@ def analyse(path):
     revisits = [0, 0]
     seen_page = [set() for _ in CH]
     mrd_reg2m = [collections.Counter() for _ in CH]
-    drops = [0, 0, 0]
 
-    pending = [{"w": collections.deque(), "r": collections.deque()} for _ in CH]
-    in_holes = [0, 0]
-    out_holes = 0
-    matched = ambiguous = unmatched = lost = 0
     holds = []
     runs, run_src, run_len = [], None, 0
     page_runs, prun_key, prun_len = [], None, 0
@@ -163,21 +223,8 @@ def analyse(path):
     visit_open = [None, None]          # page of the drive's current visit, on out
     out_ios = 0                        # completion entries on out: I/Os the out stream covers
 
-    for i, (addr, length, _gap, typ, pdw, tag, _at, info, _r) in enumerate(recs):
-        kind, port = (info >> 2) & 3, info & 3
-        if kind == dec.KIND_DROP:
-            drops[port] += 1
-            if port < 2:
-                in_holes[port] += 1
-            elif port == 2:
-                out_holes += 1
-            continue
-        if kind != dec.KIND_TLP or port > 2:
-            continue
-        c = classify(typ, addr, pdw)
-        q = "r" if c == "mrd" else "w"
-        key = (addr, typ & 0xF, pdw, length, tag)
-
+    events, ms = tlp_events(recs)
+    for i, port, c, addr, pdw, src, src_i in events:
         if port < 2:                                   # a drive's request
             p = port
             cls[p][c] += 1
@@ -196,41 +243,7 @@ def analyse(path):
                     seen_page[p].add(pg)
             elif c == "mrd":
                 mrd_reg2m[p][addr >> 21] += 1
-            pending[p][q].append(key + (i, c))
             continue
-
-        # out: find the channel this TLP came from
-        src, src_i = None, None
-        heads = [ch for ch in (0, 1) if pending[ch][q] and pending[ch][q][0][:5] == key]
-        if heads:
-            if len(heads) == 2:
-                ambiguous += 1
-                heads.sort(key=lambda ch: pending[ch][q][0][5])
-            src = heads[0]
-            src_i = pending[src][q].popleft()[5]
-            matched += 1
-        else:
-            # an out record was dropped: its TLP is still at the head
-            for ch in (0, 1):
-                dq = pending[ch][q]
-                for j in range(1, min(out_holes, len(dq) - 1) + 1):
-                    if dq[j][:5] == key:
-                        for _ in range(j):
-                            dq.popleft()
-                        out_holes -= j
-                        lost += j
-                        src, src_i = ch, dq.popleft()[5]
-                        matched += 1
-                        break
-                if src is not None:
-                    break
-            if src is None:
-                holes = [ch for ch in (0, 1) if in_holes[ch]]
-                if len(holes) == 1:                    # its in record was dropped
-                    src = holes[0]
-                    in_holes[src] -= 1
-                else:
-                    unmatched += 1                     # e.g. sent before the log started
 
         if src_i is not None:
             holds.append(i - src_i)
@@ -286,7 +299,7 @@ def analyse(path):
     out = dict(
         path=path, status=problem or ("FULL" if trailer and trailer["stop_reason"] == "region_full"
                                       else "CUT" if trailer else "NO_TRAILER"),
-        records=n, duration_us=dur_us, drops=drops,
+        records=n, duration_us=dur_us, drops=ms["drops"],
         drives={CH[p]: dict(
             classes=dict(cls[p]), ios=ios[p],
             tlp_per_io=sum(cls[p].values()) / ios[p] if ios[p] else None,
@@ -297,7 +310,7 @@ def analyse(path):
             revisit=revisits[p] / visits[p] if visits[p] else None,
             data_top_2m=top_regions(reg2m[p]), mrd_top_2m=top_regions(mrd_reg2m[p]))
             for p in (0, 1)},
-        out=dict(matched=matched, ambiguous=ambiguous, unmatched=unmatched, lost=lost,
+        out=dict(matched=ms["matched"], ambiguous=ms["ambiguous"], unmatched=ms["unmatched"], lost=ms["lost"],
                  run_mean=sum(runs) / len(runs) if runs else None, run_weighted=weighted_run,
                  run_p50=pct(runs, 50), run_p99=pct(runs, 99), run_max=max(runs) if runs else None,
                  page_run_mean=sum(page_runs) / len(page_runs) if page_runs else None,
