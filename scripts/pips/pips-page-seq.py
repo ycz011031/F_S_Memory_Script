@@ -9,6 +9,7 @@ TLP log, and how much regrouping (batching) could shorten it.
                                                   page, offset, run, visit, open pages
     pips-page-seq.py LOG --iotlb 1x64,16x4,64x1 [--strict]
                                                   also simulated IOTLB misses per policy
+    ... --json results.jsonl                      also append everything as one JSON line
 
 LOG is one pips-log.bin(.gz). Out TLPs are matched to their drive as in
 pips-addr-pattern.py. Python 3, standard library only.
@@ -47,6 +48,7 @@ import argparse
 import collections
 import csv
 import importlib.util
+import json
 import os
 import sys
 
@@ -274,6 +276,7 @@ def main():
     ap.add_argument("--port", choices=PORTS, default="out", help="stream for --show (default out)")
     ap.add_argument("--csv", help="write every TLP to this CSV")
     ap.add_argument("--iotlb", help="IOTLB geometries to simulate, SETSxWAYS[,...], e.g. 1x64,16x4")
+    ap.add_argument("--json", help="append the results to this file as one JSON line")
     ap.add_argument("--strict", action="store_true",
                     help="IOTLB: a page's new visit always misses (strict mode invalidates at unmap)")
     a = ap.parse_args()
@@ -328,6 +331,17 @@ def main():
         print(f"{'W':>4} {head}")
         for r in wi["rows"]:
             print(f"{r['w']:4d} " + "".join(f"{fmt(r['miss'][(pol, g)], '14.3f')}" for g in geoms for pol in POLICIES))
+
+    if a.json:
+        rec = dict(path=a.log, strict=a.strict, matched=ms["matched"], unmatched=ms["unmatched"],
+                   interleave={k: dict(v, open={str(d): o for d, o in v["open"].items()}) for k, v in il.items()},
+                   ios=wi["ios"], us_per_tlp=wi["us_per_tlp"],
+                   windows=[dict(w=r["w"], wait_mean=r["wait_mean"], pages_mean=r["pages_mean"],
+                                 pages_p99=r["pages_p99"], runs=r["runs"],
+                                 miss={f"{g[0]}x{g[1]}": {pol: r["miss"][(pol, g)] for pol in POLICIES}
+                                       for g in geoms}) for r in wi["rows"]])
+        with open(a.json, "a") as f:
+            f.write(json.dumps(rec) + "\n")
 
     if a.show:
         show(rows, a.port, a.start, a.show)

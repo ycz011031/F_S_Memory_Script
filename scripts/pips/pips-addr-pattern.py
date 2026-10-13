@@ -220,7 +220,6 @@ def analyse(path):
     page_runs, prun_key, prun_len = [], None, 0
     sd = StackDistance(n)
     dist = {c: collections.Counter() for c in ("data_new", "data_cont", "cqe", "mrd", "other")}
-    visit_open = [None, None]          # page of the drive's current visit, on out
     out_ios = 0                        # completion entries on out: I/Os the out stream covers
 
     events, ms = tlp_events(recs)
@@ -265,9 +264,8 @@ def analyse(path):
             prun_key, prun_len = pkey, 1
         d = sd.access(pkey)
         if c == "data":
-            new = addr & 0xFFF == 0 or visit_open[src] != addr >> 12
-            visit_open[src] = addr >> 12
-            cat = "data_new" if new else "data_cont"
+            # a new visit starts at page offset 0; a drive may write two pages at once
+            cat = "data_new" if addr & 0xFFF == 0 else "data_cont"
         else:
             cat = c if c in dist else "other"
         dist[cat][d] += 1                              # d is None for a first touch
