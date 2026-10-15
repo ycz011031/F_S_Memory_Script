@@ -179,3 +179,5 @@ scripts/pips/pips
 scripts/pips/pips-sim
 pcie-topology.csv
 pcie-topology.txt
+
+claude.md
