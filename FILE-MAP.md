@@ -299,11 +299,15 @@ falls back to default events and every column shifts.
 | `pips.c` | called/entry: the BAR0 tool (`pips`): registers, window, regfile, DMA, log, DDR dumps, `hwtest`, `soak` |
 | `pips_regs.h` | data: register map, verbatim from the FPGA repo's `sw_handoff/` |
 | `pips-log-decode.py` | called/entry: TLP log (`.bin` or `.gz`) → whole-or-cut status, per-port summary, CSV, JSON, `.rpt` |
+| `pips-addr-pattern.py` | manual: TLP logs or sweep log folders → address width, page spread, IOVA reuse, out-stream runs and hold, LRU reuse distance and predicted IOTLB misses; one table line and one JSON line per log. Imports `pips-log-decode.py`'s loader |
+| `pips-page-seq.py` | manual: one TLP log → page access sequence run by run, per-drive interleaving, batching what-if (windows regrouped by drive / page), optional set-associative IOTLB simulation, CSV of every TLP. Imports `pips-addr-pattern.py` (`tlp_events`) |
+| `pips-mwr-sizes.py` | manual: TLP logs or sweep log folders → per-drive map of MWr payload sizes (DW), with size-free checks of the "≤ 4 DW = completion entry" rule (mixed pages, interrupt after, bytes per entry); summed per sweep / IOMMU / setting / block size; long CSV; `--show` size sequence. Imports `pips-addr-pattern.py` |
 | `pips-xsct.tcl` | manual: config register, DMA and log over JTAG (XSCT) |
 | `pips_sim.c` | data: BAR0 model for `make check`; never on a testbed |
 | `test-sim.sh` | called: by `make check` |
 | `Makefile` | builds `pips`; `check` builds `pips-sim` and runs `test-sim.sh` |
 | `README.md` | doc: test points, order, expected values |
+| `PIO-MANUAL.md` | doc: everything about the PIO, BAR0, regfile, log DMA and TLP log, collected from the FPGA and AXI4-switch repos plus the hardware runs |
 
 ### `utils/`
 

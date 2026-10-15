@@ -6,9 +6,12 @@ the BAR0 registers and BRAM, and an AXI window behind them that reaches the
 batcher/logger config register (the regfile), the log DMA and the FPGA DDR
 where the DMA writes the TLP log.
 
-None of this has run on hardware yet. It is tested against a software model
-of BAR0 (`make check`, below), so the first hardware run is also the first
-check of the model's assumptions.
+Everything known about the hardware side, from the BAR0 map and the batcher
+register to the log format, findings and troubleshooting, is collected in
+[PIO-MANUAL.md](PIO-MANUAL.md). This file is about the tools.
+
+The tools work on hardware (bigserver, 2026-10-11). They are also tested
+against a software model of BAR0 (`make check`, below).
 
 ## Which bitstream
 
@@ -167,6 +170,58 @@ Its first line says whether the recording is whole:
 | `+DROPS` | after either: TLPs lost to logger FIFO overflow, kept as empty records |
 | `NO_TRAILER` | the recording never closed (the DMA did not finish) |
 | `BAD` | the dump and its trailer disagree (exit status 1) |
+
+**Address pattern.** `pips-addr-pattern.py LOG|FOLDER ... [--match GLOB] [--jsonl F]`
+reads dumps with the decoder's loader, or every `pips-log.bin(.gz)` under sweep
+log folders. Per log: each drive's TLPs by class (data, completion entry,
+interrupt, read) and per I/O; the share of addresses at or above 4 GiB; distinct
+4 KiB pages and 2 MiB / 1 GiB regions; IOVA reuse; which drive each `out` TLP
+came from (matched by per-channel order), runs of one drive and the hold
+between `in` and `out`; LRU reuse distance on `out` and the IOTLB misses per
+I/O it predicts for sizes 16–1024. Tested on synthetic logs only so far.
+
+```bash
+python3 scripts/pips/pips-addr-pattern.py utils/logs/dualssd-pips-strict-1-d1t0 \
+    utils/logs/dualssd-pips-strict-1-d16t64 --match '4k-j*' --jsonl ~/addr.jsonl
+```
+
+**Page sequence and batching what-if.** `pips-page-seq.py LOG` takes one dump
+and shows the order in which pages are asked for. First, per stream (`in0`,
+`in1`: each drive as it sends; `out`: what the IOMMU sees), how a page's
+writes are spread: TLPs per run of one page, the share of page visits written
+in one run, and how many pages a drive writes at once. Then a what-if on
+`out`: cut into windows of W TLPs and regrouped by drive (what a per-drive
+batcher can do), by page between completion entries (needs relaxed ordering),
+or by page ignoring ordering (the bound). It gives runs per I/O, distinct pages
+per window and the wait each W costs. `--iotlb 1x64,16x4 --strict` adds
+simulated IOTLB misses per I/O for those geometries (sets x ways; the real
+one is not published). `--show N --from REC --port out` prints the sequence
+run by run; `--csv` writes every TLP. Use a d1t0 log for the unbatched order.
+
+```bash
+python3 scripts/pips/pips-page-seq.py \
+    utils/logs/dualssd-pips-strict-1-d1t0/4k-j8-both-RUN-0/pips-log.bin.gz \
+    --iotlb 1x64,16x4,64x1 --strict --show 200 --from 100000
+```
+
+**Write sizes: can a completion entry be told by its size?**
+`pips-mwr-sizes.py LOG|FOLDER ... [--match GLOB] [--by iommu,bs] [--detail] [--csv F]`
+maps every drive write by payload DWORDs, per drive. The other two tools call a
+non-MSI write of at most 4 DW a completion entry, and this checks that rule
+without using the size: per size, whether `payload_dw` agrees with the beats,
+alignment, distinct pages, whether those pages also take writes from the other
+side of the limit (`mixed`: a completion queue page should take only entries),
+and how often an interrupt follows directly. Per drive and log: data bytes per
+completion entry against the block size, interrupts per entry, odd sizes.
+Each log is labelled with its IOMMU mode (`sweep.log`) and batcher setting
+(`pips-cfg.txt`). `--show N --port in1` prints one log's sizes in order, run-length
+coded (`64x16 4 1i` = a 4 KiB page, its entry, its interrupt). Tested on
+synthetic logs only so far.
+
+```bash
+python3 scripts/pips/pips-mwr-sizes.py utils/logs/dualssd-pips-off-1-d1t0 \
+    utils/logs/dualssd-pips-strict-1-d1t0 --by iommu,bs --csv ~/mwr-sizes.csv
+```
 
 ## Sweeps with the log: one cross sweep per batcher setting
 
