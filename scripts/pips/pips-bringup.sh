@@ -23,7 +23,9 @@
 #                          or reporting an error; dmesg-errors.txt: the errors only
 #   info.txt cfg.txt dma.txt   pips readouts before the tests
 #   hwtest.txt             pips hwtest
-#   log-smoke.bin/.txt     the empty recording hwtest made, and its decode
+#   log-smoke-id<XXXX>.bin/.txt   the empty recording hwtest made, and its
+#                          decode, named with the FPGA design ID (cfg.txt
+#                          design_id=; log-smoke.bin on a build without one)
 #   soak.txt               with --soak
 #   info-after.txt         pips info at the end (counters, CQ_SPLIT)
 set -u
@@ -39,7 +41,7 @@ while [ $# -gt 0 ]; do
         --ddr-addr) DDR_ADDR="$2"; shift 2 ;;
         --enable-mem) ENABLE_MEM=1; shift ;;
         -o) NAME="$2"; shift 2 ;;
-        -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
         *) echo "unknown option: $1 (-h for help)" >&2; exit 2 ;;
     esac
 done
@@ -190,14 +192,17 @@ fi
 
 # ---------------------------------------------------------------------------
 section "5. Log smoke test: the empty recording, from DDR"
+DESIGN=$(design_of "$OUT/cfg.txt" 2>/dev/null); IDT=$(pips_idtag "$DESIGN")
+SMOKE="log-smoke${IDT:+-$IDT}"
 if [ "${RESULT[hwtest]}" = ok ]; then
-    if P log-dump "$OUT/log-smoke.bin" > "$OUT/log-smoke.txt" 2>&1 &&
-       python3 "$HERE/pips-log-decode.py" "$OUT/log-smoke.bin" >> "$OUT/log-smoke.txt" 2>&1; then
+    if P log-dump "$OUT/$SMOKE.bin" > "$OUT/$SMOKE.txt" 2>&1 &&
+       python3 "$HERE/pips-log-decode.py" "$OUT/$SMOKE.bin" --design-id "${DESIGN:-none}" \
+           >> "$OUT/$SMOKE.txt" 2>&1; then
         RESULT[log]=ok
     else
         RESULT[log]=FAIL
     fi
-    sed 's/^/  /' "$OUT/log-smoke.txt"
+    sed 's/^/  /' "$OUT/$SMOKE.txt"
 else
     echo "  skipped: hwtest did not pass"
     RESULT[log]=skipped
@@ -222,6 +227,9 @@ if [ "${RESULT[regs]}" = ok ]; then
 fi
 
 section "Summary"
+[ -s "$OUT/cfg.txt" ] && echo "  FPGA design ID ${DESIGN:-?}: TLP log format" \
+    "$(sed -n 's/^log_format=//p' "$OUT/cfg.txt"), batcher" \
+    "$(pips_tag "$(cfg_of "$OUT/cfg.txt")" "$(cap_of "$OUT/cfg.txt")")"
 fail=0
 for k in enum regs hwtest log soak; do
     [ -n "${RESULT[$k]:-}" ] || continue

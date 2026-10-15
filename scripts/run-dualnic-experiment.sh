@@ -10,14 +10,34 @@
 # comparison is not confounded by a different harness.
 #
 # WHY per-NIC IOMMU numbers are not reported: on this box both NICs sit behind
-# PCIe switch 0000:97:00.0 on the single root port 0000:96:02.0, so they share
-# an IIO stack AND a Part. pcm-iio IOMMU events are per-stack (ch_mask=0x0,
-# vname=Total) and IB/OB bandwidth is per-Part, so every hardware counter is a
-# sum over both NICs. Per-NIC data comes from iperf3. See setup-server.sh.
+# one PCIe switch on a single root port, so they share an IIO stack AND a
+# Part. pcm-iio IOMMU events are per-stack (ch_mask=0x0, vname=Total) and
+# IB/OB bandwidth is per-Part, so every hardware counter is a sum over both
+# NICs. Per-NIC data comes from iperf3. See setup-server.sh.
+#
+# NICs behind the PIPS switch: every result records the switch's FPGA design
+# ID (pips_design_id, e.g. 0x0a04) and batcher setting (pips_batch, e.g.
+# d8t22c1 = depth 8, time 22, drain depth cap on), read through BAR0 before
+# the runs; each run's logs/<name>-RUN-server-<j>/pips-cfg.txt holds the
+# `pips cfg` readout it ran with.
+#
+# --pips-log 1: also record the switch's TLP log in every run, as
+# run-dualssd-experiment.sh does: the region is zeroed before the NICs are
+# set up, the recording starts once the senders run, before the measurement
+# window, and runs until the region fills (cut after 5 s); after the window it
+# is dumped from FPGA DDR through BAR0, decoded and gzipped. Per run:
+#   logs/<name>-RUN-server-<j>/pips-log-id<XXXX>.bin.gz   the recording, named
+#                               with the design ID (it picks the record format)
+#   logs/<name>-RUN-server-<j>/pips-log-summary.txt/.json, pips-log-*.txt
+#   reports/<name>-RUN-server-<j>/pips-log.rpt   status: FULL, CUT, +DROPS,
+#                               NO_TRAILER, BAD or FAILED; design_id, log_format
+# A log problem does not fail the run. PIPS_LOG_GZIP=0 keeps the .bin.
 set -u
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 . "$HERE/../utils/setup-server.sh"
+# PIPS: pips_identify, pips_run_cfg, pips_record, pips_collect, pips_meta.
+. "$HERE/pips/pips-lib.sh"
 
 exp="dualnic-test"
 nics=2                 # how many NICs to drive
@@ -33,6 +53,7 @@ cca="${CCA:-dctcp}"
 num_runs=1
 sync_client=0
 results_file=""        # JSONL to append to; default ~/<exp>-<N>.jsonl, first unused N
+pips_log=0             # 1: record the PIPS switch's TLP log in every run
 CLIENT_BRANCH="$(git -C "$HERE/.." rev-parse --abbrev-ref HEAD 2>/dev/null || echo icx-dualnic)"
 
 while [ $# -gt 0 ]; do
@@ -52,11 +73,13 @@ while [ $# -gt 0 ]; do
         --runs)          num_runs="$2"; shift 2 ;;
         --uncapped)      bandwidth="uncapped"; shift ;;
         --results)       results_file="$2"; shift 2 ;;
+        --pips-log)      pips_log="$2"; shift 2 ;;
         -h|--help)
-            sed -n '2,12p' "$0"; exit 0 ;;
+            sed -n '2,34p' "$0"; exit 0 ;;
         *) echo "unknown option: $1"; exit 2 ;;
     esac
 done
+case "$pips_log" in 0|1) ;; *) echo "ERROR: --pips-log must be 0 or 1" >&2; exit 2 ;; esac
 
 # iperf3 -b is PER FLOW. To cap a NIC at an aggregate rate its flows have to
 # divide that rate between them, otherwise "-b 40g" with 8 flows asks for
@@ -268,6 +291,10 @@ preflight() {
     done
     [ -z "$miss" ] && echo "   remote setup-envir deps: OK"
 
+    # The PIPS switch's build and setting, when a NIC is behind it; its TLP
+    # log needs it to answer (--pips-log 1).
+    pips_identify NIC ${NIC_BDFS[@]+"${NIC_BDFS[@]}"}
+
     if [ "${#PROBLEMS[@]}" -gt 0 ]; then
         echo >&2
         echo "=== preflight found ${#PROBLEMS[@]} problem(s); fix all, then re-run ===" >&2
@@ -291,6 +318,13 @@ rcp_back() {   # rcp_back <remote-path> <local-path>
 
 # Which NIC indices participate in this run.
 if [ "$nics" -eq 1 ]; then ACTIVE=( "$nic_index" ); else ACTIVE=( 0 1 ); fi
+
+# Their PCI functions, to tell whether they are behind the PIPS switch.
+NIC_BDFS=()
+for i in "${ACTIVE[@]}"; do
+    b=$(basename "$(readlink -f "/sys/class/net/${SERVER_INTFS[$i]}/device" 2>/dev/null)" 2>/dev/null)
+    [ -n "$b" ] && NIC_BDFS+=( "$b" )
+done
 
 # CPU utilisation is recorded over EVERY active NIC's cores. Recording only the
 # first NIC's meant a 2-NIC run reported half of its receive-side work.
@@ -323,7 +357,7 @@ cleanup() {
 exec 9>>/tmp/dualnic-experiment.lock
 if command -v flock >/dev/null 2>&1 && ! flock -n 9; then
     echo "ERROR: another dual-NIC experiment is already running on $(hostname):" >&2
-    pgrep -af 'dualnic_flow_swee[p]|dualnic_load_swee[p]|dualnic_ex[p]|run-dualnic-experimen[t]' \
+    pgrep -af 'dualnic_(flow|load|pips)_swee[p]|dualnic_ex[p]|run-dualnic-experimen[t]' \
         | grep -v "^$$ " | sed 's/^/    /' >&2
     echo "  Wait for it to finish, or stop it first:" >&2
     echo "    pkill -f 'dualnic_flow_swee[p]'; pkill -f 'run-dualnic-experimen[t]'" >&2
@@ -349,10 +383,13 @@ preflight
 
 for ((j = 0; j < num_runs; j++)); do
     RUN="$exp-RUN-server-$j"
-    rm -rf "$setup_dir/reports/$RUN" "$setup_dir/logs/$RUN"
-    mkdir -p "$setup_dir/reports/$RUN" "$setup_dir/logs/$RUN"
+    L="$setup_dir/logs/$RUN"
+    rm -rf "$setup_dir/reports/$RUN" "$L"
+    mkdir -p "$setup_dir/reports/$RUN" "$L"
 
     cleanup; sleep 2
+    # The PIPS build and setting this run ran with; its log region zeroed.
+    pips_run_cfg
 
     # ---------------------------------------------------------- configure NICs
     for i in "${ACTIVE[@]}"; do
@@ -462,6 +499,10 @@ for ((j = 0; j < num_runs; j++)); do
         exit 1
     fi
 
+    # The TLP log, in steady state and before the window: BAR0 accesses
+    # briefly hold up the switch's host-to-device requests.
+    [ "$pips_log" = 1 ] && pips_record
+
     # -------------------------------------------------------------- measure
     # One pcm-iio collection: the counters are a stack-level sum regardless of
     # how many NICs are active, which is exactly the contention signal.
@@ -471,10 +512,15 @@ for ((j = 0; j < num_runs; j++)); do
         --cpu-util 1 --pcie 1 --membw 1 --bw 0 --dur "$dur" \
         --cores "$active_cores" )
 
+    # The window is over: dump and decode the TLP log while iperf3 finishes.
+    t_pips=$SECONDS
+    [ "$pips_log" = 1 ] && pips_collect
+
     # iperf3 server stats are written by run-netapp-tput.sh after its own
     # 80s wait; give those background jobs time to land their .rpt files.
     echo "waiting for iperf3 stats to be written..."
-    sleep 75
+    left=$(( 75 - (SECONDS - t_pips) ))
+    [ "$left" -gt 0 ] && sleep "$left"
 
     for i in "${ACTIVE[@]}"; do
         rcp_back "$setup_dir/reports/$exp-RUN-client-$j-nic$i/retx.rpt" \
@@ -516,6 +562,7 @@ for i in "${ACTIVE[@]}"; do
     total=$(awk -v a="$total" -v b="$m" 'BEGIN{printf "%.3f", a+b}')
 done
 printf '  %-22s : %s Gbps\n' "AGGREGATE" "$total"
+pips_report
 
 # Average each counter across runs so multi-run output stays comparable.
 if [ "$num_runs" -gt 1 ]; then
@@ -594,6 +641,7 @@ if [ -z "$results_file" ]; then
     results_file="$HOME/$exp-$k.jsonl"
 fi
 flow_bw=$(per_flow_bw "$bandwidth" "$num_clients")
+pips_meta       # the PIPS build, setting and log status, when the NICs are behind it
 python3 "$HERE/dualnic-results.py" dump \
     --reports "$setup_dir/reports" --exp "$exp" --runs "$num_runs" \
     --nics "$(IFS=,; echo "${ACTIVE[*]}")" --out "$results_file" \
@@ -604,4 +652,5 @@ python3 "$HERE/dualnic-results.py" dump \
     --meta per_flow_bps="$flow_bw" \
     --meta mtu="$mtu" --meta ring_buffer="$ring_buffer" --meta sockbuf_mb="$buf" \
     --meta dur_s="$dur" --meta cca="$cca" --meta cpu_util_cores="$active_cores" \
+    ${PIPS_META[@]+"${PIPS_META[@]}"} \
     || echo "WARNING: could not write $results_file; the .rpt files are intact." >&2

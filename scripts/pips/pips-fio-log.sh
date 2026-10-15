@@ -15,7 +15,8 @@
 #                        fills or fio ends. Under load the 4 MiB region
 #                        (262143 TLPs) fills within milliseconds.
 #   --cfg "K=V ..."      batcher config for the run, `pips cfg set` fields,
-#                        e.g. "depth=8 time=0x16 mrd=1"; restored afterwards
+#                        e.g. "depth=8 time=0x16 mrd=1 cap=1" (cap: the drain
+#                        depth cap, design 0x0a03 on); restored afterwards
 #   --no-log             fio and the readouts only
 #   --no-clear           keep the old log region contents (default: zero it)
 #   --no-csv             skip log.csv (one line per record, ~15 MB when full)
@@ -30,8 +31,13 @@
 #   lspci-before.txt lspci-after.txt   lspci -vv of the PIPS functions (links, AER)
 #   dmesg.txt                      kernel log lines printed during the run
 #   log-start.txt log-stop.txt     the recording: arming, DMA status, trailer
-#   log.bin                        the recording, as the DMA wrote it to DDR
-#   log-summary.txt log-summary.json log.csv   its decode (pips-log-decode.py)
+#   log-id<XXXX>.bin               the recording, as the DMA wrote it to DDR,
+#                                  named with the FPGA design ID (log.bin on a
+#                                  build without one); its record format
+#                                  follows from that ID
+#   log-summary.txt log-summary.json log.csv   its decode (pips-log-decode.py),
+#                                  each naming the design ID and format
+# The design ID is also in cfg-before.txt (design_id=) and run.log.
 set -u
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -56,7 +62,7 @@ while [ $# -gt 0 ]; do
         --no-csv) CSV=0; shift ;;
         --bdf) BDF="$2"; shift 2 ;;
         -E) NAME="$2"; shift 2 ;;
-        -h|--help) sed -n '2,34p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,40p' "$0"; exit 0 ;;
         *) echo "unknown option: $1 (-h for help)" >&2; exit 2 ;;
     esac
 done
@@ -85,14 +91,15 @@ exec > >(tee "$OUT/run.log") 2>&1
 echo "saving to $OUT/"
 
 P() { "$PIPS" -s "$BDF" "$@"; }
-FIO_PID=""; RECORDING=0; CFG_SET=0; CFG0=""
+FIO_PID=""; RECORDING=0; CFG_SET=0; CFG0=""; CAP0=0; CAP_RESTORE=""
 cleanup() {
     [ -n "$FIO_PID" ] && kill -INT "$FIO_PID" 2>/dev/null
     if [ "$RECORDING" = 1 ]; then
         echo "stopping the recording"; P log-stop 2000 >/dev/null 2>&1; RECORDING=0
     fi
     if [ "$CFG_SET" = 1 ] && [ -n "$CFG0" ]; then
-        echo "restoring the batcher config to $CFG0"; P cfg set raw="$CFG0" >/dev/null && CFG_SET=0
+        echo "restoring the batcher config to $CFG0${CAP_RESTORE:+, drain cap $CAP0}"
+        P cfg set raw="$CFG0" ${CAP_RESTORE:+cap="$CAP0"} >/dev/null && CFG_SET=0
     fi
     chown -R "$OWNER": "$OUT" 2>/dev/null
 }
@@ -120,9 +127,12 @@ done
 P info > "$OUT/info-before.txt" 2>&1 || { cat "$OUT/info-before.txt"; die "pips info failed: run pips-bringup.sh first"; }
 P cfg > "$OUT/cfg-before.txt" 2>&1 || die "cannot read the batcher config: $(cat "$OUT/cfg-before.txt")"
 P dma > "$OUT/dma-before.txt" 2>&1
-CFG0=$(sed -n 's/^cfg=\(0x[0-9a-f]*\).*/\1/p' "$OUT/cfg-before.txt")
-echo "  FPGA design ID: $(sed -n 's/^design_id=//p' "$OUT/cfg-before.txt")"
-echo "  batcher config before: $(grep '^cfg=' "$OUT/cfg-before.txt")"
+CFG0=$(cfg_of "$OUT/cfg-before.txt"); CAP0=$(cap_of "$OUT/cfg-before.txt")
+DESIGN=$(design_of "$OUT/cfg-before.txt"); IDT=$(pips_idtag "$DESIGN")
+pips_design_ge "$DESIGN" 0x0a03 && CAP_RESTORE=1
+LOG="log${IDT:+-$IDT}"          # log-id0a04.bin: the design ID picks the decoder
+echo "  FPGA design ID: ${DESIGN:-?}, TLP log format $(sed -n 's/^log_format=//p' "$OUT/cfg-before.txt")"
+echo "  batcher config before: $(grep '^cfg=' "$OUT/cfg-before.txt"), $(grep '^drain=' "$OUT/cfg-before.txt")"
 for b in $BDF $(pips_below "$BDF"); do echo "### $b"; lspci -vv -s "$b" 2>&1; done > "$OUT/lspci-before.txt"
 DMESG0=$(dmesg 2>/dev/null | wc -l)
 
@@ -130,7 +140,7 @@ if [ -n "$CFG" ]; then
     # shellcheck disable=SC2086   # one argument per field
     P cfg set $CFG > "$OUT/cfg-run.txt" 2>&1 || die "pips cfg set $CFG: $(cat "$OUT/cfg-run.txt")"
     CFG_SET=1
-    echo "  batcher config for the run: $(grep '^cfg=' "$OUT/cfg-run.txt")"
+    echo "  batcher config for the run: $(grep '^cfg=' "$OUT/cfg-run.txt"), $(grep '^drain=' "$OUT/cfg-run.txt")"
 fi
 if [ "$DO_LOG" = 1 ] && [ "$CLEAR" = 1 ]; then
     P log-clear 2>&1 | sed 's/^/  /'
@@ -189,18 +199,19 @@ echo "  fio done, status $FIO_RC"
 section "3. Collect"
 if [ "$DO_LOG" = 1 ]; then
     if [ "$LOG_RC" = 0 ]; then
-        P log-dump "$OUT/log.bin" 2>&1 | sed 's/^/  /'
-        DEC=( "$OUT/log.bin" )
+        P log-dump "$OUT/$LOG.bin" 2>&1 | sed 's/^/  /'
+        DEC=( "$OUT/$LOG.bin" )
     else
         echo "  the DMA did not finish: dumping the whole region for a post-mortem (--scan decode)"
         bytes=$(awk '$1 == "LOG_BYTES" {print $2}' "$OUT/info-before.txt")
-        P log-dump "$OUT/log-region.bin" "${bytes:-0x400000}" 2>&1 | sed 's/^/  /'
-        DEC=( "$OUT/log-region.bin" --scan )
+        P log-dump "$OUT/$LOG-region.bin" "${bytes:-0x400000}" 2>&1 | sed 's/^/  /'
+        DEC=( "$OUT/$LOG-region.bin" --scan )
     fi
     [ "$CSV" = 1 ] && DEC+=( --csv "$OUT/log.csv" )
-    python3 "$HERE/pips-log-decode.py" "${DEC[@]}" --json "$OUT/log-summary.json" \
-        > "$OUT/log-summary.txt" 2>&1
-    echo "  decode: log-summary.txt$([ "$CSV" = 1 ] && echo ", log.csv"), log-summary.json"
+    python3 "$HERE/pips-log-decode.py" "${DEC[@]}" --design-id "${DESIGN:-none}" \
+        --json "$OUT/log-summary.json" > "$OUT/log-summary.txt" 2>&1
+    echo "  decode: log-summary.txt$([ "$CSV" = 1 ] && echo ", log.csv"), log-summary.json:" \
+         "$(sed -n 's/^  design /design /p' "$OUT/log-summary.txt" | head -1)"
 fi
 P info > "$OUT/info-after.txt" 2>&1
 P cfg > "$OUT/cfg-after.txt" 2>&1
@@ -233,6 +244,8 @@ EOF
 
 # ---------------------------------------------------------------------------
 section "Summary"
+RUNCFG="$OUT/cfg-before.txt"; [ -n "$CFG" ] && RUNCFG="$OUT/cfg-run.txt"
+echo "  FPGA design ${DESIGN:-?}; batcher during the run: $(pips_tag "$(cfg_of "$RUNCFG")" "$(cap_of "$RUNCFG")")"
 echo "  fio:"; sed 's/^/    /' "$OUT/fio-summary.txt"
 if [ "$DO_LOG" = 1 ]; then
     echo "  log:"

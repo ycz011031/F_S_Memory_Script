@@ -8,9 +8,16 @@ together, [LOCAL-SETUP.md](LOCAL-SETUP.md) for first-time provisioning.
 - **Branch:** `icx-dualnic` on `ycz011031/F_S_Memory_Script`
 - **Upstream:** `host-architecture/Fast-and-Safe-IO-Memory-Protection` (remote `upstream`)
 - `master` is a pristine mirror. `git diff master..icx-dualnic` is the whole delta.
-- **Last updated:** 2026-10-11: dual-SSD sweeps on switch design D (§7, "Fifth
-  result"). icx last updated 2026-10-04: the uncapped flow sweep (§4.1) and
-  the IOMMU counters checked against Intel's Ice Lake event list (§4.3).
+- **Last updated:** 2026-10-15: PIPS switch design `0x0A04` (drain depth cap,
+  new TLP log format), the PIPS sweeps crossed with the cap, a dual-NIC PIPS
+  sweep, and the design ID on every artifact (§8). 2026-10-11: dual-SSD sweeps
+  on switch design D (§7, "Fifth result"). icx last updated 2026-10-04: the
+  uncapped flow sweep (§4.1) and the IOMMU counters checked against Intel's
+  Ice Lake event list (§4.3).
+- **PIPS switch (§8):** the FPGA switch the drives (bigserver) and now the NICs
+  sit behind. Its batcher setting and, from design `0x0A03`, its drain depth
+  cap are swept on both testbeds with a TLP log in every run. Every result
+  names the switch's design ID, which also picks the log decoder.
 - **Headline:** IOMMU strict and IOMMU off give the same throughput in every
   configuration run so far. Reasons are speculated in §4.1; the experiments
   that would settle them are in §5.
@@ -92,6 +99,10 @@ git pull                                              # always first
 
 # single configuration
 ./scripts/run-dualnic-experiment.sh -E mytest --nics 2 --uncapped -S 8 --runs 3
+
+# NICs behind PIPS: the flow sweep once per batcher setting, drain cap off and
+# on, with the switch's TLP log in every run (§8)
+./scripts/sosp24-experiments/dualnic_pips_sweep.sh --cfgs "1:0 8:22" --single --tmux
 ```
 
 ### `run-dualnic-experiment.sh` options
@@ -109,6 +120,7 @@ git pull                                              # always first
 | `-M`, `--ring_buffer`, `--buf`, `-d` | MTU, NIC ring size, socket buffer MB, duration |
 | `--sync-client` | git fetch/checkout/pull on styx before running |
 | `--results <file>` | JSONL file to append the result to (default `~/<exp>-<N>.jsonl`, first unused N) |
+| `--pips-log 0\|1` | NICs behind PIPS: also record the switch's TLP log in every run (§8). Without it, NICs behind PIPS still get the design ID and batcher setting in the result |
 
 `-b` is an **aggregate per-NIC** rate and is divided by the flow count before
 reaching iperf3, whose own `-b` is per-flow. `-b 40g` with 8 flows sends 5 Gbps
@@ -496,9 +508,12 @@ off. `PWC_CACHE_FILLS` would give an independent count to compare it with.
 In order of what each one decides. Commands run on icx from
 `~/F_S_Memory_Script`.
 
-1. **Simpler switch design (planned).** Removes the bias from the current
-   topology: both NICs behind one PCIe switch with a single x8 Gen4 uplink,
-   which capped every 2-NIC run at ~105.7 Gbps (§4.1 A).
+1. **Simpler switch design.** As of 2026-10-15 the NICs sit behind the PIPS
+   switch (§8), whose batcher and drain cap are now swept with
+   `dualnic_pips_sweep.sh`. The steps below still apply to the new placement.
+   It removes the bias from the earlier topology: both NICs behind one PCIe
+   switch with a single x8 Gen4 uplink, which capped every 2-NIC run at
+   ~105.7 Gbps (§4.1 A).
    **Keep the IOMMU shared** if contention is still the question: NICs behind
    different IOMMU (DMAR) units have nothing to contend for (§1). With the
    IOMMU on, check which unit each NIC is behind:
@@ -1408,3 +1423,94 @@ mode or the load. Its strict 4k anomaly is C's, so the address-width test
 3. **Stay at 4k (or 8k) for IOMMU comparisons.** There the data is clean:
    fio and `PCIe_wr` agree, there is no buffer traffic from the 990 EVO Plus,
    and strict runs below the link.
+4. **The PIPS sweep again on design `0x0A04`, cap off and on** (§8, "Next").
+
+---
+
+## 8. PIPS switch: batcher sweeps on the drives and the NICs
+
+PIPS is the FPGA PCIe switch (VCK190, FPGA repo `pips_batch`,
+`C:\Xilinx_Projects\pips_batch_new\Programmable-Intelligent-PCIe-Switch`)
+whose batcher regroups the devices' upstream writes. The host reaches its
+config, log DMA and TLP log through the upstream port's BAR0 (the PIO). How it
+works, every register, and the log format:
+[scripts/pips/PIO-MANUAL.md](scripts/pips/PIO-MANUAL.md); the tools and test
+points: [scripts/pips/README.md](scripts/pips/README.md).
+
+- **Drives:** bigserver, both NVMe drives behind PIPS (since 2026-10-11).
+  The first PIPS sweeps ran 2026-10-13 on design `0x0A02`:
+  `dualssd-pips-{off,strict}-1-{d1t0,d4t22,d8t22,d16t64}` (local copies in
+  `dualssd/1013/`).
+- **NICs:** behind PIPS as of 2026-10-15, one per downstream port. Run the NIC
+  experiments on that server, as before on icx (§2); `run-dualnic-experiment.sh`
+  finds the NICs below the switch by their PCI path.
+
+### Switch designs (design ID)
+
+Every build reports a design ID (`sudo scripts/pips/pips cfg`, `design_id=`).
+Two changes since the 10-13 sweeps matter to the experiments:
+
+| Design | FPGA repo | Change |
+|---|---|---|
+| `0x0A02` | `e389cca`, 10-11 | design ID register. The 10-13 sweeps |
+| `0x0A03` | `2c6c3f5`, 10-14 | **drain depth cap** (regfile reg1, `pips cfg set cap=1`): a drain sends at most `depth_threshold` packets instead of the whole FIFO. Off (0) is the reset value and what `0x0A02` did |
+| `0x0A04` | `591d854`, 10-15 | **TLP log format v2**: one record per TLP leaving the batcher, tagged with its input and its time in the batcher (`pkt_wait`); no separate input records. Same trailer, so only the design ID tells the formats apart |
+
+**Every artifact carries the design ID from now on**: raw logs in the name
+(`pips-log-id0a04.bin.gz`), sweeps in the name (`<NAME>-id0a04-d8t22c1`), text
+inside (`pips-cfg.txt`, `.rpt`, JSONL `pips_design_id`, summary first lines,
+rows labelled `strict d8t22c1@0a04`). The decoders pick the log format by it:
+`-id<XXXX>` in the name, else a `pips-cfg.txt` beside the log, else v1 (every
+log from before). So the 10-13 logs still decode as before. Details:
+[scripts/pips/README.md](scripts/pips/README.md), "Design IDs".
+
+Settings are named `d<depth>t<time>[m1][c1]`: `d8t22c1` = depth 8, time 0x16,
+drain cap on. A name without `c1` has the cap off, as every name from before.
+
+### Run
+
+```bash
+git pull; sudo -v
+sudo bash scripts/pips/pips-bringup.sh        # after programming a new design: hwtest now checks reg1
+
+# drives (bigserver): the cross sweep + uneven co-runs per setting
+DUALSSD_ARGS="--membw 0" ./scripts/sosp24-experiments/dualssd_pips_sweep.sh \
+    --cfgs "1:0 4:22 8:22 16:64" --tmux
+
+# NICs (the server whose NICs are behind PIPS): the flow sweep per setting
+./scripts/sosp24-experiments/dualnic_pips_sweep.sh --cfgs "1:0 4:22 8:22 16:64" --single --tmux
+```
+
+Both take each `--cfgs` setting with the drain cap off and then on (`--caps
+"0 1"`, the default; twice the runs of the 10-13 sweeps; `--caps 0` for the old
+set). Cap on needs design `0x0A03` or later; on an older build they refuse to
+start. Each setting is a full sweep named `<NAME>-id<XXXX>-<setting>`, with a
+TLP log in every run checked FULL / CUT; `~/<NAME>.txt` has every setting side
+by side, the log check, and the time in the batcher (`WAIT_us`, v2 logs).
+Defaults: `dualnic_pips_sweep.sh` 5/10/15/30 flows per NIC, uncapped, 1 run,
+co-run only (`--single` adds each NIC alone, for CONTENTION); about 15 min per
+setting without `--single`. Stop and restore as their `-h` says.
+
+Compare cap off against on per setting:
+
+```bash
+python3 scripts/dualssd-results.py summary ~/dualssd-pips-strict-2-id0a04-d8t22.jsonl \
+    ~/dualssd-pips-strict-2-id0a04-d8t22c1.jsonl
+python3 scripts/dualnic-results.py summary ~/dualnic-pips-strict-1-id0a04-*.jsonl
+python3 scripts/pips/pips-mwr-sizes.py utils/logs/dualssd-pips-strict-2-id0a04-d8t22 \
+    utils/logs/dualssd-pips-strict-2-id0a04-d8t22c1 --by cfg,bs
+```
+
+### Next
+
+1. **First run on `0x0A04`:** `pips-bringup.sh` (hwtest flips the cap and
+   restores it), then `pips-fio-log.sh --cfg "depth=8 time=0x16 cap=1"`, and
+   check the decode: format v2, `in0 + in1 = out`, `pkt_wait` plausible (≥ 4
+   cycles; µs-scale with batching). Neither the cap nor the v2 log has run on
+   hardware yet: only against the model (`make -C scripts/pips check`).
+2. **Drives:** `dualssd_pips_sweep.sh` strict and off on `0x0A04`. The cap-off
+   half repeats the 10-13 settings on the new build, so compare it with
+   `dualssd/1013/` first: if they differ, the build changed more than the cap.
+3. **NICs:** `dualnic_pips_sweep.sh --single`, strict and off. Check first
+   that both NICs are behind the same DMAR unit (§5 item 1) and re-run
+   `discover-pcie-topology.sh` for `PCIE_PATTERN`.

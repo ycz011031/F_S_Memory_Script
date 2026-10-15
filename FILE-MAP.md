@@ -1,7 +1,7 @@
 # File map
 
 Which file does what, and which file calls, sources or reads which. Read this
-instead of scanning the repo. It covers every tracked file (as of 2026-10-10,
+instead of scanning the repo. It covers every tracked file (as of 2026-10-15,
 branch `icx-dualnic`).
 
 - Testbed state, results and how to run: [HANDOFF.md](HANDOFF.md)
@@ -25,14 +25,15 @@ run by hand when needed · **orphan** = no caller and superseded · **data** /
 | Dual-SSD: sweep fio instances per drive | `scripts/sosp24-experiments/dualssd_sweep.sh` | bigserver |
 | Dual-SSD: sweep block size | `scripts/sosp24-experiments/dualssd_bs_sweep.sh` | bigserver |
 | Dual-SSD: block size × instances | `scripts/sosp24-experiments/dualssd_cross_sweep.sh` | bigserver |
-| Dual-SSD through PIPS: the cross sweep + uneven co-runs once per batcher depth/time, TLP log checked in every run | `scripts/sosp24-experiments/dualssd_pips_sweep.sh --cfgs "1:0 8:22"` | bigserver |
+| Dual-SSD through PIPS: the cross sweep + uneven co-runs once per batcher depth/time, drain cap off and on, TLP log checked in every run | `scripts/sosp24-experiments/dualssd_pips_sweep.sh --cfgs "1:0 8:22"` | bigserver |
 | Dual-SSD: uneven co-runs (one drive LOW, the other HIGH instances) | `--asy` on either sweep above, or `run-dualssd-experiment.sh -J n0,n1` | bigserver |
 | Dual-SSD: one configuration | `scripts/run-dualssd-experiment.sh` | bigserver |
 | Dual-SSD: find the pcm-iio row, check VT-d counters | `sudo bash utils/discover-ssd-pcie.sh` | bigserver |
 | Dual-SSD: tables from results | `python3 scripts/dualssd-results.py summary\|grid ~/<sweep>.jsonl` | any |
 | Dual-NIC: NIC0 alone, NIC1 alone, both | `scripts/sosp24-experiments/dualnic_exp.sh` | icx |
 | Dual-NIC: sweep flows / offered load | `dualnic_flow_sweep.sh` / `dualnic_load_sweep.sh` (same folder) | icx |
-| Dual-NIC: one configuration | `scripts/run-dualnic-experiment.sh` | icx |
+| Dual-NIC through PIPS: the flow sweep once per batcher depth/time, drain cap off and on, TLP log checked in every run | `scripts/sosp24-experiments/dualnic_pips_sweep.sh --cfgs "1:0 8:22"` | NIC host behind PIPS |
+| Dual-NIC: one configuration | `scripts/run-dualnic-experiment.sh` (`--pips-log 1` behind PIPS) | icx |
 | Dual-NIC: map NIC → pcm-iio row | `sudo bash utils/discover-pcie-topology.sh` | icx |
 | Dual-NIC: tables from results | `python3 scripts/dualnic-results.py summary ~/<sweep>.jsonl` | any |
 | Which IOMMU mode a device got | `bash utils/iommu-mode.sh <intf\|nvme dev\|BDF>` | any |
@@ -42,6 +43,7 @@ run by hand when needed · **orphan** = no caller and superseded · **data** /
 | PIPS switch: bring-up (enumeration, BAR0, regfile, DMA, DDR, empty log) | `sudo bash scripts/pips/pips-bringup.sh` | PIPS host |
 | PIPS switch: one fio run with the TLP log collected from FPGA DDR | `sudo bash scripts/pips/pips-fio-log.sh` | PIPS host |
 | PIPS switch: one register / test point / log by hand | `sudo scripts/pips/pips <command>` ([scripts/pips/README.md](scripts/pips/README.md)) | PIPS host |
+| PIPS switch: which build, which log format | `sudo scripts/pips/pips cfg` (`design_id=`, `log_format=`; design IDs: [scripts/pips/README.md](scripts/pips/README.md) "Design IDs") | PIPS host |
 | PIPS switch: same over JTAG | `source scripts/pips/pips-xsct.tcl` in XSCT | XSCT host |
 | PIPS tools: test without hardware | `make -C scripts/pips check` | any Linux |
 
@@ -58,10 +60,11 @@ Create it from `utils/setup-server.sh.example` (upstream / icx) or
 ### 2.1 Dual-SSD (bigserver, Skylake-SP)
 
 ```
-scripts/sosp24-experiments/dualssd_pips_sweep.sh    once per PIPS batcher setting (--cfgs):
- · scripts/pips/pips-lib.sh       pips_build, pips_find_usp, pips_lock, pips_tag, cfg_of
- ─ scripts/pips/pips cfg set      depth/time/batch_mrd through BAR0; restored at the end
- ─ dualssd_sweep.sh -o <NAME>-<setting> --asy, DUALSSD_ARGS += --pips-log 1
+scripts/sosp24-experiments/dualssd_pips_sweep.sh    once per PIPS batcher setting (--cfgs x --caps):
+ · scripts/pips/pips-lib.sh       pips_build, pips_find_usp, pips_lock, pips_tag, cfg_of, cap_of,
+                                  design_of, pips_idtag, pips_design_ge
+ ─ scripts/pips/pips cfg set      depth/time/batch_mrd/cap through BAR0; restored at the end
+ ─ dualssd_sweep.sh -o <NAME>-id<XXXX>-<setting> --asy, DUALSSD_ARGS += --pips-log 1
  ─ scripts/dualssd-results.py summary|grid  all settings → ~/<NAME>.txt
 scripts/sosp24-experiments/dualssd_cross_sweep.sh   exec, SWEEP_PREFIX=dualssd-xsweep
 scripts/sosp24-experiments/dualssd_bs_sweep.sh      exec, SWEEP_PREFIX=dualssd-bssweep
@@ -88,9 +91,13 @@ scripts/run-dualssd-experiment.sh            one configuration × --runs
  │    writes windows.txt (start/end of each measurement window)
  ─ scripts/dualssd-results.py fio-sum --windows   → reports/<exp>-RUN-<j>-ssd<i>/fio.rpt
  ─ scripts/dualssd-results.py dump                → ~/<sweep>.jsonl (or --results)
- with --pips-log 1, per run (· scripts/pips/pips-lib.sh):
+ · scripts/pips/pips-lib.sh       runner hooks: pips_identify (preflight; drives behind PIPS
+                                  → design ID + setting in the JSONL), pips_run_cfg (per run:
+                                  pips-cfg.txt), pips_meta, pips_report
+ with --pips-log 1, per run (pips-lib.sh pips_record, pips_collect):
  ─ make -C scripts/pips; sudo scripts/pips/pips cfg, log-clear, log-start, log-wait|log-stop, log-dump
- ─ scripts/pips/pips-log-decode.py --rpt          → reports/<exp>-RUN-<j>/pips-log.rpt (status)
+ ─ scripts/pips/pips-log-decode.py --design-id --rpt   → logs/<exp>-RUN-<j>/pips-log-id<XXXX>.bin.gz,
+                                                         reports/<exp>-RUN-<j>/pips-log.rpt (status)
 
 utils/discover-ssd-pcie.sh                   once per host or after hardware changes
  · utils/setup-server.sh (if present), utils/ssd-lib.sh
@@ -106,9 +113,15 @@ names `discover-ssd-pcie.sh` and `setup-server.sh.bigserver.example`;
 ### 2.2 Dual-NIC (icx receiver, client over ssh)
 
 ```
+scripts/sosp24-experiments/dualnic_pips_sweep.sh   once per PIPS batcher setting (--cfgs x --caps):
+ · utils/ssd-lib.sh (relaunch_in_tmux), scripts/pips/pips-lib.sh (as dualssd_pips_sweep.sh)
+ ─ scripts/pips/pips cfg set      depth/time/batch_mrd/cap through BAR0; restored at the end
+ ─ dualnic_flow_sweep.sh -o/-p <NAME>-id<XXXX>-<setting>, DUALNIC_ARGS += --pips-log 1
+ ─ scripts/dualnic-results.py summary   all settings → ~/<NAME>.txt
 scripts/sosp24-experiments/dualnic_exp.sh          3 points: NIC0, NIC1, both
 scripts/sosp24-experiments/dualnic_load_sweep.sh   offered-load sweep
-scripts/sosp24-experiments/dualnic_flow_sweep.sh   flow-count sweep
+scripts/sosp24-experiments/dualnic_flow_sweep.sh   flow-count sweep (-p PREFIX names its runs;
+  │                                                 DUALNIC_ARGS go to the runner)
   │  (flow sweep also: ─ utils/iommu-mode.sh, ─ scripts/dualnic-results.py summary → ~/<sweep>.txt)
   ▼
 scripts/run-dualnic-experiment.sh            runs on icx; drives the client over ssh
@@ -119,6 +132,8 @@ scripts/run-dualnic-experiment.sh            runs on icx; drives the client over
  ─ SSH    utils/tcp/run-netapp-tput.sh -m client  (iperf3 -c)
  ─ LOCAL  utils/record-host-metrics.sh       pcm-iio reads utils/opCode-6-106.txt from cwd
  ─ scripts/dualnic-results.py dump           → ~/<exp>-<N>.jsonl (or --results)
+ · scripts/pips/pips-lib.sh       NICs behind PIPS: the same runner hooks as run-dualssd-experiment.sh;
+                                  --pips-log 1 records after the senders start, collects after the window
 
 utils/discover-pcie-topology.sh              NIC → root port → pcm-iio row (PCIE_PATTERN)
  · utils/setup-server.sh (if present)
@@ -178,18 +193,22 @@ scripts/pips/pips-bringup.sh                 enumeration, then the test points
  · scripts/pips/pips-lib.sh       pips_build, pips_find_usp, pips_below, lspci_brief, pips_outdir, pips_lock
  ─ make → scripts/pips/pips       built from pips.c + pips_regs.h on first use
  ─ pips info / cfg / dma / hwtest / log-dump / soak
- ─ scripts/pips/pips-log-decode.py           the smoke recording
+ ─ scripts/pips/pips-log-decode.py           the smoke recording, log-smoke-id<XXXX>.bin
  ─ utils/iommu-mode.sh <BDF>                 devices behind the switch
 
 scripts/pips/pips-fio-log.sh                 one fio run with a TLP log
  · scripts/pips/pips-lib.sh       also pips_nvme_below, blk_bdf
  ─ pips info / cfg / dma, log-clear, log-start, log-wait | log-stop, log-dump
  ─ fio (system binary, --readonly)
- ─ scripts/pips/pips-log-decode.py           → log-summary.txt/.json, log.csv
+ ─ scripts/pips/pips-log-decode.py           log-id<XXXX>.bin → log-summary.txt/.json, log.csv
  ─ utils/iommu-mode.sh <dev>
 
-scripts/pips/Makefile  check ─ pips-sim (pips.c + pips_sim.c) ─ scripts/pips/test-sim.sh
-                                 ─ pips-log-decode.py, pips-fio-log.sh with a stand-in fio
+scripts/pips/Makefile  check ─ pips-sim (pips.c + pips_sim.c; PIPS_SIM_DESIGN picks the build)
+                             ─ scripts/pips/test-sim.sh
+                                 ─ pips-log-decode.py and the three analysis tools on v1 and v2 logs
+                                 ─ pips-lib.sh runner hooks, dualssd-results.py, dualnic-results.py
+                                 ─ pips-fio-log.sh with a stand-in fio
+                                 ─ dualssd_pips_sweep.sh, dualnic_pips_sweep.sh with stand-in sweeps
 ```
 
 ---
@@ -201,13 +220,14 @@ scripts/pips/Makefile  check ─ pips-sim (pips.c + pips_sim.c) ─ scripts/pips
 | `utils/setup-server.sh` (git-ignored) | Per-host config: paths, PCM, interfaces/IPs, client ssh, `SSD_*` | Sourced by nearly every runner and wrapper, `record-host-metrics.sh`, `setup-envir.sh`, `run-netapp-tput.sh`, `run-ssdapp.sh`, both `discover-*.sh` |
 | `utils/setup-server.sh.example` | Template for icx | Copied by hand |
 | `utils/setup-server.sh.bigserver.example` | Template for bigserver (drive serials, cores, pcm-iio row) | Copied by hand |
-| `utils/ssd-lib.sh` | `ssd_resolve`, `iommu_unit`, `relaunch_in_tmux`, `pci_chain`, `bdf_link`, `link_gbps`, `shared_link_gbps`, `csv_col` | `run-dualssd-experiment.sh`, `dualssd_sweep.sh`, `discover-ssd-pcie.sh` |
+| `utils/ssd-lib.sh` | `ssd_resolve`, `iommu_unit`, `relaunch_in_tmux`, `pci_chain`, `bdf_link`, `link_gbps`, `shared_link_gbps`, `csv_col` | `run-dualssd-experiment.sh`, `dualssd_sweep.sh`, `dualssd_pips_sweep.sh`, `discover-ssd-pcie.sh`; `dualnic_pips_sweep.sh` (`relaunch_in_tmux`) |
 | `utils/record-host-metrics.sh` | The measurement harness: `sar`, pcm-iio, pcm-memory, netstat, tcplog, IIO occupancy, perf | Every driver: `run-dual{nic,ssd}-experiment.sh`, `run-dctcp-tput-experiment*.sh`, `run-ssd-*.sh` |
 | `utils/iommu-mode.sh` | Prints off / pt / strict / lazy / on for an interface, block device or BDF | `run-dual{nic,ssd}-experiment.sh`, `dualnic_flow_sweep.sh`, `dualssd_sweep.sh`, `discover-ssd-pcie.sh` |
 | `utils/opCode-6-85.txt` | pcm-iio events, Skylake / Cascade Lake (model 85): paper's VT-d set | pcm-iio, run from `utils/` on bigserver |
 | `utils/opCode-6-106.txt` | pcm-iio events, Ice Lake-SP (model 106) | pcm-iio, run from `utils/` on icx |
-| `scripts/dualssd-results.py` | `fio-sum`, `dump`, `summary` (plus every PCM value, and the PIPS log table), `grid`. Records with a PIPS batcher setting (`pips_batch`) group as `<iommu> <setting>` | `run-dualssd-experiment.sh`, `dualssd_sweep.sh`, `dualssd_pips_sweep.sh`, `discover-ssd-pcie.sh` |
-| `scripts/dualnic-results.py` | `dump`, `summary` | `run-dualnic-experiment.sh`, `dualnic_flow_sweep.sh` |
+| `scripts/dualssd-results.py` | `fio-sum`, `dump`, `summary` (plus every PCM value, and the PIPS log table), `grid`. Records with a PIPS batcher setting (`pips_batch`) group as `<iommu> <setting>`, plus `@<design ID>` when they have one (`off d8t22c1@0a04`); summaries start with a `PIPS design ID:` line | `run-dualssd-experiment.sh`, `dualssd_sweep.sh`, `dualssd_pips_sweep.sh`, `discover-ssd-pcie.sh` |
+| `scripts/dualnic-results.py` | `dump`, `summary` (with the PIPS log table). Groups like `dualssd-results.py` | `run-dualnic-experiment.sh`, `dualnic_flow_sweep.sh`, `dualnic_pips_sweep.sh` |
+| `scripts/pips/pips-lib.sh` | PIPS device lookup, `pips_tag`/`cap_of`/`design_of`/`pips_idtag`, and the runner hooks (`pips_identify`, `pips_run_cfg`, `pips_record`, `pips_collect`, `pips_meta`, `pips_report`) | both runners, both PIPS sweeps, `pips-bringup.sh`, `pips-fio-log.sh` |
 | `utils/setup-envir.sh` | MTU, ring, socket buffers, ECN, DDIO, prefetch, PFC | All NIC drivers, locally and over ssh |
 | `utils/tcp/run-netapp-tput.sh` | Starts iperf3 servers or clients | All NIC drivers |
 
@@ -262,9 +282,10 @@ falls back to default events and every column shifts.
 | `dualssd_sweep.sh` | entry: instance sweep; the engine behind the two below |
 | `dualssd_bs_sweep.sh` | entry: block-size sweep (wrapper) |
 | `dualssd_cross_sweep.sh` | entry: block size × instances (wrapper) |
-| `dualssd_pips_sweep.sh` | entry: the cross sweep with `--asy`, once per PIPS batcher setting, with the switch's TLP log in every run |
+| `dualssd_pips_sweep.sh` | entry: the cross sweep with `--asy`, once per PIPS batcher setting (`--cfgs` x `--caps`, the drain cap off and on), with the switch's TLP log in every run |
 | `dualnic_exp.sh` | entry: three-point dual-NIC comparison |
-| `dualnic_flow_sweep.sh` | entry: dual-NIC flow-count sweep |
+| `dualnic_flow_sweep.sh` | entry: dual-NIC flow-count sweep; `-p PREFIX` and `DUALNIC_ARGS` for `dualnic_pips_sweep.sh` |
+| `dualnic_pips_sweep.sh` | entry: the flow sweep once per PIPS batcher setting (`--cfgs` x `--caps`), with the switch's TLP log in every run |
 | `dualnic_load_sweep.sh` | entry: dual-NIC offered-load sweep |
 | `flows_exp.sh` | entry: paper Fig 2 / 5 |
 | `flows_exp_client.sh` | entry: Fig 2 / 5, client-side driver |
@@ -295,15 +316,15 @@ falls back to default events and every column shifts.
 |---|---|
 | `pips-bringup.sh` | entry: enumeration, links, `pips hwtest`, smoke recording, optional soak |
 | `pips-fio-log.sh` | entry: one read-only fio run on the NVMe behind PIPS, with the TLP log |
-| `pips-lib.sh` | lib: tool build, device discovery below the switch, lspci summary, output folder, run lock, batcher setting names (`pips_tag`). Also sourced by `run-dualssd-experiment.sh` and `dualssd_pips_sweep.sh` |
-| `pips.c` | called/entry: the BAR0 tool (`pips`): registers, window, regfile, DMA, log, DDR dumps, `hwtest`, `soak` |
-| `pips_regs.h` | data: register map, verbatim from the FPGA repo's `sw_handoff/` |
-| `pips-log-decode.py` | called/entry: TLP log (`.bin` or `.gz`) → whole-or-cut status, per-port summary, CSV, JSON, `.rpt` |
+| `pips-lib.sh` | lib: tool build, device discovery below the switch, lspci summary, output folder, run lock, batcher setting names (`pips_tag`, `c1` for the drain cap), design ID tags (`design_of`, `pips_idtag`), and the runner hooks. Also sourced by both runners and both PIPS sweeps |
+| `pips.c` | called/entry: the BAR0 tool (`pips`): registers, window, regfile (with the drain cap, design ID, log format), DMA, log, DDR dumps, `hwtest`, `soak` |
+| `pips_regs.h` | data: register map, verbatim from the FPGA repo's `sw_handoff/` (design 0x0a04) |
+| `pips-log-decode.py` | called/entry: TLP log (`.bin` or `.gz`) → whole-or-cut status, per-port summary, CSV, JSON, `.rpt`. Record format v1 or v2 by design ID (`--design-id`, `-id<XXXX>` in the name, `pips-cfg.txt` beside it, else v1); `detect()`/`load()` serve the three tools below |
 | `pips-addr-pattern.py` | manual: TLP logs or sweep log folders → address width, page spread, IOVA reuse, out-stream runs and hold, LRU reuse distance and predicted IOTLB misses; one table line and one JSON line per log. Imports `pips-log-decode.py`'s loader |
 | `pips-page-seq.py` | manual: one TLP log → page access sequence run by run, per-drive interleaving, batching what-if (windows regrouped by drive / page), optional set-associative IOTLB simulation, CSV of every TLP. Imports `pips-addr-pattern.py` (`tlp_events`) |
 | `pips-mwr-sizes.py` | manual: TLP logs or sweep log folders → per-drive map of MWr payload sizes (DW), with size-free checks of the "≤ 4 DW = completion entry" rule (mixed pages, interrupt after, bytes per entry); summed per sweep / IOMMU / setting / block size; long CSV; `--show` size sequence. Imports `pips-addr-pattern.py` |
-| `pips-xsct.tcl` | manual: config register, DMA and log over JTAG (XSCT) |
-| `pips_sim.c` | data: BAR0 model for `make check`; never on a testbed |
+| `pips-xsct.tcl` | manual: config and drain registers, design ID, DMA and log over JTAG (XSCT) |
+| `pips_sim.c` | data: BAR0 model for `make check`, any design (`PIPS_SIM_DESIGN`); never on a testbed |
 | `test-sim.sh` | called: by `make check` |
 | `Makefile` | builds `pips`; `check` builds `pips-sim` and runs `test-sim.sh` |
 | `README.md` | doc: test points, order, expected values |
@@ -352,15 +373,19 @@ falls back to default events and every column shifts.
 | `~/<sweep>.jsonl`, `~/<sweep>.txt` | `*-results.py dump` / the sweeps' summary step, on the host that ran them | no |
 | `/dualssd/`, `/dualnic/` | copies of `~/*.jsonl` / `.txt` brought back for analysis; `dualssd/` keeps one folder per batch (`1006/`, `1010/`; sweep names repeat across batches) and `dualssd-xsweeps-report.html`, the local copy of the cross-sweep report (HANDOFF §7) | no (ignored) |
 | `/tmp/dualssd-experiment.lock` | `run-dualssd-experiment.sh`: one run at a time | no |
-| `utils/logs/pips-bringup-<date>-<time>/`, `utils/logs/pips-fio-<date>-<time>/` (or `-o` / `-E` name) | `pips-bringup.sh`, `pips-fio-log.sh`: lspci, dmesg, register readouts, `hwtest.txt`, fio JSON, `log.bin` + its decode | no |
-| `/tmp/pips-run.lock`, `/tmp/pips-bar0.lock` | the PIPS scripts and `dualssd_pips_sweep.sh` (one at a time) and the `pips` tool (one BAR0 user at a time) | no |
-| `utils/logs/<sweep>/<config>-RUN-<j>/pips-log.bin.gz`, `pips-log-summary.txt/.json`, `pips-cfg.txt`; `utils/reports/<sweep>/<config>-RUN-<j>/pips-log.rpt` | `run-dualssd-experiment.sh --pips-log 1`: each run's TLP log from FPGA DDR, its decode, and its status (FULL, CUT, +DROPS, NO_TRAILER, BAD, FAILED) | no |
-| `~/<NAME>.txt`, `~/<NAME>-<setting>.{jsonl,txt}`, `utils/logs/<NAME>/pips-sweep.log` | `dualssd_pips_sweep.sh`: every setting side by side with the log check; one cross sweep per setting | no |
+| `utils/logs/pips-bringup-<date>-<time>/`, `utils/logs/pips-fio-<date>-<time>/` (or `-o` / `-E` name) | `pips-bringup.sh`, `pips-fio-log.sh`: lspci, dmesg, register readouts (`cfg*.txt` with `design_id=`), `hwtest.txt`, fio JSON, `log-id<XXXX>.bin` / `log-smoke-id<XXXX>.bin` + its decode | no |
+| `/tmp/pips-run.lock`, `/tmp/pips-bar0.lock` | the PIPS scripts and both PIPS sweeps (one at a time) and the `pips` tool (one BAR0 user at a time) | no |
+| `utils/logs/<sweep>/<config>-RUN-<j>/pips-log-id<XXXX>.bin.gz` (`pips-log.bin.gz` before design IDs), `pips-log-summary.txt/.json`, `pips-cfg.txt`; `utils/reports/<sweep>/<config>-RUN-<j>/pips-log.rpt` | `run-dualssd-experiment.sh --pips-log 1`: each run's TLP log from FPGA DDR, its decode, and its status (FULL, CUT, +DROPS, NO_TRAILER, BAD, FAILED) with `design_id:`. `pips-cfg.txt` is written whenever the drives are behind PIPS | no |
+| `utils/logs/<exp>-RUN-server-<j>/pips-log-id<XXXX>.bin.gz`, ...; `utils/reports/<exp>-RUN-server-<j>/pips-log.rpt` | `run-dualnic-experiment.sh --pips-log 1`: the same, per dual-NIC run | no |
+| `~/<NAME>.txt`, `~/<NAME>-id<XXXX>-<setting>.{jsonl,txt}`, `utils/logs/<NAME>/pips-sweep.log`, `cfg-<setting>.txt` | `dualssd_pips_sweep.sh`, `dualnic_pips_sweep.sh`: every setting side by side with the log check (first lines name the design ID); one cross / flow sweep per setting. Before design IDs: `~/<NAME>-<setting>.*` | no |
 | `scripts/pips/pips`, `scripts/pips/pips-sim` | `make` in `scripts/pips/` | no (ignored) |
 
 Sweep names never repeat: `<prefix>-<iommu>-<N>` with the first unused `N`
 (prefixes `dualssd-sweep`, `dualssd-bssweep`, `dualssd-xsweep`,
-`dualnic-flowsweep`). A run whose `-E` name already has output is refused.
+`dualnic-flowsweep`, `dualssd-pips`, `dualnic-pips`; the PIPS sweeps' settings
+add `-id<XXXX>-<setting>`). A dual-SSD run whose `-E` name already has output
+is refused; a dual-NIC run's is replaced, which is why the dual-NIC PIPS sweep
+names its runs after each setting (`-p`).
 
 ---
 

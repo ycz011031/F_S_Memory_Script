@@ -3,11 +3,11 @@
  * and the scripts without hardware: `make check`. Not used on a testbed.
  *
  * Models what the tool relies on: BAR0 registers and counters, BRAM and its
- * aliases, the AXI window with its error reporting, the regfile (reg0,
- * DESIGN_ID, reserved registers, repeating every 0x40), the AXI DMA S2MM
- * registers in direct register mode, 2 GB
- * of DDR, and a logger that writes TLP records and a trailer on log_enable
- * edges. Timing, AXI timeouts and the PIO's limits (F2) are not modelled.
+ * aliases, the AXI window with its error reporting, the regfile (reg0, the
+ * drain config reg1, DESIGN_ID, reserved registers, repeating every 0x40),
+ * the AXI DMA S2MM registers in direct register mode, 2 GB of DDR, and a
+ * logger that writes TLP records and a trailer on log_enable edges. Timing,
+ * AXI timeouts and the PIO's limits (F2) are not modelled.
  *
  * State lives in files so it survives across pips invocations, as the
  * hardware does: $PIPS_SIM_STATE (default /tmp/pips-sim.state) and a sparse
@@ -15,6 +15,13 @@
  * cycle". $PIPS_SIM_RECORDS (default 1000) is how many TLPs a recording sees;
  * 262143 or more fills the 4 MiB region. Every $PIPS_SIM_DROP_EVERY-th
  * record (default 500, 0 for none) is a dropped-TLP record.
+ *
+ * $PIPS_SIM_DESIGN picks the build (default 0x0a04, the current one): its
+ * DESIGN_ID, whether reg1 exists (0x0a03 and later; before, it reads 0 and
+ * ignores writes) and the record format (v2 from 0x0a04: one record per TLP
+ * leaving the batcher, port = its input, pkt_wait at 0x0c, tag at 0x0f, AT in
+ * pkt_type[5:4]; before, v1: records for in0, in1 and out, tag at 0x0c, AT at
+ * 0x0d). "none" is a build from before DESIGN_ID: 0x20 answers DECERR.
  */
 #define _GNU_SOURCE
 #include <fcntl.h>
@@ -26,17 +33,17 @@
 
 #include "pips_regs.h"
 
-#define SIM_MAGIC       0x5053494Du
+#define SIM_MAGIC       0x5053494Eu
 #define LOG_BYTES       4194304u            /* pips.tcl pips_log_region_bytes, base 0 */
 #define DMACR_RESET_VAL 0x00010002u
 #define BUS_NUM_VAL     0x009a9897u         /* primary 97, secondary 98, subordinate 9a */
-#define DESIGN_ID       PIPS_DESIGN_ID_FIRST
+#define DESIGN_DEFAULT  PIPS_DESIGN_ID_LOG_V2
 
 struct state {
     uint32_t magic;
     uint32_t scratch, mwr, mrd, ctrl[8];
     uint32_t win_lo, win_hi, win_st, err_lo, err_hi;
-    uint32_t cfg, dmacr, dmasr, da, len;
+    uint32_t cfg, drain, dmacr, dmasr, da, len;
     uint32_t xfer;      /* a transfer is programmed and waits for stream data */
     uint32_t rec;       /* recording */
     uint32_t nrec, ndrop;
@@ -46,6 +53,18 @@ struct state {
 
 static struct state *S;
 static uint8_t *ddr;
+
+/* $PIPS_SIM_DESIGN: the build's design ID, -1 for "none" (no DESIGN_ID register). */
+static int design(void)
+{
+    const char *e = getenv("PIPS_SIM_DESIGN");
+
+    if (!e || !*e)
+        return DESIGN_DEFAULT;
+    if (!strcmp(e, "none"))
+        return -1;
+    return (int)(strtoul(e, NULL, 0) & 0xFFFF);
+}
 
 static void *map_file(const char *path, size_t size)
 {
@@ -79,6 +98,7 @@ void sim_open(void)
         memset(S, 0, sizeof *S);
         S->magic = SIM_MAGIC;
         S->cfg = PIPS_BATCH_CFG_RESET;
+        S->drain = PIPS_BATCH_DRAIN_RESET;
         S->dmacr = DMACR_RESET_VAL;
         S->dmasr = PIPS_DMA_SR_HALTED;
     }
@@ -111,12 +131,15 @@ static void put_rec(uint32_t slot, const uint8_t r[16])
     memcpy(ddr + S->da + 16u * slot, r, 16);
 }
 
-/* A plausible TLP mix: in0/in1 device writes and reads, out = batched writes. */
+/* A plausible TLP mix. v1: in0/in1 device writes and reads, out = batched
+ * writes. v2: every record is a TLP leaving the batcher, from in0 or in1 in
+ * runs of 4 (a batch), with the cycles it waited. */
 static void make_rec(uint32_t i, uint8_t r[16])
 {
-    uint32_t port = i % 3;
+    int v2 = design() >= (int)PIPS_DESIGN_ID_LOG_V2;
+    uint32_t port = v2 ? (i / 4) % 2 : i % 3;
     uint64_t addr = 0x100000000ull + 64ull * i;
-    int mwr = port == 2 || (i & 4);
+    int mwr = v2 ? (i % 8) != 7 : port == 2 || (i & 4);
 
     const char *e = getenv("PIPS_SIM_DROP_EVERY");
     uint32_t every = e ? (uint32_t)strtoul(e, NULL, 0) : 500;
@@ -132,8 +155,14 @@ static void make_rec(uint32_t i, uint8_t r[16])
     r[9] = (uint8_t)(i % 7);            /* gap */
     r[10] = mwr ? 1 : 0;                /* MWr / MRd */
     r[11] = mwr ? 64 : 0;               /* payload DW */
-    r[12] = (uint8_t)i;
     r[14] = 0x80 | port;
+    if (v2) {
+        uint16_t wait = (uint16_t)(4 + (i * 7) % 300);
+        memcpy(r + 12, &wait, 2);       /* pkt_wait */
+        r[15] = (uint8_t)i;             /* pkt_tag; AT 0 in pkt_type[5:4] */
+    } else {
+        r[12] = (uint8_t)i;             /* pkt_tag; AT 0 at 0x0d */
+    }
 }
 
 static void put_trailer(uint32_t slot, uint8_t reason)
@@ -190,7 +219,12 @@ static uint32_t axi_read(uint64_t a, int *err)
     if (a >= PIPS_AXI_REGFILE && a < PIPS_AXI_REGFILE + 0x10000) {
         switch (a & 0x3F) {             /* 16 registers, repeating every 0x40 */
         case PIPS_BATCH_CFG_OFF: return S->cfg;
-        case PIPS_DESIGN_ID_OFF: return DESIGN_ID;
+        case PIPS_BATCH_DRAIN_OFF:
+            return design() >= (int)PIPS_DESIGN_ID_DRAIN_CFG ? S->drain : 0;
+        case PIPS_DESIGN_ID_OFF:
+            if (design() < 0)
+                break;                  /* before the register: DECERR */
+            return (uint32_t)design();
         default: return 0;
         }
     } else if (a >= PIPS_AXI_DMA_LOG && a < PIPS_AXI_DMA_LOG + 0x10000) {
@@ -214,6 +248,10 @@ static int axi_write(uint64_t a, uint32_t v)
 {
     if (a >= PIPS_AXI_REGFILE && a < PIPS_AXI_REGFILE + 0x10000) {
         uint32_t old = S->cfg;
+        if ((a & 0x3F) == PIPS_BATCH_DRAIN_OFF && design() >= (int)PIPS_DESIGN_ID_DRAIN_CFG) {
+            S->drain = v & PIPS_BATCH_DRAIN_DEPTH_CAP;
+            return 0;
+        }
         if (a & 0x3F)
             return 0;                   /* read-only registers: ignored, OKAY */
         S->cfg = v;

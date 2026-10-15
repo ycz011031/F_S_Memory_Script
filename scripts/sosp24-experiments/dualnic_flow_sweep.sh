@@ -9,7 +9,11 @@
 #
 # Arguments: flows per NIC, rates in Gbps per NIC (default "uncapped", i.e.
 # line rate), repeats, modes (default "both", the co-run).
-# -o NAME anywhere names the result files.
+# -o NAME anywhere names the result files. -p PREFIX names the experiments
+# (run folders in utils/logs and utils/reports) <PREFIX>-<rate>-f<flows>-<mode>
+# instead of dnflows-<iommu>-...; dualnic_pips_sweep.sh gives each batcher
+# setting its own. Extra runner options go in DUALNIC_ARGS, e.g.
+# DUALNIC_ARGS="--pips-log 1" (run-dualnic-experiment.sh -h).
 #
 # Before the sweep, one single run of NIC0 alone at the lowest flow count checks
 # the datapath; the sweep stops there if it carries no traffic.
@@ -36,10 +40,12 @@ cd "$(dirname "$0")/.."
 . ../utils/setup-server.sh
 
 NAME=""
+PREFIX=""
 POS=()
 while [ $# -gt 0 ]; do
     case "$1" in
         -o|--out) NAME="$2"; shift 2 ;;
+        -p|--exp-prefix) PREFIX="$2"; shift 2 ;;
         *)        POS+=( "$1" ); shift ;;
     esac
 done
@@ -47,9 +53,11 @@ FLOWS="${POS[0]:-5 10 15 30}"
 RATES="${POS[1]:-uncapped}"
 RUNS="${POS[2]:-3}"
 MODES="${POS[3]:-both}"
+EXTRA=( ${DUALNIC_ARGS:-} )
 
 IOMMU=$(for i in 0 1; do bash ../utils/iommu-mode.sh "${SERVER_INTFS[$i]}"; done \
         | sort -u | paste -sd+)
+PREFIX="${PREFIX:-dnflows-$IOMMU}"
 DIR="${RESULTS_DIR:-$HOME}"
 if [ -z "$NAME" ]; then
     n=1
@@ -62,6 +70,8 @@ TXT="$DIR/$NAME.txt"
 
 echo "######## dual-NIC flow sweep: ${FLOWS} flows/NIC, rate/NIC ${RATES}, ${RUNS} run(s)"
 echo "######## modes: ${MODES}"
+[ ${#EXTRA[@]} -gt 0 ] && echo "######## runner args: ${EXTRA[*]}"
+echo "######## experiments: $PREFIX-<rate>-f<flows>-<mode>"
 echo "######## IOMMU: ${IOMMU}   kernel $(uname -r)"
 echo "######## cmdline: $(cat /proc/cmdline)"
 echo "######## results: $JSONL"
@@ -76,6 +86,7 @@ summarize() {
         echo "IOMMU $IOMMU  kernel $(uname -r)"
         echo "cmdline: $(cat /proc/cmdline)"
         echo "flows/NIC: $FLOWS   rates: $RATES   runs: $RUNS   modes: $MODES"
+        [ ${#EXTRA[@]} -gt 0 ] && echo "runner args: ${EXTRA[*]}"
         echo
         python3 ../scripts/dualnic-results.py summary "$JSONL"
     } | tee "$TXT"
@@ -94,11 +105,11 @@ rate_args() {   # <rate> -> sets bwarg (for the runner) and tag (for names)
 # as a summary full of zeros.
 low=$(printf '%s\n' $FLOWS | sort -n | head -1)
 rate_args "${RATES%% *}"
-e="dnflows-$IOMMU-$tag-f$low-datapath"
+e="$PREFIX-$tag-f$low-datapath"
 echo
 echo "######## datapath check: NIC0 alone, $low flows/NIC, $tag, 1 run"
 if ! ./run-dualnic-experiment.sh -E "$e" --nics 1 --nic-index 0 \
-        -S "$low" -C "$low" -b "$bwarg" --runs 1 --results "$JSONL"; then
+        -S "$low" -C "$low" -b "$bwarg" --runs 1 --results "$JSONL" ${EXTRA[@]+"${EXTRA[@]}"}; then
     echo "######## ABORTING: datapath check failed" >&2
     exit 1
 fi
@@ -123,8 +134,9 @@ for r in $RATES; do
             esac
             echo
             echo "######## IOMMU $IOMMU  $tag/NIC  $f flows/NIC  $mode"
-            if ! ./run-dualnic-experiment.sh -E "dnflows-$IOMMU-$tag-f$f-$mode" $args \
-                    -S "$f" -C "$f" -b "$bwarg" --runs "$RUNS" --results "$JSONL"; then
+            if ! ./run-dualnic-experiment.sh -E "$PREFIX-$tag-f$f-$mode" $args \
+                    -S "$f" -C "$f" -b "$bwarg" --runs "$RUNS" --results "$JSONL" \
+                    ${EXTRA[@]+"${EXTRA[@]}"}; then
                 echo "######## ABORTING at $tag/f$f/$mode" >&2
                 summarize
                 exit 1

@@ -37,17 +37,27 @@
 #   reports/<name>-RUN-<j>/     pcie.rpt, membw.rpt, cpu_util.rpt
 #   reports/<name>-RUN-<j>-ssd<i>/fio.rpt
 #
-# --pips-log 1 (drives behind the PIPS switch): also record the switch's TLP
-# log in every run, and tag the result with the switch's batcher setting
-# (pips_batch, e.g. d8t22 = depth 8, time 22). The log region is zeroed before
-# fio starts. The recording starts after the warm-up, before the measurement
-# windows, and runs until the region fills (milliseconds under load; cut after
-# 5 s). After fio stops it is dumped from FPGA DDR through BAR0, decoded and
-# gzipped. No BAR0 access overlaps a measurement window. Per run:
-#   logs/<name>-RUN-<j>/pips-log.bin.gz      the recording, as the DMA wrote it
+# Drives behind the PIPS switch: every result records the switch's FPGA
+# design ID (pips_design_id, e.g. 0x0a04) and batcher setting (pips_batch,
+# e.g. d8t22 = depth 8, time 22; m1 = batch_mrd on; c1 = drain depth cap on),
+# read through BAR0 before the runs, and each run's logs/<name>-RUN-<j>/
+# pips-cfg.txt holds the `pips cfg` readout it ran with. Results of different
+# builds or settings never mix (dualssd-results.py groups by both).
+#
+# --pips-log 1: also record the switch's TLP log in every run. The log region
+# is zeroed before fio starts. The recording starts after the warm-up, before
+# the measurement windows, and runs until the region fills (milliseconds under
+# load; cut after 5 s). After fio stops it is dumped from FPGA DDR through
+# BAR0, decoded and gzipped. No BAR0 access overlaps a measurement window.
+# Per run:
+#   logs/<name>-RUN-<j>/pips-log-id<XXXX>.bin.gz   the recording, as the DMA
+#                               wrote it, named with the design ID, which picks
+#                               its record format (pips-log.bin.gz on a build
+#                               without one)
 #   logs/<name>-RUN-<j>/pips-log-summary.txt/.json, pips-cfg.txt, pips-log-*.txt
 #   reports/<name>-RUN-<j>/pips-log.rpt       status: FULL, FULL+DROPS, CUT,
-#                               CUT+DROPS, NO_TRAILER, BAD or FAILED (no log)
+#                               CUT+DROPS, NO_TRAILER, BAD or FAILED (no log);
+#                               design_id and log_format lines
 # A log problem does not fail the run; it shows in the status. PIPS_LOG_GZIP=0
 # keeps pips-log.bin uncompressed.
 #
@@ -98,7 +108,7 @@ while [ $# -gt 0 ]; do
         --results)      results_file="$2"; shift 2 ;;
         --pips-log)     pips_log="$2"; shift 2 ;;
         -h|--help)
-            sed -n '2,56p' "$SELF"; exit 0 ;;
+            sed -n '2,66p' "$SELF"; exit 0 ;;
         *) echo "unknown option: $1"; exit 2 ;;
     esac
 done
@@ -198,50 +208,12 @@ stop_fio() {    # SIGINT makes fio stop and still write its JSON
     sudo -n pkill -KILL -f "$FIO_MATCH" >/dev/null 2>&1 || true
 }
 
-# ------------------------------------------------------------ PIPS log (--pips-log 1)
-# The pips tool (scripts/pips/README.md) runs as root; pips_cfg/pips_design/
-# pips_region are read in preflight. PIPS_STATUS collects each run's log status.
-# pips-lib.sh: $PIPS, pips_tag, cfg_of.
+# ------------------------------------------------------------ PIPS switch
+# The switch's build and batcher setting with every result, and with
+# --pips-log 1 its TLP log in every run: pips_identify (preflight),
+# pips_run_cfg (each run), pips_record, pips_collect, pips_meta, all in
+# pips-lib.sh with $PIPS, pips_tag, cfg_of, cap_of, design_of.
 . "$HERE/pips/pips-lib.sh"
-pipsc() { sudo -n "$PIPS" "$@"; }
-pips_cfg=""; pips_design=""; pips_region=""; PIPS_STATUS=()
-pips_gzip="${PIPS_LOG_GZIP:-1}"
-
-# One recording, while fio is in steady state and no window is open.
-pips_record() {
-    local f="$L/pips-log-record.txt" t0
-    t0=$(date +%s%3N)
-    { pipsc log-start && pipsc log-wait 5000; } > "$f" 2>&1
-    grep -q '^status=timeout' "$f" && pipsc log-stop 2000 >> "$f" 2>&1
-    pipsc cfg set log=0 >> "$f" 2>&1        # a region-full stop leaves log_enable at 1
-    echo "   PIPS log recorded in $(( $(date +%s%3N) - t0 )) ms:" \
-         "$(grep -E '^(stop_reason|n_records|n_dropped|duration_us)=' "$f" | xargs)"
-}
-
-# After fio has stopped: dump, decode, compress. Never fails the run.
-pips_collect() {
-    local f="$L/pips-log-record.txt" bin="$L/pips-log.bin" rpt="$setup_dir/reports/$RUN/pips-log.rpt"
-    local scan=()
-    if grep -q '^stop_reason=' "$f" 2>/dev/null; then
-        pipsc log-dump "$bin" > "$L/pips-log-dump.txt" 2>&1
-    elif [ -n "$pips_region" ]; then
-        # The recording never closed: the whole region as it is, read without a trailer.
-        pipsc log-dump "$bin" "$pips_region" > "$L/pips-log-dump.txt" 2>&1
-        scan=( --scan )
-    fi
-    if [ -s "$bin" ]; then
-        sudo -n chown "$(id -un)": "$bin"
-        python3 "$HERE/pips/pips-log-decode.py" "$bin" ${scan[@]+"${scan[@]}"} \
-            --region-bytes "${pips_region:-0}" --rpt "$rpt" --json "$L/pips-log-summary.json" \
-            > "$L/pips-log-summary.txt" 2>&1
-        [ "$pips_gzip" = 1 ] && gzip -f "$bin"
-    fi
-    [ -s "$rpt" ] || echo "status: FAILED" > "$rpt"
-    PIPS_STATUS+=( "$(awk '/^status:/{print $2; exit}' "$rpt")" )
-    echo "   PIPS log: $(awk '/^status:/{print $2; exit}' "$rpt")," \
-         "$(awk '/^pips_records:/{r=$2} /^pips_dropped:/{d=$2} END{printf "%s records, %s dropped", r, d}' "$rpt")" \
-         "(logs: pips-log-*.txt)"
-}
 
 # Fail fast on the things that otherwise produce a full run of zeros. Collect
 # every problem rather than stopping at the first.
@@ -333,23 +305,7 @@ $(printf '%s\n' "$busy" | sed 's/^/      /')")
             fi
         done
     done
-    if [ "$pips_log" = 1 ]; then
-        if ! make -s -C "$HERE/pips" pips >/dev/null 2>&1; then
-            PROBLEMS+=("--pips-log: cannot build $PIPS (make -C scripts/pips pips)")
-        elif ! out=$(pipsc cfg 2>&1); then
-            PROBLEMS+=("--pips-log: the PIPS switch does not answer:
-$(printf '%s\n' "$out" | tail -2 | sed 's/^/      /')
-    Bring it up first: sudo bash scripts/pips/pips-bringup.sh")
-        else
-            pips_cfg=$(cfg_of <(printf '%s\n' "$out"))
-            pips_design=$(printf '%s\n' "$out" | sed -n 's/^design_id=//p')
-            pips_region=$(pipsc info 2>/dev/null | awk '$1 == "LOG_BYTES" {print $2}')
-            echo "   PIPS: design ${pips_design:-?}, batcher $(pips_tag "$pips_cfg") ($pips_cfg)," \
-                 "log region ${pips_region:-?} bytes"
-            [ -n "$pips_cfg" ] || PROBLEMS+=("--pips-log: could not read the batcher setting (pips cfg)")
-            [ -n "$pips_region" ] || PROBLEMS+=("--pips-log: pips info shows no LOG_BYTES")
-        fi
-    fi
+    pips_identify drive "${BDFS[@]}"
     if [ "$ssds" -eq 2 ] && [ "$(printf '%s' "$iommu_units" | tr '+' '\n' | grep -c .)" -gt 1 ]; then
         echo "   NOTE: the drives are behind DIFFERENT IOMMU units ($iommu_units); a co-run"
         echo "         has no shared IOTLB to contend for."
@@ -455,16 +411,8 @@ for ((j = 0; j < num_runs; j++)); do
     stop_fio; sleep 1
     [ "$num_runs" -gt 1 ] && echo "-- run $((j + 1))/$num_runs"
 
-    if [ "$pips_log" = 1 ]; then
-        # The setting this run ran with; zero the region so leftovers never pass for data.
-        pipsc cfg > "$L/pips-cfg.txt" 2>&1
-        now=$(cfg_of "$L/pips-cfg.txt")
-        [ -n "$now" ] && [ "$(pips_tag "$now")" != "$(pips_tag "$pips_cfg")" ] && \
-            echo "WARNING: the PIPS batcher setting changed during the experiment:" \
-                 "$(pips_tag "$pips_cfg") at the start, $(pips_tag "$now") now" >&2
-        pipsc log-clear > "$L/pips-log-clear.txt" 2>&1 || \
-            echo "WARNING: PIPS log-clear failed: $(tail -1 "$L/pips-log-clear.txt")" >&2
-    fi
+    # The switch's build and setting this run ran with; the log region zeroed.
+    pips_run_cfg
 
     # ---------------------------------------------------------------- load
     want=0; fio_pids=()
@@ -615,8 +563,7 @@ for i in "${ACTIVE[@]}"; do
 done
 printf '  %-25s : %s kIOPS, %s Gbps\n' "AGGREGATE" \
     "$(awk -v x="$iops_total" 'BEGIN{printf "%.1f", x/1e3}')" "$gbps_total"
-[ "$pips_log" = 1 ] && printf '  %-25s : %s   (batcher %s)\n' "PIPS log, per run" \
-    "${PIPS_STATUS[*]:-none}" "$(pips_tag "$pips_cfg")"
+pips_report
 
 # Average each counter across runs so multi-run output stays comparable. The
 # key set depends on the CPU, so take it from the first run's report.
@@ -684,13 +631,9 @@ per_drive=()
 for i in "${ACTIVE[@]}"; do
     per_drive+=( --meta "instances_ssd$i=${JOBS[$i]}" --meta "cores_ssd$i=${CORES[$i]}" )
 done
-# pips_batch keeps records of different batcher settings apart in the summary;
-# pips_log is each run's log status, comma-separated.
-if [ "$pips_log" = 1 ]; then
-    per_drive+=( --meta pips_batch="$(pips_tag "$pips_cfg")" --meta pips_cfg="$pips_cfg"
-                 --meta pips_design_id="${pips_design:-unknown}"
-                 --meta pips_log="$(IFS=,; echo "${PIPS_STATUS[*]}")" )
-fi
+# The PIPS build, setting and log status (pips_meta, pips-lib.sh).
+pips_meta
+per_drive+=( ${PIPS_META[@]+"${PIPS_META[@]}"} )
 python3 "$HERE/dualssd-results.py" dump \
     --reports "$setup_dir/reports" --exp "$exp" --runs "$num_runs" \
     --ssds "$(IFS=,; echo "${ACTIVE[*]}")" --out "$results_file" \

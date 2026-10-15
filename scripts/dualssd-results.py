@@ -349,12 +349,31 @@ def load(files):
     return recs
 
 
+def design_short(r):
+    """The PIPS FPGA design ID a record was measured on, '0a04', or '' when it
+    has none (records from before design IDs were recorded)."""
+    d = str(r.get('pips_design_id') or '').lower()
+    return d[2:] if re.fullmatch(r'0x[0-9a-f]{4}', d) else ''
+
+
 def tag(r):
     """The IOMMU mode, plus the PIPS batcher setting when the record has one
-    (run-dualssd-experiment.sh --pips-log 1), e.g. 'off d8t22'. Records with
-    different settings are different points and never mix."""
+    (drives behind PIPS), e.g. 'off d8t22', and the FPGA design ID when the
+    record has that too, e.g. 'off d8t22c1@0a04'. Records with different
+    settings or designs are different points and never mix."""
     b = r.get('pips_batch')
-    return f"{r.get('iommu')} {b}" if b else str(r.get('iommu'))
+    if not b:
+        return str(r.get('iommu'))
+    d = design_short(r)
+    return f"{r.get('iommu')} {b}" + (f"@{d}" if d else '')
+
+
+def designs_line(recs):
+    """'PIPS design ID: 0x0a04 (90 records)' for the records that have one, or ''."""
+    c = collections.Counter(f'0x{design_short(r)}' for r in recs if design_short(r))
+    if not c:
+        return ''
+    return 'PIPS design ID: ' + ', '.join(f'{d} ({n} records)' for d, n in sorted(c.items()))
 
 
 def tag_w(recs):
@@ -567,7 +586,7 @@ def pips_table(recs):
     sw = max([13] + [len(str(r['pips_log'])) for r in rs])
     hdr = (f"{'IOMMU':<{tw}} {'BS':<5} {'INST':>5} {'MODE':<9} {'LOG, per run':<{sw}} "
            f"{'RECORDS':>8} {'DROP':>5} {'SPAN_us':>8} {'in0_TLP':>8} {'in1_TLP':>8} "
-           f"{'out_TLP':>8} {'out_MWr_Gbps':>12}")
+           f"{'out_TLP':>8} {'out_MWr_Gbps':>12} {'WAIT_us':>11}")
     print()
     print('PIPS TLP log per configuration (numbers: means over runs)')
     print(hdr)
@@ -586,7 +605,7 @@ def pips_table(recs):
               f"{fmt(m.get('pips_in0_tlp'), None, '.0f'):>8} "
               f"{fmt(m.get('pips_in1_tlp'), None, '.0f'):>8} "
               f"{fmt(m.get('pips_out_tlp'), None, '.0f'):>8} "
-              f"{fmt(m.get('pips_out_mwr_gbps'), None, '.2f'):>12}{flag}")
+              f"{fmt(m.get('pips_out_mwr_gbps'), None, '.2f'):>12} {wait_us(m):>11}{flag}")
     print()
     print('  logs: ' + ', '.join(f'{n} {s}' for s, n in counts.most_common()))
     print('  FULL       = it ran until the log region (4 MiB, 262,143 TLPs) filled.')
@@ -595,12 +614,28 @@ def pips_table(recs):
     print('  NO_TRAILER = the recording never closed; BAD = the dump and its trailer')
     print('               disagree; FAILED = no log. SPAN_us = the recording\'s length.')
     print('  in0 = from downstream port one (b348), in1 = from downstream port zero')
-    print('  (b148), out = the batched stream to the host.')
+    print('  (b148), out = the batched stream to the host. WAIT_us = mean/p99 time a')
+    print('  TLP spent in the batcher (pkt_wait; logs of design 0x0a04 on, - before).')
+
+
+# The logger's clock (pips-log-decode.py CLOCK_HZ): pkt_wait is in its cycles.
+LOG_CLOCK_MHZ = 250.0
+
+
+def wait_us(m):
+    """'mean/p99' of the out stream's pkt_wait in us, '-' for logs without it."""
+    w, p = m.get('pips_out_wait_mean'), m.get('pips_out_wait_p99')
+    if w is None or p is None:
+        return '-'
+    return f'{w / LOG_CLOCK_MHZ:.2f}/{p / LOG_CLOCK_MHZ:.2f}'
 
 
 def summary(a):
     recs = load(a.files)
     key = sort_key
+    if designs_line(recs):
+        print(designs_line(recs))
+        print()
 
     # Single-drive misses per I/O and IOPS, per IOMMU mode / block size / instances.
     base = {}
@@ -678,8 +713,9 @@ def summary(a):
     print('  modes at the same BS/INST. LINK BOUND: PCIe write above 85% of the')
     print('  narrowest shared PCIe link, which then caps the run, not the IOMMU.')
     if any(r.get('pips_batch') for r in recs):
-        print('  IOMMU <mode> d<D>t<T>[m1] = run through PIPS with batcher depth D, time T')
-        print('               (and batch_mrd on); see the PIPS log table below.')
+        print('  IOMMU <mode> d<D>t<T>[m1][c1][@<id>] = run through PIPS with batcher depth D,')
+        print('               time T (m1: batch_mrd on; c1: drain depth cap on, a drain sends')
+        print('               at most D packets) on FPGA design 0x<id>; see the PIPS log table.')
     asym_table(recs)
     pips_table(recs)
     pcm_tables(recs)
@@ -689,6 +725,9 @@ def grid(a):
     """Block size x instances tables, one per IOMMU mode and metric."""
     recs = load(a.files)
     alone = alone_iops(recs)
+    if designs_line(recs):
+        print(designs_line(recs))
+        print()
     # A point measured twice (say, a re-run) shows its last record.
     pts = {group(r) + (r.get('mode'),): r for r in recs if not is_asym(r)}
 

@@ -12,12 +12,21 @@
 
 The .rpt files stay the source of truth; this only collects them, so a run
 whose reports are missing shows up as null rather than as zero.
+
+NICs behind the PIPS switch: records carry pips_batch (the batcher setting,
+e.g. d8t22c1) and pips_design_id (the FPGA build, e.g. 0x0a04), and with
+--pips-log 1 each run's TLP log numbers (pips_*) and status (pips_log).
+Records with a different setting or build are different points: the IOMMU
+column reads e.g. 'off d8t22c1@0a04'. Records without them (NICs not behind
+PIPS, or from before) read as before.
 """
 import argparse
+import collections
 import datetime
 import json
 import os
 import platform
+import re
 import socket
 import statistics
 import sys
@@ -87,6 +96,10 @@ def one_run(reports, exp, j, nics):
         rx = read_kv(os.path.join(base, f'retx-nic{i}.rpt'))
         if 'Retx_percent' in rx:
             r[f'retx_nic{i}_pct'] = rx['Retx_percent']
+    # The PIPS TLP log's numbers (--pips-log 1), pips_*: full or not, records,
+    # drops, per-port TLPs, MWr Gbps and time in the batcher. Its text status
+    # goes in 'pips_log'.
+    r.update(read_kv(os.path.join(base, 'pips-log.rpt')))
     return r
 
 
@@ -130,6 +143,69 @@ def fmt(m, s, spec):
     return format(m, spec) if not s else f'{format(m, spec)}+/-{format(s, spec)}'
 
 
+def design_short(r):
+    """The PIPS FPGA design ID a record was measured on, '0a04', or ''."""
+    d = str(r.get('pips_design_id') or '').lower()
+    return d[2:] if re.fullmatch(r'0x[0-9a-f]{4}', d) else ''
+
+
+def tag(r):
+    """The IOMMU mode, plus the PIPS batcher setting and design ID when the
+    record has them, e.g. 'off d8t22c1@0a04': different points never mix."""
+    b = r.get('pips_batch')
+    if not b:
+        return str(r.get('iommu'))
+    d = design_short(r)
+    return f"{r.get('iommu')} {b}" + (f"@{d}" if d else '')
+
+
+def designs_line(recs):
+    """'PIPS design ID: 0x0a04 (12 records)' for the records that have one, or ''."""
+    c = collections.Counter(f'0x{design_short(r)}' for r in recs if design_short(r))
+    if not c:
+        return ''
+    return 'PIPS design ID: ' + ', '.join(f'{d} ({n} records)' for d, n in sorted(c.items()))
+
+
+def pips_table(recs, key, tw):
+    """Each configuration's PIPS TLP log (--pips-log 1): whether every run's
+    recording is whole, and what it saw per input."""
+    rs = [r for r in recs if r.get('pips_log') is not None]
+    if not rs:
+        return
+    sw = max([13] + [len(str(r['pips_log'])) for r in rs])
+    hdr = (f"{'IOMMU':<{tw}} {'RATE':<9} {'FLOWS':>5} {'MODE':<9} {'LOG, per run':<{sw}} "
+           f"{'RECORDS':>8} {'DROP':>5} {'SPAN_us':>8} {'in0_TLP':>8} {'in1_TLP':>8} "
+           f"{'out_MWr_Gbps':>12} {'WAIT_us':>11}")
+    print()
+    print('PIPS TLP log per configuration (numbers: means over runs)')
+    print(hdr)
+    print('-' * len(hdr))
+    counts = collections.Counter()
+    for r in sorted(rs, key=key):
+        m = r['mean']
+        st = str(r['pips_log']) or 'none'
+        counts.update(st.split(','))
+        flag = '' if set(st.split(',')) == {'FULL'} else '  <-- NOT ALL FULL'
+        w, p = m.get('pips_out_wait_mean'), m.get('pips_out_wait_p99')
+        wait = '-' if w is None or p is None else f'{w / 250:.2f}/{p / 250:.2f}'
+        print(f"{tag(r):<{tw}} {str(r.get('bandwidth_per_nic')):<9} "
+              f"{str(r.get('flows_per_nic')):>5} {str(r.get('mode')):<9} {st:<{sw}} "
+              f"{fmt(m.get('pips_records'), None, '.0f'):>8} "
+              f"{fmt(m.get('pips_dropped'), None, '.0f'):>5} "
+              f"{fmt(m.get('pips_duration_us'), None, '.0f'):>8} "
+              f"{fmt(m.get('pips_in0_tlp'), None, '.0f'):>8} "
+              f"{fmt(m.get('pips_in1_tlp'), None, '.0f'):>8} "
+              f"{fmt(m.get('pips_out_mwr_gbps'), None, '.2f'):>12} {wait:>11}{flag}")
+    print()
+    print('  logs: ' + ', '.join(f'{n} {s}' for s, n in counts.most_common()))
+    print('  FULL = it ran until the log region filled; CUT = ended first (5 s);')
+    print('  +DROPS = TLP records lost to logger FIFO overflow; NO_TRAILER, BAD,')
+    print('  FAILED = no usable log. in0 = from downstream port one (b348), in1 = from')
+    print('  downstream port zero (b148). WAIT_us = mean/p99 time a TLP spent in the')
+    print('  batcher (logs of design 0x0a04 on; - before).')
+
+
 def summary(a):
     recs = []
     for path in a.files:
@@ -137,20 +213,25 @@ def summary(a):
             recs += [json.loads(l) for l in f if l.strip()]
     if not recs:
         sys.exit('no records')
+    if designs_line(recs):
+        print(designs_line(recs))
+        print()
 
     def key(r):
         return (str(r.get('bandwidth_per_nic')), r.get('flows_per_nic') or 0,
                 {'nic0only': 0, 'nic1only': 1, 'both': 2}.get(r.get('mode'), 3),
-                str(r.get('iommu')))
+                tag(r))
 
-    # contention = both / mean(nic0only, nic1only) - 1, per IOMMU mode, rate, flows
+    # contention = both / mean(nic0only, nic1only) - 1, per IOMMU mode (and
+    # PIPS setting and build), rate, flows
     base = {}
     for r in recs:
         if r.get('mode') in ('nic0only', 'nic1only'):
-            g = (r.get('iommu'), r.get('bandwidth_per_nic'), r.get('flows_per_nic'))
+            g = (tag(r), r.get('bandwidth_per_nic'), r.get('flows_per_nic'))
             base.setdefault(g, []).append(r['mean'].get('misses_per_gbps'))
 
-    hdr = f"{'IOMMU':<7} {'RATE':<9} {'FLOWS':>5} {'MODE':<9} {'TPUT_Gbps':>16} " \
+    tw = max([7] + [len(tag(r)) for r in recs])
+    hdr = f"{'IOMMU':<{tw}} {'RATE':<9} {'FLOWS':>5} {'MODE':<9} {'TPUT_Gbps':>16} " \
           f"{'PCIe_wr':>8} {'MISS_PER_GBPS':>20} {'CPU_%':>12} {'CONTENTION':>10}"
     print(hdr)
     print('-' * len(hdr))
@@ -160,13 +241,13 @@ def summary(a):
         # Without translation there are no misses to contend over; the ratio
         # of two near-zero counts would read as a large, meaningless swing.
         if r.get('mode') == 'both' and r.get('iommu') not in ('off', 'pt'):
-            b = base.get((r.get('iommu'), r.get('bandwidth_per_nic'), r.get('flows_per_nic')), [])
+            b = base.get((tag(r), r.get('bandwidth_per_nic'), r.get('flows_per_nic')), [])
             both = m.get('misses_per_gbps')
             if len(b) >= 2 and None not in b and both and sum(b) > 0:
                 cont = f'{100 * (both / (sum(b) / len(b)) - 1):+.1f}%'
         wr = m.get('PCIe_wr_tput')
         flag = '  <-- LINK BOUND' if (wr or 0) > 100 else ''
-        print(f"{str(r.get('iommu')):<7} {str(r.get('bandwidth_per_nic')):<9} "
+        print(f"{tag(r):<{tw}} {str(r.get('bandwidth_per_nic')):<9} "
               f"{str(r.get('flows_per_nic')):>5} {str(r.get('mode')):<9} "
               f"{fmt(m.get('tput_total_gbps'), s.get('tput_total_gbps'), '.2f'):>16} "
               f"{fmt(wr, None, '.1f'):>8} "
@@ -179,6 +260,10 @@ def summary(a):
     print('  the on/off comparison is TPUT and CPU_% at the same RATE/FLOWS.')
     print('  Ignore LINK BOUND rows for IOMMU conclusions: there the ~126 Gbps')
     print('  shared uplink, not the IOMMU, is the constraint.')
+    if any(r.get('pips_batch') for r in recs):
+        print('  IOMMU <mode> d<D>t<T>[m1][c1][@<id>] = NICs behind PIPS with batcher depth D,')
+        print('  time T (m1: batch_mrd on; c1: drain depth cap on) on FPGA design 0x<id>.')
+    pips_table(recs, key, tw)
 
 
 def main():

@@ -18,9 +18,13 @@ repos. It collects and summarises:
 Section 16 lists where each part came from. **If this file and those disagree,
 those win.** Update this file when they change.
 
-As of 2026-10-12: FPGA repo `pips_batch` at `e389cca`, design ID `0x0A02`,
-BAR0 map v2.1. "PIO" means programmed I/O: host loads and stores to a BAR.
-The tools are described in [README.md](README.md).
+As of 2026-10-15: FPGA repo `pips_batch` at `591d854`, design ID `0x0A04`,
+BAR0 map v2.1. Since `0x0A02` (2026-10-12) two things changed that the host
+sees: the batcher's **drain depth cap** (regfile reg1, from `0x0A03`, §6) and
+the **TLP log record format v2** (from `0x0A04`, §8). Logs and results from
+before keep their old meaning; the design ID tells them apart (§6, "Design
+ID"). "PIO" means programmed I/O: host loads and stores to a BAR. The tools
+are described in [README.md](README.md).
 
 ---
 
@@ -29,10 +33,10 @@ The tools are described in [README.md](README.md).
 | | |
 |---|---|
 | Path | Host → upstream port BAR0 (`10ee:b048`) → PIO in the FPGA → registers, 2 KB BRAM, and a 16 KB window onto an AXI4-Lite bus |
-| Behind the window | `0xA400_0000` regfile (batcher/logger config, design ID), `0xA401_0000` log DMA registers, `0x0000_0000–0x7FFF_FFFF` DDR4 |
+| Behind the window | `0xA400_0000` regfile (batcher/logger config, drain config, design ID), `0xA401_0000` log DMA registers, `0x0000_0000–0x7FFF_FFFF` DDR4 |
 | BAR0 | 64-bit, non-prefetchable, **32 KB**. The IP is set to "1 MB" to get this (§11.1) |
-| Identity | BAR0 `+0x800` reads `0x5049_5053` ("PIPS"); `+0x804` reads `0x0002_0001` (map v2.1); regfile `+0x20` reads the design ID (`0x0A02`) |
-| TLP log | 3 ports (in0, in1, out), 16-byte records, 4 MiB region at DDR `0x0` = 262,143 records + trailer. Under full load it fills in ~4.4 ms |
+| Identity | BAR0 `+0x800` reads `0x5049_5053` ("PIPS"); `+0x804` reads `0x0002_0001` (map v2.1); regfile `+0x20` reads the design ID (`0x0A04` now) |
+| TLP log | 16-byte records, 4 MiB region at DDR `0x0` = 262,143 records + trailer. v2 (design `0x0A04` on): one record per TLP sent to the host, tagged with its input and its time in the batcher. v1 (before): records for 3 ports (in0, in1, out). Under full load it fills in ~4.4 ms (v1) |
 | No | interrupts, host DMA, or bulk data path. Everything is polled, one TLP at a time |
 | Status | Working on hardware: bring-up, regfile, DMA, DDR, error path, and a full recording under fio (bigserver, 2026-10-11) |
 
@@ -218,8 +222,9 @@ returns DECERR.
 
 | Offset | Access | Content |
 |---|---|---|
-| `0x00` | RW | **batcher/logger config** (below) |
-| `0x04–0x1C` | RO | reserved, read 0. Could become read/write in a later build |
+| `0x00` | RW | **batcher/logger config** (reg0, below) |
+| `0x04` | RW | **batcher drain config** (reg1, below), from design `0x0A03`. Before: reserved, reads 0, ignores writes |
+| `0x08–0x1C` | RO | reserved, read 0. Can become read/write in a later build (`REG_RW_MASK`) |
 | `0x20` | RO | **design ID**: `[15:0]` build identifier, `[31:16]` 0 |
 | `0x24–0x3C` | RO | reserved, read 0 |
 
@@ -229,11 +234,23 @@ Writes to read-only registers are ignored with an OKAY response
 **Design ID.**
 - Set in `pips.tcl` (`pips_design_id`), `0x0A02` first, +1 with every FPGA
   design update. Read it at startup and record it with every result: it is
-  the only way to know which build is loaded.
+  the only way to know which build is loaded, and it picks the log decoder.
 - Builds older than `0x0A02` answer `+0x20` with DECERR (`0xFFFFFFFF`,
   `WIN_STATUS[0]`).
 - XSCT reads the same value at `mrd 0xA4000020`. It is also ILA probe3 of
-  `pips_control_plane/axis_ila_0`.
+  `pips_control_plane/axis_ila_0` (probe4 is reg1).
+
+| Design ID | FPGA repo | Change the host sees |
+|---|---|---|
+| none | before `e389cca` | no DESIGN_ID (DECERR); log v1 |
+| `0x0A02` | `e389cca`, 10-11 | DESIGN_ID; log v1. The 10-13 dual-SSD PIPS sweeps ran on it |
+| `0x0A03` | `2c6c3f5`, 10-14 | reg1 `drain_depth_cap`; log v1 |
+| `0x0A04` | `591d854`, 10-15 | log record format v2 (§8.3) |
+
+Every artifact the tools write carries the design ID: in the name for raw logs
+(`pips-log-id0a04.bin.gz`) and sweeps (`<NAME>-id0a04-<setting>`), inside for
+text (`design_id=` / `design_id:` lines, JSON fields). See
+[README.md](README.md), "Design IDs".
 
 **Config register (reg0).** Reset value `0x0000_0001`. Each field sits on its
 own byte, and fields are always written with read-modify-write.
@@ -255,6 +272,27 @@ How the batcher uses it:
 - Requests of other types pass through a shared FIFO.
 - The reset value (depth 1, time 0) releases every packet at once: no
   batching.
+- How much one drain sends is reg1's `drain_depth_cap` (below).
+
+**Drain config register (reg1, `0xA400_0004`), design `0x0A03` on.** Reset
+value `0x0000_0000`. Same rule: read-modify-write, reserved bits written 0.
+
+| Bits | Field | Meaning |
+|---|---|---|
+| `[0]` | `drain_depth_cap` | 0: a drain grant sends **every packet in the FIFO** when it starts (the snapshot), as every earlier build did. 1: a drain sends **at most `depth_threshold` packets** (a threshold of 0 counts as 1); the rest go in the next batch |
+| `[31:1]` | reserved | write 0 |
+
+- Safe to change at any time: a drain already running keeps the size it
+  started with.
+- Builds before `0x0A03` read 0 here and ignore writes, so check the design
+  ID (or read the bit back) before relying on it. `pips cfg set cap=1` refuses
+  on such a build; `pips cfg` prints `drain=none drain_depth_cap=0` there.
+- With cap 1 and depth 1, each drain sends one packet: unlike cap 0, where a
+  drain also takes whatever arrived while the previous one ran.
+- Setting tags in result and sweep names add `c1` when it is on:
+  `d8t22c1` = depth 8, time 0x16, cap on. No `c1` = cap off, which is also what
+  every older tag (`d8t22`) meant.
+- XSCT: `mwr 0xA4000004 1`.
 
 **Old layout.** XSCT notes from before 2026-10-10 use an older layout, where
 `batch_mrd` and `log_enable` sat inside `time_threshold`. The old `0x1608`
@@ -298,22 +336,34 @@ the status bits and a full recording all behaved as PG021 says. After reset:
 
 ### 8.1 What it records
 
-Three taps on the batcher, merged into one timeline by
-`axi4_telemetry_logger`:
+**v2, design `0x0A04` on.** One tap, on the batched output, through
+`axi4_telemetry_logger`: one 16-byte record per TLP **as it left the batcher
+toward the host**, in the order they left. Each record names the input the
+TLP came in on (`port`) and how long it waited inside the batcher
+(`pkt_wait`):
 
-| Port | Bus | On bigserver |
+| Port | Input | On bigserver |
 |---|---|---|
 | `in0` (0) | requests from downstream port **one** (`b348`) | 9100 PRO, nvme0 |
 | `in1` (1) | requests from downstream port **zero** (`b148`) | 990 EVO Plus, nvme1 |
-| `out` (2) | the batched stream sent up to the host | both |
 
-So it sees the requests the drives send towards the host:
-- memory writes: read data, NVMe completion-queue entries, interrupts;
+There is no port 2. Each input's arrival order can be rebuilt from the same
+records (§8.4), so nothing is lost by dropping the input taps, and the region
+holds twice as many TLPs.
+
+**v1, before `0x0A04`.** Three taps on the batcher, merged into one timeline:
+`in0` (0) and `in1` (1) as above, and `out` (2), the batched stream sent up to
+the host. Each TLP appears twice: once on its input, once on `out`.
+
+Either way it sees the requests the devices behind the switch send towards
+the host:
+- memory writes: read data, NVMe completion-queue entries, interrupts (a
+  NIC's receive data, descriptors and interrupts);
 - memory reads: command fetches.
 
 It records one 16-byte record per TLP, at the TLP's last beat. It does not see
-host-to-device traffic (doorbells, the host's completions to the drives' reads)
-or BAR0 accesses to the PIO.
+host-to-device traffic (doorbells, the host's completions to the devices'
+reads) or BAR0 accesses to the PIO.
 
 ### 8.2 The region
 
@@ -328,32 +378,43 @@ or BAR0 accesses to the PIO.
 
 ### 8.3 Record format (16 bytes, little-endian)
 
+**Which format a log is in follows from the design ID of the build that wrote
+it, and only from that**: the info byte and the trailer are the same in both,
+so a v1 decoder reads a v2 log without error but with wrong tags. The tools
+take the ID from the log's file name (`-id0a04`), else from a `pips cfg`
+readout next to it, else read it as v1 (README, "Design IDs").
+
 The info byte at offset `0x0E` is in every record:
 
 | Bits | Field | Values |
 |---|---|---|
 | `[7]` | written | always 1; never-written memory reads 0 here |
 | `[3:2]` | kind | 0 TLP, 1 dropped TLP, 2 trailer, 3 pad |
-| `[1:0]` | port | 0 in0, 1 in1, 2 out (0 for trailer and pad) |
+| `[1:0]` | port | 0 in0, 1 in1; v1 also 2 out (0 for trailer and pad) |
 
-So TLP records have info `0x80–0x82`, dropped ones `0x84–0x86`, the trailer
-`0x88`, and pads `0x8C`. Byte `0x0F` is 0.
+So TLP records have info `0x80–0x81` (v1 also `0x82`), dropped ones
+`0x84–0x85` (`0x86`), the trailer `0x88`, and pads `0x8C`.
 
-**TLP record:**
+**TLP record, v2 (design `0x0A04` on):**
 
 | Offset | Size | Field | Meaning |
 |---|---|---|---|
 | `0x00` | 8 | `pkt_addr` | byte address = descriptor `Address[61:0] << 2` |
-| `0x08` | 1 | `pkt_length` | TLP length in 512-bit beats, start to end; 1–255, 255 = ≥ 255 |
-| `0x09` | 1 | `pkt_gap` | idle cycles on this port since its previous TLP ended; 255 = ≥ 255 |
-| `0x0A` | 1 | `pkt_type` | low nibble = PCIe request type: 0 MRd, 1 MWr, 2 IORd, 3 IOWr, 4 FetchAdd, 5 Swap, 6 CAS, 7 LockedRd, 8–B config, C Msg, D VendorMsg, E ATSMsg |
+| `0x08` | 1 | `pkt_length` | TLP length in 512-bit beats on the output, start to end; 1–255, 255 = ≥ 255 |
+| `0x09` | 1 | `pkt_gap` | cycles between the previous TLP's end **on the output** and this one's start; 255 = ≥ 255 |
+| `0x0A` | 1 | `pkt_type` | `[3:0]` PCIe request type: 0 MRd, 1 MWr, 2 IORd, 3 IOWr, 4 FetchAdd, 5 Swap, 6 CAS, 7 LockedRd, 8–B config, C Msg, D VendorMsg, E ATSMsg. `[5:4]` AT: 0 untranslated, 1 translation request, 2 translated |
 | `0x0B` | 1 | `payload_dw` | MWr only: payload DWORDs, clamped at 255 (= ≥ 1020 B); 0 otherwise |
-| `0x0C` | 1 | `pkt_tag` | descriptor tag |
-| `0x0D` | 1 | `addr_type` | low 2 bits = AT: 0 untranslated, 1 translation request, 2 translated |
-| `0x0E` | 1 | info | `0x80` + port |
+| `0x0C` | 2 | `pkt_wait` | u16: cycles from the TLP's start being accepted on its input to its start being accepted on the output, i.e. its time in the batcher; 65535 = ≥ 65535. Never 0 (at least ~4: FIFO and arbitration latency) |
+| `0x0E` | 1 | info | `0x80` + port (its input) |
+| `0x0F` | 1 | `pkt_tag` | descriptor tag |
 
-**Dropped-TLP record:** bytes `0x00–0x0D` are zero, info `0x84 | port`. It takes
-the slot of a TLP whose record was lost.
+**TLP record, v1 (before `0x0A04`):** the same up to `0x0B`, except `pkt_gap`
+counts idle cycles **on this record's port** and `pkt_type` holds only the
+type. Then `0x0C` `pkt_tag` (u8), `0x0D` `addr_type` (low 2 bits = AT), `0x0E`
+info, `0x0F` always 0. No `pkt_wait`.
+
+**Dropped-TLP record:** all bytes but the info byte are zero, info `0x84 | port`
+(v2: the TLP's input). It takes the slot of a TLP whose record was lost.
 
 **Pad record:** all zero except info `0x8C`. It appears only with a stream wider
 than 128 bits; never as built.
@@ -370,9 +431,13 @@ DMA transfer:
 | `0x0E` | 1 | info `0x88` |
 
 ```c
-typedef struct __attribute__((packed, aligned(16))) {
-    uint64_t pkt_addr; uint8_t pkt_length, pkt_gap, pkt_type, payload_dw, pkt_tag, addr_type, info, rsvd;
+typedef struct __attribute__((packed, aligned(16))) {      /* v2, design 0x0A04 on */
+    uint64_t pkt_addr; uint8_t pkt_length, pkt_gap, pkt_type, payload_dw;
+    uint16_t pkt_wait; uint8_t info, pkt_tag;
 } tel_rec_t;
+typedef struct __attribute__((packed, aligned(16))) {      /* v1, before 0x0A04 */
+    uint64_t pkt_addr; uint8_t pkt_length, pkt_gap, pkt_type, payload_dw, pkt_tag, addr_type, info, rsvd;
+} tel_rec_v1_t;
 typedef struct __attribute__((packed, aligned(16))) {
     uint32_t n_records, n_dropped, duration; uint8_t stop_reason, rsvd0, info, rsvd1;
 } tel_trailer_t;
@@ -382,12 +447,25 @@ typedef struct __attribute__((packed, aligned(16))) {
 
 ### 8.4 Reading the fields
 
-- **Saturation.** `pkt_length`, `pkt_gap` and `payload_dw` clamp at 255.
-  Treat 255 as "at least", and leave such samples out of means and
-  percentiles.
-- **No timestamps.** Time within a port can only be estimated as the running
-  sum of `pkt_gap + pkt_length`. That is a lower bound: stalls in the middle
-  of a packet are counted by neither field, and a saturated gap breaks it.
+- **Saturation.** `pkt_length`, `pkt_gap` and `payload_dw` clamp at 255,
+  `pkt_wait` at 65535. Treat those as "at least", and leave such samples out
+  of means and percentiles.
+- **No timestamps.** v1: time within a port can only be estimated as the
+  running sum of `pkt_gap + pkt_length`. That is a lower bound: stalls in the
+  middle of a packet are counted by neither field, and a saturated gap breaks
+  it. v2 (`telemetry_dma_format.md` §4.3), on the output, from the first
+  record's start = 0:
+  `out_sop[n] = out_eop[n-1] + 1 + pkt_gap[n]`,
+  `out_eop[n] = out_sop[n] + pkt_length[n] - 1`, and
+  `in_sop[n] = out_sop[n] - pkt_wait[n]`. Sorting one input's TLPs by
+  `in_sop` gives its arrival order. Exact while there is no saturated gap or
+  wait, no dropped record, and no stall inside a packet on the output; after
+  any of those later times are lower bounds. `pips-log-decode.py --csv` writes
+  `out_sop`, `in_sop` and a segment number that goes up at each break.
+- **`pkt_wait`** covers everything between the two ports: waiting in the
+  batching FIFO for its trigger, for the other input's drain, behind the
+  packets ahead of it, and output backpressure. With `drain_depth_cap` on, a
+  FIFO drains in pieces, which shows here.
 - **`pkt_gap` includes backpressure** that delays the next packet's start, not
   just idle time.
 - **`pkt_addr`** is meaningful for memory, I/O and atomic requests only. Its
@@ -420,19 +498,23 @@ typedef struct __attribute__((packed, aligned(16))) {
 
 ### 8.6 Order and drops
 
-- Records appear in **end-of-packet order across all three ports**. TLPs that
-  end in the same cycle are ordered in0, in1, out.
+- v2: records are in **output order**: the order the TLPs left the batcher.
+  Per input that is its arrival order within each FIFO (memory reads have
+  their own unless `batch_mrd`).
+- v1: records appear in **end-of-packet order across all three ports**. TLPs
+  that end in the same cycle are ordered in0, in1, out.
 - The logger drains one record per clock through a 512-entry FIFO (one entry
   per cycle in which any port ended a TLP).
 - **Drops.** When the FIFO is full, that cycle's records are dropped, but each
   still takes its slot as a dropped record.
-- **Per port the order is exact:** the n-th record of a port is the n-th TLP
-  that ended there. Across ports, dropped records are only roughly placed.
-  `n_dropped` counts them all.
+- **Per port the order is exact** (v1): the n-th record of a port is the n-th
+  TLP that ended there. Across ports, dropped records are only roughly placed.
+  `n_dropped` counts them all. In v2 a dropped record keeps its place in the
+  output order and names its input.
 - Causes: the DMA not running when `log_enable` rises (which is why it is
   armed first), DDR or interconnect stalls longer than the FIFO covers, or
-  more than one TLP end per cycle summed over the three ports for long
-  stretches.
+  (v1) more than one TLP end per cycle summed over the three ports for long
+  stretches. v2 has one tap, at most one record per cycle.
 - None were seen at 1.62M IOPS.
 
 ### 8.7 Recording procedure
@@ -480,7 +562,10 @@ A FULL log is a **snapshot**: the first 262,143 TLPs after the edge, about
 ### 8.9 What a recording looks like
 
 From bigserver, 2026-10-11: both drives, 4 jobs × iodepth 32 each, 4k random
-reads, IOMMU off, 1.62M IOPS. Recording started 5 s into fio.
+reads, IOMMU off, 1.62M IOPS. Recording started 5 s into fio. A v1 log
+(`e389cca`'s build, design `0x0A02`): each TLP is on its input and on `out`.
+A v2 log of the same load would cover about twice the time, with `in0` +
+`in1` = `out` by construction.
 
 | | |
 |---|---|
@@ -589,14 +674,18 @@ connect -url TCP:192.17.103.45:3121
 targets 1
 configparams force-mem-access 1
 mrd 0xA4000000          ;# config register
+mrd 0xA4000004          ;# drain config (design 0x0A03 on)
 mrd 0xA4000020          ;# design ID
 mwr 0xA4000000 0x01001608   ;# depth 8, time 0x16, log on (new layout)
+mwr 0xA4000004 1            ;# drain depth cap on
 ```
 
-`scripts/pips/pips-xsct.tcl` wraps the config, DMA and log procedures. DDR is
-read through the PS's NoC port, at JTAG speed. XSCT cannot reach BAR0
-registers, so the log region is hard-coded there (`0x0`, 4 MiB). Change it
-there too if `pips.tcl` changes.
+`scripts/pips/pips-xsct.tcl` wraps the config (`pips_cfg_set ... cap 1`),
+design ID (`pips_design`), DMA and log procedures. DDR is read through the
+PS's NoC port, at JTAG speed. XSCT cannot reach BAR0 registers, so the log
+region is hard-coded there (`0x0`, 4 MiB). Change it there too if `pips.tcl`
+changes. Name a dump with the design ID (`log-id0a04.bin`) so the decoder
+picks the right format.
 
 ---
 
@@ -625,10 +714,10 @@ there too if `pips.tcl` changes.
 
 | Setting | Value | Where |
 |---|---|---|
-| `pips_design_id` | `0x0A02` (+1 per design update) | regfile `+0x20` |
+| `pips_design_id` | `0x0A04` (+1 per design update; `0x0A02` first) | regfile `+0x20` |
 | `pips_log_ddr_base`, `pips_log_region_bytes` | `0x0`, 4 MiB | BAR0 `LOG_*`; the DMA's address range |
-| `axi4_mwr_batch_top_0` | `DMA_LOG 1`, `DMA_REGION_BYTES` = region, `LOG_TDATA_WIDTH 128`; others default (`LOG_FIFO_DEPTH 512`, `MRD_DEDICATED_FIFO 0`, 8-bit thresholds) | §6, §8 |
-| `axil4_regfile_0` | `NUM_REGS 16`, `C_S_AXI_ADDR_WIDTH 6` | §6 |
+| `axi4_mwr_batch_top_0` | `DMA_LOG 1`, `DMA_REGION_BYTES` = region, `LOG_TDATA_WIDTH 128`; others default (`LOG_FIFO_DEPTH 512`, `MRD_DEDICATED_FIFO 0`, 8-bit thresholds); `drain_depth_cap` from `xlslice_4` (reg1 bit 0) | §6, §8 |
+| `axil4_regfile_0` | `NUM_REGS 16`, `C_S_AXI_ADDR_WIDTH 6`, `REG_RW_MASK 00000011` (reg0, reg1 have storage) | §6 |
 | `axi_dma_log` | `c_include_sg 0`, `c_addr_width 32`, `c_sg_length_width 26`, `c_s2mm_burst_size 256` | §7 |
 | Clocks | upstream `user_clk` 250 MHz for the PIO, batcher, logger, regfile and DMA | |
 
@@ -670,11 +759,11 @@ widen the DMA back to 2 GB and keep the constants.
 
 | Tool | Use |
 |---|---|
-| `pips` (C, `make`) | `info`, `rd`/`wr`, `axi-rd`/`axi-wr`, `cfg [set depth= time= mrd= log=]` (prints `design_id=`), `dma`, `dma-reset`, `log-clear`, `log-start`, `log-wait`/`log-stop`, `log-dump`, `ddr-dump`, `hwtest [steps]`, `soak` |
-| `pips-bringup.sh` | enumeration, links, kernel log, `hwtest`, an empty recording; logs in `utils/logs/pips-bringup-*` |
-| `pips-fio-log.sh` | one read-only fio run with a recording, before/after readouts |
-| `dualssd_pips_sweep.sh` | the dual-SSD cross sweep with uneven co-runs, once per batcher setting, a recording per run checked FULL/CUT |
-| `pips-log-decode.py` | dump → status, per-port summary, CSV, JSON, `.rpt`; reads `.gz` |
+| `pips` (C, `make`) | `info`, `rd`/`wr`, `axi-rd`/`axi-wr`, `cfg [set depth= time= mrd= log= raw= cap=]` (prints `drain=`, `design_id=`, `log_format=`), `dma`, `dma-reset`, `log-clear`, `log-start`, `log-wait`/`log-stop`, `log-dump`, `ddr-dump`, `hwtest [steps]`, `soak` |
+| `pips-bringup.sh` | enumeration, links, kernel log, `hwtest`, an empty recording (`log-smoke-id<XXXX>.bin`); logs in `utils/logs/pips-bringup-*` |
+| `pips-fio-log.sh` | one read-only fio run with a recording (`log-id<XXXX>.bin`), before/after readouts |
+| `dualssd_pips_sweep.sh`, `dualnic_pips_sweep.sh` | the dual-SSD cross sweep with uneven co-runs / the dual-NIC flow sweep, once per batcher setting with the drain cap off and on, a recording per run checked FULL/CUT; names carry the design ID |
+| `pips-log-decode.py` | dump → status, per-port summary, CSV, JSON, `.rpt`; reads `.gz`; v1 or v2 by design ID |
 | `pips-xsct.tcl` | the same over JTAG |
 | `make check` | all of it against a software model of BAR0 (`pips_sim.c`), no hardware |
 
@@ -714,10 +803,14 @@ volatile.
 
 ## 15. Open items
 
+- Design `0x0A04` on hardware: the drain cap (reg1) and v2 logs have only run
+  against the software model (`make check`). First run: `pips-bringup.sh`
+  (the regfile step flips reg1), then one `pips-fio-log.sh` and a look at
+  `pkt_wait` and `in0 + in1 = out` in its decode.
 - D19's narrowed DMA address range: `BD 41-1266` critical warning; decide
   (§11.2).
-- `CTRL0–7` are not connected to anything. The regfile is now reachable from
-  the host, so new knobs can go in regfile registers 1–7.
+- `CTRL0–7` are not connected to anything. The regfile is reachable from the
+  host, so new knobs go in regfile registers 2–7 (reg1 is the drain config).
 - A PIPS-specific USP device ID, to rule out `qdma_pf` (§2).
 - `Linux_QRH.txt` still has the old XSCT layout (`mwr 0xA4000000 0x1608` →
   `0x01001608`).
@@ -734,7 +827,7 @@ volatile.
 
 | Topic | Source |
 |---|---|
-| BAR0 map, window, access rules, host procedure | FPGA repo `pips_batch`: `src/pio_pips/pips_pio.v` (header), `sw_handoff/README.md`, `sw_handoff/pips_regs.h` (copied here as `pips_regs.h`) |
+| BAR0 map, window, access rules, host procedure, drain config, record format by design ID | FPGA repo `pips_batch` (`C:\Xilinx_Projects\pips_batch_new\Programmable-Intelligent-PCIe-Switch`): `src/pio_pips/pips_pio.v` (header), `sw_handoff/README.md` §6–§7, `sw_handoff/pips_regs.h` (copied here as `pips_regs.h`, 2026-10-15). `sw_handoff/` is git-ignored there |
 | Design decisions D1–D21, verification, limits | FPGA repo `PIO_KNOWLEDGE_MAP.md` (gitignored, Windows dev copy) |
 | Rebuild and enumeration steps, machines | FPGA repo `BRINGUP_HANDOFF.md` (gitignored) |
 | AXI map, log constants, regfile, DMA, IP settings | FPGA repo `pips.tcl` |

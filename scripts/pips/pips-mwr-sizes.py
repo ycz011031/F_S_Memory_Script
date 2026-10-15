@@ -9,8 +9,8 @@ completion entry can be told from read data by its size alone.
                                                       these folders
     ... --match '4k-j*-both*'                         only run folders matching this
     ... --by iommu,bs                                 what the size maps are summed
-                                                      over: iommu, cfg, bs, sweep
-                                                      (default) or all
+                                                      over: iommu, cfg, bs, design,
+                                                      sweep (default) or all
     ... --detail                                      also every log's own size map
     ... --csv sizes.csv                               one row per log, drive and size
     pips-mwr-sizes.py LOG --show 60 [--port in1] [--from REC]
@@ -18,7 +18,12 @@ completion entry can be told from read data by its size alone.
                                                       run-length coded
 
 LOG is a dump as `pips log-dump` wrote it, e.g. a sweep run's pips-log.bin.gz,
-read with pips-log-decode.py's loader. Python 3, standard library only.
+read with pips-log-decode.py's loader, which picks the record format by the
+design ID (pips-log-decode.py --help; --design-id overrides it). In a v2 log
+(design 0x0a04 on) every record is a TLP sent to the host, tagged with its
+input: in0/in1 are each drive's TLPs as they left, out is all of them, so
+"out by size" always equals in0 + in1, and >msi is the drive's next TLP on
+out. Python 3, standard library only.
 
 What there is to tell apart. The log holds what the drives send up, so no
 doorbells: those are host-to-device writes. Per read I/O a drive writes the
@@ -58,8 +63,9 @@ Per drive and log:
   mixed     writes on pages that take both sides of the limit
 
 Each log is labelled from its folders, utils/logs/<sweep>/<config>-RUN-<j>/:
-the IOMMU mode from the sweep's sweep.log, the batcher setting from the run's
-pips-cfg.txt (what the run read before it started), the block size from the
+the IOMMU mode from the sweep's sweep.log, the batcher setting (with c1 for
+the drain cap) and design ID from the run's pips-cfg.txt (what the run read
+before it started), else from the sweep's name, the block size from the
 config name. Unknown fields print as ?.
 """
 import argparse
@@ -80,8 +86,12 @@ dec = ap_mod.dec
 PORTS = ("in0", "in1", "out")
 CQE_DW = 4                                       # an NVMe completion entry: 16 bytes
 FEAT = ("n", "beats_ok", "a16", "off0", "end", "mixed", "next_msi", "pages", "logs")
-GROUP_KEYS = ("iommu", "cfg", "bs", "sweep", "all")
-SWEEP_RE = re.compile(r"^dualssd-pips-(?P<iommu>.+)-\d+-(?P<cfg>d\d+t\d+(?:m1)?)$")
+GROUP_KEYS = ("iommu", "cfg", "bs", "design", "sweep", "all")
+# <sweep>-<setting> as dualssd_pips_sweep.sh / dualnic_pips_sweep.sh name them:
+# dualssd-pips-strict-1-d8t22 (before design IDs were recorded),
+# dualssd-pips-strict-1-id0a04-d8t22c1 (after).
+SWEEP_RE = re.compile(r"^dual(?:ssd|nic)-pips-(?P<iommu>.+)-\d+(?:-id(?P<design>[0-9a-fA-F]{4}))?"
+                      r"-(?P<cfg>d\d+t\d+(?:m1)?(?:c1)?)$")
 CONFIG_RE = re.compile(r"^(?:datapath-)?(?P<bs>\d+[kmg]?)-j[\d+]+(?:-\w+?)?-RUN-\d+$", re.I)
 
 
@@ -94,9 +104,9 @@ def beats(pdw):
     return -(-(16 + 4 * pdw) // 64)
 
 
-def cfg_tag(v):
-    """The batcher setting as pips-lib.sh's pips_tag writes it: d<depth>t<time>[m1]."""
-    return f"d{v & 0xFF}t{(v >> 8) & 0xFF}" + ("m1" if (v >> 16) & 1 else "")
+def cfg_tag(v, cap=0):
+    """The batcher setting as pips-lib.sh's pips_tag writes it: d<depth>t<time>[m1][c1]."""
+    return f"d{v & 0xFF}t{(v >> 8) & 0xFF}" + ("m1" if (v >> 16) & 1 else "") + ("c1" if cap else "")
 
 
 def first_match(path, regex):
@@ -116,17 +126,26 @@ def meta(path):
     run_dir = os.path.dirname(os.path.abspath(path))
     sweep_dir = os.path.dirname(run_dir)
     m = dict(sweep=os.path.basename(sweep_dir), run=os.path.basename(run_dir),
-             iommu="?", cfg="?", bs="?")
+             iommu="?", cfg="?", bs="?", design="?")
     s = SWEEP_RE.match(m["sweep"])
     if s:
         m.update(iommu=s["iommu"], cfg=s["cfg"])
+        if s["design"]:
+            m["design"] = "0x" + s["design"].lower()
     # What the sweep and the run recorded wins over the folder name.
     io = first_match(os.path.join(sweep_dir, "sweep.log"), re.compile(r"^######## IOMMU: (\S+)"))
     if io:
         m["iommu"] = io[1]
-    cf = first_match(os.path.join(run_dir, "pips-cfg.txt"), re.compile(r"^cfg=(0x[0-9a-fA-F]+)"))
+    pc = os.path.join(run_dir, "pips-cfg.txt")
+    cf = first_match(pc, re.compile(r"^cfg=(0x[0-9a-fA-F]+)"))
     if cf:
-        m["cfg"] = cfg_tag(int(cf[1], 16))
+        cap = first_match(pc, re.compile(r".*drain_depth_cap=([01])"))
+        m["cfg"] = cfg_tag(int(cf[1], 16), cap and cap[1] == "1")
+    di = first_match(pc, re.compile(r"^design_id=(\S+)"))
+    if di:
+        m["design"] = di[1]
+    elif m["design"] == "?":
+        m["design"] = dec.detect(path)["design"]
     c = CONFIG_RE.match(m["run"])
     if c:
         m["bs"] = c["bs"]
@@ -137,42 +156,48 @@ def new_bin():
     return dict.fromkeys(FEAT, 0)
 
 
-def analyse(path, cqe_max):
+def analyse(path, cqe_max, design=None):
     """Per port, the MWr size bins: {(msi, payload_dw): {feature: count}}, and
-    per bin the top 2 MiB region and its share."""
-    recs, trailer, _pads, _nbytes, problem = dec.load(path, False)
+    per bin the top 2 MiB region and its share. A v2 record counts for its
+    input port and for out."""
+    fi = dec.detect(path, design)
+    v2 = fi["format"] == "v2"
+    recs, trailer, _pads, _nbytes, problem = dec.load(path, False, fi["format"])
     bins = [collections.defaultdict(new_bin) for _ in PORTS]
     pages = [collections.defaultdict(collections.Counter) for _ in PORTS]
     regions = [collections.defaultdict(collections.Counter) for _ in PORTS]
     side = [(set(), set()) for _ in PORTS]            # pages written at/under, over the limit
     last = [None] * len(PORTS)                         # the bin of each port's previous MWr
     drops = [0] * len(PORTS)
-    for addr, length, _gap, typ, pdw, _tag, _at, info, _r in recs:
+    for addr, length, _gap, typ, pdw, _tag, _at, info, _w in recs:
         kind, port = (info >> 2) & 3, info & 3
-        if port > 2:
+        if port > (1 if v2 else 2):
             continue
+        targets = (port, 2) if v2 else (port,)
         if kind == dec.KIND_DROP:
-            drops[port] += 1
-            last[port] = None                          # a hole: the next TLP is unknown
+            for p in targets:
+                drops[p] += 1
+                last[p] = None                         # a hole: the next TLP is unknown
             continue
         if kind != dec.KIND_TLP or typ & 0xF != 1:
             continue
         msi = ap_mod.MSI_LO <= addr < ap_mod.MSI_HI
         key = (msi, pdw)
-        b = bins[port][key]
         off = addr & 0xFFF
-        b["n"] += 1
-        b["beats_ok"] += length == beats(pdw)
-        b["a16"] += addr & 0xF == 0
-        b["off0"] += off == 0
-        b["end"] += off + 4 * pdw == 0x1000
-        if msi and last[port] is not None and not last[port][0]:
-            bins[port][last[port]]["next_msi"] += 1
-        last[port] = key
-        if not msi:
-            pages[port][key][addr >> 12] += 1
-            regions[port][key][addr >> 21] += 1
-            side[port][pdw > cqe_max].add(addr >> 12)
+        for p in targets:
+            b = bins[p][key]
+            b["n"] += 1
+            b["beats_ok"] += length == beats(pdw)
+            b["a16"] += addr & 0xF == 0
+            b["off0"] += off == 0
+            b["end"] += off + 4 * pdw == 0x1000
+            if msi and last[p] is not None and not last[p][0]:
+                bins[p][last[p]]["next_msi"] += 1
+            last[p] = key
+            if not msi:
+                pages[p][key][addr >> 12] += 1
+                regions[p][key][addr >> 21] += 1
+                side[p][pdw > cqe_max].add(addr >> 12)
     top = [{} for _ in PORTS]
     for p in range(len(PORTS)):
         for key, pc in pages[p].items():
@@ -190,8 +215,8 @@ def analyse(path, cqe_max):
     else:
         status = "FULL" if trailer["stop_reason"] == "region_full" else "CUT"
         status += "+DROPS" if trailer["n_dropped"] else ""
-    return dict(path=path, status=status, records=len(recs), drops=drops,
-                bins=[dict(b) for b in bins], top=top)
+    return dict(path=path, design_id=fi["design"], log_format=fi["format"], status=status,
+                records=len(recs), drops=drops, bins=[dict(b) for b in bins], top=top)
 
 
 def summary(bins, cqe_max):
@@ -242,7 +267,7 @@ def print_map(bins3, cqe_max, top=None):
         if not bins:
             continue
         s = summary(bins, cqe_max)
-        print(f"  {PORTS[p]} ({dec.PORT_DESC[PORTS[p]]}): {s['mwr']} MWr, CQE {s['cqe']}, "
+        print(f"  {PORTS[p]} ({dec.PORT_DESC['v1'][PORTS[p]]}): {s['mwr']} MWr, CQE {s['cqe']}, "
               f"B/CQE {fmt(s['b_per_cqe'], '.0f')}, MSI/CQE {fmt(s['msi_per_cqe'], '.3f')}, "
               f"odd {s['odd']}, mixed {s['mixed']}")
         print(f"    {'DW':>4} {'class':5} {'count':>9} {'share':>6} {'beats ok':>8} {'16B al':>6} "
@@ -288,15 +313,17 @@ def add_bins(into, bins3):
                 t[f] += b[f]
 
 
-def show(path, port, start, count):
+def show(path, port, start, count, design=None):
     """The MWr sizes of one port in log order, run-length coded per 4 KiB page."""
-    recs, _trailer, _pads, _nbytes, _problem = dec.load(path, False)
+    fi = dec.detect(path, design)
+    recs, _trailer, _pads, _nbytes, _problem = dec.load(path, False, fi["format"])
     want = PORTS.index(port)
+    every = fi["format"] == "v2" and port == "out"  # v2: out is every record
     toks = []                                       # [first record, token, page, repeat]
     for i in range(start, len(recs)):
-        addr, _length, _gap, typ, pdw, _tag, _at, info, _r = recs[i]
+        addr, _length, _gap, typ, pdw, _tag, _at, info, _w = recs[i]
         kind, p = (info >> 2) & 3, info & 3
-        if p != want or kind not in (dec.KIND_TLP, dec.KIND_DROP):
+        if (p != want and not every) or kind not in (dec.KIND_TLP, dec.KIND_DROP):
             continue
         page = None
         if kind == dec.KIND_DROP:
@@ -315,8 +342,9 @@ def show(path, port, start, count):
         if len(toks) == count:
             break
         toks.append([i, tok, page, 1])
-    print(f"{path}, {port} from record {start}: payload DW per MWr; xN = N in a row to one 4 KiB page; "
-          f"i = interrupt (MSI range); rd = memory read")
+    print(f"{path} (design {fi['design']}, format {fi['format']}), {port} from record {start}: "
+          f"payload DW per MWr; xN = N in a row to one 4 KiB page; i = interrupt (MSI range); "
+          f"rd = memory read")
     for j in range(0, len(toks), 12):
         row = toks[j:j + 12]
         print(f"{row[0][0]:8d}  " + " ".join(t[1] + (f"x{t[3]}" if t[3] > 1 else "") for t in row))
@@ -324,7 +352,11 @@ def show(path, port, start, count):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("paths", nargs="+", help="logs, or folders searched for pips-log.bin(.gz)")
+    ap.add_argument("paths", nargs="+",
+                    help="logs, or folders searched for pips-log[-id<XXXX>].bin(.gz)")
+    ap.add_argument("--design-id", metavar="ID",
+                    help="design ID of the build that wrote every log (0x0a04, or none); "
+                         "default: found per log (pips-log-decode.py --help)")
     ap.add_argument("--match", help="only run folders whose name matches this glob")
     ap.add_argument("--cqe-max", type=int, default=4, metavar="DW",
                     help="the size rule: non-MSI writes of at most this many DW are completion "
@@ -350,28 +382,31 @@ def main():
     if a.show:
         if len(logs) != 1:
             sys.exit(f"pips-mwr-sizes: --show takes one log, found {len(logs)}")
-        show(logs[0], a.port, a.start, a.show)
+        show(logs[0], a.port, a.start, a.show, a.design_id)
         return 0
 
     groups = collections.OrderedDict()             # group -> [bins per port, logs]
     rows = []
     print(f"size rule: a non-MSI MWr of at most {a.cqe_max} DW is a completion entry")
-    print(f"{'run':30} {'IOMMU':>6} {'cfg':>7} {'drive':>5} {'MWr':>7} {'sizes DW:count (i = interrupt)':40} "
+    print(f"{'run':30} {'IOMMU':>6} {'cfg':>9} {'design':>6} {'drive':>5} {'MWr':>7} "
+          f"{'sizes DW:count (i = interrupt)':40} "
           f"{'CQE':>6} {'B/CQE':>7} {'bs':>5} {'MSI/CQE':>7} {'>msi':>5} {'odd':>5} {'mixed':>5}")
     sweep = None
     for path in logs:
         try:
-            r = analyse(path, a.cqe_max)
+            r = analyse(path, a.cqe_max, a.design_id)
         except SystemExit as e:                     # pips-log-decode's fail()
             print(f"{path}: {e}", file=sys.stderr)
             continue
         m = meta(path)
+        m["design"] = r["design_id"]                # what the decoder went by
         if m["sweep"] != sweep:
             sweep = m["sweep"]
             print(f"== {os.path.dirname(os.path.dirname(path)) or sweep}")
         for p in (0, 1):
             s = summary(r["bins"][p], a.cqe_max)
-            print(f"{(m['run'] if p == 0 else '')[-30:]:30} {m['iommu']:>6} {m['cfg']:>7} {PORTS[p]:>5} "
+            did = m["design"][2:] if m["design"].startswith("0x") else m["design"]
+            print(f"{(m['run'] if p == 0 else '')[-30:]:30} {m['iommu']:>6} {m['cfg']:>9} {did:>6} {PORTS[p]:>5} "
                   f"{s['mwr']:7d} {size_list(r['bins'][p]):40} {s['cqe']:6d} "
                   f"{fmt(s['b_per_cqe'], '7.0f')} {m['bs']:>5} {fmt(s['msi_per_cqe'], '7.3f')} "
                   f"{fmt(pc(s['cqe_next_msi'], s['cqe']), '4.0f')}% "
@@ -390,7 +425,7 @@ def main():
             for key in order(r["bins"][p]):
                 b = r["bins"][p][key]
                 reg = r["top"][p].get(key)
-                rows.append((m["sweep"], m["run"], m["iommu"], m["cfg"], m["bs"], PORTS[p], key[1],
+                rows.append((m["sweep"], m["run"], m["iommu"], m["cfg"], m["bs"], m["design"], PORTS[p], key[1],
                              int(key[0]), label(key, main, a.cqe_max), b["n"], b["beats_ok"], b["a16"],
                              b["off0"], b["end"], b["pages"], b["mixed"], b["next_msi"],
                              f"0x{reg[0]:x}" if reg else "", f"{reg[1]:.4f}" if reg else ""))
@@ -403,7 +438,7 @@ def main():
     if a.csv:
         with open(a.csv, "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(("sweep", "run", "iommu", "cfg", "bs", "port", "payload_dw", "msi", "class", "count",
+            w.writerow(("sweep", "run", "iommu", "cfg", "bs", "design_id", "port", "payload_dw", "msi", "class", "count",
                         "beats_ok", "align16", "off0", "page_end", "pages", "mixed", "next_msi",
                         "top_2m", "top_2m_share"))
             w.writerows(rows)

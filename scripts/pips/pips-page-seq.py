@@ -11,8 +11,11 @@ TLP log, and how much regrouping (batching) could shorten it.
                                                   also simulated IOTLB misses per policy
     ... --json results.jsonl                      also append everything as one JSON line
 
-LOG is one pips-log.bin(.gz). Out TLPs are matched to their drive as in
-pips-addr-pattern.py. Python 3, standard library only.
+LOG is one pips-log.bin(.gz) (pips-log-id<XXXX>.bin.gz from design 0x0a02 on).
+Out TLPs are matched to their drive as in pips-addr-pattern.py; in a v2 log
+(design 0x0a04 on) every record names its drive, and the in0/in1 streams are
+each drive's TLPs in the order they left. --design-id overrides the design ID
+found for the log (pips-log-decode.py --help). Python 3, standard library only.
 
 Terms. A run is consecutive TLPs to the same (drive, 4 KiB page) on one
 stream; every run boundary is a translation of a different page. A visit is
@@ -86,7 +89,7 @@ def annotate(events):
     state = {}
     for port in range(3):
         st = state[port] = dict(prev=None, run=-1, next_off={}, seen=set(), open=[set(), set()])
-    for i, port, c, addr, pdw, src, _src_i in events:
+    for i, port, c, addr, pdw, src, _src_i, _w in events:
         st = state[port]
         page = addr >> 12
         key = (src, page) if c != "msi" else (src, "msi")
@@ -205,9 +208,9 @@ def regroup_flags(items, w, policy):
 
 
 def whatif(events, dur_us, geoms, strict):
-    items = [(src, addr >> 12, c) for _i, port, c, addr, pdw, src, _s in events
+    items = [(src, addr >> 12, c) for _i, port, c, addr, pdw, src, _s, _w in events
              if port == 2 and src is not None and c != "msi"]
-    new = [c == "data" and (addr & 0xFFF) == 0 for _i, port, c, addr, pdw, src, _s in events
+    new = [c == "data" and (addr & 0xFFF) == 0 for _i, port, c, addr, pdw, src, _s, _w in events
            if port == 2 and src is not None and c != "msi"]
     n_out = sum(1 for e in events if e[1] == 2)
     ios = sum(1 for it in items if it[2] == "cqe")
@@ -269,7 +272,7 @@ def _line(first, last, n):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("log", help="one pips-log.bin or .bin.gz")
+    ap.add_argument("log", help="one pips-log[-id<XXXX>].bin or .bin.gz")
     ap.add_argument("--show", type=int, metavar="N", help="print N runs of the sequence")
     ap.add_argument("--from", dest="start", type=int, default=0, metavar="REC",
                     help="start --show at this record index")
@@ -279,6 +282,9 @@ def main():
     ap.add_argument("--json", help="append the results to this file as one JSON line")
     ap.add_argument("--strict", action="store_true",
                     help="IOTLB: a page's new visit always misses (strict mode invalidates at unmap)")
+    ap.add_argument("--design-id", metavar="ID",
+                    help="design ID of the build that wrote the log (0x0a04, or none); default: "
+                         "found from its name or folder (pips-log-decode.py --help)")
     a = ap.parse_args()
     geoms = []
     if a.iotlb:
@@ -286,17 +292,21 @@ def main():
             s, w = g.lower().split("x")
             geoms.append((int(s), int(w)))
 
-    recs, trailer, _pads, _nbytes, problem = dec.load(a.log, False)
+    fi = dec.detect(a.log, a.design_id)
+    recs, trailer, _pads, _nbytes, problem = dec.load(a.log, False, fi["format"])
     dur_us = trailer["duration_cycles"] / dec.CLOCK_HZ * 1e6 if trailer else None
-    events, ms = ap_mod.tlp_events(recs)
+    events, ms = ap_mod.tlp_events(recs, fi["format"])
     rows = annotate(events)
     print(f"log {a.log}: {len(recs)} records, {fmt(dur_us, '.0f')} us"
           + (f" ({problem})" if problem else "")
           + f"; out matched {ms['matched']}, unmatched {ms['unmatched']}, ambiguous {ms['ambiguous']}")
+    print(f"  design {fi['design']}, record format {fi['format']} (design ID from: {fi['source']})"
+          + ("; in0/in1 = each drive's TLPs in the order they left" if fi["format"] == "v2" else ""))
 
     if a.csv:
         with open(a.csv, "w", newline="") as f:
             wr = csv.writer(f)
+            wr.writerow((f"# design_id={fi['design']} log_format={fi['format']}",))
             wr.writerow(("record", "port", "drive", "class", "page", "offset", "payload_bytes", "run",
                          "visit", "open_d0", "open_d1"))
             for r in rows:
@@ -333,7 +343,8 @@ def main():
             print(f"{r['w']:4d} " + "".join(f"{fmt(r['miss'][(pol, g)], '14.3f')}" for g in geoms for pol in POLICIES))
 
     if a.json:
-        rec = dict(path=a.log, strict=a.strict, matched=ms["matched"], unmatched=ms["unmatched"],
+        rec = dict(path=a.log, design_id=fi["design"], log_format=fi["format"],
+                   strict=a.strict, matched=ms["matched"], unmatched=ms["unmatched"],
                    interleave={k: dict(v, open={str(d): o for d, o in v["open"].items()}) for k, v in il.items()},
                    ios=wi["ios"], us_per_tlp=wi["us_per_tlp"],
                    windows=[dict(w=r["w"], wait_mean=r["wait_mean"], pages_mean=r["pages_mean"],

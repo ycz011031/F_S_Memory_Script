@@ -1,5 +1,5 @@
-# Helpers shared by pips-bringup.sh and pips-fio-log.sh. Sourced, not run.
-# Safe under `set -u`.
+# Helpers shared by pips-bringup.sh, pips-fio-log.sh, the dual-SSD and
+# dual-NIC runners and their PIPS sweeps. Sourced, not run. Safe under `set -u`.
 
 PIPS_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PIPS_REPO=$(cd "$PIPS_DIR/../.." && pwd)
@@ -127,12 +127,44 @@ link_partner() {
     return 0
 }
 
-# Batcher setting from `pips cfg`: cfg_of <file> -> 0x..., pips_tag <cfg> ->
-# d<depth>t<time>, plus m1 with batch_mrd (names results and sweeps).
+# Batcher setting from `pips cfg`: cfg_of <file> -> 0x..., cap_of <file> ->
+# drain_depth_cap (0 when the build has no drain register), pips_tag <cfg>
+# [cap] -> d<depth>t<time>, plus m1 with batch_mrd and c1 with the drain cap
+# (names results and sweeps; no c1 = whole-FIFO drains, as every build before
+# design 0x0a03 did).
 cfg_of() { sed -n 's/^cfg=\(0x[0-9a-f]*\).*/\1/p' "$1"; }
+cap_of() { local c; c=$(sed -n 's/.*drain_depth_cap=\([01]\).*/\1/p' "$1" | head -1); echo "${c:-0}"; }
 pips_tag() {
-    local v=$(( $1 ))
-    printf 'd%dt%d%s\n' $(( v & 0xFF )) $(( (v >> 8) & 0xFF )) "$( (( (v >> 16) & 1 )) && echo m1)"
+    local v=$(( $1 )) c="${2:-0}"
+    printf 'd%dt%d%s%s\n' $(( v & 0xFF )) $(( (v >> 8) & 0xFF )) \
+        "$( (( (v >> 16) & 1 )) && echo m1)" "$( [ "$c" = 1 ] && echo c1)"
+}
+
+# The FPGA build, from `pips cfg`: design_of <file> -> 0x0a04, or none (a build
+# from before the DESIGN_ID register). pips_idtag <design> -> id0a04, the tag
+# every artifact name carries; nothing for none or unknown, which keeps the
+# names of before design IDs were recorded. The log decoders read the ID back
+# from these names (pips-log-decode.py --help, "Design ID").
+design_of() { sed -n 's/^design_id=//p' "$1" | head -1; }
+pips_idtag() {
+    case "${1:-}" in
+        0x[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]) printf 'id%s\n' "$(echo "${1#0x}" | tr 'A-F' 'a-f')" ;;
+        *) echo "" ;;
+    esac
+}
+# pips_design_ge <design> <min>: true if the build is <min> or later (0x0a03 = drain cap).
+pips_design_ge() {
+    case "${1:-}" in 0x[0-9a-fA-F]*) [ $(( $1 )) -ge $(( $2 )) ] ;; *) return 1 ;; esac
+}
+
+# pips_behind <usp> <bdf>...: true if any of the PCI functions sits below the
+# PIPS upstream port, i.e. its traffic goes through the switch.
+pips_behind() {
+    local u="$1" b; shift
+    for b in "$@"; do
+        case "$(readlink -f "/sys/bus/pci/devices/$b" 2>/dev/null)" in */"$u"/*) return 0 ;; esac
+    done
+    return 1
 }
 
 # Kernel log lines that report a PCIe, IOMMU or NVMe problem. Not the boot-time
@@ -165,6 +197,137 @@ pips_outdir() {
     mkdir -p "$out" && echo "$out"
 }
 
+# ------------------------------------------------------------------ runner hooks
+# Shared by run-dualssd-experiment.sh and run-dualnic-experiment.sh: the
+# switch's build and batcher setting go with every result whose devices are
+# behind it, and --pips-log 1 records its TLP log in every run. The runner
+# sets pips_log (0 or 1) and, per run, RUN, L (the run's log folder) and
+# setup_dir (utils/); preflight collects problems in PROBLEMS. pips_identify
+# sets pips_here (an active device is behind PIPS), pips_cfg, pips_cap,
+# pips_design, pips_idt (id0a04) and pips_region; PIPS_STATUS collects each
+# run's log status. The runner's pips calls run as root without a prompt.
+pipsc() { sudo -n "$PIPS" "$@"; }
+pips_here=0; pips_cfg=""; pips_cap=0; pips_design=""; pips_idt=""; pips_region=""; PIPS_STATUS=()
+pips_gzip="${PIPS_LOG_GZIP:-1}"
+pips_setting() { pips_tag "$pips_cfg" "$pips_cap"; }
+
+# pips_identify <what> <bdf>...: in preflight. Reads the switch's build and
+# batcher setting when one of the devices (<what>: "drive", "NIC") is behind
+# it, or when --pips-log 1 asks for its log. A problem is fatal (PROBLEMS)
+# only with --pips-log 1; otherwise the results go untagged, with a warning.
+pips_identify() {
+    local what="$1" usp out msg=""
+    shift
+    usp=$(pips_find_usp 2>/dev/null) && pips_behind "$usp" "$@" && pips_here=1
+    [ "$pips_log" = 1 ] || [ "$pips_here" = 1 ] || return 0
+    if ! pips_build >/dev/null 2>&1; then
+        msg="cannot build $PIPS (make -C scripts/pips pips)"
+    elif ! out=$(pipsc cfg 2>&1); then
+        msg="the PIPS switch does not answer:
+$(printf '%s\n' "$out" | tail -2 | sed 's/^/      /')
+    Bring it up first: sudo bash scripts/pips/pips-bringup.sh"
+    else
+        pips_cfg=$(cfg_of <(printf '%s\n' "$out"))
+        pips_cap=$(cap_of <(printf '%s\n' "$out"))
+        pips_design=$(design_of <(printf '%s\n' "$out"))
+        pips_idt=$(pips_idtag "$pips_design")
+        pips_region=$(pipsc info 2>/dev/null | awk '$1 == "LOG_BYTES" {print $2}')
+        echo "   PIPS: ${usp:-?}, design ${pips_design:-?}, batcher $(pips_setting) ($pips_cfg)," \
+             "log region ${pips_region:-?} bytes$( [ "$pips_here" = 1 ] || echo "; NO active $what is behind it")"
+        [ -n "$pips_cfg" ] || msg="could not read the batcher setting (pips cfg)"
+        [ "$pips_log" = 1 ] && [ -z "$pips_region" ] && msg="pips info shows no LOG_BYTES"
+    fi
+    [ -n "$msg" ] || return 0
+    if [ "$pips_log" = 1 ]; then
+        PROBLEMS+=("--pips-log: $msg")
+    else
+        echo "   WARNING: a ${what} is behind PIPS, but its design ID and setting cannot be read:" \
+             "$msg" | head -3
+        pips_cfg=""
+    fi
+}
+
+# pips_run_cfg: at the start of each run, before the load. The run's folder
+# keeps the `pips cfg` readout it ran with (pips-cfg.txt: setting, drain cap,
+# design ID, log format); with --pips-log 1 the log region is zeroed, so
+# leftovers never pass for data.
+pips_run_cfg() {
+    local now
+    if [ -n "$pips_cfg" ]; then
+        pipsc cfg > "$L/pips-cfg.txt" 2>&1
+        now=$(cfg_of "$L/pips-cfg.txt")
+        [ -n "$now" ] && [ "$(pips_tag "$now" "$(cap_of "$L/pips-cfg.txt")")" != "$(pips_setting)" ] && \
+            echo "WARNING: the PIPS batcher setting changed during the experiment:" \
+                 "$(pips_setting) at the start, $(pips_tag "$now" "$(cap_of "$L/pips-cfg.txt")") now" >&2
+    fi
+    if [ "$pips_log" = 1 ]; then
+        pipsc log-clear > "$L/pips-log-clear.txt" 2>&1 || \
+            echo "WARNING: PIPS log-clear failed: $(tail -1 "$L/pips-log-clear.txt")" >&2
+    fi
+    return 0
+}
+
+# One recording, while the load is in steady state and no window is open.
+pips_record() {
+    local f="$L/pips-log-record.txt" t0
+    t0=$(date +%s%3N)
+    { pipsc log-start && pipsc log-wait 5000; } > "$f" 2>&1
+    grep -q '^status=timeout' "$f" && pipsc log-stop 2000 >> "$f" 2>&1
+    pipsc cfg set log=0 >> "$f" 2>&1        # a region-full stop leaves log_enable at 1
+    echo "   PIPS log recorded in $(( $(date +%s%3N) - t0 )) ms:" \
+         "$(grep -E '^(stop_reason|n_records|n_dropped|duration_us)=' "$f" | xargs)"
+}
+
+# After the measurement windows: dump, decode, compress. Never fails the run.
+# The dump is named with the design ID (pips-log-id0a04.bin.gz), which picks
+# its record format; the decode and the .rpt name it too.
+pips_collect() {
+    local f="$L/pips-log-record.txt" bin="$L/pips-log${pips_idt:+-$pips_idt}.bin"
+    local rpt="$setup_dir/reports/$RUN/pips-log.rpt"
+    local scan=()
+    if grep -q '^stop_reason=' "$f" 2>/dev/null; then
+        pipsc log-dump "$bin" > "$L/pips-log-dump.txt" 2>&1
+    elif [ -n "$pips_region" ]; then
+        # The recording never closed: the whole region as it is, read without a trailer.
+        pipsc log-dump "$bin" "$pips_region" > "$L/pips-log-dump.txt" 2>&1
+        scan=( --scan )
+    fi
+    if [ -s "$bin" ]; then
+        sudo -n chown "$(id -un)": "$bin"
+        python3 "$PIPS_DIR/pips-log-decode.py" "$bin" ${scan[@]+"${scan[@]}"} \
+            --design-id "${pips_design:-none}" --region-bytes "${pips_region:-0}" --rpt "$rpt" \
+            --json "$L/pips-log-summary.json" > "$L/pips-log-summary.txt" 2>&1
+        [ "$pips_gzip" = 1 ] && gzip -f "$bin"
+    fi
+    [ -s "$rpt" ] || printf 'status: FAILED\ndesign_id: %s\n' "${pips_design:-none}" > "$rpt"
+    PIPS_STATUS+=( "$(awk '/^status:/{print $2; exit}' "$rpt")" )
+    echo "   PIPS log: $(awk '/^status:/{print $2; exit}' "$rpt")," \
+         "$(awk '/^pips_records:/{r=$2} /^pips_dropped:/{d=$2} END{printf "%s records, %s dropped", r, d}' "$rpt")" \
+         "(logs: pips-log-*.txt)"
+}
+
+# pips_meta: PIPS_META = the --meta arguments for the results dump.
+# pips_batch and pips_design_id keep records of different batcher settings and
+# FPGA builds apart in the summaries; pips_log is each run's log status,
+# comma-separated.
+pips_meta() {
+    PIPS_META=()
+    if [ -n "$pips_cfg" ]; then
+        PIPS_META+=( --meta pips_batch="$(pips_setting)" --meta pips_cfg="$pips_cfg"
+                     --meta pips_drain_cap="$pips_cap" --meta pips_design_id="${pips_design:-unknown}" )
+    fi
+    [ "$pips_log" = 1 ] && PIPS_META+=( --meta pips_log="$(IFS=,; echo "${PIPS_STATUS[*]}")" )
+    return 0
+}
+
+# pips_report: the result's PIPS lines.
+pips_report() {
+    [ -n "$pips_cfg" ] && printf '  %-25s : design %s, batcher %s\n' "PIPS switch" \
+        "${pips_design:-?}" "$(pips_setting)"
+    [ "$pips_log" = 1 ] && printf '  %-25s : %s\n' "PIPS log, per run" "${PIPS_STATUS[*]:-none}"
+    return 0
+}
+
 # One PIPS run at a time: they share the log DMA, log_enable and WIN_BASE.
 # Opened read-only, created only if missing: with fs.protected_regular even
 # root may not O_CREAT-open another user's file in /tmp.
@@ -174,6 +337,6 @@ pips_lock() {
     exec 8< "$f" || return 1
     flock -n 8 && return 0
     echo "ERROR: another PIPS script is running (/tmp/pips-run.lock):" >&2
-    pgrep -af 'pips-(bringu[p]|fio-lo[g])' >&2
+    pgrep -af 'pips-(bringu[p]|fio-lo[g])|dual(ssd|nic)_pips_swee[p]' >&2
     return 1
 }

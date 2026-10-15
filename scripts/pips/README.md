@@ -23,6 +23,43 @@ read it first. On a build without the PIO that first read is forwarded to the
 device on downstream port one (PIO_KNOWLEDGE_MAP D6) and fails. So know which
 image is loaded before running.
 
+## Design IDs: what each build changes, and how artifacts carry the ID
+
+From `e389cca` on, every build reports a design ID (regfile +0x20, `pips cfg`
+prints `design_id=`, `pips info` a `DESIGN_ID` line). It goes up by one with
+every FPGA design update (`pips.tcl` `pips_design_id`).
+
+| Design ID | FPGA repo | What the host sees |
+|---|---|---|
+| none | before `e389cca` | +0x20 answers DECERR; `pips cfg` prints `design_id=none` |
+| `0x0a02` | `e389cca` (10-11) | DESIGN_ID register; the 10-13 dual-SSD PIPS sweeps ran on it |
+| `0x0a03` | `2c6c3f5` (10-14) | **drain config register**, regfile reg1 (`0xA4000004`) bit 0 `drain_depth_cap`: 0 = one drain sends every packet in the FIFO (reset value, and what older builds always did), 1 = at most `depth_threshold` packets (0 counts as 1), the rest in the next batch. Safe to change at any time. Older builds read 0 there and ignore writes |
+| `0x0a04` | `591d854` (10-15) | **log record format v2**: one record per TLP leaving the batcher, in output order; `port` = the input it came in on; new `pkt_wait` (u16 at 0x0C, cycles in the batcher); `pkt_tag` moved 0x0C → 0x0F; AT moved from byte 0x0D into `pkt_type[5:4]`. No more separate in0/in1/out records |
+
+The trailer is the same in both log formats, so **a log cannot tell its own
+format**: a v1 decoder reads a v2 log without an error but with wrong tags.
+The design ID picks the decoder, so from now on every artifact carries it:
+
+- **Raw TLP logs** have it in the name: `pips-log-id0a04.bin.gz` (runners),
+  `log-id0a04.bin` (`pips-fio-log.sh`), `log-smoke-id0a04.bin`
+  (`pips-bringup.sh`). A header would change the raw DDR dump.
+- **Text** has it inside: `pips cfg` readouts (`pips-cfg.txt`,
+  `cfg-before.txt`, ...: `design_id=`, `log_format=`), the decode
+  (`log-summary.txt` second line, JSON `design_id`/`log_format`, CSV first
+  line `# design_id=0x0a04 log_format=v2`), the `.rpt` (`design_id:`), the
+  results JSONL (`pips_design_id`), and the sweep summaries (`design_id=` line,
+  `PIPS design ID:` line, rows labelled `off d8t22c1@0a04`).
+- **Sweep names** have it too: `<NAME>-id0a04-d8t22c1` per setting.
+
+A build without a design ID writes names and files as before (no `-id`).
+
+The decoders find the ID in this order: `--design-id`; `-id<XXXX>` in the log's
+file name; a `design_id=` line in a `pips cfg` readout in the same folder
+(`pips-cfg.txt`, `cfg-before.txt`, `cfg-run.txt`, `cfg.txt`). With none of
+those the log is from before IDs were recorded and is read as v1, exactly as
+before. So the 10-13 sweep logs (`pips-log.bin.gz` next to a `pips-cfg.txt`
+saying `0x0a02`) decode as v1, and so would any older dump on its own.
+
 ## BAR0 size
 
 The PIO needs a 64-bit, 32 KB BAR0 on the upstream port: registers at 0x800,
@@ -87,9 +124,11 @@ sudo bash scripts/pips/pips-fio-log.sh                 # [--dev /dev/nvme1n1] [-
 cd scripts/pips && make                                # builds ./pips (the scripts do it too)
 sudo ./pips info
 sudo ./pips hwtest regfile                             # regfile write/read-back only
+sudo ./pips cfg                                        # setting, drain cap, design_id, log_format
 sudo ./pips cfg set depth=8 time=0x16                  # batcher config, read-modify-write
-sudo ./pips log-start; sleep 1; sudo ./pips log-stop; sudo ./pips log-dump log.bin
-python3 pips-log-decode.py log.bin --csv log.csv
+sudo ./pips cfg set cap=1                              # drain depth cap on (design 0x0a03 on)
+sudo ./pips log-start; sleep 1; sudo ./pips log-stop; sudo ./pips log-dump log-id0a04.bin
+python3 pips-log-decode.py log-id0a04.bin --csv log.csv   # the -id0a04 picks the v2 decoder
 ```
 
 Both scripts keep everything in a new `utils/logs/<name>/` folder and never
@@ -102,13 +141,13 @@ overwrite one. Only one runs at a time (`/tmp/pips-run.lock`).
 | 1 | Enumeration | `pips-bringup.sh` §1 | USP `10ee:b048` with BAR0 32 KB and Mem+; both downstream ports (`b148`, `b348`); no link DEGRADED, i.e. below what both of its ends support (a Gen4 switch on a Gen3 root port is normal); one MaxPayload across the tree. Error bits are sticky since boot: compare before and after, as `pips-fio-log.sh` does |
 | 2 | BAR0 registers | `pips hwtest regs` | `ID` = `0x50495053`, `VERSION` = `0x00020001`, `PIO_STATUS` 0, `SCRATCH` round trips, `MWR_COUNT`/`MRD_COUNT` count exactly, `BUS_NUM` matches config space |
 | 3 | BAR0 BRAM | `pips hwtest bram`, `pips soak N` | 4/8/1-byte round trips at the PIO's known-bad offsets, aliases, unmapped reads 0; soak: no mismatch |
-| 4 | Regfile R/W | `pips hwtest regfile`, `pips cfg [set ...]` | `WIN_BASE` round trip; reg0 at `0xA4000000` reads what XSCT `mrd 0xA4000000` reads; two patterns over every field write and read back, original restored; `DESIGN_ID` at +0x20 identifies the build (≥ 0x0A02, also printed by `pips cfg`) and ignores writes; the other registers read 0; +0x40 repeats reg0 |
+| 4 | Regfile R/W | `pips hwtest regfile`, `pips cfg [set ...]` | `WIN_BASE` round trip; reg0 at `0xA4000000` reads what XSCT `mrd 0xA4000000` reads; two patterns over every field write and read back, original restored; `DESIGN_ID` at +0x20 identifies the build (≥ 0x0A02, also printed by `pips cfg` with its log format) and ignores writes; from 0x0A03, reg1 (+0x04, drain config) takes `drain_depth_cap` flipped and back; the other registers read 0 (0x04–0x1C before 0x0A03, 0x08–0x1C from it); +0x40 repeats reg0 |
 | 5 | Log DMA registers | `pips hwtest dma`, `pips dma` | registers answer; SGIncld 0; halted agrees with run/stop; `S2MM_DA` round trip (this is what confirms the PG021 offsets) |
 | 6 | DDR | `pips hwtest ddr` | 4 KB at `0x10000000` (outside the log region) written and read back; alternating 16 KB pages; prints µs per access |
 | 7 | Window errors | `pips hwtest err` | unmapped `0xB0000000`: `0xFFFFFFFF`, `WIN_STATUS` rd_err/wr_err, `WIN_ERR` = the address, clears with `0x1F`, window works afterwards |
 | 8 | CQ split | `pips hwtest split`, `pips info` | BAR0 hits recorded. Whether forwarded TLPs report a different BAR ID or aperture decides PIO_KNOWLEDGE_MAP D4: on 2026-10-11 both reported BAR ID 0, aperture 20, so the split by address stays |
 | 9 | Log smoke | `pips hwtest log` | an empty recording: DMA finishes, trailer at the end, `bytes = 16 × records + 16` |
-| 10 | fio + log | `pips-fio-log.sh` | fio runs read-only; the recording closes (region full or log-stop); `log.bin` decodes with no unexpected records; `PIO_STATUS` and `WIN_STATUS` stay 0; no new AER/DMAR lines |
+| 10 | fio + log | `pips-fio-log.sh` | fio runs read-only; the recording closes (region full or log-stop); `log-id<XXXX>.bin` decodes, in its build's format, with no unexpected records; `PIO_STATUS` and `WIN_STATUS` stay 0; no new AER/DMAR lines |
 
 `pips hwtest` runs 2–9 in order and stops at the first failing step. Steps
 can be named to run alone or in any subset, e.g. `pips hwtest regs regfile`.
@@ -122,10 +161,10 @@ notes. Exit status: 0 ok, 1 failed, 2 usage, 3 timeout.
 
 | Command | What |
 |---|---|
-| `info` | every BAR0 register, decoded |
+| `info` | every BAR0 register, decoded, then the build's `DESIGN_ID` and log format |
 | `rd OFF [N]`, `wr OFF VAL` | raw BAR0, 32-bit |
 | `axi-rd ADDR [N]`, `axi-wr ADDR VAL` | through the window; non-zero exit on an AXI error |
-| `cfg`, `cfg set depth= time= mrd= log= raw=` | the batcher/logger config register (`0xA4000000`) |
+| `cfg`, `cfg set depth= time= mrd= log= raw= cap=` | the batcher/logger config register (`0xA4000000`) and, from design 0x0a03, the drain config (`0xA4000004`, `cap=` = `drain_depth_cap`; refused on older builds). Prints `cfg=...`, `drain=... drain_depth_cap=N` (`drain=none` before 0x0a03), `design_id=0x....` (or `none`), `log_format=v1\|v2` |
 | `dma`, `dma-reset` | the log DMA's S2MM registers (`0xA4010000`) |
 | `log-clear` | zero the log region, so later reads show where the DMA wrote |
 | `log-start` | `log_enable` off, DMA (reset if needed) armed on `LOG_BASE`/`LOG_BYTES`, then `log_enable` on |
@@ -151,15 +190,32 @@ to catch steady state.
 
 ## Decoding
 
-`pips-log-decode.py log.bin [--csv F] [--json F] [--scan]`, Python 3 with the
-standard library only. It prints per port (`in0` = downstream port one /
-`b348`, `in1` = downstream port zero / `b148`, `out` = batched stream to the
-host) the TLP and drop counts, the MRd/MWr split, MWr bytes and Gbps over the
-recording, TLPs per µs, beats, and gap statistics. Saturated values (255) are
-counted apart. Then the types, AT, payload sizes and address ranges. `--scan`
-reads a region whose DMA never finished: no trailer, so it walks the records
-until one was never written. The fio script dumps the whole region and uses it
-when a recording does not close.
+`pips-log-decode.py log.bin [--csv F] [--json F] [--rpt F] [--scan] [--design-id ID]`,
+Python 3 with the standard library only. It picks the record format from the
+design ID (section "Design IDs" above) and says which and where from on its
+second line. It prints per port (`in0` = downstream port one / `b348`, `in1` =
+downstream port zero / `b148`, `out` = batched stream to the host) the TLP and
+drop counts, the MRd/MWr split, MWr bytes and Gbps over the recording, TLPs
+per µs, beats, and gap statistics. Saturated values (255) are counted apart.
+Then the types, AT, payload sizes and address ranges.
+
+- v1 (before 0x0a04): each port's own records; gaps per port; the CSV's `t_lb`
+  is a per-port lower bound on time.
+- v2 (0x0a04 on): every record is a TLP sent to the host. `in0`/`in1` are each
+  input's TLPs as they left and `out` is all of them, so out = in0 + in1;
+  gaps are the output's. Also the time each TLP spent in the batcher
+  (`pkt_wait`: mean/p50/p99/max cycles and µs, saturated at 65535 counted
+  apart), in the summary, the JSON and the `.rpt` (`pips_<port>_wait_*`). The
+  CSV adds `wait`, `out_sop`, `in_sop` (the timeline of
+  `telemetry_dma_format.md` §4.3, from the first record's output SOP = 0) and
+  `seg`, which goes up after each saturated gap or dropped record, where later
+  times become lower bounds.
+
+A v1 log read as v2 comes out BAD (it has port-2 records); a v2 log read as v1
+shows no `out` records and a NOTE saying so. `--scan` reads a region whose DMA
+never finished: no trailer, so it walks the records until one was never
+written. The fio script dumps the whole region and uses it when a recording
+does not close.
 
 Its first line says whether the recording is whole:
 
@@ -171,14 +227,22 @@ Its first line says whether the recording is whole:
 | `NO_TRAILER` | the recording never closed (the DMA did not finish) |
 | `BAD` | the dump and its trailer disagree (exit status 1) |
 
+All three analysis tools below read logs with the decoder's loader, so they
+take either format, find the design ID the same way, take `--design-id` to
+override it, and name it in their output (a `design` column, JSON
+`design_id`/`log_format`, CSV first line). In folders they find
+`pips-log.bin(.gz)` and `pips-log-id<XXXX>.bin(.gz)`.
+
 **Address pattern.** `pips-addr-pattern.py LOG|FOLDER ... [--match GLOB] [--jsonl F]`
-reads dumps with the decoder's loader, or every `pips-log.bin(.gz)` under sweep
-log folders. Per log: each drive's TLPs by class (data, completion entry,
-interrupt, read) and per I/O; the share of addresses at or above 4 GiB; distinct
-4 KiB pages and 2 MiB / 1 GiB regions; IOVA reuse; which drive each `out` TLP
-came from (matched by per-channel order), runs of one drive and the hold
-between `in` and `out`; LRU reuse distance on `out` and the IOTLB misses per
-I/O it predicts for sizes 16–1024. Tested on synthetic logs only so far.
+reads dumps, or every log under sweep log folders. Per log: each drive's TLPs
+by class (data, completion entry, interrupt, read) and per I/O; the share of
+addresses at or above 4 GiB; distinct 4 KiB pages and 2 MiB / 1 GiB regions;
+IOVA reuse; which drive each `out` TLP came from, runs of one drive and how
+long a TLP was held in the batcher; LRU reuse distance on `out` and the IOTLB
+misses per I/O it predicts for sizes 16–1024. In a v1 log each `out` TLP is
+matched to its `in` record by per-channel order and the hold is the records in
+between; in a v2 log the record names its drive and the hold is its
+`pkt_wait`. Tested on synthetic logs only so far.
 
 ```bash
 python3 scripts/pips/pips-addr-pattern.py utils/logs/dualssd-pips-strict-1-d1t0 \
@@ -197,6 +261,8 @@ per window and the wait each W costs. `--iotlb 1x64,16x4 --strict` adds
 simulated IOTLB misses per I/O for those geometries (sets x ways; the real
 one is not published). `--show N --from REC --port out` prints the sequence
 run by run; `--csv` writes every TLP. Use a d1t0 log for the unbatched order.
+In a v2 log `in0`/`in1` are each drive's TLPs in the order they left, which is
+the order it sent them within each batching FIFO.
 
 ```bash
 python3 scripts/pips/pips-page-seq.py \
@@ -213,51 +279,73 @@ alignment, distinct pages, whether those pages also take writes from the other
 side of the limit (`mixed`: a completion queue page should take only entries),
 and how often an interrupt follows directly. Per drive and log: data bytes per
 completion entry against the block size, interrupts per entry, odd sizes.
-Each log is labelled with its IOMMU mode (`sweep.log`) and batcher setting
-(`pips-cfg.txt`). `--show N --port in1` prints one log's sizes in order, run-length
-coded (`64x16 4 1i` = a 4 KiB page, its entry, its interrupt). Tested on
-synthetic logs only so far.
+Each log is labelled with its IOMMU mode (`sweep.log`), batcher setting with
+`c1` for the drain cap, and design ID (`pips-cfg.txt`, else the sweep name).
+`--by` also takes `design`. `--show N --port in1` prints one log's sizes in
+order, run-length coded (`64x16 4 1i` = a 4 KiB page, its entry, its
+interrupt). Tested on synthetic logs only so far.
 
 ```bash
 python3 scripts/pips/pips-mwr-sizes.py utils/logs/dualssd-pips-off-1-d1t0 \
     utils/logs/dualssd-pips-strict-1-d1t0 --by iommu,bs --csv ~/mwr-sizes.csv
+python3 scripts/pips/pips-mwr-sizes.py utils/logs/dualssd-pips-strict-2-id0a04-d8t22 \
+    utils/logs/dualssd-pips-strict-2-id0a04-d8t22c1 --by cfg,bs     # cap off against on
 ```
 
-## Sweeps with the log: one cross sweep per batcher setting
+## Sweeps with the log: one sweep per batcher setting, cap off and on
 
 ```bash
 sudo -v
+# drives: the dual-SSD cross sweep per setting (bigserver)
 DUALSSD_ARGS="--membw 0" ./scripts/sosp24-experiments/dualssd_pips_sweep.sh --cfgs "1:0 4:22 8:22 16:64" --tmux
+# NICs: the dual-NIC flow sweep per setting (the server whose NICs are behind PIPS)
+./scripts/sosp24-experiments/dualnic_pips_sweep.sh --cfgs "1:0 4:22 8:22 16:64" --single --tmux
 ```
 
-For each `DEPTH:TIME[:MRD]` setting, in order, it sets the batcher through
-BAR0. It then runs the whole dual-SSD cross sweep with the uneven co-runs
-(`--asy`), named `<NAME>-d<DEPTH>t<TIME>`. At the end it puts the original
-setting back.
+For each `DEPTH:TIME[:MRD]` setting, in order, and each `--caps` value (default
+`"0 1"`: drain depth cap off, then on, which doubles the runs), it sets the
+batcher through BAR0. It then runs the whole sweep: for the drives the dual-SSD
+cross sweep with the uneven co-runs (`--asy`), for the NICs the dual-NIC flow
+sweep (flows x rates x modes). Each is named `<NAME>-id<XXXX>-d<DEPTH>t<TIME>[m1][c1]`,
+e.g. `dualssd-pips-strict-2-id0a04-d8t22c1`. At the end it puts the original
+setting and cap back. Cap 1 needs design 0x0a03 or later: on an older build
+the sweep refuses to start unless given `--caps 0`.
 
-Every run records a TLP log (`run-dualssd-experiment.sh --pips-log 1`):
-- the log region is zeroed before fio starts;
-- the recording starts after the warm-up and runs until the region fills,
-  milliseconds under load, cut after 5 s;
-- it is dumped after fio stops. No BAR0 access overlaps a measurement window.
+Every run records a TLP log (`run-dualssd-experiment.sh` /
+`run-dualnic-experiment.sh --pips-log 1`):
+- the log region is zeroed before the load starts;
+- the recording starts once the load is steady (after fio's warm-up, or once
+  the iperf3 senders run) and runs until the region fills, milliseconds under
+  load, cut after 5 s;
+- it is dumped after the measurement windows. No BAR0 access overlaps a
+  measurement window.
 
-Each run's folder keeps `pips-log.bin.gz` (the whole recording),
+Each run's folder keeps `pips-log-id<XXXX>.bin.gz` (the whole recording),
 `pips-log-summary.txt/.json` and `pips-cfg.txt`. Its report folder keeps
 `pips-log.rpt` with the status above, or `FAILED` when there is no log.
 
-`~/<NAME>.txt` has every setting side by side, rows labelled `off d8t22` and so
-on, and the PIPS log table. It flags each configuration whose runs were not all
-`FULL` and counts each status. The sweep ends by printing that check again.
-Results from other settings never mix: `dualssd-results.py` groups by IOMMU
-mode plus setting.
+`~/<NAME>.txt` starts with `design_id=`, then has every setting side by side,
+rows labelled `off d8t22c1@0a04` and so on, and the PIPS log table with the
+time in the batcher (v2 logs). It flags each configuration whose runs were not
+all `FULL` and counts each status. The sweep ends by printing that check again.
+Results from other settings or builds never mix: `dualssd-results.py` and
+`dualnic-results.py` group by IOMMU mode plus setting plus design ID.
+
+Runs whose drives or NICs are behind PIPS record the design ID and setting
+even without `--pips-log` (`pips-cfg.txt` per run, `pips_design_id` and
+`pips_batch` in the JSONL).
 
 ## Without the host path: XSCT
 
 `pips-xsct.tcl` has the same config, DMA and log procedures over JTAG
-(`pips_connect`, `pips_cfg`, `pips_cfg_set`, `pips_dma`, `pips_log_start`,
-`pips_log_stop`, `pips_log_dump`). Use it when BAR0 does not answer, or to
+(`pips_connect`, `pips_cfg`, `pips_cfg_set` with `cap`, `pips_design`,
+`pips_dma`, `pips_log_start`, `pips_log_stop`, `pips_log_dump`). `pips_cfg`
+prints the same `drain=`, `design_id=` and `log_format=` lines as `pips cfg`;
+`pips_log_dump` reminds you to name the file `*-id<XXXX>.bin` (or pass
+`--design-id` to the decoder). Use it when BAR0 does not answer, or to
 cross-check the host. The log region is hard-coded there (XSCT cannot read
-BAR0), so keep it in step with `pips.tcl`.
+BAR0), so keep it in step with `pips.tcl`. Not run since the cap and design
+ID procedures were added.
 
 ## Testing without hardware
 
@@ -267,20 +355,26 @@ cd scripts/pips && make check
 
 Builds `pips-sim`, which is `pips.c` linked against [pips_sim.c](pips_sim.c),
 a model of BAR0. The model covers the registers, BRAM and aliases, the window
-and its errors, the regfile, the DMA in direct register mode, DDR, and a
-logger. [test-sim.sh](test-sim.sh) then drives every command, including
-region-full, stale-tail and DMA-error recovery, and runs the decoder and
-`pips-fio-log.sh` with a stand-in fio. The model does not cover timing, AXI
-timeouts or the PIO's own limits.
+and its errors, the regfile with the drain config, the DMA in direct register
+mode, DDR, and a logger. `PIPS_SIM_DESIGN` picks the build it plays (default
+`0x0a04`; `0x0a02`, `0x0a03`, `none`): its design ID, whether reg1 exists, and
+the record format it logs. [test-sim.sh](test-sim.sh) then drives every
+command, including region-full, stale-tail and DMA-error recovery, on the
+current build and the older ones; runs the decoder and the three analysis
+tools on v1 and v2 logs, with the design ID found from the file name, a
+`pips-cfg.txt`, or nowhere; the runners' PIPS hooks (`pips-lib.sh`); both
+results scripts; `pips-fio-log.sh` with a stand-in fio; and both PIPS sweeps
+with stand-in sweeps under them. The model does not cover timing, AXI timeouts
+or the PIO's own limits.
 
 ## Sources of truth
 
 | What | Where |
 |---|---|
 | BAR0 map, window, access rules | FPGA repo `sw_handoff/README.md`, `src/pio_pips/pips_pio.v` |
-| [pips_regs.h](pips_regs.h) | verbatim copy of the FPGA repo's `sw_handoff/pips_regs.h`: re-copy it when the map changes |
-| Log region, regfile bit fields, DMA config | FPGA repo `pips.tcl` (`pips_log_*`, `xlslice_0..3`, `axi_dma_log`) |
-| Log record format, recording lifecycle | AXI4-switch repo `telemetry_dma_format.md` §4–§7 |
+| [pips_regs.h](pips_regs.h) | verbatim copy of the FPGA repo's `sw_handoff/pips_regs.h`: re-copy it when the map changes (last: 10-15, design 0x0a04). `sw_handoff/` is git-ignored in the FPGA repo, so check its file dates, not its log |
+| Log region, regfile bit fields, DMA config, design ID | FPGA repo `pips.tcl` (`pips_log_*`, `xlslice_0..3`, `axi_dma_log`, `pips_design_id`); drain config: `sw_handoff/README.md` §6 |
+| Log record format, recording lifecycle | AXI4-switch repo `telemetry_dma_format.md` §4–§7 (v2; the v1 differences are its §4.2 note "Changed from the earlier format") |
 | What each logged field means | AXI4-switch repo `axi4_telemetry_decode.md` §4, §8 |
 
 ## First hardware run (bigserver, 2026-10-11)

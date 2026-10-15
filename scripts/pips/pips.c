@@ -13,9 +13,11 @@
  *   wr OFF VAL                 write one 32-bit BAR0 word
  *   axi-rd ADDR [N]            read N 32-bit words at AXI address ADDR
  *   axi-wr ADDR VAL            write one 32-bit word at AXI address ADDR
- *   cfg                        batcher/logger config register, decoded, and
- *                              the build's DESIGN_ID
- *   cfg set K=V...             read-modify-write it: depth= time= mrd= log= raw=
+ *   cfg                        batcher/logger config register and the drain
+ *                              config register (design >= 0x0a03), decoded,
+ *                              the build's DESIGN_ID and its log format
+ *   cfg set K=V...             read-modify-write them: depth= time= mrd= log=
+ *                              raw= (reg0) cap= (reg1, drain_depth_cap)
  *   dma                        log DMA (S2MM) registers, decoded
  *   dma-reset                  soft-reset the log DMA
  *   log-clear                  zero the log region in DDR
@@ -397,26 +399,60 @@ static void cfg_print(uint32_t v)
                "Old 0x1608 is 0x01001608 now\n", v & CFG_RESERVED);
 }
 
+/* The build's DESIGN_ID, or -1 for a build from before the register (DECERR). */
+static int design_id(void)
+{
+    uint32_t id = axi_rd(PIPS_AXI_REGFILE + PIPS_DESIGN_ID_OFF);
+
+    return win_check(NULL) ? -1 : (int)PIPS_DESIGN_ID(id);
+}
+
+static int has_drain_cfg(int id) { return id >= (int)PIPS_DESIGN_ID_DRAIN_CFG; }
+
+/* The TLP log record format a build writes (pips_regs.h, "Record format"). */
+static const char *log_format(int id) { return id >= (int)PIPS_DESIGN_ID_LOG_V2 ? "v2" : "v1"; }
+
+static uint32_t drain_rd(void)
+{
+    return axi_rd_ok(PIPS_AXI_REGFILE + PIPS_BATCH_DRAIN_OFF, "drain config register read");
+}
+
+/* The drain line, then the design ID and log format: key=value lines for scripts. */
+static void drain_id_print(int id, int have, uint32_t drain)
+{
+    if (have)
+        printf("drain=0x%08x drain_depth_cap=%u\n", drain, !!(drain & PIPS_BATCH_DRAIN_DEPTH_CAP));
+    else
+        printf("drain=none drain_depth_cap=0\n# no drain config register (design < 0x%04x): "
+               "every drain sends the whole FIFO\n", PIPS_DESIGN_ID_DRAIN_CFG);
+    if (id < 0)
+        printf("design_id=none\n# no DESIGN_ID register: a build older than design 0x%04x\n",
+               PIPS_DESIGN_ID_FIRST);
+    else
+        printf("design_id=0x%04x\n", id);
+    printf("log_format=%s\n", log_format(id));
+}
+
 static int cmd_cfg(int argc, char **argv)
 {
-    uint32_t old, v, rb;
+    uint32_t old, v, rb, dold = 0, d = 0, drb = 0;
+    int id, have, set_cap = 0;
 
     win_start();
     old = cfg_rd();
+    id = design_id();
+    have = has_drain_cfg(id);
+    if (have)
+        dold = drain_rd();
     if (argc == 0) {
-        uint32_t id = axi_rd(PIPS_AXI_REGFILE + PIPS_DESIGN_ID_OFF);
-
         cfg_print(old);
-        if (win_check(NULL))
-            printf("design_id=none\n# no DESIGN_ID register: a build older than design 0x%04x\n",
-                   PIPS_DESIGN_ID_FIRST);
-        else
-            printf("design_id=0x%04x\n", PIPS_DESIGN_ID(id));
+        drain_id_print(id, have, dold);
         return 0;
     }
     if (strcmp(argv[0], "set") || argc < 2)
-        die("usage: pips cfg [set depth=N time=N mrd=0|1 log=0|1 raw=VAL ...]");
+        die("usage: pips cfg [set depth=N time=N mrd=0|1 log=0|1 raw=VAL cap=0|1 ...]");
     v = old;
+    d = dold;
     for (int i = 1; i < argc; i++) {
         char *eq = strchr(argv[i], '=');
         uint64_t n;
@@ -438,16 +474,39 @@ static int cmd_cfg(int argc, char **argv)
             uint32_t bit = argv[i][0] == 'm' ? PIPS_BATCH_MRD : PIPS_BATCH_LOG_ENABLE;
             if (n > 1) die("%s: 0 or 1", argv[i]);
             v = n ? v | bit : v & ~bit;
+        } else if (!strcmp(argv[i], "cap")) {
+            if (n > 1) die("cap: 0 or 1");
+            if (!have) {
+                if (id < 0)
+                    die("cap: this build has no DESIGN_ID, so no drain config register "
+                        "(needs design >= 0x%04x)", PIPS_DESIGN_ID_DRAIN_CFG);
+                die("cap: design 0x%04x has no drain config register (needs >= 0x%04x)", id,
+                    PIPS_DESIGN_ID_DRAIN_CFG);
+            }
+            d = n ? d | PIPS_BATCH_DRAIN_DEPTH_CAP : d & ~PIPS_BATCH_DRAIN_DEPTH_CAP;
+            set_cap = 1;
         } else {
-            die("unknown field '%s' (depth time mrd log raw)", argv[i]);
+            die("unknown field '%s' (depth time mrd log raw cap)", argv[i]);
         }
     }
     cfg_wr(v);
     rb = cfg_rd();
-    printf("# was 0x%08x\n", old);
+    if (set_cap)
+        axi_wr_ok(PIPS_AXI_REGFILE + PIPS_BATCH_DRAIN_OFF, d, "drain config register write");
+    if (have)
+        drb = drain_rd();
+    printf("# was 0x%08x", old);
+    if (have)
+        printf(", drain 0x%08x", dold);
+    putchar('\n');
     cfg_print(rb);
+    drain_id_print(id, have, drb);
     if (rb != v) {
         fprintf(stderr, "pips: wrote 0x%08x, read back 0x%08x\n", v, rb);
+        return 1;
+    }
+    if (set_cap && (drb & PIPS_BATCH_DRAIN_DEPTH_CAP) != (d & PIPS_BATCH_DRAIN_DEPTH_CAP)) {
+        fprintf(stderr, "pips: drain config: wrote 0x%08x, read back 0x%08x\n", d, drb);
         return 1;
     }
     return 0;
@@ -780,6 +839,7 @@ static int cmd_info(void)
 {
     uint32_t v[0x80 / 4];
     uint8_t bus[3];
+    int id;
 
     for (uint32_t i = 0; i < 0x80 / 4; i++)
         v[i] = bar_rd32(PIPS_REG_BLOCK_OFF + 4 * i);
@@ -831,6 +891,13 @@ static int cmd_info(void)
            R(PIPS_REG_LOG_BYTES) >> 10,
            R(PIPS_REG_LOG_BYTES) ? R(PIPS_REG_LOG_BYTES) / 16 - 1 : 0);
 #undef R
+    win_start();
+    id = design_id();
+    if (id < 0)
+        printf("DESIGN_ID    none        older than 0x%04x; log format v1\n", PIPS_DESIGN_ID_FIRST);
+    else
+        printf("DESIGN_ID    0x%04x      log format %s, drain config %s\n", id, log_format(id),
+               has_drain_cfg(id) ? "yes" : "no");
     return 0;
 }
 
@@ -970,6 +1037,7 @@ static void t_regfile(void)
 {
     const uint64_t a = PIPS_AXI_REGFILE + PIPS_BATCH_CFG_OFF;
     uint32_t lo, hi, orig, v, st, id, bad, pats[3];
+    int drain;
 
     win_start();
     bar_wr32(PIPS_REG_WIN_BASE_LO, (uint32_t)PIPS_AXI_REGFILE | 3u);
@@ -1002,7 +1070,8 @@ static void t_regfile(void)
               i == 2 ? " (restored)" : "");
     }
     /* The rest of the 64-byte aperture (pips.tcl, above axil4_regfile_0): DESIGN_ID at 0x20,
-     * read-only; every other register reads 0; the 64 bytes repeat through the segment. */
+     * read-only; from design 0x0a03 the drain config at 0x04; every other register reads 0;
+     * the 64 bytes repeat through the segment. */
     id = axi_rd(a + PIPS_DESIGN_ID_OFF);
     st = win_check(NULL);
     if (st & PIPS_WIN_ST_RD_ERR) {
@@ -1014,18 +1083,41 @@ static void t_regfile(void)
     check(!st && !(id >> 16) && PIPS_DESIGN_ID(id) >= PIPS_DESIGN_ID_FIRST,
           "DESIGN_ID 0x%04x at 0x%08" PRIx64 " (pips.tcl pips_design_id; bits [31:16] 0x%04x)",
           PIPS_DESIGN_ID(id), a + PIPS_DESIGN_ID_OFF, id >> 16);
+    note("log format %s; drain config register %s", log_format((int)PIPS_DESIGN_ID(id)),
+         has_drain_cfg((int)PIPS_DESIGN_ID(id)) ? "at +0x04" : "absent (design < 0x0a03)");
     axi_wr(a + PIPS_DESIGN_ID_OFF, ~id);
     v = axi_rd(a + PIPS_DESIGN_ID_OFF);
     st = win_check(NULL);
     check(v == id && !st, "a write to DESIGN_ID is ignored: still 0x%08x, WIN_STATUS %s", v,
           win_flags(st));
+    drain = has_drain_cfg((int)PIPS_DESIGN_ID(id));
+    if (drain) {
+        const uint64_t r1 = PIPS_AXI_REGFILE + PIPS_BATCH_DRAIN_OFF;
+        uint32_t d0 = axi_rd(r1), want;
+
+        st = win_check(NULL);
+        if (!check(!st, "reg1 (drain config) at 0x%08" PRIx64 " answers: 0x%08x, drain_depth_cap "
+                   "%u (WIN_STATUS %s)", r1, d0, !!(d0 & PIPS_BATCH_DRAIN_DEPTH_CAP),
+                   win_flags(st)))
+            return;
+        /* drain_depth_cap flipped, then back: safe at any time (a running drain keeps its size) */
+        for (int i = 0; i < 2; i++) {
+            want = i == 0 ? d0 ^ PIPS_BATCH_DRAIN_DEPTH_CAP : d0;
+            axi_wr(r1, want);
+            v = axi_rd(r1);
+            st = win_check(NULL);
+            check(((v ^ want) & PIPS_BATCH_DRAIN_DEPTH_CAP) == 0 && !st,
+                  "reg1 wrote 0x%08x read 0x%08x (drain_depth_cap %u)%s", want, v,
+                  !!(v & PIPS_BATCH_DRAIN_DEPTH_CAP), i == 1 ? " (restored)" : "");
+        }
+    }
     bad = 0;
     for (uint32_t off = 4; off < 0x40; off += 4)
-        if (off != PIPS_DESIGN_ID_OFF)
+        if (off != PIPS_DESIGN_ID_OFF && !(drain && off == PIPS_BATCH_DRAIN_OFF))
             bad += axi_rd(a + off) != 0;
     st = win_check(NULL);
-    check(!bad && !st, "reserved registers 0x04-0x1c and 0x24-0x3c read 0 (%u do not, WIN_STATUS "
-          "%s)", bad, win_flags(st));
+    check(!bad && !st, "reserved registers 0x%02x-0x1c and 0x24-0x3c read 0 (%u do not, WIN_STATUS "
+          "%s)", drain ? 0x08 : 0x04, bad, win_flags(st));
     v = axi_rd(a + 0x40);
     st = win_check(NULL);
     check(v == orig && !st, "0x%08" PRIx64 " repeats reg0: 0x%08x", a + 0x40, v);
@@ -1292,7 +1384,7 @@ static void usage(void)
 {
     fputs("usage: pips [-s BDF] [-f] <command> [args]\n"
           "  info | rd OFF [N] | wr OFF VAL | axi-rd ADDR [N] | axi-wr ADDR VAL\n"
-          "  cfg | cfg set depth=N time=N mrd=0|1 log=0|1 raw=VAL ...\n"
+          "  cfg | cfg set depth=N time=N mrd=0|1 log=0|1 raw=VAL cap=0|1 ...\n"
           "  dma | dma-reset\n"
           "  log-clear | log-start | log-stop [MS] | log-wait [MS] | log-dump FILE [BYTES]\n"
           "  ddr-dump ADDR BYTES FILE\n"

@@ -99,9 +99,20 @@
 #define PIPS_BATCH_LOG_ENABLE   (1u << 24)              /* log_enable, rising edge arms a recording */
 #define PIPS_BATCH_CFG_RESET    0x00000001u             /* depth 1, everything else 0 */
 
+/* Batcher drain config: axil4_regfile_0 reg1 at PIPS_AXI_REGFILE + 0x4 (design ID >= 0x0A03;
+ * older builds read 0 and ignore writes). Same byte-lane rule as reg0.
+ * drain_depth_cap 0: one drain sends every packet in the FIFO when it starts (reset value)
+ *                 1: one drain sends at most depth_threshold packets (0 counts as 1)
+ * Safe to change at any time; a drain in progress keeps the size it started with. */
+#define PIPS_BATCH_DRAIN_OFF        0x4u
+#define PIPS_BATCH_DRAIN_DEPTH_CAP  (1u << 0)           /* drain_depth_cap */
+#define PIPS_BATCH_DRAIN_RESET      0x00000000u
+#define PIPS_DESIGN_ID_DRAIN_CFG    0x0A03u             /* first build with reg1 */
+
 /* axil4_regfile_0 layout (pips.tcl, comment above axil4_regfile_0):
  *   0x00        batcher config, RW (above)
- *   0x04 - 0x1C reserved, read 0
+ *   0x04        batcher drain config, RW (above)
+ *   0x08 - 0x1C reserved, read 0
  *   0x20 - 0x3F read-only range; writes are ignored (OKAY, WIN_STATUS stays 0)
  *     0x20      DESIGN_ID: [15:0] build identifier (pips.tcl pips_design_id), [31:16] 0
  *     0x24-0x3C reserved, read 0
@@ -135,9 +146,17 @@
 #define PIPS_LOG_REGION_BYTES   4194304u      /* program S2MM_LENGTH = LOG_BYTES */
 #define PIPS_LOG_RECORD_BYTES   16u
 #define PIPS_LOG_DA_ALIGN       16u           /* S2MM_DA alignment (no DRE / unaligned transfers) */
+
+/* Record format: choose by design ID (README section 7; telemetry_dma_format.md section 4).
+ *   >= PIPS_DESIGN_ID_LOG_V2: one record per TLP leaving the batcher; port = the input it came in
+ *                             on (IN0/IN1), pkt_wait u16 at 0x0C, pkt_tag at 0x0F, AT in pkt_type[5:4].
+ *   <  PIPS_DESIGN_ID_LOG_V2: three-port format; records for IN0, IN1 and OUT, pkt_tag at 0x0C,
+ *                             AT at 0x0D, no pkt_wait.
+ * Info byte (0x0E) and trailer are the same in both. */
+#define PIPS_DESIGN_ID_LOG_V2   0x0A04u       /* first build with the v2 (output-only) record format */
 #define PIPS_LOG_PORT_IN0       0u            /* requests from downstream port one (10ee:b348) */
 #define PIPS_LOG_PORT_IN1       1u            /* requests from downstream port zero (10ee:b148) */
-#define PIPS_LOG_PORT_OUT       2u            /* batched stream sent to the host */
+#define PIPS_LOG_PORT_OUT       2u            /* older format only: batched stream sent to the host */
 
 /* ------------------------------------------------------------------ access helpers
  * bar = base of the mmap()ed BAR0 (UC mapping of sysfs resource0).

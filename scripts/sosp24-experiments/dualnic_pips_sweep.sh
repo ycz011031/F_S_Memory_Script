@@ -1,0 +1,259 @@
+#!/bin/bash
+# Dual-NIC flow sweep through the PIPS switch, once per batcher setting: the
+# NIC counterpart of dualssd_pips_sweep.sh. For each DEPTH:TIME pair, with the
+# drain depth cap off and then on, it sets the batcher through BAR0 (pips cfg
+# set), runs the whole flow sweep (dualnic_flow_sweep.sh: every flow count at
+# every rate and mode) with the switch's TLP log recorded in every run and
+# checked whole or cut, then moves to the next setting. At the end it puts the
+# original setting back and prints every setting side by side. Run it on the
+# server/receiver, whose NICs are behind PIPS, as run-dualnic-experiment.sh.
+#
+#   ./dualnic_pips_sweep.sh                                # settings "1:0 8:22", cap off and on
+#   ./dualnic_pips_sweep.sh --cfgs "1:0 4:22 8:22 16:64"   # DEPTH:TIME pairs, in order
+#   ./dualnic_pips_sweep.sh --cfgs "8:22:1"                # and batch_mrd on
+#   ./dualnic_pips_sweep.sh --caps 0                       # cap off only (as before 0x0a03)
+#   ./dualnic_pips_sweep.sh --single --tmux                # also each NIC alone, in tmux
+#   ./dualnic_pips_sweep.sh "5 10 30" "30 uncapped" 3      # flows/NIC, rates, runs
+#
+# Options:
+#   --cfgs "DEPTH:TIME[:MRD] ..."  batcher settings: DEPTH depth_threshold and
+#                     TIME time_threshold, 0-255 each; MRD batch_mrd, 0 or 1
+#                     (default 0). Default "1:0 8:22": the reset value (no
+#                     batching), then depth 8 / time 0x16, the old XSCT setting.
+#   --caps "0 1"      drain_depth_cap values run with every --cfgs setting, in
+#                     order (default "0 1": twice the runs). 0 = a drain sends
+#                     the whole FIFO (reset value, and every build before
+#                     design 0x0a03); 1 = at most DEPTH packets per drain. Cap
+#                     1 needs design 0x0a03 or later; the sweep refuses to
+#                     start without it.
+#   --single          also each NIC alone (modes "nic0only nic1only both");
+#                     the summary's CONTENTION needs them
+#   --modes "..."     the modes outright (default "both", the co-run)
+#   -o NAME           name the sweep (default dualnic-pips-<iommu>-<N>)
+#   --tmux            run it in a new tmux session instead of this terminal
+# Runner options go in DUALNIC_ARGS, e.g. DUALNIC_ARGS="--cca cubic"; this
+# adds --pips-log 1 (run-dualnic-experiment.sh -h). Arguments: flows per NIC
+# (default "5 10 15 30"), rates in Gbps per NIC (default "uncapped"), repeats
+# (default 1).
+#
+# Each setting is one flow sweep named <NAME>-id<XXXX>-d<DEPTH>t<TIME>[m1][c1]
+# (id<XXXX> = the FPGA design ID, e.g. id0a04; c1 = cap on), whose
+# experiments are <that>-<rate>-f<flows>-<mode>: ~/<that>.jsonl and .txt,
+# utils/logs/<that>-*-RUN-server-<j>/, utils/reports/<that>-*. Each run's log
+# folder also holds its TLP log, pips-log-id<XXXX>.bin.gz, with
+# pips-log-summary.txt/.json and pips-cfg.txt; its report folder pips-log.rpt
+# with the status: FULL, CUT, +DROPS, NO_TRAILER, BAD or FAILED. Then:
+#   ~/<NAME>.txt                       every setting side by side and the log
+#                                      check; its first lines name the design ID
+#   utils/logs/<NAME>/pips-sweep.log   this output
+#   utils/logs/<NAME>/cfg-<setting>.txt  the batcher registers as set
+# On a build without a design ID (older than 0x0a02) names have no id<XXXX>.
+#
+# Time per setting: each run is ~2.5 min (NIC setup, 12 s warm-up, the 20 s
+# window, iperf3's 75 s), plus ~5 s for the log; the defaults are 4 flow
+# counts x 1 mode + the datapath check, ~15 min per setting. --single triples
+# the points; the default --caps doubles the settings. Stop with Ctrl-C, or:
+#   pkill -f 'dualnic_pips_swee[p]'; pkill -f 'dualnic_flow_swee[p]'; pkill -f 'run-dualnic-experimen[t]'
+# Either way the original batcher setting and drain cap are put back.
+set -u
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+HERE=$(dirname "$SELF")
+. "$HERE/../../utils/ssd-lib.sh"          # relaunch_in_tmux
+. "$HERE/../pips/pips-lib.sh"
+
+# --tmux: start over inside a tmux session, with the same arguments minus it.
+PASS=(); IN_TMUX=0
+for a in "$@"; do if [ "$a" = --tmux ]; then IN_TMUX=1; else PASS+=( "$a" ); fi; done
+set -- ${PASS[@]+"${PASS[@]}"}
+
+CFGS="1:0 8:22"; CAPS="0 1"; NAME=""; MODES="both"; POS=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --cfgs)        CFGS="$2"; shift 2 ;;
+        --caps)        CAPS="$2"; shift 2 ;;
+        --single)      MODES="nic0only nic1only both"; shift ;;
+        --modes)       MODES="$2"; shift 2 ;;
+        -o|--out)      NAME="$2"; shift 2 ;;
+        -h|--help)     sed -n '2,57p' "$SELF"; exit 0 ;;
+        -*)            echo "unknown option: $1" >&2; exit 2 ;;
+        *)             POS+=( "$1" ); shift ;;
+    esac
+done
+for m in $MODES; do
+    case "$m" in nic0only|nic1only|both) ;; *) echo "--modes: '$m' is not nic0only, nic1only or both" >&2; exit 2 ;; esac
+done
+
+# Every setting checked before anything runs: "d:t" or "d:t:m", each with
+# every --caps value (cap off first by default).
+for c in $CAPS; do
+    case "$c" in 0|1) ;; *) echo "--caps: '$c' is not 0 or 1" >&2; exit 2 ;; esac
+done
+TAGS=(); VALS=(); WANT_CAP=0
+for c in $CFGS; do
+    IFS=: read -r d t m extra <<< "$c"
+    m=${m:-0}
+    case "$d$t" in *[!0-9]*|'') d=x ;; esac
+    if [ "$d" = x ] || [ -z "$t" ] || [ -n "${extra:-}" ] || [ "$d" -gt 255 ] || [ "$t" -gt 255 ] ||
+       { [ "$m" != 0 ] && [ "$m" != 1 ]; }; then
+        echo "--cfgs: '$c' is not DEPTH:TIME[:MRD] (0-255, 0-255, 0 or 1)" >&2; exit 2
+    fi
+    for cap in $CAPS; do
+        TAGS+=( "$(pips_tag $(( d | t << 8 | m << 16 )) "$cap")" ); VALS+=( "$d $t $m $cap" )
+        [ "$cap" = 1 ] && WANT_CAP=1
+    done
+done
+[ ${#TAGS[@]} -gt 0 ] || { echo "--cfgs/--caps: no settings" >&2; exit 2; }
+[ "$(printf '%s\n' "${TAGS[@]}" | sort -u | wc -l)" -eq ${#TAGS[@]} ] ||
+    { echo "--cfgs/--caps: a setting is listed twice" >&2; exit 2; }
+
+[ "$IN_TMUX" = 1 ] && relaunch_in_tmux "$SELF" ${PASS[@]+"${PASS[@]}"}
+
+cd "$HERE/.." || exit 1
+. ../utils/setup-server.sh
+FLOWS="${POS[0]:-5 10 15 30}"
+RATES="${POS[1]:-uncapped}"
+RUNS="${POS[2]:-1}"
+
+# -------------------------------------------------------------- preflight
+sudo -n true 2>/dev/null || die "passwordless sudo is needed (run-dualnic-experiment.sh's preflight says how)"
+pips_lock || exit 1
+pips_build || die "cannot build $PIPS"
+USP=$(pips_find_usp) || exit 1
+P() { sudo -n "$PIPS" -s "$USP" "$@"; }
+out=$(P cfg 2>&1) ||
+    { printf '%s\n' "$out" >&2; die "the PIPS switch does not answer: run scripts/pips/pips-bringup.sh"; }
+CFG0=$(cfg_of <(printf '%s\n' "$out")); CAP0=$(cap_of <(printf '%s\n' "$out"))
+DESIGN=$(design_of <(printf '%s\n' "$out")); IDT=$(pips_idtag "$DESIGN")
+[ -n "$CFG0" ] || die "could not read the batcher setting: $out"
+# The drain cap register exists from design 0x0a03; without it only cap 0 runs.
+HAVE_CAP=""; pips_design_ge "$DESIGN" 0x0a03 && HAVE_CAP=1
+[ "$WANT_CAP" = 1 ] && [ -z "$HAVE_CAP" ] &&
+    die "--caps 1: design ${DESIGN:-?} has no drain depth cap (needs 0x0a03 or later); use --caps 0"
+
+# The NICs whose TLPs the log is for must be behind the switch.
+BDFS=()
+for i in 0 1; do
+    b=$(basename "$(readlink -f "/sys/class/net/${SERVER_INTFS[$i]}/device" 2>/dev/null)" 2>/dev/null)
+    [ -n "$b" ] && BDFS+=( "$b" )
+    pips_behind "$USP" "$b" || echo "WARNING: NIC $i (${SERVER_INTFS[$i]}, ${b:-?}) is not behind PIPS ($USP):" \
+                                    "its TLPs are not in the log" >&2
+done
+pips_behind "$USP" ${BDFS[@]+"${BDFS[@]}"} ||
+    die "neither NIC (${SERVER_INTFS[*]}) is behind PIPS ($USP): nothing for the log to record"
+
+IOMMU=$(for i in 0 1; do bash ../utils/iommu-mode.sh "${SERVER_INTFS[$i]}"; done | sort -u | paste -sd+)
+[ -n "$IOMMU" ] || exit 1
+
+DIR="${RESULTS_DIR:-$HOME}"
+taken() {   # <name> -> true if it or any of its settings has results in $DIR
+    local s
+    [ -e "$DIR/$1.txt" ] && return 0
+    for s in d id; do
+        compgen -G "$DIR/$1-$s*t*.jsonl" >/dev/null || compgen -G "$DIR/$1-$s*t*.txt" >/dev/null &&
+            return 0
+    done
+    return 1
+}
+if [ -z "$NAME" ]; then
+    n=1; while taken "dualnic-pips-$IOMMU-$n"; do n=$((n + 1)); done
+    NAME="dualnic-pips-$IOMMU-$n"
+elif taken "$NAME"; then
+    die "a sweep named '$NAME' already has results in $DIR; pick another -o NAME"
+fi
+UTILS="$(cd ../utils && pwd)"
+LOGDIR="$UTILS/logs/$NAME"
+mkdir -p "$LOGDIR"
+exec > >(trap '' INT TERM; exec tee -a "$LOGDIR/pips-sweep.log") 2>&1
+
+# Put the original setting and drain cap back however the sweep ends, without
+# log_enable: raising it would start a recording.
+restore() {
+    local v
+    v=$(printf '0x%08x' $(( CFG0 & ~0x1000000 )))
+    if P cfg set raw="$v" ${HAVE_CAP:+cap="$CAP0"} > "$LOGDIR/cfg-restored.txt" 2>&1; then
+        echo "######## batcher setting restored: $(pips_tag "$v" "$CAP0") ($v)"
+    else
+        echo "######## WARNING: could not restore the batcher setting $v:" \
+             "$(tail -1 "$LOGDIR/cfg-restored.txt")" >&2
+    fi
+}
+trap restore EXIT
+STOP=0
+trap 'STOP=1' INT TERM
+
+echo "######## dual-NIC PIPS sweep $NAME"
+echo "######## settings: ${TAGS[*]}   (each a full flow sweep)"
+echo "######## flows/NIC $FLOWS, rates $RATES, modes $MODES, $RUNS run(s)"
+echo "######## PIPS: $USP, design ${DESIGN:-?}, batcher before: $(pips_tag "$CFG0" "$CAP0") ($CFG0)"
+echo "######## NICs: ${SERVER_INTFS[*]} (${BDFS[*]:-?})"
+echo "######## IOMMU: $IOMMU   kernel $(uname -r)   runner args: ${DUALNIC_ARGS:-} --pips-log 1"
+echo "######## per setting: $NAME${IDT:+-$IDT}-<setting>"
+echo "######## logs: $LOGDIR/"
+
+# ----------------------------------------------------------------- sweep
+DONE=(); NOTES=(); t0=$SECONDS
+for k in "${!TAGS[@]}"; do
+    tag=${TAGS[$k]}; read -r d t m cap <<< "${VALS[$k]}"
+    sub="$NAME${IDT:+-$IDT}-$tag"
+    echo
+    echo "######## [$((k + 1))/${#TAGS[@]}] batcher $tag: depth $d, time $t, batch_mrd $m," \
+         "drain cap $cap ($(( (SECONDS - t0) / 60 )) min in)"
+    if ! P cfg set depth="$d" time="$t" mrd="$m" log=0 ${HAVE_CAP:+cap="$cap"} \
+            > "$LOGDIR/cfg-$tag.txt" 2>&1; then
+        NOTES+=( "$tag: NOT RUN, setting it failed: $(tail -1 "$LOGDIR/cfg-$tag.txt")" )
+        echo "######## ${NOTES[-1]}" >&2
+        continue
+    fi
+    echo "######## set: $(grep -E '^(cfg|drain|design_id)=' "$LOGDIR/cfg-$tag.txt" | xargs)"
+    # The PIPS lock is this sweep's; the flow sweep and runner do not take it.
+    DUALNIC_ARGS="${DUALNIC_ARGS:-} --pips-log 1" \
+        bash "$HERE/dualnic_flow_sweep.sh" -o "$sub" -p "$sub" "$FLOWS" "$RATES" "$RUNS" "$MODES"
+    rc=$?
+    DONE+=( "$sub" )
+    [ "$rc" = 0 ] || NOTES+=( "$tag: the flow sweep stopped early (exit $rc): see $LOGDIR/pips-sweep.log" )
+    P cfg > "$LOGDIR/cfg-$tag-after.txt" 2>/dev/null
+    now=$(cfg_of "$LOGDIR/cfg-$tag-after.txt")
+    if [ -n "$now" ] && [ "$(pips_tag "$now" "$(cap_of "$LOGDIR/cfg-$tag-after.txt")")" != "$tag" ]; then
+        NOTES+=( "$tag: the batcher read $(pips_tag "$now" "$(cap_of "$LOGDIR/cfg-$tag-after.txt")") at the end: changed during the sweep" )
+        echo "######## WARNING: ${NOTES[-1]}" >&2
+    fi
+    if [ "$STOP" = 1 ] || [ "$rc" = 130 ] || [ "$rc" = 143 ]; then
+        NOTES+=( "stopped by hand during $tag" )
+        echo "######## STOPPED by hand" >&2
+        break
+    fi
+done
+
+# --------------------------------------------------------------- summary
+FILES=()
+for s in ${DONE[@]+"${DONE[@]}"}; do [ -s "$DIR/$s.jsonl" ] && FILES+=( "$DIR/$s.jsonl" ); done
+{
+    echo "dual-NIC PIPS sweep $NAME  $(date '+%F %T')  host $(hostname)"
+    echo "design_id=${DESIGN:-none}"
+    echo "IOMMU $IOMMU  kernel $(uname -r)  PIPS design ${DESIGN:-?}"
+    echo "settings: ${TAGS[*]}   flows/NIC: $FLOWS   rates: $RATES   modes: $MODES   runs: $RUNS"
+    echo "per setting: ~/$NAME${IDT:+-$IDT}-<setting>.jsonl/.txt, utils/logs/$NAME${IDT:+-$IDT}-<setting>-*"
+    for x in ${NOTES[@]+"${NOTES[@]}"}; do echo "NOTE: $x"; done
+    echo
+    if [ ${#FILES[@]} -gt 0 ]; then
+        python3 ../scripts/dualnic-results.py summary "${FILES[@]}"
+    else
+        echo "no results recorded"
+    fi
+} > "$DIR/$NAME.txt"
+echo
+echo "=============================================================="
+echo "  DUAL-NIC PIPS SWEEP $NAME: ${#DONE[@]} of ${#TAGS[@]} setting(s) run"
+echo "=============================================================="
+cat "$DIR/$NAME.txt"
+echo
+echo "=============================================================="
+# The log check again, as the last thing on screen: the configurations whose
+# runs did not all record a FULL log, and the count of each status.
+echo "  log check:"
+sed -n '/^PIPS TLP log per configuration/,/^  logs: /p' "$DIR/$NAME.txt" | grep -E 'NOT ALL FULL|^  logs: '
+for x in ${NOTES[@]+"${NOTES[@]}"}; do echo "  NOTE: $x"; done
+echo "  everything side by side: $DIR/$NAME.txt   (design ${DESIGN:-?})"
+echo "  per setting: $DIR/$NAME${IDT:+-$IDT}-<setting>.{jsonl,txt}, $UTILS/logs/$NAME${IDT:+-$IDT}-<setting>-*"
+[ "$STOP" = 1 ] && exit 130
+exit 0

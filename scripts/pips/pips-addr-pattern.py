@@ -3,13 +3,18 @@
 
     pips-addr-pattern.py LOG [LOG ...]                  one table line per log
     pips-addr-pattern.py utils/logs/dualssd-pips-strict-1-d8t22 ...
-                                                        every pips-log.bin(.gz) under
-                                                        these folders
+                                                        every pips-log[-id<XXXX>].bin(.gz)
+                                                        under these folders
     ... --jsonl addr-pattern.jsonl                      also one JSON object per log
     ... --match '4k-j*-both'                            only run folders matching this
+    ... --design-id 0x0a04                              the build that wrote the logs,
+                                                        when nothing next to them says
 
 LOG is a dump as `pips log-dump` wrote it, e.g. a sweep run's pips-log.bin.gz.
-It is read with pips-log-decode.py's loader. Python 3, standard library only.
+It is read with pips-log-decode.py's loader, which takes the record format
+from the design ID (pips-log-decode.py --help, "Design ID"): v1 logs (before
+design 0x0a04) have in0, in1 and out records, v2 logs one record per TLP sent
+to the host, tagged with its input. Python 3, standard library only.
 
 Classes. Each TLP from a drive is one of: data (MWr, more than 16 bytes), cqe
 (MWr of at most 16 bytes: an NVMe completion entry), msi (MWr to
@@ -28,11 +33,16 @@ Per log:
             under O_DIRECT). TLPs per visit, and the share of visits to a page
             the log saw before (an IOVA or buffer handed out again).
   ios       NVMe completion entries per drive: one per I/O completed.
-  out       each out TLP is matched to its in0/in1 record. Per channel the
+  out       v1: each out TLP is matched to its in0/in1 record. Per channel the
             batcher keeps order (memory reads in their own FIFO), so the match
-            is the oldest pending TLP of that channel and class. Then: runs of
-            one drive's TLPs on out, and the records logged between a TLP's in
-            and out records ("hold"), in µs at the log's average record rate.
+            is the oldest pending TLP of that channel and class. v2: the record
+            names its input, so every out TLP is matched. Then: runs of one
+            drive's TLPs on out, and how long a TLP was held in the batcher
+            ("hold"): v1, the records logged between its in and out records,
+            in µs at the log's average record rate; v2, its pkt_wait.
+            In v2 a drive's own stream (the per-drive numbers above) is its
+            TLPs in the order they left, which is the order it sent them
+            within each FIFO (writes; reads have their own).
   reuse     LRU stack distance on out, per translated TLP (msi left out): how
             many other (drive, 4 KiB page) pairs were touched since this pair's
             last touch. A fully associative LRU IOTLB of E entries hits iff
@@ -51,6 +61,7 @@ import fnmatch
 import importlib.util
 import json
 import os
+import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -63,6 +74,7 @@ MSI_LO, MSI_HI = 0xFEE00000, 0xFEF00000
 BUCKETS = (0, 1, 4, 16, 64, 256, 1024, 4096)          # lower bounds; then "cold"
 IOTLB_SIZES = (16, 32, 64, 128, 256, 512, 1024)
 CH = ("in0", "in1")
+LOG_NAME = re.compile(r"^pips-log(?:-id[0-9a-fA-F]{4})?\.bin(?:\.gz)?$")
 
 
 def classify(typ, addr, pdw):
@@ -132,19 +144,24 @@ def pct(vals, p):
     return s[min(len(s) - 1, int(p / 100 * len(s)))]
 
 
-def tlp_events(recs):
-    """Every TLP record in log order as (index, port, class, addr, payload_dw,
-    drive, drive's record index). For in0/in1 the drive is the port. For out it
-    is the channel whose oldest pending TLP of the same class (memory reads have
-    their own FIFO) has the same address, type, size and tag; None when no
-    channel matches, e.g. a TLP sent before the log started. Also returns
-    counts: drops per port, matched, ambiguous, unmatched, lost."""
+def tlp_events(recs, fmt="v1"):
+    """Every TLP in log order as (index, port, class, addr, payload_dw, drive,
+    drive's record index, wait). For in0/in1 the drive is the port. For out,
+    v1: the channel whose oldest pending TLP of the same class (memory reads
+    have their own FIFO) has the same address, type, size and tag; None when
+    no channel matches, e.g. a TLP sent before the log started. v2: each
+    record is the out TLP and names its input, so it yields the drive's event
+    (port 0/1) and then the out event (port 2); wait is its pkt_wait in cycles
+    (None in v1). Also returns counts: drops per port, matched, ambiguous,
+    unmatched, lost."""
+    if fmt == "v2":
+        return _tlp_events_v2(recs)
     pending = [{"w": collections.deque(), "r": collections.deque()} for _ in CH]
     in_holes = [0, 0]
     out_holes = 0
     st = dict(drops=[0, 0, 0], matched=0, ambiguous=0, unmatched=0, lost=0)
     events = []
-    for i, (addr, length, _gap, typ, pdw, tag, _at, info, _r) in enumerate(recs):
+    for i, (addr, length, _gap, typ, pdw, tag, _at, info, _w) in enumerate(recs):
         kind, port = (info >> 2) & 3, info & 3
         if kind == dec.KIND_DROP:
             st["drops"][port] += 1
@@ -160,7 +177,7 @@ def tlp_events(recs):
         key = (addr, typ & 0xF, pdw, length, tag)
         if port < 2:
             pending[port][q].append(key + (i,))
-            events.append((i, port, c, addr, pdw, port, i))
+            events.append((i, port, c, addr, pdw, port, i, None))
             continue
         src, src_i = None, None
         heads = [ch for ch in (0, 1) if pending[ch][q] and pending[ch][q][0][:5] == key]
@@ -193,12 +210,32 @@ def tlp_events(recs):
                     in_holes[src] -= 1
                 else:
                     st["unmatched"] += 1
-        events.append((i, 2, c, addr, pdw, src, src_i))
+        events.append((i, 2, c, addr, pdw, src, src_i, None))
     return events, st
 
 
-def analyse(path):
-    recs, trailer, _pads, _nbytes, problem = dec.load(path, False)
+def _tlp_events_v2(recs):
+    st = dict(drops=[0, 0, 0], matched=0, ambiguous=0, unmatched=0, lost=0)
+    events = []
+    for i, (addr, _length, _gap, typ, pdw, _tag, _at, info, wait) in enumerate(recs):
+        kind, port = (info >> 2) & 3, info & 3
+        if port > 1:
+            continue
+        if kind == dec.KIND_DROP:
+            st["drops"][port] += 1
+            continue
+        if kind != dec.KIND_TLP:
+            continue
+        c = classify(typ, addr, pdw)
+        events.append((i, port, c, addr, pdw, port, i, wait))
+        events.append((i, 2, c, addr, pdw, port, i, wait))
+        st["matched"] += 1
+    return events, st
+
+
+def analyse(path, design=None):
+    fi = dec.detect(path, design)
+    recs, trailer, _pads, _nbytes, problem = dec.load(path, False, fi["format"])
     n = len(recs)
     dur_us = trailer["duration_cycles"] / dec.CLOCK_HZ * 1e6 if trailer else None
     us_per_rec = dur_us / n if dur_us and n else None
@@ -215,15 +252,16 @@ def analyse(path):
     seen_page = [set() for _ in CH]
     mrd_reg2m = [collections.Counter() for _ in CH]
 
-    holds = []
+    holds = []                         # v1: records between in and out
+    hold_us = []                       # v2: pkt_wait in us (saturated ones left out)
     runs, run_src, run_len = [], None, 0
     page_runs, prun_key, prun_len = [], None, 0
     sd = StackDistance(n)
     dist = {c: collections.Counter() for c in ("data_new", "data_cont", "cqe", "mrd", "other")}
     out_ios = 0                        # completion entries on out: I/Os the out stream covers
 
-    events, ms = tlp_events(recs)
-    for i, port, c, addr, pdw, src, src_i in events:
+    events, ms = tlp_events(recs, fi["format"])
+    for i, port, c, addr, pdw, src, src_i, wait in events:
         if port < 2:                                   # a drive's request
             p = port
             cls[p][c] += 1
@@ -244,7 +282,10 @@ def analyse(path):
                 mrd_reg2m[p][addr >> 21] += 1
             continue
 
-        if src_i is not None:
+        if wait is not None:
+            if wait != dec.WAIT_SAT:
+                hold_us.append(wait / dec.CLOCK_HZ * 1e6)
+        elif src_i is not None:
             holds.append(i - src_i)
         if src is not None and src == run_src:
             run_len += 1
@@ -294,9 +335,15 @@ def analyse(path):
         return [[f"0x{r << 21:x}", round(cnt / tot, 4)] for r, cnt in counter.most_common(k)] if tot else []
 
     weighted_run = sum(r * r for r in runs) / sum(runs) if runs else None
+    if fi["format"] == "v1":
+        h50 = pct(holds, 50) * us_per_rec if holds and us_per_rec else None
+        h99 = pct(holds, 99) * us_per_rec if holds and us_per_rec else None
+    else:
+        h50, h99 = pct(hold_us, 50), pct(hold_us, 99)
     out = dict(
-        path=path, status=problem or ("FULL" if trailer and trailer["stop_reason"] == "region_full"
-                                      else "CUT" if trailer else "NO_TRAILER"),
+        path=path, design_id=fi["design"], log_format=fi["format"], design_source=fi["source"],
+        status=problem or ("FULL" if trailer and trailer["stop_reason"] == "region_full"
+                           else "CUT" if trailer else "NO_TRAILER"),
         records=n, duration_us=dur_us, drops=ms["drops"],
         drives={CH[p]: dict(
             classes=dict(cls[p]), ios=ios[p],
@@ -313,8 +360,7 @@ def analyse(path):
                  run_p50=pct(runs, 50), run_p99=pct(runs, 99), run_max=max(runs) if runs else None,
                  page_run_mean=sum(page_runs) / len(page_runs) if page_runs else None,
                  hold_rec_p50=pct(holds, 50), hold_rec_p99=pct(holds, 99),
-                 hold_us_p50=pct(holds, 50) * us_per_rec if holds and us_per_rec else None,
-                 hold_us_p99=pct(holds, 99) * us_per_rec if holds and us_per_rec else None),
+                 hold_us_p50=h50, hold_us_p99=h99),
         reuse=dict(buckets=bucket_names(), **hist),
         predicted_miss_per_io={str(e): v for e, v in pred.items()})
     return out
@@ -326,7 +372,7 @@ def find_logs(args, pattern):
             for root, dirs, files in os.walk(a):
                 dirs.sort()
                 for f in sorted(files):
-                    if f in ("pips-log.bin", "pips-log.bin.gz"):
+                    if LOG_NAME.match(f):
                         run = os.path.basename(root)
                         if not pattern or fnmatch.fnmatch(run, pattern):
                             yield os.path.join(root, f)
@@ -340,18 +386,22 @@ def fmt(v, spec):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("paths", nargs="+", help="logs, or folders searched for pips-log.bin(.gz)")
+    ap.add_argument("paths", nargs="+",
+                    help="logs, or folders searched for pips-log[-id<XXXX>].bin(.gz)")
     ap.add_argument("--match", help="only run folders whose name matches this glob")
     ap.add_argument("--jsonl", help="append one JSON object per log to this file")
+    ap.add_argument("--design-id", metavar="ID",
+                    help="design ID of the build that wrote every log (0x0a04, or none); "
+                         "default: found per log (pips-log-decode.py --help)")
     a = ap.parse_args()
 
     jl = open(a.jsonl, "a") if a.jsonl else None
-    print(f"{'run':52} {'IOs d0/d1':>11} {'TLP/IO':>11} {'64b%':>5} {'pages d0/d1':>13} "
+    print(f"{'run':52} {'design':>6} {'IOs d0/d1':>11} {'TLP/IO':>11} {'64b%':>5} {'pages d0/d1':>13} "
           f"{'2M':>7} {'reuse%':>9} {'out run':>8} {'hold us p50/p99':>16} "
           f"{'pred miss/IO strict E=64/256':>29}")
     for path in find_logs(a.paths, a.match):
         try:
-            r = analyse(path)
+            r = analyse(path, a.design_id)
         except SystemExit as e:                       # pips-log-decode's fail()
             print(f"{path}: {e}", file=sys.stderr)
             continue
@@ -359,7 +409,8 @@ def main():
         o, pm = r["out"], r["predicted_miss_per_io"]
         w = [x["width64"] for x in (d0, d1) if x["width64"] is not None]
         name = os.path.relpath(os.path.dirname(path)) if os.path.dirname(path) else path
-        print(f"{name[-52:]:52} {d0['ios']:5d}/{d1['ios']:<5d} "
+        did = "none" if r["design_id"] == "none" else r["design_id"][2:]
+        print(f"{name[-52:]:52} {did:>6} {d0['ios']:5d}/{d1['ios']:<5d} "
               f"{fmt(d0['tlp_per_io'], '5.1f')}/{fmt(d1['tlp_per_io'], '<5.1f')} "
               f"{fmt(100 * sum(w) / len(w) if w else None, '5.1f')} "
               f"{d0['data_pages']:6d}/{d1['data_pages']:<6d} {d0['data_2m']:3d}/{d1['data_2m']:<3d} "
