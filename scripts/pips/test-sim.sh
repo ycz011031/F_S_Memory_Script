@@ -264,6 +264,28 @@ run 0 "--format v2 --by kind,load, one log --detail" bash -c "
     has '^      DW    writes  share  burst payload'
 run 2 "--by bogus is refused" python3 "$HERE/pips-traffic.py" "$TL" --by bogus
 
+echo "-- pips-page-seq.py on NIC logs, pips-seq-grab.sh"
+NICLOG="$TL/dualnic-pips-strict-1-id0a04-d8t22-uncapped-f5-both-RUN-server-0/pips-log-id0a04.bin.gz"
+run 0 "page-seq: kind nic from the path, 16 DW writes are completions" \
+    python3 "$HERE/pips-page-seq.py" "$NICLOG" --json "$T/psn.jsonl"
+    has 'kind nic; design 0x0a04'; lacks ' 0 I/Os'
+run 0 "  json: kind nic, one I/O per packet" python3 -c "
+import json; r = json.loads(open('$T/psn.jsonl').readline())
+assert r['kind'] == 'nic' and 1000 < r['ios'] < 1300, (r['kind'], r['ios'])"
+run 0 "  --kind ssd on the same log finds no I/Os" python3 "$HERE/pips-page-seq.py" "$NICLOG" --kind ssd
+    has ' 0 I/Os'
+run 0 "pips-seq-grab.sh nic: a log per setting and point, missing ones listed, packed" \
+    bash "$HERE/pips-seq-grab.sh" nic --logs "$TL" --sets "d8t22 d8t22c1" --points "f5-both f30-both" -j 2 -o "$T/grab"
+    has '2 logs, 2 missing'; has '2 of 2 logs analysed'
+[ -f "$T/grab.tar.gz" ] && [ "$(wc -l < "$T/grab/seq.jsonl")" -eq 2 ] && [ -s "$T/grab/seq-d8t22c1-f5-both.txt" ] &&
+    grep -q '^missing  d8t22 f30-both' "$T/grab/manifest.txt" && ok "  files and manifest" ||
+    bad "  grab output: $(ls "$T/grab" 2>&1)"
+run 1 "  an existing output folder is refused" bash "$HERE/pips-seq-grab.sh" nic --logs "$TL" -o "$T/grab"
+run 0 "pips-seq-grab.sh ssd on a v1 sweep" bash "$HERE/pips-seq-grab.sh" ssd --logs "$TL" \
+    --sweep dualssd-pips-off-1 --sets d8t22 --points 4k-j1-both -o "$T/grab-ssd"
+    has '1 of 1 logs analysed'
+grep -q 'record format v1' "$T/grab-ssd/seq-d8t22-4k-j1-both.txt" && ok "  v1 log read" || bad "  v1: $(head -3 "$T/grab-ssd/seq-d8t22-4k-j1-both.txt")"
+
 echo "-- run-dualssd-experiment.sh / run-dualnic-experiment.sh hooks (pips-lib.sh)"
 # The runners' own functions, run against the model.
 runner_pips() {   # <want status> <records> [fail] [design]

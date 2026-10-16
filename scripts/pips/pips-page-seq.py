@@ -12,6 +12,11 @@ TLP log, and how much regrouping (batching) could shorten it.
     ... --json results.jsonl                      also append everything as one JSON line
 
 LOG is one pips-log.bin(.gz) (pips-log-id<XXXX>.bin.gz from design 0x0a02 on).
+--kind nic reads a NIC log (default: nic when the path has "dualnic" in it):
+writes of up to 16 DW (the NIC's 64-byte completions) count as completions
+instead of 4 DW (NVMe), and a packet's buffer visit ends at its device's next
+completion, since a 4000-byte packet never fills its 4 KiB page. "drive"
+below then means NIC, and an I/O is a received packet.
 Out TLPs are matched to their drive as in pips-addr-pattern.py; in a v2 log
 (design 0x0a04 on) every record names its drive, and the in0/in1 streams are
 each drive's TLPs in the order they left. --design-id overrides the design ID
@@ -82,9 +87,10 @@ def fmt(v, spec):
     return "-" if v is None else format(v, spec)
 
 
-def annotate(events):
+def annotate(events, kind="ssd"):
     """Per port: the TLP sequence with run numbers, visit state and open pages.
-    Rows: (rec, port, drive, cls, addr, pdw, run, visit, open_d0, open_d1)."""
+    Rows: (rec, port, drive, cls, addr, pdw, run, visit, open_d0, open_d1).
+    kind nic: a completion closes its device's open pages."""
     rows = []
     state = {}
     for port in range(3):
@@ -97,6 +103,10 @@ def annotate(events):
             st["run"] += 1
             st["prev"] = key
         visit = ""
+        if kind == "nic" and c == "cqe" and src is not None:
+            st["open"][src].clear()
+            for k in [k for k in st["next_off"] if k[0] == src]:
+                del st["next_off"][k]
         if c == "data" and src is not None:
             off, nbytes = addr & 0xFFF, 4 * pdw
             k = (src, page)
@@ -282,6 +292,8 @@ def main():
     ap.add_argument("--json", help="append the results to this file as one JSON line")
     ap.add_argument("--strict", action="store_true",
                     help="IOTLB: a page's new visit always misses (strict mode invalidates at unmap)")
+    ap.add_argument("--kind", choices=("ssd", "nic"),
+                    help="device kind (default: nic if the path contains 'dualnic', else ssd)")
     ap.add_argument("--design-id", metavar="ID",
                     help="design ID of the build that wrote the log (0x0a04, or none); default: "
                          "found from its name or folder (pips-log-decode.py --help)")
@@ -292,15 +304,16 @@ def main():
             s, w = g.lower().split("x")
             geoms.append((int(s), int(w)))
 
+    kind = a.kind or ("nic" if "dualnic" in os.path.abspath(a.log) else "ssd")
     fi = dec.detect(a.log, a.design_id)
     recs, trailer, _pads, _nbytes, problem = dec.load(a.log, False, fi["format"])
     dur_us = trailer["duration_cycles"] / dec.CLOCK_HZ * 1e6 if trailer else None
-    events, ms = ap_mod.tlp_events(recs, fi["format"])
-    rows = annotate(events)
+    events, ms = ap_mod.tlp_events(recs, fi["format"], 16 if kind == "nic" else 4)
+    rows = annotate(events, kind)
     print(f"log {a.log}: {len(recs)} records, {fmt(dur_us, '.0f')} us"
           + (f" ({problem})" if problem else "")
           + f"; out matched {ms['matched']}, unmatched {ms['unmatched']}, ambiguous {ms['ambiguous']}")
-    print(f"  design {fi['design']}, record format {fi['format']} (design ID from: {fi['source']})"
+    print(f"  kind {kind}; design {fi['design']}, record format {fi['format']} (design ID from: {fi['source']})"
           + ("; in0/in1 = each drive's TLPs in the order they left" if fi["format"] == "v2" else ""))
 
     if a.csv:
@@ -343,7 +356,7 @@ def main():
             print(f"{r['w']:4d} " + "".join(f"{fmt(r['miss'][(pol, g)], '14.3f')}" for g in geoms for pol in POLICIES))
 
     if a.json:
-        rec = dict(path=a.log, design_id=fi["design"], log_format=fi["format"],
+        rec = dict(path=a.log, kind=kind, design_id=fi["design"], log_format=fi["format"],
                    strict=a.strict, matched=ms["matched"], unmatched=ms["unmatched"],
                    interleave={k: dict(v, open={str(d): o for d, o in v["open"].items()}) for k, v in il.items()},
                    ios=wi["ios"], us_per_tlp=wi["us_per_tlp"],

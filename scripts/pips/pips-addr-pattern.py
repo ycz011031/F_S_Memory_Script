@@ -77,14 +77,16 @@ CH = ("in0", "in1")
 LOG_NAME = re.compile(r"^pips-log(?:-id[0-9a-fA-F]{4})?\.bin(?:\.gz)?$")
 
 
-def classify(typ, addr, pdw):
+def classify(typ, addr, pdw, ring_dw=4):
+    """ring_dw: the largest write that counts as a completion (cqe): 4 DW for an
+    NVMe completion entry, 16 DW for a NIC's 64-byte completion/descriptor write-back."""
     t = typ & 0xF
     if t == 0:
         return "mrd"
     if t == 1:
         if MSI_LO <= addr < MSI_HI:
             return "msi"
-        return "cqe" if pdw <= 4 else "data"
+        return "cqe" if pdw <= ring_dw else "data"
     return "other"
 
 
@@ -144,7 +146,7 @@ def pct(vals, p):
     return s[min(len(s) - 1, int(p / 100 * len(s)))]
 
 
-def tlp_events(recs, fmt="v1"):
+def tlp_events(recs, fmt="v1", ring_dw=4):
     """Every TLP in log order as (index, port, class, addr, payload_dw, drive,
     drive's record index, wait). For in0/in1 the drive is the port. For out,
     v1: the channel whose oldest pending TLP of the same class (memory reads
@@ -153,9 +155,9 @@ def tlp_events(recs, fmt="v1"):
     record is the out TLP and names its input, so it yields the drive's event
     (port 0/1) and then the out event (port 2); wait is its pkt_wait in cycles
     (None in v1). Also returns counts: drops per port, matched, ambiguous,
-    unmatched, lost."""
+    unmatched, lost. ring_dw: see classify()."""
     if fmt == "v2":
-        return _tlp_events_v2(recs)
+        return _tlp_events_v2(recs, ring_dw)
     pending = [{"w": collections.deque(), "r": collections.deque()} for _ in CH]
     in_holes = [0, 0]
     out_holes = 0
@@ -172,7 +174,7 @@ def tlp_events(recs, fmt="v1"):
             continue
         if kind != dec.KIND_TLP or port > 2:
             continue
-        c = classify(typ, addr, pdw)
+        c = classify(typ, addr, pdw, ring_dw)
         q = "r" if c == "mrd" else "w"
         key = (addr, typ & 0xF, pdw, length, tag)
         if port < 2:
@@ -214,7 +216,7 @@ def tlp_events(recs, fmt="v1"):
     return events, st
 
 
-def _tlp_events_v2(recs):
+def _tlp_events_v2(recs, ring_dw=4):
     st = dict(drops=[0, 0, 0], matched=0, ambiguous=0, unmatched=0, lost=0)
     events = []
     for i, (addr, _length, _gap, typ, pdw, _tag, _at, info, wait) in enumerate(recs):
@@ -226,7 +228,7 @@ def _tlp_events_v2(recs):
             continue
         if kind != dec.KIND_TLP:
             continue
-        c = classify(typ, addr, pdw)
+        c = classify(typ, addr, pdw, ring_dw)
         events.append((i, port, c, addr, pdw, port, i, wait))
         events.append((i, 2, c, addr, pdw, port, i, wait))
         st["matched"] += 1

@@ -8,7 +8,9 @@ together, [LOCAL-SETUP.md](LOCAL-SETUP.md) for first-time provisioning.
 - **Branch:** `icx-dualnic` on `ycz011031/F_S_Memory_Script`
 - **Upstream:** `host-architecture/Fast-and-Safe-IO-Memory-Protection` (remote `upstream`)
 - `master` is a pristine mirror. `git diff master..icx-dualnic` is the whole delta.
-- **Last updated:** 2026-10-15: PIPS switch design `0x0A04` (drain depth cap,
+- **Last updated:** 2026-10-16: first `0x0A04` sweeps, strict, drives and
+  NICs (§8, "0x0A04 results"); the C/D "extra inbound writes" withdrawn as a
+  `pcm-iio` undersampling artifact (§7). 2026-10-15: PIPS switch design `0x0A04` (drain depth cap,
   new TLP log format), the PIPS sweeps crossed with the cap, a dual-NIC PIPS
   sweep, and the design ID on every artifact (§8). 2026-10-11: dual-SSD sweeps
   on switch design D (§7, "Fifth result"). icx last updated 2026-10-04: the
@@ -1232,6 +1234,12 @@ share the same link split from 16k up). For C it doesn't fully agree:
    Repeat first (the four points ran back to back, 14:15–14:18). **Repeated
    on design D (Fifth result, item 4):** the extra writes come back, larger,
    on another day; the 64k slowness does not.
+   **Withdrawn 2026-10-16 (§8, "0x0A04 results"):** the extra writes and
+   ~2× misses are a `pcm-iio` artifact, not traffic. They appear only in runs
+   where `pcm-iio` logged 1–5 one-second samples instead of 17, and every
+   `pcm-iio` rate in such a run reads ~2× high. On 0x0A04 the switch's own
+   log shows 1.01× fio's data at those points. C's records predate
+   `pcie_samples`, but its extra writes sit at the same points.
 5. Strict sweeps differ by up to 26% below the link limit (4k, 1–2 instances;
    B fastest, C slowest). Not attributed to the switch until repeated: one run,
    shared host.
@@ -1299,6 +1307,9 @@ before `a268b81f7` kept such runs with the IOMMU off; `off-2` is the rerun.
    - Extra inbound writes at 4k: 22.3 / 27.9 / 23.8 Gbps with both drives at
      4 / 8 / 16 (C: 15.6 / 20.6), and 7.6 / 10.5 / 16.9 / 12.7 Gbps with
      drive 0 alone at 4 / 8 / 16 / 32. IOMMU off: 0.9–1.4 Gbps.
+     **Not real (2026-10-16):** these are exactly D's 14 strict 4k runs with
+     1–5 `pcm-iio` samples (inbound writes 1.38–2.43× fio); its 7 runs with
+     17 samples read 1.02×. Same for the misses below (§8, "0x0A04 results").
    - Misses per 4 KiB at 4 and 8 instances: 2.65 and 3.60 (C: 2.80 and 3.17).
    - C's slow 64k with drive 0 alone (97–99K) does not recur: 103–105K.
    - **LINK BOUND misfires here.** The summary flags the 4k strict uneven rows
@@ -1373,6 +1384,14 @@ mode or the load. Its strict 4k anomaly is C's, so the address-width test
   LINK BOUND when PCIe write exceeds 85% of the narrowest shared link. On
   designs C and D in strict mode at 4k, the extra inbound writes trip it while
   fio moves only ~25 Gbps (Fifth result, item 4): check fio's GB/s there.
+- **`pcm-iio` sometimes logs only 1–5 samples, and then every rate it reports
+  is ~2× high** (inbound writes, reads, IOTLB hits and misses alike). Seen at
+  heavy strict 4k points on design D (10-10) and 0x0A04 (10-16), always the
+  same points; 0x0A02 (10-13) logged 15–17 everywhere. Check `pcie_samples`
+  in the JSONL (`mean.pcie_samples`) before using any `pcm-iio` value; treat
+  < 10 as missing. Runs with 0 samples are dropped by the runner. Cause not
+  yet known: read `pcm-iio.out` and `pcie.csv` in such a run's
+  `utils/logs/<name>-RUN-<j>/` folder.
 - **1 MiB at 32 instances puts 1 GiB in flight per drive** (1024 reads). On
   switch designs that starve drive 0 at 1m, its reads waited ~1 s at 4
   instances, so expect several seconds at 32, against a 30 s NVMe timeout.
@@ -1391,7 +1410,10 @@ mode or the load. Its strict 4k anomaly is C's, so the address-width test
 
 0. **After the cross sweeps (2026-10-06 and 10-10), in this order** (commands
    in the report's "Next runs"):
-   - **Address pattern, on design D.** D repeats C's strict 4k anomaly
+   - **Address pattern, on design D.** (The extra-writes rationale below is
+     withdrawn, see the Fourth result, item 4; the `forcedac` test no longer
+     has a target. The IOVA tracing is partly covered by
+     `pips-addr-pattern.py` on the PIPS logs, §8.) D repeats C's strict 4k anomaly
      (Fifth result, item 4), so C's planned repeat can run on D: strict at
      4k, 4/8 instances, 3 runs, for the run-to-run spread. Record the IOVAs
      the drives get with the `iommu:map`/`iommu:unmap` tracepoints (about
@@ -1423,7 +1445,8 @@ mode or the load. Its strict 4k anomaly is C's, so the address-width test
 3. **Stay at 4k (or 8k) for IOMMU comparisons.** There the data is clean:
    fio and `PCIe_wr` agree, there is no buffer traffic from the 990 EVO Plus,
    and strict runs below the link.
-4. **The PIPS sweep again on design `0x0A04`, cap off and on** (§8, "Next").
+4. **The PIPS sweep on design `0x0A04`:** strict done 2026-10-16; IOMMU off
+   still to run (§8, "Next").
 
 ---
 
@@ -1444,6 +1467,18 @@ points: [scripts/pips/README.md](scripts/pips/README.md).
 - **NICs:** behind PIPS as of 2026-10-15, one per downstream port. Run the NIC
   experiments on that server, as before on icx (§2); `run-dualnic-experiment.sh`
   finds the NICs below the switch by their PCI path.
+- **Design `0x0A04`, 2026-10-15/16, strict only, cap off and on:** drives
+  `dualssd-pips-strict-1-id0a04-{d1t0,d4t22,d8t22,d16t64}[c1]` (700 of 720
+  runs; local copies in `dualssd/1016/`, with `traffic-ssd.txt`) and NICs
+  `dualnic-pips-strict-1-id0a04-*` on icx (104 runs; `dualnic/1016/`, with
+  `traffic-nic.txt`). Results below, "0x0A04 results".
+- **Reports (artifacts):** "PIPS Batcher Sweeps"
+  (https://claude.ai/artifact/XsrLugEhsaMzY6vwARSLGU) is design 0x0A02 only
+  (drives, IOMMU off and strict, page-order Figures 5–6); "PIPS 0x0A04 Sweeps"
+  (https://claude.ai/artifact/MbNxzaJ5KgmuM59PPC4NcA) is 0x0A04, drives and
+  NICs, with what pcm logged on icx. Both generators are in the git-ignored
+  `dualssd/report-gen/` (README there: `py -3 build.py` for 0x0A02,
+  `py -3 page4.py` for 0x0A04, from the local copies).
 
 ### Switch designs (design ID)
 
@@ -1510,16 +1545,73 @@ line per log as it goes, the verdict per kind and design at the end
 python3 scripts/pips/pips-traffic.py --csv ~/traffic-sizes.csv --jsonl ~/traffic.jsonl | tee ~/traffic.txt
 ```
 
+### 0x0A04 results (2026-10-15/16, strict)
+
+The cap and the v2 log work on hardware: all 804 logs FULL, no drops,
+`pkt_wait` plausible. Details and figures in the report (above).
+
+1. **Drives, the cap moves a full link's split, not its total.** 4k/8k: median
+   change per setting within ±0.6%. Link full: drive 0's share 47% → 53–56%
+   at 16k (d1t0, d4t22, d8t22; d16t64c1 barely moves it), 49% → 46–48% at
+   1m; at 64k drive 0 +8–11%, drive 1 −8–11%, total +3–4% at every point
+   (drive 1's 64k reads cost ~2× link bytes).
+2. **Drives, cap off repeats 0x0A02** within 2.4% (median) from 2 per drive,
+   equal at 64k/1m. **Except drive 0 at 1 instance per drive:** 16–31% slower
+   at 4–16k in all 8 settings (8k: 145–149K vs 195–206K); drive 1 unchanged.
+   Build or boot, not batcher; untested which.
+3. **Time in the batcher (v2 `pkt_wait`, out port, mean):** strict 4k 1+1:
+   0.06 µs d1t0, 0.14 d4t22, 0.16 d8t22, 0.34 d16t64 (p99 0.6–0.9); the cap
+   adds nothing there. Link full: 0.9–1.6 µs in every setting; the cap raises
+   the p99 (64k: 3.0–3.2 vs 2.4 µs). 0x0A02's hold estimate for d16t64
+   (0.66 µs) was ~2× high.
+4. **`pcm-iio` undersampling (gotcha above).** 84 of 124 strict 4k runs have
+   1–3 samples (same 12 points in every setting, from 4+4 up), and 20 more
+   had none and were dropped (8+32 ×8, 32+32 ×7, 32+8 ×5). In those runs
+   `pcm-iio` writes read 2.02× fio (median) while the switch's output reads
+   1.01×. This withdraws the C/D extra-writes result (§7).
+5. **NICs (icx):** one NIC 85–97 Gbps in every setting but d1t0c1, two NICs
+   105–107 at 5–10 flows; IOTLB misses per Gbps within −1.1/+2.4% of d1t0.
+   **d1t0c1 holds one NIC to 75–78 Gbps (−18 to −21%)** at every flow count
+   (one TLP per drain); two NICs lose ≤1.5%. d16t64/c1: −5 to −11% for one
+   NIC at 30 flows (ran last; drift not ruled out). Two NICs at 30 flows:
+   48 Gbps in every setting, the §4.1 cliff. PIPS splits 5 flows evenly
+   (53.5 + 53.5), where the direct path gave 41 + 64 (§4.1, item E).
+6. **`traffic-ssd.txt` includes stale logs**: 16 `datapath-4k-j1` checks, the
+   21 TLP logs of runs dropped for missing `pcm-iio` rows (1 on 0x0A02, 20
+   on 0x0A04), and one 10-11 bring-up log (`pips-fio-20261011-225629`,
+   design "none"). Its verdicts don't change, but per-sweep counts are 91
+   logs, not 90. Move or delete the bring-up log on bigserver.
+7. **What pcm logged on icx** (NIC records, means over 20 s): `pcm-iio`
+   inbound PCIe writes/reads, IOTLB lookups and misses, context-cache hits,
+   page-walk-cache hits at 4K/2M/1G/512G, IOMMU memory accesses; `pcm-memory`
+   DRAM read/write per node. No sample count is kept, but writes are
+   0.98–1.10× the switch's output and lookups 0.98–1.09 per switch TLP in all
+   96 runs: no undersampling on icx. 9.2–9.4 lookups and 1.09–1.21 misses per
+   4 KiB, miss rate 11.9–12.8%, 4.2–5.7 memory accesses per miss, as on 09-29
+   (§4.1). Settings differ by ≤ 3% (misses/4K) and ≤ 7% (accesses/miss) per
+   point; d1t0c1 is the high end. Node-0 DRAM writes (4.4–9.4 GB/s one NIC)
+   stay below the ~12 GB/s DMA rate (likely DDIO).
+
 ### Next
 
-1. **First run on `0x0A04`:** `pips-bringup.sh` (hwtest flips the cap and
-   restores it), then `pips-fio-log.sh --cfg "depth=8 time=0x16 cap=1"`, and
-   check the decode: format v2, `in0 + in1 = out`, `pkt_wait` plausible (≥ 4
-   cycles; µs-scale with batching). Neither the cap nor the v2 log has run on
-   hardware yet: only against the model (`make -C scripts/pips check`).
-2. **Drives:** `dualssd_pips_sweep.sh` strict and off on `0x0A04`. The cap-off
-   half repeats the 10-13 settings on the new build, so compare it with
-   `dualssd/1013/` first: if they differ, the build changed more than the cap.
-3. **NICs:** `dualnic_pips_sweep.sh --single`, strict and off. Check first
-   that both NICs are behind the same DMAR unit (§5 item 1) and re-run
-   `discover-pcie-topology.sh` for `PCIE_PATTERN`.
+0. **Page order on the 0x0A04 logs (for the report's Figures 5–6 equivalents):**
+   on bigserver `bash scripts/pips/pips-seq-grab.sh ssd`, on icx
+   `bash scripts/pips/pips-seq-grab.sh nic`; copy `~/seq-dualssd-pips-strict-1-id0a04.tar.gz`
+   to `dualssd/1016/` and `~/seq-dualnic-pips-strict-1-id0a04.tar.gz` to
+   `dualnic/1016/`. `pips-page-seq.py --kind nic` (auto for `dualnic` paths)
+   makes the NIC logs readable: 16 DW completions, packet visits end at them.
+   This also covers item 5 below (16k, 64k, 1m points are in the default set).
+1. **IOMMU off on `0x0A04`**, drives and NICs, cap off and on. Completes the
+   comparison with 0x0A02, and tells whether drive 0's single-instance drop
+   needs the IOMMU. Check first that both NICs are behind the same DMAR unit
+   (§5 item 1).
+2. **Build or boot for drive 0:** drive 0 alone and 1+1 at 4–16k, 1 instance,
+   on the 0x0A04 and 0x0A02 bitstreams within one boot, then after a reboot.
+3. **`pcm-iio` samples:** read `pcm-iio.out` and `pcie.csv` (every stack,
+   every second) in a few-sample run folder, e.g.
+   `utils/logs/dualssd-pips-strict-1-id0a04-d1t0/4k-j8-both-RUN-0/`; make
+   the summaries flag runs with `pcie_samples` < 10.
+4. **One input through d1t0c1:** one drive alone at 1m, d1t0 vs d1t0c1, to
+   see whether the per-drain limit that holds one NIC to 78 Gbps binds a drive.
+5. **How the cap reorders a full link:** `pips-page-seq.py` on cap-off and
+   cap-on logs at 16k, 64k and 1m (8+8).

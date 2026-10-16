@@ -262,12 +262,34 @@ simulated IOTLB misses per I/O for those geometries (sets x ways; the real
 one is not published). `--show N --from REC --port out` prints the sequence
 run by run; `--csv` writes every TLP. Use a d1t0 log for the unbatched order.
 In a v2 log `in0`/`in1` are each drive's TLPs in the order they left, which is
-the order it sent them within each batching FIFO.
+the order it sent them within each batching FIFO. `--kind nic` (the default
+when the path contains `dualnic`) reads a NIC log: writes of up to 16 DW (the
+NIC's 64-byte completions) are the I/Os instead of 4 DW NVMe completion
+entries, and a packet's page visit ends at its NIC's next completion, since a
+4,032-byte packet (7 × 128 DW + 112 DW) never fills its 4 KiB page. Tested on
+synthetic logs (`make check`).
 
 ```bash
 python3 scripts/pips/pips-page-seq.py \
     utils/logs/dualssd-pips-strict-1-d1t0/4k-j8-both-RUN-0/pips-log.bin.gz \
     --iotlb 1x64,16x4,64x1 --strict --show 200 --from 100000
+```
+
+**Page order for a whole sweep.** `pips-seq-grab.sh ssd|nic` runs
+`pips-page-seq.py --json --show 600 --from 100000 --iotlb 1x64,16x4,64x1`
+(plus `--strict` on strict sweeps) on one log per point and batcher setting,
+4 at a time, and packs the reports, one JSON line per log and a manifest into
+`~/seq-<sweep>.tar.gz`: what the report's page-sequence and batching what-if
+figures are built from. Defaults are the 0x0A04 sweeps' eight settings and 7
+drive points (4k at j8, j16, j32; 16k, 64k, 1m at j8; 1m at j16) or 5 NIC
+points (both NICs at f5, f15, f30; NIC0 alone at f5, f30); `--sweep`,
+`--sets`, `--points` choose others, e.g. the 0x0A02 sweeps. A 4k point whose
+run was dropped for missing `pcm-iio` rows still has its log and is used.
+
+```bash
+bash scripts/pips/pips-seq-grab.sh ssd          # bigserver, ~/seq-dualssd-pips-strict-1-id0a04.tar.gz
+bash scripts/pips/pips-seq-grab.sh nic          # icx, ~/seq-dualnic-pips-strict-1-id0a04.tar.gz
+bash scripts/pips/pips-seq-grab.sh ssd --sweep dualssd-pips-strict-1 --sets "d1t0 d16t64" --points 4k-j8-both
 ```
 
 **Write sizes: can a completion entry be told by its size?**
