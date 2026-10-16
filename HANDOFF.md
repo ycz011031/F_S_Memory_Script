@@ -1501,6 +1501,15 @@ python3 scripts/pips/pips-mwr-sizes.py utils/logs/dualssd-pips-strict-2-id0a04-d
     utils/logs/dualssd-pips-strict-2-id0a04-d8t22c1 --by cfg,bs
 ```
 
+Can the switch tell payload from control writes (completion entries,
+descriptor write-backs) by size? On every log on the host, drives or NICs, a
+line per log as it goes, the verdict per kind and design at the end
+([scripts/pips/README.md](scripts/pips/README.md), "Payload or control"):
+
+```bash
+python3 scripts/pips/pips-traffic.py --csv ~/traffic-sizes.csv --jsonl ~/traffic.jsonl | tee ~/traffic.txt
+```
+
 ### Next
 
 1. **First run on `0x0A04`:** `pips-bringup.sh` (hwtest flips the cap and

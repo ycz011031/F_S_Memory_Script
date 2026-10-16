@@ -178,6 +178,92 @@ grep -q ',0x0a04,in0,' "$T/ms.csv" && ok "  csv design column" || bad "  csv: $(
 run 0 "pips-mwr-sizes.py --show out, v2" python3 "$HERE/pips-mwr-sizes.py" "$NEW/pips-log-id0a04.bin.gz" --show 3 --port out
     has 'design 0x0a04, format v2'
 
+echo "-- pips-traffic.py: payload vs ring writes on every log, synthetic NVMe and NIC traffic"
+# Logs as two NVMe drives or two NICs write them (the model's records are not
+# device-like): ssd = 16 x 64 DW of data, a 4 DW completion entry, an MSI per
+# I/O; nic = a 4000 B packet as 15 x 64 DW + 40 DW at headroom 64, a 16 DW
+# entry, an MSI and a descriptor read every 8 packets; nic-il = two packets'
+# data interleaved TLP by TLP, then both entries; ssd-pair = two I/Os' data,
+# then both entries back to back. The two devices' TLPs interleave in batches.
+cat > "$T/synth.py" <<'EOF'
+import gzip, random, struct, sys
+kind, out, fmt = sys.argv[1], sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else "v2"
+rng, MSI = random.Random(1), 0xFEE00000
+def device(src):
+    base = 0x100000000 * (src + 1)
+    cq = [base + 0x80000000 + 0x1000 * q for q in range(4)]
+    cqi, n = [0] * 4, 0
+    while True:
+        q, buf = rng.randrange(4), base + 0x1000 * rng.randrange(256)
+        buf2 = base + 0x1000 * rng.randrange(256, 512)
+        if kind in ("ssd", "ssd-pair"):
+            bufs = (buf, buf2) if kind == "ssd-pair" else (buf,)
+            yield (cq[q] - 0x10000 + 64 * cqi[q] % 0x1000, 0, 0)
+            for b in bufs:
+                for i in range(16):
+                    yield (b + 256 * i, 64, 1)
+            for b in bufs:
+                yield (cq[q] + 16 * cqi[q], 4, 1); cqi[q] = (cqi[q] + 1) % 256
+            yield (MSI + 0x1000 * q, 1, 1)
+        else:
+            bufs = (buf, buf2) if kind == "nic-il" else (buf,)
+            if n % 8 == 0:
+                yield (cq[q] - 0x10000 + 64 * (n // 8 % 64), 0, 0)
+            for i in range(16):
+                for b in bufs:
+                    yield (b + 64 + 256 * i, 64 if i < 15 else 40, 1)
+            for b in bufs:
+                yield (cq[q] + 64 * cqi[q], 16, 1); cqi[q] = (cqi[q] + 1) % 64
+            if n % 8 == 7:
+                yield (MSI + 0x1000 * q, 1, 1)
+        n += 1
+gens, recs = [device(0), device(1)], []
+while len(recs) < 20000:
+    s = rng.randrange(2)
+    for _ in range(rng.randrange(1, 5)):
+        addr, pdw, typ = next(gens[s])
+        beats = -(-(16 + 4 * pdw) // 64) if typ == 1 else 1
+        if fmt == "v2":
+            recs.append(struct.pack("<QBBBBHBB", addr, beats, 2, typ, pdw, 4 + rng.randrange(200), 0x80 | s, 0))
+        else:
+            recs.append(struct.pack("<QBBBBBBBB", addr, beats, 2, typ, pdw, 0, 0, 0x80 | s, 0))
+            recs.append(struct.pack("<QBBBBBBBB", addr, beats, 2, typ, pdw, 0, 0, 0x82, 0))
+recs = recs[:20000]
+with gzip.open(out, "wb") as f:
+    f.write(b"".join(recs) + struct.pack("<IIIBBBB", len(recs), 0, 5 * len(recs), 2, 0, 0x88, 0))
+EOF
+TL="$T/tlogs"
+mk() {   # <kind> <run folder> <log name> [v1]
+    mkdir -p "$TL/$2" && python3 "$T/synth.py" "$1" "$TL/$2/$3" "${4:-v2}"
+}
+mk ssd dualssd-pips-strict-2-id0a04-d8t22/4k-j8-both-RUN-0 pips-log-id0a04.bin.gz
+mk ssd-pair dualssd-pips-strict-2-id0a04-d8t22c1/4k-j8-both-RUN-0 pips-log-id0a04.bin.gz
+mk nic dualnic-pips-strict-1-id0a04-d8t22-uncapped-f5-both-RUN-server-0 pips-log-id0a04.bin.gz
+mk nic-il dualnic-pips-strict-1-id0a04-d8t22c1-uncapped-f5-both-RUN-server-0 pips-log-id0a04.bin.gz
+mk ssd dualssd-pips-off-1-d8t22/4k-j1-both-RUN-0 pips-log.bin.gz v1
+printf 'design_id=0x0a02\n' > "$TL/dualssd-pips-off-1-d8t22/4k-j1-both-RUN-0/pips-cfg.txt"
+mkdir -p "$TL/dualssd-pips-off-1-d8t22/4k-j2-both-RUN-0"
+printf 'cut short' | gzip | head -c 12 > "$TL/dualssd-pips-off-1-d8t22/4k-j2-both-RUN-0/pips-log.bin.gz"
+run 0 "every log, a line as each is done, a cut .gz skipped" python3 "$HERE/pips-traffic.py" "$TL" -j 2 \
+    --csv "$T/tr.csv" --jsonl "$T/tr.jsonl"
+    has '^pips-traffic: 6 log(s) under'; has '^\[[1-6]/6\] .*SKIPPED: EOFError'
+    has '^\[[1-6]/6\] .*4k-j1-both-RUN-0/pips-log.bin.gz: v1 0x0a02 FULL'
+    has 'pips-traffic: 5 log(s) analysed, 1 skipped'
+    has '^  ssd 0x0a04 in0: ring if <= 4 DW: 100.000% .*ring sizes 4, payload 64 -> RELIABLE'
+    has '^  ssd 0x0a02 in1: ring if <= 4 DW: 100.000% .* -> RELIABLE'
+    has '^  nic 0x0a04 in1: ring if <= 16 DW: 100.000% .*ring sizes 16, payload 64:94%,40:6% -> RELIABLE'
+    has '100.0%  64x16 -> 1$'; has '64x15 40 -> 1$'; has '64x30 40x2 -> 2$'; has '64x32 -> 2$'
+    has '== kind nic  design 0x0a04  iommu strict  cfg d8t22c1  (format v2)'; has 'time in batcher, us mean/p99: payload'
+[ "$(wc -l < "$T/tr.jsonl")" -eq 5 ] && head -1 "$T/tr.csv" | grep -q '^path,kind,sweep,iommu,cfg,design_id,log_format' &&
+    grep -q ',nic,dualnic-pips-strict-1-id0a04-d8t22c1,strict,d8t22c1,0x0a04,v2,uncapped f5,both,FULL,in0,16,' "$T/tr.csv" &&
+    ok "  csv and jsonl, labelled" || bad "  csv/jsonl: $(head -3 "$T/tr.csv")"
+run 0 "--format v2 --by kind,load, one log --detail" bash -c "
+    python3 '$HERE/pips-traffic.py' '$TL' --format v2 --by kind,load -j 1 &&
+    python3 '$HERE/pips-traffic.py' '$TL/dualssd-pips-strict-2-id0a04-d8t22/4k-j8-both-RUN-0/pips-log-id0a04.bin.gz' --detail"
+    has '^pips-traffic: 4 log(s) under'; has '== kind nic  load uncapped f5'; has '== kind ssd  load 4k j8'
+    has '^      DW    writes  share  burst payload'
+run 2 "--by bogus is refused" python3 "$HERE/pips-traffic.py" "$TL" --by bogus
+
 echo "-- run-dualssd-experiment.sh / run-dualnic-experiment.sh hooks (pips-lib.sh)"
 # The runners' own functions, run against the model.
 runner_pips() {   # <want status> <records> [fail] [design]

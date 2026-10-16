@@ -292,6 +292,32 @@ python3 scripts/pips/pips-mwr-sizes.py utils/logs/dualssd-pips-strict-2-id0a04-d
     utils/logs/dualssd-pips-strict-2-id0a04-d8t22c1 --by cfg,bs     # cap off against on
 ```
 
+**Payload or control, by size? On every log.** `pips-traffic.py [PATH ...]`
+(default: everything under `utils/logs`) reads every sweep and fio-log trace,
+both formats, both drives and NICs, and prints a line as each log is done. Per
+device it classes each write by address behaviour: `ring` (a page written as a
+ring of fixed-size entries, a few per visit, each visit continuing where the
+last ended: completion entries, descriptor write-backs), `payload` (pages
+filled in multi-write bursts), `msi`, or `unclear`. It then finds the size
+threshold that best splits ring from payload and how often size and address
+agree (RELIABLE at ≥ 99.9%). It also reports the length pattern: the payload
+sent before each group of ring writes, run-length coded (`64x16 -> 1` = 4 KiB
+then one NVMe entry, `64x15 40 -> 1` = a 4000 B packet then one entry), bytes,
+interrupts and reads per ring write, and on v2 logs the time each class spent
+in the batcher. End tables are summed `--by kind,design,iommu,cfg` (also
+`load`, `mode`, `sweep`, `run`, `all`), then a verdict per kind and design.
+`--csv`/`--jsonl` keep every log's numbers; `-j N` decodes N logs at a time
+(default 4). Doorbells are host-to-device writes and are never in the log, so
+"control" here means what the devices write to signal the host. Unlike
+`pips-mwr-sizes.py` it assumes no sizes, so it works for NICs too. Tested on
+synthetic NVMe and NIC traffic only so far.
+
+```bash
+python3 scripts/pips/pips-traffic.py --csv ~/traffic-sizes.csv --jsonl ~/traffic.jsonl | tee ~/traffic.txt
+python3 scripts/pips/pips-traffic.py --format v2 --by kind,design,iommu,cfg,load    # new logs, per load
+python3 scripts/pips/pips-traffic.py utils/logs/dualnic-pips-strict-1-id0a04-d8t22c1-uncapped-f5-both-RUN-server-0 --detail
+```
+
 ## Sweeps with the log: one sweep per batcher setting, cap off and on
 
 ```bash
@@ -362,7 +388,9 @@ the record format it logs. [test-sim.sh](test-sim.sh) then drives every
 command, including region-full, stale-tail and DMA-error recovery, on the
 current build and the older ones; runs the decoder and the three analysis
 tools on v1 and v2 logs, with the design ID found from the file name, a
-`pips-cfg.txt`, or nowhere; the runners' PIPS hooks (`pips-lib.sh`); both
+`pips-cfg.txt`, or nowhere; `pips-traffic.py` on synthetic NVMe and NIC
+traffic (entries posted singly and back to back, packets' data interleaved,
+a v1 log, a cut `.gz`); the runners' PIPS hooks (`pips-lib.sh`); both
 results scripts; `pips-fio-log.sh` with a stand-in fio; and both PIPS sweeps
 with stand-in sweeps under them. The model does not cover timing, AXI timeouts
 or the PIO's own limits.

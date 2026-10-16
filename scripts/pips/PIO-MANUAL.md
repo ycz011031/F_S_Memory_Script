@@ -764,6 +764,7 @@ widen the DMA back to 2 GB and keep the constants.
 | `pips-fio-log.sh` | one read-only fio run with a recording (`log-id<XXXX>.bin`), before/after readouts |
 | `dualssd_pips_sweep.sh`, `dualnic_pips_sweep.sh` | the dual-SSD cross sweep with uneven co-runs / the dual-NIC flow sweep, once per batcher setting with the drain cap off and on, a recording per run checked FULL/CUT; names carry the design ID |
 | `pips-log-decode.py` | dump → status, per-port summary, CSV, JSON, `.rpt`; reads `.gz`; v1 or v2 by design ID |
+| `pips-traffic.py` | every log under `utils/logs` → payload vs control (ring) writes per device, whether size alone separates them, payload-length motifs, time in the batcher per class |
 | `pips-xsct.tcl` | the same over JTAG |
 | `make check` | all of it against a software model of BAR0 (`pips_sim.c`), no hardware |
 
