@@ -8,7 +8,11 @@ together, [LOCAL-SETUP.md](LOCAL-SETUP.md) for first-time provisioning.
 - **Branch:** `icx-dualnic` on `ycz011031/F_S_Memory_Script`
 - **Upstream:** `host-architecture/Fast-and-Safe-IO-Memory-Protection` (remote `upstream`)
 - `master` is a pristine mirror. `git diff master..icx-dualnic` is the whole delta.
-- **Last updated:** 2026-10-16: first `0x0A04` sweeps, strict, drives and
+- **Last updated:** 2026-10-16: `pips-page-seq.py` rebuilds the arrival order
+  and models the batcher on it; regrab pending (§8, "Next" item 0). Page order
+  on the `0x0A04` logs, drives and
+  NICs (§8, "0x0A04 results" item 8; the cap at depth 1 doubles page switches,
+  misses don't move); first `0x0A04` sweeps, strict, drives and
   NICs (§8, "0x0A04 results"); the C/D "extra inbound writes" withdrawn as a
   `pcm-iio` undersampling artifact (§7). 2026-10-15: PIPS switch design `0x0A04` (drain depth cap,
   new TLP log format), the PIPS sweeps crossed with the cap, a dual-NIC PIPS
@@ -1476,9 +1480,11 @@ points: [scripts/pips/README.md](scripts/pips/README.md).
   (https://claude.ai/artifact/XsrLugEhsaMzY6vwARSLGU) is design 0x0A02 only
   (drives, IOMMU off and strict, page-order Figures 5–6); "PIPS 0x0A04 Sweeps"
   (https://claude.ai/artifact/MbNxzaJ5KgmuM59PPC4NcA) is 0x0A04, drives and
-  NICs, with what pcm logged on icx. Both generators are in the git-ignored
-  `dualssd/report-gen/` (README there: `py -3 build.py` for 0x0A02,
-  `py -3 page4.py` for 0x0A04, from the local copies).
+  NICs, with what pcm logged on icx and the page order (Figures 3–6, Tables
+  6–7). Both generators are in the git-ignored `dualssd/report-gen/` (README
+  there: `py -3 build.py` for 0x0A02, `py -3 page4.py` for 0x0A04, from the
+  local copies; the 0x0A04 page order is `seq4.py` + `seq4.js`, reading the
+  `pips-seq-grab.sh` output unpacked in `dualssd/1016/` and `dualnic/1016/`).
 
 ### Switch designs (design ID)
 
@@ -1591,16 +1597,62 @@ The cap and the v2 log work on hardware: all 804 logs FULL, no drops,
    (§4.1). Settings differ by ≤ 3% (misses/4K) and ≤ 7% (accesses/miss) per
    point; d1t0c1 is the high end. Node-0 DRAM writes (4.4–9.4 GB/s one NIC)
    stay below the ~12 GB/s DMA rate (likely DDIO).
+8. **Page order (`pips-seq-grab.sh`, 7 drive + 5 NIC points × 8 settings,
+   96 logs, all found; unpacked in `dualssd/1016/seq-dualssd-pips-strict-1-id0a04/`
+   and `dualnic/1016/seq-dualnic-pips-strict-1-id0a04/`):**
+   - Drives, cap off: d16t64 cuts page switches per 4 KiB page only at 4k
+     (4.81–4.98 → 4.16–4.53), as on 0x0A02; link full (16k/64k/1m) all four
+     settings give the same order.
+   - **d1t0c1 alternates the drives TLP by TLP on a full link**: 1.10–1.36
+     TLPs per run on out, page switches ×2.1–2.3 at 16k/1m, ×1.6 at 64k,
+     ×1.4–1.7 at 4k. Cap at depth 4: +6–29%, 8: +1–15%, 16: −4/+6%. Each
+     drive's own stream is unchanged (drive 0: 2 TLPs per run, two pages
+     alternating, from 16k up).
+   - **NICs:** a packet is 8 × 512 B TLPs (7 × 128 DW + 112 DW, 4032 B) into
+     one page, then a 64 B completion; ~1.1 completion writes per packet (the
+     sends' too). Cap off, both NICs: 2.6–3.1 page switches per packet, each
+     NIC 86–97% of packets in one run. d1t0c1 with both: ×1.8–3.3.
+     **NIC0 alone splits its own packets** (2–3 at once, a TLP each) when held
+     0.37–0.48 µs (d1t0c1, d4t22c1 at 5 flows, d16t64/c1): 5.4–8.6 switches
+     per packet vs 2.3–2.6 at 0.13–0.14 µs (d1t0). Both NICs at 24–54 Gbps
+     each don't split at 0.2–0.8 µs, so the wait alone doesn't decide it.
+   - **Misses don't follow the order:** pcm-iio misses per 4 KiB within 5%
+     across the 8 settings at every point (16k: 1.50 for d1t0 and d1t0c1 at
+     2.25× the switches; NIC0 alone: d4t22c1 splits like d1t0c1 at 95.5 Gbps
+     and 1.095 misses vs d1t0's 1.096). The 64-entry simulated IOTLB agrees
+     within 2% per point. Lookups per 4 KiB don't move (one per TLP).
+   - Tool fix after the grab: `pips-page-seq.py --kind nic` now ends a packet's
+     visit at its short last TLP, not at any completion of its NIC (which,
+     with several queues in flight, closed pages early: false `gap` marks,
+     open pages undercounted). Runs, visits, what-if and IOTLB sims were not
+     affected; the report ignores the grab's NIC `gap` marks. Regrab only if
+     NIC open-page counts are needed.
+   - **The what-if baseline was wrong (user review):** it regrouped windows of
+     the *output*, already shaped by the setting, and placed each setting at
+     W = depth. A depth-D batcher groups at its inputs (D packets of one
+     drive, or TIME cycles), about 2D+ output TLPs when both send, so the
+     recorded diamonds beat the "by drive" line (4k 8+8: d4t22 4.47 vs 4.78
+     at W = 4; d8t22 4.42 vs 4.55 at W = 8). Fixed in `pips-page-seq.py`:
+     arrival order rebuilt from `pkt_wait` (stream `arr`) and `--model`, the
+     `axi4_mwr_batch.v` batcher (triggers, snapshot drains, cap, round robin,
+     reads behind their input's writes; output cycles per TLP measured from
+     the log) run on it; `--model self` checks it against each log. Needs the
+     regrab below; the 0x0A04 page's Figures 4 and 6 are still the old ones.
 
 ### Next
 
-0. **Page order on the 0x0A04 logs (for the report's Figures 5–6 equivalents):**
-   on bigserver `bash scripts/pips/pips-seq-grab.sh ssd`, on icx
-   `bash scripts/pips/pips-seq-grab.sh nic`; copy `~/seq-dualssd-pips-strict-1-id0a04.tar.gz`
-   to `dualssd/1016/` and `~/seq-dualnic-pips-strict-1-id0a04.tar.gz` to
-   `dualnic/1016/`. `pips-page-seq.py --kind nic` (auto for `dualnic` paths)
-   makes the NIC logs readable: 16 DW completions, packet visits end at them.
-   This also covers item 5 below (16k, 64k, 1m points are in the default set).
+0. **Regrab page order with arrival order and the batcher model, every point**
+   (uneven co-runs and NIC1-alone included; the 10-16 grab had 7 + 5 points):
+   on bigserver `bash scripts/pips/pips-seq-grab.sh ssd -j 8` (720 logs, about
+   a minute each; ~1.5 h at -j 8), on icx `bash scripts/pips/pips-seq-grab.sh nic`
+   (96 logs, ~25 min). Move the old `~/seq-*` folder/tarball aside first (the
+   script refuses to overwrite). Copy the tarballs to `dualssd/1016/` and
+   `dualnic/1016/` (unpack next to the 10-16 grab, which they replace). Then:
+   Figures 4/6 from the model on the arrival order (x = depth, lines from the
+   chosen log's arrivals, diamonds = recorded, model-self beside them as the
+   check), and Figures 3/5 with each panel's point, setting and order (arrival
+   or output) chosen freely; with ~800 logs the sequences go in per-point data
+   files loaded on demand, not in the page.
 1. **IOMMU off on `0x0A04`**, drives and NICs, cap off and on. Completes the
    comparison with 0x0A02, and tells whether drive 0's single-instance drop
    needs the IOMMU. Check first that both NICs are behind the same DMAR unit
@@ -1613,5 +1665,3 @@ The cap and the v2 log work on hardware: all 804 logs FULL, no drops,
    the summaries flag runs with `pcie_samples` < 10.
 4. **One input through d1t0c1:** one drive alone at 1m, d1t0 vs d1t0c1, to
    see whether the per-drain limit that holds one NIC to 78 Gbps binds a drive.
-5. **How the cap reorders a full link:** `pips-page-seq.py` on cap-off and
-   cap-on logs at 16k, 64k and 1m (8+8).

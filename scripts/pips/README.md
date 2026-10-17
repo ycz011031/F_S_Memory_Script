@@ -265,30 +265,67 @@ In a v2 log `in0`/`in1` are each drive's TLPs in the order they left, which is
 the order it sent them within each batching FIFO. `--kind nic` (the default
 when the path contains `dualnic`) reads a NIC log: writes of up to 16 DW (the
 NIC's 64-byte completions) are the I/Os instead of 4 DW NVMe completion
-entries, and a packet's page visit ends at its NIC's next completion, since a
-4,032-byte packet (7 × 128 DW + 112 DW) never fills its 4 KiB page. Tested on
-synthetic logs (`make check`).
+entries, and a packet's page visit ends at its last TLP, the first one shorter
+than the NIC's largest, since a 4,032-byte packet (7 × 128 DW + 112 DW) never
+fills its 4 KiB page. A NIC held in the switch can write 2–3 packets at once,
+with completions of other queues in between, so a completion doesn't end a
+visit. An I/O is a completion write: about 1.1 per received packet, since the
+NIC's sends (ACKs) complete too. Tested on synthetic logs (`make check`).
+
+The out order is already shaped by the setting, so in a v2 log (0x0A04 on)
+the tool also rebuilds the order the TLPs entered the switch: each record's
+output start (from the gaps and lengths) minus its `pkt_wait`. That stream,
+`arr`, gets the same interleaving figures and windowed what-if, and
+`--show --port out,arr` lists both. Batching starts from it. Regrouping
+windows of `out` (the what-if above) is not what the batcher does: it groups
+at its inputs, DEPTH packets of one drive or TIME cycles, so a depth-D batch
+spans about 2D or more output TLPs when both drives send. `--model` therefore
+runs the batcher itself on the arrival order, as `axi4_mwr_batch.v` does it:
+per input a FIFO of writes asks for the output at DEPTH packets, TIME cycles
+after it became non-empty (restarted when a drain ends) or when fewer than 16
+of its 109 admit beats are left; a grant sends the packets present at the
+grant (with the cap, at most DEPTH) as one run; when both inputs ask they
+alternate; a read waits until its input's writes have left (which flushes
+that FIFO and holds the input behind it) and then goes ahead of the next
+batched packet. How many cycles each kind of TLP holds the output (link and
+credit stalls included) is the median over back-to-back pairs of one drain
+in this log. `--model self` runs the log's own setting (from its path, or
+`--setting`) and prints it beside the recorded order and wait: the check of
+the model. `std` adds the eight 0x0A04 settings, `sweep` depths 1–64 at time
+255 (the longest the 8-bit field allows), or name any `dDtT[m1][c1]`. Per
+setting: page switches per I/O as sent, with each drain regrouped by page
+(between completion entries, and ignoring ordering), IOTLB misses for the
+first `--iotlb` geometry, and the time each TLP would spend in the switch.
+The arrival order is the switch's input acceptance: where a FIFO was full or
+a read held its input, the device was already held back. A test log written
+by the model itself checks the rebuild and the model end to end.
 
 ```bash
 python3 scripts/pips/pips-page-seq.py \
     utils/logs/dualssd-pips-strict-1-d1t0/4k-j8-both-RUN-0/pips-log.bin.gz \
     --iotlb 1x64,16x4,64x1 --strict --show 200 --from 100000
+python3 scripts/pips/pips-page-seq.py \
+    utils/logs/dualssd-pips-strict-1-id0a04-d16t64/4k-j8-both-RUN-0/pips-log-id0a04.bin.gz \
+    --iotlb 1x64 --strict --model self,std,sweep --show 200 --from 100000 --port out,arr
 ```
 
 **Page order for a whole sweep.** `pips-seq-grab.sh ssd|nic` runs
-`pips-page-seq.py --json --show 600 --from 100000 --iotlb 1x64,16x4,64x1`
-(plus `--strict` on strict sweeps) on one log per point and batcher setting,
-4 at a time, and packs the reports, one JSON line per log and a manifest into
-`~/seq-<sweep>.tar.gz`: what the report's page-sequence and batching what-if
-figures are built from. Defaults are the 0x0A04 sweeps' eight settings and 7
-drive points (4k at j8, j16, j32; 16k, 64k, 1m at j8; 1m at j16) or 5 NIC
-points (both NICs at f5, f15, f30; NIC0 alone at f5, f30); `--sweep`,
-`--sets`, `--points` choose others, e.g. the 0x0A02 sweeps. A 4k point whose
-run was dropped for missing `pcm-iio` rows still has its log and is used.
+`pips-page-seq.py --json --show 600 --from 100000 --port out,arr --iotlb
+1x64,16x4,64x1 --model self,std,sweep` (plus `--strict` on strict sweeps) on
+one log per point and batcher setting, 4 at a time (`-j`), and packs the
+reports, one JSON line per log and a manifest into `~/seq-<sweep>.tar.gz`:
+what the report's page-sequence and batching figures are built from. A line
+per log as it finishes (`[done/total]`, seconds; about a minute each on
+bigserver with the model). Defaults are the 0x0A04 sweeps' eight settings and
+every point of the sweep (`--points all`: the runs found for the first
+setting, uneven co-runs and one-NIC runs included, datapath checks left out);
+`--sweep`, `--sets`, `--points`, `--model` choose others, e.g. the 0x0A02
+sweeps (v1 logs: no arrival order or model). A 4k point whose run was dropped
+for missing `pcm-iio` rows still has its log and is used.
 
 ```bash
-bash scripts/pips/pips-seq-grab.sh ssd          # bigserver, ~/seq-dualssd-pips-strict-1-id0a04.tar.gz
-bash scripts/pips/pips-seq-grab.sh nic          # icx, ~/seq-dualnic-pips-strict-1-id0a04.tar.gz
+bash scripts/pips/pips-seq-grab.sh ssd -j 8     # bigserver, ~/seq-dualssd-pips-strict-1-id0a04.tar.gz (720 logs)
+bash scripts/pips/pips-seq-grab.sh nic          # icx, ~/seq-dualnic-pips-strict-1-id0a04.tar.gz (96 logs)
 bash scripts/pips/pips-seq-grab.sh ssd --sweep dualssd-pips-strict-1 --sets "d1t0 d16t64" --points 4k-j8-both
 ```
 

@@ -14,9 +14,10 @@ TLP log, and how much regrouping (batching) could shorten it.
 LOG is one pips-log.bin(.gz) (pips-log-id<XXXX>.bin.gz from design 0x0a02 on).
 --kind nic reads a NIC log (default: nic when the path has "dualnic" in it):
 writes of up to 16 DW (the NIC's 64-byte completions) count as completions
-instead of 4 DW (NVMe), and a packet's buffer visit ends at its device's next
-completion, since a 4000-byte packet never fills its 4 KiB page. "drive"
-below then means NIC, and an I/O is a received packet.
+instead of 4 DW (NVMe), and a packet's buffer visit ends at its last TLP, the
+first one shorter than the NIC's largest, since a 4000-byte packet never fills
+its 4 KiB page. "drive" below then means NIC, and an I/O is a completion write
+(received packets, plus the sends' completions: about 1.1 per packet).
 Out TLPs are matched to their drive as in pips-addr-pattern.py; in a v2 log
 (design 0x0a04 on) every record names its drive, and the in0/in1 streams are
 each drive's TLPs in the order they left. --design-id overrides the design ID
@@ -51,6 +52,23 @@ page number mod S, entries tagged by drive) on each regrouped stream. The real
 geometry is not published; compare S x W with 1 x (S*W) for conflict misses at
 equal size. --strict counts every new visit as a miss, because strict mode
 invalidates a page's entry when its I/O completes.
+
+Arrival order (v2 logs). Each record's gap and pkt_wait rebuild when the TLP
+entered the batcher (in_sop = out_sop - pkt_wait), so the out TLPs sorted by
+it are the order the two inputs handed them over: stream "arr" (--port arr,
+interleaving, and a windowed what-if from it). That is the order batching
+starts from; out is what the setting made of it.
+
+--model runs the batcher of axi4_mwr_batch.v on the arrival order, for the
+log's own setting (self: checks the model against the log), the 0x0A04
+settings (std), a depth sweep at time 255 (sweep) or any dDtT[m1][c1]. Per
+input a FIFO of writes asks for the output at DEPTH packets, after TIME
+cycles non-empty, or when nearly full; a grant sends what the FIFO holds then
+(with c1, at most DEPTH) as one run; the inputs alternate; a read waits until
+its input's writes are out and then goes first. How long each TLP holds the
+output is measured from this log (back-to-back pairs of one drain). Reported:
+page switches per I/O as sent, with each drain regrouped by page (with and
+without ordering), simulated misses, and the time in the switch.
 """
 import argparse
 import collections
@@ -58,6 +76,7 @@ import csv
 import importlib.util
 import json
 import os
+import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -69,7 +88,20 @@ dec = ap_mod.dec
 
 WINDOWS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512)
 POLICIES = ("drive", "page", "ideal")
-PORTS = ("in0", "in1", "out")
+PORTS = ("in0", "in1", "out", "arr")
+ARR = 3                                    # port index of the arrival-order stream (v2 logs)
+WAIT_SAT = 65535
+# The 0x0A04 sweeps' settings, and a depth sweep at the longest time limit the
+# 8-bit field allows, for --model std / sweep.
+STD_SETS = ("d1t0", "d1t0c1", "d4t22", "d4t22c1", "d8t22", "d8t22c1", "d16t64", "d16t64c1")
+SWEEP_SETS = tuple(f"d{d}t255" for d in (1, 2, 4, 8, 16, 32, 64))
+SET_RE = re.compile(r"^d(\d+)t(\d+)(m1)?(c1)?$")
+SET_IN_PATH = re.compile(r"-(d\d+t\d+(?:m1)?(?:c1)?)(?=[/-]|$)")
+# axi4_mwr_batch.v at its build parameters: FIFO_DEPTH 128 beats, MAX_PKT_BEATS 16,
+# so prog_full stops the input at 109 beats and the full trigger fires once fewer
+# than 16 beats of that are left.
+ADMIT_BEATS = 109
+FULL_BEATS = ADMIT_BEATS - 16
 
 
 def pct(vals, p):
@@ -90,11 +122,11 @@ def fmt(v, spec):
 def annotate(events, kind="ssd"):
     """Per port: the TLP sequence with run numbers, visit state and open pages.
     Rows: (rec, port, drive, cls, addr, pdw, run, visit, open_d0, open_d1).
-    kind nic: a completion closes its device's open pages."""
+    kind nic: a TLP shorter than the device's largest so far is a packet's last."""
     rows = []
     state = {}
-    for port in range(3):
-        st = state[port] = dict(prev=None, run=-1, next_off={}, seen=set(), open=[set(), set()])
+    for port in range(len(PORTS)):
+        st = state[port] = dict(prev=None, run=-1, next_off={}, seen=set(), open=[set(), set()], mps=[0, 0])
     for i, port, c, addr, pdw, src, _src_i, _w in events:
         st = state[port]
         page = addr >> 12
@@ -103,10 +135,6 @@ def annotate(events, kind="ssd"):
             st["run"] += 1
             st["prev"] = key
         visit = ""
-        if kind == "nic" and c == "cqe" and src is not None:
-            st["open"][src].clear()
-            for k in [k for k in st["next_off"] if k[0] == src]:
-                del st["next_off"][k]
         if c == "data" and src is not None:
             off, nbytes = addr & 0xFFF, 4 * pdw
             k = (src, page)
@@ -116,7 +144,8 @@ def annotate(events, kind="ssd"):
                 st["open"][src].add(page)
             elif st["next_off"].get(k) != off:
                 visit = "gap"                      # not where this page's last write ended
-            if off + nbytes >= 4096:
+            st["mps"][src] = max(st["mps"][src], pdw)
+            if off + nbytes >= 4096 or (kind == "nic" and pdw < st["mps"][src]):
                 st["open"][src].discard(page)
                 st["next_off"].pop(k, None)
             else:
@@ -131,6 +160,8 @@ def interleave(rows):
     out = {}
     for name in PORTS:
         rs = [r for r in rows if r[1] == name and r[3] == "data" and r[2] is not None]
+        if name == "arr" and not rs:
+            continue                                   # v1 log: no arrival order
         runs = collections.Counter(r[6] for r in rs)
         run_len = list(runs.values())
         # a visit is single-run if all its TLPs share one run number
@@ -217,12 +248,13 @@ def regroup_flags(items, w, policy):
     return regroup(tagged, w, policy)
 
 
-def whatif(events, dur_us, geoms, strict):
+def whatif(events, dur_us, geoms, strict, on=2):
+    """Windows of W TLPs of stream `on` (2 = out, ARR = arrival order), each regrouped."""
     items = [(src, addr >> 12, c) for _i, port, c, addr, pdw, src, _s, _w in events
-             if port == 2 and src is not None and c != "msi"]
+             if port == on and src is not None and c != "msi"]
     new = [c == "data" and (addr & 0xFFF) == 0 for _i, port, c, addr, pdw, src, _s, _w in events
-           if port == 2 and src is not None and c != "msi"]
-    n_out = sum(1 for e in events if e[1] == 2)
+           if port == on and src is not None and c != "msi"]
+    n_out = sum(1 for e in events if e[1] == on)
     ios = sum(1 for it in items if it[2] == "cqe")
     us_per_tlp = dur_us / n_out if dur_us and n_out else None
     rows = []
@@ -247,15 +279,248 @@ def whatif(events, dur_us, geoms, strict):
     return dict(items=len(items), ios=ios, us_per_tlp=us_per_tlp, rows=rows)
 
 
+def arrival(recs, events):
+    """v2: rebuild when each TLP entered the batcher, as pips-log-decode.py does
+    (telemetry_dma_format.md §4.3): out_sop = previous out EOP + 1 + gap, and
+    in_sop = out_sop - pkt_wait. Returns the out events again as stream ARR, in
+    order of (segment, in_sop): the order the two inputs handed the TLPs over.
+    A segment ends at a saturated gap (255) or a dropped record, after which
+    times are lower bounds; no TLP waits that long here, so the order holds.
+    Also returns per record index (out_sop, in_sop, beats) and counts."""
+    tl, out_eop, seg, wsat = {}, None, 0, 0
+    for i, (_addr, length, gap, _typ, _pdw, _tag, _at, info, wait) in enumerate(recs):
+        kind, port = (info >> 2) & 3, info & 3
+        if port > 1:
+            continue
+        if kind == dec.KIND_DROP:
+            seg += 1
+            continue
+        if kind != dec.KIND_TLP:
+            continue
+        out_sop = 0 if out_eop is None else out_eop + 1 + gap
+        seg += out_eop is not None and gap == 255
+        out_eop = out_sop + length - 1
+        wsat += wait == WAIT_SAT
+        tl[i] = (out_sop, out_sop - wait, length, seg)
+    out = [e for e in events if e[1] == 2 and e[0] in tl]
+    order = sorted(range(len(out)), key=lambda k: (tl[out[k][0]][3], tl[out[k][0]][1], k))
+    arr = [(e[0], ARR) + e[2:] for e in (out[k] for k in order)]
+    moved = sum(1 for pos, k in enumerate(order) if pos != k)
+    return arr, tl, dict(tlps=len(out), segments=seg + 1, wait_saturated=wsat,
+                         moved=moved / len(out) if out else None)
+
+
+def parse_setting(name):
+    """'d16t64c1' -> (depth 16, time 64, cap 1, batch_mrd 0)."""
+    m = SET_RE.match(name)
+    if not m:
+        raise ValueError(f"not a batcher setting: {name} (dDEPTHtTIME[m1][c1])")
+    return int(m.group(1)), int(m.group(2)), int(bool(m.group(4))), int(bool(m.group(3)))
+
+
+BATCHED = ("data", "cqe", "msi")             # memory writes: they wait in the batching FIFOs
+
+
+def service(out_items):
+    """Cycles a TLP keeps the output busy, link or credit stalls included: per
+    (class, payload DW), the median over this log of out_sop(next) - out_sop(this)
+    for back-to-back pairs of one drain, that is consecutive written TLPs from
+    the same input where the second had entered before that input's run on
+    the output began (so it was in the same grant and nothing held it).
+    out_items: (src, cls, pdw, out_sop, in_sop, beats) in out order. Returns
+    (table, cycles per beat for kinds with too few pairs)."""
+    samples = collections.defaultdict(list)
+    per_beat = []
+    run_start = None
+    for k, a in enumerate(out_items):
+        if k == 0 or out_items[k - 1][0] != a[0]:
+            run_start = a[3]
+        if k + 1 == len(out_items):
+            break
+        b = out_items[k + 1]
+        if a[0] == b[0] and a[1] in BATCHED and b[1] in BATCHED and b[4] <= run_start:
+            d = b[3] - a[3]
+            samples[(a[1], a[2])].append(d)
+            per_beat.append(d / max(a[5], 1))
+    table = {k: pct(v, 50) for k, v in samples.items() if len(v) >= 20}
+    one_beat = [v for (c, _p), v in table.items() if c in ("cqe", "msi")]
+    if one_beat:
+        table[("one-beat", 0)] = min(one_beat)
+    return table, (pct(per_beat, 50) if per_beat else 1.0)
+
+
+def cycles(svc, per_beat, cls, pdw, beats):
+    """Output cycles of one TLP: its own kind's median, a read or other single
+    beat as the cheapest single-beat write, else per beat."""
+    v = svc.get((cls, pdw))
+    if v is None and beats == 1:
+        v = svc.get(("one-beat", 0))
+    return v if v is not None else max(beats, round(per_beat * beats))
+
+
+def batcher(arr, depth, time, cap, mrd_batched):
+    """The batcher of axi4_mwr_batch.v on TLPs in arrival order. arr: (t_in,
+    src, cls, beats, cycles) per TLP. Per input a FIFO of writes (reads too
+    with batch_mrd) that asks for the output once it holds `depth` packets,
+    has been non-empty for `time` cycles (restarted when a drain ends), or
+    has fewer than 16 of its 109 admit beats left. A grant sends the packets
+    in the FIFO at that moment (with the cap: at most `depth`), as one run;
+    when both inputs ask, they alternate. A read (pass-through) enters only
+    once its input's FIFO is empty, which flushes that FIFO and holds back
+    the input behind it, and then goes out ahead of the next batched packet.
+    An input stops taking packets at 109 beats. Returns the TLPs in output
+    order as (arr index, start cycle, drain number)."""
+    n = len(arr)
+    trig_depth = max(depth, 1)
+    take_cap = trig_depth if cap else None
+    inq = [collections.deque(), collections.deque()]  # arrived, not admitted (blocked)
+    fifo = [collections.deque(), collections.deque()]
+    fill = [0, 0]
+    tmr = [None, None]                                 # timer start: FIFO non-empty / drain end
+    latch = [False, False]
+    snap = [0, 0]                                      # packets left in the granted drain; -1: flush
+    f2 = collections.deque()
+    owner, rr_last, drain_no = None, 1, 0
+    nxt, t, out = 0, 0, []
+
+    def passes(j):
+        return arr[j][2] not in BATCHED and not mrd_batched
+
+    def admit(c, now):
+        q = inq[c]
+        while q:
+            j = q[0]
+            if passes(j):
+                if fifo[c]:
+                    return                             # ordering barrier: flush first
+                f2.append(j)
+            else:
+                if fill[c] >= ADMIT_BEATS:
+                    return                             # prog_full
+                if not fifo[c]:
+                    tmr[c] = max(now, arr[j][0])
+                fifo[c].append(j)
+                fill[c] += arr[j][3]
+            q.popleft()
+
+    def arrive(upto):
+        nonlocal nxt
+        while nxt < n and arr[nxt][0] <= upto:
+            c = arr[nxt][1]
+            inq[c].append(nxt)
+            if len(inq[c]) == 1:
+                admit(c, arr[nxt][0])
+            nxt += 1
+
+    def asks(c, now):
+        if not fifo[c]:
+            return False
+        if inq[c] and passes(inq[c][0]):
+            return True                                # flush request
+        if not latch[c] and (len(fifo[c]) >= trig_depth or now - tmr[c] >= time or fill[c] > FULL_BEATS):
+            latch[c] = True
+        return latch[c]
+
+    def serve(c, now):
+        nonlocal owner
+        j = fifo[c].popleft()
+        fill[c] -= arr[j][3]
+        out.append((j, now, drain_no))
+        end = now + arr[j][4]
+        if snap[c] > 0:
+            snap[c] -= 1
+        if not fifo[c]:
+            snap[c], latch[c], tmr[c], owner = 0, False, None, None
+        elif snap[c] == 0:                             # drain done: leftovers start a new batch
+            latch[c], tmr[c], owner = False, end, None
+        if inq[c]:
+            admit(c, end)                              # room again, or the barrier cleared
+        return end
+
+    while len(out) < n:
+        arrive(t)
+        if f2:
+            j = f2.popleft()
+            out.append((j, t, -1))
+            t += arr[j][4]
+            continue
+        a = [asks(0, t), asks(1, t)]
+        if owner is not None and a[owner] and (snap[owner] != 0):
+            t = serve(owner, t)
+            continue
+        c = (0 if rr_last == 1 else 1) if a[0] and a[1] else 1 if a[1] else 0 if a[0] else None
+        if c is None:
+            ev = [arr[nxt][0]] if nxt < n else []
+            ev += [tmr[k] + time for k in (0, 1) if fifo[k] and not latch[k]]
+            if not ev:
+                break                                  # only blocked input left (cannot happen)
+            t = max(t + 1, min(ev))
+            continue
+        owner, rr_last = c, c
+        drain_no += 1
+        flush = bool(inq[c]) and passes(inq[c][0])
+        k = len(fifo[c])
+        snap[c] = -1 if flush else (min(k, take_cap) if take_cap else k)
+        t = serve(c, t)
+    return out
+
+
+def model(events, tl, names, svc, per_beat, geoms, strict, kind):
+    """Each named batcher setting run on the arrival order (batcher()); page
+    switches per I/O as it would send them, and with each drain regrouped by
+    page (with barriers, and without: the bound), simulated IOTLB misses of
+    the first geometry, and the time each TLP would spend in the switch."""
+    arr_ev = [e for e in events if e[1] == ARR and e[5] is not None]
+    arr, prev = [], None
+    for e in arr_ev:
+        _out_sop, in_sop, beats, _seg = tl[e[0]]
+        prev = in_sop if prev is None else max(in_sop, prev)   # past a saturated gap times are bounds
+        arr.append((prev, e[5], e[2], beats, cycles(svc, per_beat, e[2], e[4], beats)))
+    t0 = arr[0][0] if arr else 0
+    arr = [(a[0] - t0,) + a[1:] for a in arr]
+    res = []
+    for name in names:
+        depth, time, cap, mrd = parse_setting(name)
+        sent = batcher(arr, depth, time, cap, mrd)
+        items, flags, groups, waits = [], [], [], []
+        for j, start, d in sent:
+            _i, _p, c, addr, _pdw, src, _s, _w = arr_ev[j]
+            waits.append(start - arr[j][0])
+            if c == "msi":
+                continue
+            it = (src, addr >> 12, c)
+            items.append(it)
+            flags.append(c == "data" and (addr & 0xFFF) == 0)
+            if groups and groups[-1][0] == d and d >= 0:
+                groups[-1][1].append(it)
+            else:
+                groups.append((d, [it]))
+        ios = sum(1 for it in items if it[2] == "cqe")
+        runs = {"drive": count_runs(items) / ios if ios else None}
+        for pol in POLICIES[1:]:
+            seq = []
+            for _d, g in groups:
+                seq.extend(regroup(g, len(g), pol))
+            runs[pol] = count_runs(seq) / ios if ios else None
+        miss = (simulate(items, geoms[0][0], geoms[0][1], strict, flags) / ios) if geoms and ios else None
+        us = 1e6 / dec.CLOCK_HZ
+        res.append(dict(setting=name, depth=depth, time=time, cap=cap, batch_mrd=mrd, runs=runs,
+                        miss=miss, miss_geom=f"{geoms[0][0]}x{geoms[0][1]}" if geoms else None,
+                        wait_mean_us=mean(waits) * us if waits else None,
+                        wait_p99_us=pct(waits, 99) * us if waits else None,
+                        drains=len({d for _j, _s, d in sent if d >= 0})))
+    return res
+
+
 def show(rows, port, start, count):
     print(f"\n{port}: the sequence, one line per run (data offsets in hex; visit: new = offset 0 of a page "
           f"not seen before, reuse = offset 0 of a page seen before, gap = not where its last write ended)")
     print(f"{'run':>7} {'record':>7} {'drive':>5} {'class':5} {'page':>12} {'offsets':>11} {'TLPs':>5} "
           f"{'visit':6} {'open d0/d1':>10}")
     cur, shown = None, 0
-    for r in rows:
-        if r[1] != port or r[0] < start:
-            continue
+    seq = [r for r in rows if r[1] == port]
+    first = next((k for k, r in enumerate(seq) if r[0] >= start), len(seq))
+    for r in seq[first:]:                    # arr is not in record order: start, then list on
         if cur is None or r[6] != cur[6]:
             if cur is not None:
                 _line(cur, last, n)
@@ -286,7 +551,15 @@ def main():
     ap.add_argument("--show", type=int, metavar="N", help="print N runs of the sequence")
     ap.add_argument("--from", dest="start", type=int, default=0, metavar="REC",
                     help="start --show at this record index")
-    ap.add_argument("--port", choices=PORTS, default="out", help="stream for --show (default out)")
+    ap.add_argument("--port", default="out",
+                    help="stream(s) for --show, comma-separated: out, arr (v2: the order the TLPs "
+                         "entered the switch), in0, in1 (default out)")
+    ap.add_argument("--model", metavar="LIST",
+                    help="v2: run the batcher model on the arrival order for these settings, "
+                         "comma-separated: self (the log's own, from its path or --setting), std "
+                         f"({' '.join(STD_SETS)}), sweep ({' '.join(SWEEP_SETS)}), or dDtT[m1][c1]")
+    ap.add_argument("--setting", metavar="dDtT[c1]",
+                    help="the log's own batcher setting for --model self (default: from the path)")
     ap.add_argument("--csv", help="write every TLP to this CSV")
     ap.add_argument("--iotlb", help="IOTLB geometries to simulate, SETSxWAYS[,...], e.g. 1x64,16x4")
     ap.add_argument("--json", help="append the results to this file as one JSON line")
@@ -303,12 +576,39 @@ def main():
         for g in a.iotlb.split(","):
             s, w = g.lower().split("x")
             geoms.append((int(s), int(w)))
+    show_ports = a.port.split(",")
+    for p in show_ports:
+        if p not in PORTS:
+            ap.error(f"--port {p}: one of {', '.join(PORTS)}")
+    own = a.setting
+    if own is None:
+        m = SET_IN_PATH.search(os.path.abspath(a.log).replace("\\", "/"))
+        own = m.group(1) if m else None
+    names = []
+    for x in (a.model.split(",") if a.model else []):
+        add = STD_SETS if x == "std" else SWEEP_SETS if x == "sweep" else (own,) if x == "self" else (x,)
+        if x == "self" and own is None:
+            ap.error("--model self: no setting in the log's path; give --setting")
+        for nm in add:
+            try:
+                parse_setting(nm)
+            except ValueError as err:
+                ap.error(f"--model: {err}")
+            if nm not in names:
+                names.append(nm)
 
     kind = a.kind or ("nic" if "dualnic" in os.path.abspath(a.log) else "ssd")
     fi = dec.detect(a.log, a.design_id)
     recs, trailer, _pads, _nbytes, problem = dec.load(a.log, False, fi["format"])
     dur_us = trailer["duration_cycles"] / dec.CLOCK_HZ * 1e6 if trailer else None
     events, ms = ap_mod.tlp_events(recs, fi["format"], 16 if kind == "nic" else 4)
+    tl, ainfo = None, None
+    if fi["format"] == "v2":
+        arr_events, tl, ainfo = arrival(recs, events)
+        events = events + arr_events
+    elif names or "arr" in show_ports:
+        print(f"pips-page-seq: {fi['format']} log has no pkt_wait: no arrival order or model", file=sys.stderr)
+        names = []
     rows = annotate(events, kind)
     print(f"log {a.log}: {len(recs)} records, {fmt(dur_us, '.0f')} us"
           + (f" ({problem})" if problem else "")
@@ -328,7 +628,8 @@ def main():
                              4 * r[5], r[6], r[7], r[8], r[9]))
 
     il = interleave(rows)
-    print("\nInterleaving of data writes (in0, in1: as each drive sends them; out: as the IOMMU sees them)")
+    print("\nInterleaving of data writes (in0, in1: as each drive sends them; out: as the IOMMU sees them"
+          + ("; arr: as they entered the switch" if "arr" in il else "") + ")")
     print(f"{'stream':6} {'data TLPs':>9} {'TLPs/run':>8} {'p50':>4} {'visits':>7} {'one run':>7} "
           f"{'runs/visit':>10} {'open pages d0 mean/p50/p99/max':>31} {'d1':>16}")
     for name, x in il.items():
@@ -355,6 +656,40 @@ def main():
         for r in wi["rows"]:
             print(f"{r['w']:4d} " + "".join(f"{fmt(r['miss'][(pol, g)], '14.3f')}" for g in geoms for pol in POLICIES))
 
+    wa, svc, per_beat, mod, recorded = None, {}, None, [], None
+    if tl is not None:
+        print(f"\nArrival order (arr): each TLP's output start minus its pkt_wait. {ainfo['tlps']} TLPs, "
+              f"{ainfo['segments']} segment(s), {ainfo['wait_saturated']} saturated waits; "
+              f"{fmt(ainfo['moved'] and 100 * ainfo['moved'], '.1f')}% left in another position than they arrived")
+        wa = whatif(events, dur_us, [], a.strict, ARR)
+        print(f"Batching what-if on arr (windows of the arrival order): {wa['ios']} I/Os")
+        print(f"{'W':>4} {'runs per I/O: as arrived':>25} {'drive':>7} {'page':>7} {'ideal':>7}")
+        for r in wa["rows"]:
+            print(f"{r['w']:4d} {fmt(wa['rows'][0]['runs']['drive'], '25.2f')} {fmt(r['runs']['drive'], '7.2f')} "
+                  f"{fmt(r['runs']['page'], '7.2f')} {fmt(r['runs']['ideal'], '7.2f')}")
+        out_items = [(e[5], e[2], e[4], tl[e[0]][0], tl[e[0]][1], tl[e[0]][2])
+                     for e in events if e[1] == 2 and e[0] in tl and e[5] is not None]
+        svc, per_beat = service(out_items)
+        waits = [e[7] for e in events if e[1] == 2 and e[7] is not None and e[7] != WAIT_SAT]
+        recorded = dict(setting=own, runs=wi["rows"][0]["runs"]["drive"],
+                        miss=wi["rows"][0]["miss"][("drive", geoms[0])] if geoms else None,
+                        wait_mean_us=mean(waits) * 1e6 / dec.CLOCK_HZ if waits else None)
+        if names:
+            mod = model(events, tl, names, svc, per_beat, geoms, a.strict, kind)
+            print(f"\nBatcher model on the arrival order (axi4_mwr_batch.v: depth/time/full triggers, drains of "
+                  f"the packets present at the grant, cap, inputs alternating, reads after their input's writes). "
+                  f"Output cycles per TLP when queued, from this log: "
+                  + ", ".join(f"{c} {p} DW {v}" for (c, p), v in sorted(svc.items(), key=lambda kv: str(kv[0])))
+                  + f"; else {per_beat:.2f} per beat")
+            print(f"{'setting':>10} {'runs per I/O: as sent':>22} {'by page':>8} {'bound':>7} "
+                  f"{'misses/I/O':>11} {'wait us mean/p99':>17}")
+            for m_ in mod:
+                print(f"{m_['setting']:>10} {fmt(m_['runs']['drive'], '22.2f')} {fmt(m_['runs']['page'], '8.2f')} "
+                      f"{fmt(m_['runs']['ideal'], '7.2f')} {fmt(m_['miss'], '11.3f')} "
+                      f"{fmt(m_['wait_mean_us'], '8.2f')}/{fmt(m_['wait_p99_us'], '<8.2f')}")
+            print(f"{'recorded':>10} {fmt(recorded['runs'], '22.2f')} {'':>8} {'':>7} {fmt(recorded['miss'], '11.3f')} "
+                  f"{fmt(recorded['wait_mean_us'], '8.2f')}   ({own or 'setting unknown'}, as logged on out)")
+
     if a.json:
         rec = dict(path=a.log, kind=kind, design_id=fi["design"], log_format=fi["format"],
                    strict=a.strict, matched=ms["matched"], unmatched=ms["unmatched"],
@@ -364,11 +699,20 @@ def main():
                                  pages_p99=r["pages_p99"], runs=r["runs"],
                                  miss={f"{g[0]}x{g[1]}": {pol: r["miss"][(pol, g)] for pol in POLICIES}
                                        for g in geoms}) for r in wi["rows"]])
+        if wa is not None:
+            rec.update(setting=own, arrival=ainfo, recorded=recorded,
+                       windows_arr=[dict(w=r["w"], wait_mean=r["wait_mean"], pages_mean=r["pages_mean"],
+                                         pages_p99=r["pages_p99"], runs=r["runs"]) for r in wa["rows"]],
+                       service={f"{c}/{p}": v for (c, p), v in svc.items()}, service_per_beat=per_beat,
+                       model=mod)
         with open(a.json, "a") as f:
             f.write(json.dumps(rec) + "\n")
 
     if a.show:
-        show(rows, a.port, a.start, a.show)
+        for p in show_ports:
+            if p == "arr" and tl is None:
+                continue
+            show(rows, p, a.start, a.show)
     return 0
 
 

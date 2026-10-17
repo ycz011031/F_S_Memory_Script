@@ -1,9 +1,12 @@
 #!/bin/bash
 # What the page-order figures need from a PIPS sweep's TLP logs: the TLP
-# sequence on the switch's output (one block per run of a page), and page
-# switches per I/O when that output is regrouped in windows of W TLPs, with
-# the IOTLB simulation. Runs pips-page-seq.py on one log per point and
-# batcher setting, on the host that holds the logs, and packs the results.
+# sequence as it entered the switch (rebuilt from each TLP's time in the
+# batcher, v2 logs) and as it left (one block per run of a page), page
+# switches per I/O when either is regrouped in windows of W TLPs, the IOTLB
+# simulation, and the batcher model run on the arrival order (the log's own
+# setting, to check the model, the eight 0x0A04 settings and a depth sweep).
+# Runs pips-page-seq.py on one log per point and batcher setting, on the host
+# that holds the logs, and packs the results.
 #
 #   bash scripts/pips/pips-seq-grab.sh ssd|nic [options]
 #
@@ -11,14 +14,15 @@
 #                    dualssd-pips-strict-1-id0a04 / dualnic-pips-strict-1-id0a04)
 #   --sets "S ..."   batcher settings (default: the eight 0x0A04 ones,
 #                    d1t0 d1t0c1 d4t22 d4t22c1 d8t22 d8t22c1 d16t64 d16t64c1)
-#   --points "P ..." run names. ssd default: 4k-j8-both 4k-j16-both
-#                    4k-j32-both 16k-j8-both 64k-j8-both 1m-j8-both 1m-j16-both.
-#                    nic default: f5-both f15-both f30-both f5-nic0only
-#                    f30-nic0only
-#   --show N         runs of the sequence to list per log, from record 100000
+#   --points "P ..." run names, or "all" (default): every run of the sweep's
+#                    first setting that has a log, uneven co-runs (4k-j2+16-both)
+#                    and one-NIC runs included, datapath checks left out
+#   --model LIST     batcher model settings, as pips-page-seq.py --model
+#                    (default self,std,sweep; "" for none)
+#   --show N         runs of each sequence to list per log, from record 100000
 #                    (default 600)
 #   --logs DIR       where the sweep logs are (default utils/logs)
-#   -j N             logs at a time (default 4)
+#   -j N             logs at a time (default 4; each takes about a minute)
 #   -o DIR           output folder (default ~/seq-<sweep>); refused if it exists
 #
 # Logs used, the first match of:
@@ -29,12 +33,14 @@
 # new visit always misses in the IOTLB simulation).
 #
 # Output in DIR, then DIR.tar.gz of it:
-#   seq-<set>-<point>.txt   pips-page-seq.py's report: interleaving, what-if,
-#                           simulated IOTLB misses, and the sequence (--show)
+#   seq-<set>-<point>.txt   pips-page-seq.py's report: interleaving, what-ifs,
+#                           simulated IOTLB misses, the model, and both
+#                           sequences (--show, --port out,arr)
 #   seq.jsonl               one JSON line per log (--json), with its path
 #   manifest.txt            the log used for each point, missing ones, the
 #                           git revision and the command line
-# Copy DIR.tar.gz back next to the sweep results (dualssd/1016/, dualnic/1016/).
+# A line per log as it finishes ([done/total], seconds). Copy DIR.tar.gz back
+# next to the sweep results (dualssd/1016/, dualnic/1016/).
 set -u
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -49,17 +55,15 @@ case "$KIND" in
 esac
 SWEEP="dual${KIND}-pips-strict-1-id0a04"
 SETS="d1t0 d1t0c1 d4t22 d4t22c1 d8t22 d8t22c1 d16t64 d16t64c1"
-if [ "$KIND" = ssd ]; then
-    POINTS="4k-j8-both 4k-j16-both 4k-j32-both 16k-j8-both 64k-j8-both 1m-j8-both 1m-j16-both"
-else
-    POINTS="f5-both f15-both f30-both f5-nic0only f30-nic0only"
-fi
+POINTS=all
+MODEL="self,std,sweep"
 SHOW=600; JOBS=4; OUT=""; LOGS="$REPO/utils/logs"
 while [ $# -gt 0 ]; do
     case "$1" in
         --sweep) SWEEP="$2"; shift 2 ;;
         --sets) SETS="$2"; shift 2 ;;
         --points) POINTS="$2"; shift 2 ;;
+        --model) MODEL="$2"; shift 2 ;;
         --show) SHOW="$2"; shift 2 ;;
         --logs) LOGS="$2"; shift 2 ;;
         -j) JOBS="$2"; shift 2 ;;
@@ -81,6 +85,21 @@ STRICT=""
 case "$SWEEP" in *-strict-*) STRICT="--strict" ;; esac
 PY=${PYTHON:-python3}
 SEQ="$HERE/pips-page-seq.py"
+MODEL_ARG=""
+[ -n "$MODEL" ] && MODEL_ARG="--model $MODEL"
+
+if [ "$POINTS" = all ]; then                   # every run of the first setting with a log
+    first=${SETS%% *}
+    if [ "$KIND" = ssd ]; then
+        cands=$(ls -d "$LOGS/$SWEEP-$first"/*-RUN-* 2>/dev/null | sed 's#.*/##; s#-RUN-.*##')
+    else
+        cands=$(ls -d "$LOGS/$SWEEP-$first"-uncapped-*-RUN-* 2>/dev/null \
+                | sed "s#.*/$SWEEP-$first-uncapped-##; s#-RUN-.*##")
+    fi
+    POINTS=$(printf '%s\n' $cands | grep -v '^datapath' | sort -u | tr '\n' ' ')
+    POINTS=${POINTS% }
+    [ -n "$POINTS" ] || { echo "pips-seq-grab: no runs under $LOGS for $SWEEP-$first" >&2; exit 1; }
+fi
 
 jobs_file="$OUT/.jobs"
 : > "$jobs_file"
@@ -89,7 +108,7 @@ jobs_file="$OUT/.jobs"
     echo "repo revision $(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)"
     echo "sweep $SWEEP  sets: $SETS"
     echo "points: $POINTS"
-    echo "pips-page-seq.py --kind $KIND --iotlb 1x64,16x4,64x1 $STRICT --show $SHOW --from 100000"
+    echo "pips-page-seq.py --kind $KIND --iotlb 1x64,16x4,64x1 $STRICT $MODEL_ARG --show $SHOW --from 100000 --port out,arr"
     echo
 } > "$OUT/manifest.txt"
 missing=0
@@ -114,20 +133,24 @@ for set in $SETS; do
     done
 done
 n=$(wc -l < "$jobs_file")
-echo "pips-seq-grab: $n logs, $missing missing, $JOBS at a time, into $OUT"
+echo "pips-seq-grab: $n logs ($(echo "$POINTS" | wc -w) points), $missing missing, $JOBS at a time, into $OUT"
 
 one() {
     local set=$1 point=$2 log=$3
-    local base="$set-$point"
-    if $PY "$SEQ" "$log" --kind "$KIND" --iotlb 1x64,16x4,64x1 $STRICT --json "$OUT/.$base.json" \
-           --show "$SHOW" --from 100000 > "$OUT/seq-$base.txt" 2> "$OUT/.$base.err"; then
-        echo "  done  $base"
+    local base="$set-$point" t0=$SECONDS st
+    if $PY "$SEQ" "$log" --kind "$KIND" --iotlb 1x64,16x4,64x1 $STRICT $MODEL_ARG --json "$OUT/.$base.json" \
+           --show "$SHOW" --from 100000 --port out,arr > "$OUT/seq-$base.txt" 2> "$OUT/.$base.err"; then
+        st="done"
     else
-        echo "  FAIL  $base: $(tail -n 1 "$OUT/.$base.err")"
+        st="FAIL ($(tail -n 1 "$OUT/.$base.err"))"
     fi
+    echo "$base" >> "$OUT/.finished"
+    echo "  [$(wc -l < "$OUT/.finished")/$TOTAL] $st  $base  $((SECONDS - t0)) s"
 }
 export -f one
-export PY SEQ KIND STRICT OUT SHOW
+TOTAL=$n
+: > "$OUT/.finished"
+export PY SEQ KIND STRICT OUT SHOW MODEL_ARG TOTAL
 xargs -P "$JOBS" -n 3 bash -c 'one "$@"' _ < "$jobs_file"
 
 cat "$OUT"/.*.json > "$OUT/seq.jsonl" 2>/dev/null
@@ -135,7 +158,7 @@ done_n=$(wc -l < "$OUT/seq.jsonl")
 for e in "$OUT"/.*.err; do
     [ -s "$e" ] && { echo "--- $(basename "$e")"; cat "$e"; } >> "$OUT/manifest.txt"
 done
-rm -f "$OUT"/.*.json "$OUT"/.*.err "$jobs_file"
+rm -f "$OUT"/.*.json "$OUT"/.*.err "$jobs_file" "$OUT/.finished"
 echo "analysed $done_n of $n logs" >> "$OUT/manifest.txt"
 ( cd "$(dirname "$OUT")" && tar -czf "$(basename "$OUT").tar.gz" "$(basename "$OUT")" ) \
     || { echo "pips-seq-grab: tar failed; the results are in $OUT" >&2; exit 1; }

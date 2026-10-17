@@ -183,7 +183,9 @@ echo "-- pips-traffic.py: payload vs ring writes on every log, synthetic NVMe an
 # device-like): ssd = 16 x 64 DW of data, a 4 DW completion entry, an MSI per
 # I/O; nic = a 4000 B packet as 15 x 64 DW + 40 DW at headroom 64, a 16 DW
 # entry, an MSI and a descriptor read every 8 packets; nic-il = two packets'
-# data interleaved TLP by TLP, then both entries; ssd-pair = two I/Os' data,
+# data interleaved TLP by TLP, then both entries; nic-il0 = as the NICs on icx
+# write when held back: two 4032 B packets from offset 0 as 7 x 128 DW + 112 DW,
+# interleaved, the previous pair's entries after 3 TLPs; ssd-pair = two I/Os' data,
 # then both entries back to back. The two devices' TLPs interleave in batches.
 cat > "$T/synth.py" <<'EOF'
 import gzip, random, struct, sys
@@ -205,6 +207,13 @@ def device(src):
             for b in bufs:
                 yield (cq[q] + 16 * cqi[q], 4, 1); cqi[q] = (cqi[q] + 1) % 256
             yield (MSI + 0x1000 * q, 1, 1)
+        elif kind == "nic-il0":
+            for i in range(8):
+                if i == 3 and n:
+                    for _ in range(2):
+                        yield (cq[q] + 64 * cqi[q], 16, 1); cqi[q] = (cqi[q] + 1) % 64
+                for b in (buf, buf2):
+                    yield (b + 512 * i, 128 if i < 7 else 112, 1)
         else:
             bufs = (buf, buf2) if kind == "nic-il" else (buf,)
             if n % 8 == 0:
@@ -274,13 +283,91 @@ import json; r = json.loads(open('$T/psn.jsonl').readline())
 assert r['kind'] == 'nic' and 1000 < r['ios'] < 1300, (r['kind'], r['ios'])"
 run 0 "  --kind ssd on the same log finds no I/Os" python3 "$HERE/pips-page-seq.py" "$NICLOG" --kind ssd
     has ' 0 I/Os'
+IL0="$T/tl0/dualnic-pips-strict-1-id0a04-d1t0c1-uncapped-f5-both-RUN-server-0"
+mkdir -p "$IL0" && python3 "$T/synth.py" nic-il0 "$IL0/pips-log-id0a04.bin.gz"
+run 0 "  two packets at once: each open to its short last TLP, a completion between closes neither" \
+    python3 "$HERE/pips-page-seq.py" "$IL0/pips-log-id0a04.bin.gz" --port in0 --show 400 --from 1000 --json "$T/il0.jsonl"
+    lacks '[0-9] gap '; has ' 2/0 *$'
+run 0 "  json: in0 has 2 pages open, 1 TLP per run" python3 -c "
+import json; r = json.loads(open('$T/il0.jsonl').readline())['interleave']['in0']
+assert r['open']['0'][3] == 2 and r['open']['0'][0] > 1.5 and r['run_mean'] < 1.2, r"
+
+echo "-- pips-page-seq.py: arrival order and the batcher model"
+# A v2 log written by the model itself: two drives whose TLPs arrive
+# interleaved one by one, sent as d16t64 would. Rebuilding the arrival order
+# from gap and pkt_wait and running the model on it as d16t64 must give back
+# the logged order and waits.
+cat > "$T/synthb.py" <<'EOF'
+import gzip, importlib.util, random, struct, sys
+spec = importlib.util.spec_from_file_location("ps", sys.argv[1]); ps = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(ps)
+rng, MSI = random.Random(7), 0xFEE00000
+CYC, BEATS, PDW = dict(data=6, cqe=2, msi=2, mrd=2), dict(data=5, cqe=1, msi=1, mrd=1), dict(data=64, cqe=4, msi=1, mrd=16)
+def device(src):
+    base, t, k = 0x10000000 * (src + 1), rng.randrange(50), 0
+    while True:
+        page = base + 0x1000 * rng.randrange(4096)
+        yield (t, src, "mrd", base + 0x8000000 + 64 * (k % 64)); t += 3
+        for i in range(16):
+            yield (t, src, "data", page + 256 * i); t += 9 if src == 0 else 11
+        yield (t, src, "cqe", base + 0x9000000 + 16 * (k % 256)); t += 2
+        yield (t, src, "msi", MSI + 0x1000 * src); t += 40 + rng.randrange(200); k += 1
+gens = [device(0), device(1)]; heads = [next(g) for g in gens]; tlps = []
+while len(tlps) < 20000:
+    s = 0 if heads[0][0] <= heads[1][0] else 1
+    tlps.append(heads[s]); heads[s] = next(gens[s])
+sent = ps.batcher([(t, s, c, BEATS[c], CYC[c]) for t, s, c, _a in tlps], 16, 64, 0, 0)
+recs, eop = [], None
+for j, start, _d in sent:
+    t, s, c, addr = tlps[j]
+    gap = 0 if eop is None else min(255, start - eop - 1); eop = start + BEATS[c] - 1
+    recs.append(struct.pack("<QBBBBHBB", addr, BEATS[c], gap, 0 if c == "mrd" else 1, PDW[c], start - t, 0x80 | s, 0))
+with gzip.open(sys.argv[2], "wb") as f:
+    f.write(b"".join(recs) + struct.pack("<IIIBBBB", len(recs), 0, eop + 1, 2, 0, 0x88, 0))
+EOF
+BL="$T/tlb/dualssd-pips-strict-3-id0a04-d16t64/4k-j8-both-RUN-0"
+mkdir -p "$BL" && python3 "$T/synthb.py" "$HERE/pips-page-seq.py" "$BL/pips-log-id0a04.bin.gz"
+run 0 "model on the rebuilt arrival order: self (d16t64, from the path), std, sweep" \
+    python3 "$HERE/pips-page-seq.py" "$BL/pips-log-id0a04.bin.gz" --iotlb 1x64 --strict --model self,std,sweep \
+    --show 40 --from 5000 --port out,arr --json "$T/mb.jsonl"
+    has '^arr: the sequence'; has '^out: the sequence'; has '^Arrival order (arr)'
+    has '^ *d16t64 '; has '^ *d64t255 '; has '^ *recorded .*(d16t64, as logged on out)'
+run 0 "  json: d16t64 on the arrival order gives back the logged order and waits; arrivals were interleaved" python3 -c "
+import json; r = json.loads(open('$T/mb.jsonl').readline())
+m = {x['setting']: x for x in r['model']}; rec = r['recorded']
+assert r['setting'] == 'd16t64' and len(m) == 15, (r['setting'], list(m))
+assert abs(m['d16t64']['runs']['drive'] - rec['runs']) < 1e-9, (m['d16t64']['runs'], rec)
+assert abs(m['d16t64']['wait_mean_us'] - rec['wait_mean_us']) < 1e-9, (m['d16t64'], rec)
+assert r['interleave']['arr']['run_mean'] < 2 < r['interleave']['out']['run_mean'], r['interleave']
+assert r['windows_arr'][0]['runs']['drive'] > m['d1t0']['runs']['drive'] > m['d16t64']['runs']['drive'], m
+assert r['arrival']['segments'] == 1 and r['arrival']['moved'] > 0.5, r['arrival']"
+run 2 "  --model self without a setting in the path is refused" \
+    python3 "$HERE/pips-page-seq.py" "$T/synth-nosetting.bin.gz" --model self
+    has 'no setting in the'
+run 0 "  a v1 log: no arrival order, no model, a note" python3 "$HERE/pips-page-seq.py" \
+    "$TL/dualssd-pips-off-1-d8t22/4k-j1-both-RUN-0/pips-log.bin.gz" --model std --port out,arr --show 5
+    has 'has no pkt_wait: no arrival order or model'; lacks '^arr: the sequence'; has '^out: the sequence'
+
 run 0 "pips-seq-grab.sh nic: a log per setting and point, missing ones listed, packed" \
     bash "$HERE/pips-seq-grab.sh" nic --logs "$TL" --sets "d8t22 d8t22c1" --points "f5-both f30-both" -j 2 -o "$T/grab"
-    has '2 logs, 2 missing'; has '2 of 2 logs analysed'
+    has '2 logs (2 points), 2 missing'; has '2 of 2 logs analysed'; has '\[2/2\] done '
 [ -f "$T/grab.tar.gz" ] && [ "$(wc -l < "$T/grab/seq.jsonl")" -eq 2 ] && [ -s "$T/grab/seq-d8t22c1-f5-both.txt" ] &&
     grep -q '^missing  d8t22 f30-both' "$T/grab/manifest.txt" && ok "  files and manifest" ||
     bad "  grab output: $(ls "$T/grab" 2>&1)"
 run 1 "  an existing output folder is refused" bash "$HERE/pips-seq-grab.sh" nic --logs "$TL" -o "$T/grab"
+grep -q '"model": \[' "$T/grab/seq.jsonl" && grep -q '^arr: the sequence' "$T/grab/seq-d8t22-f5-both.txt" &&
+    ok "  model and arrival order in the grab" || bad "  grab: no model or arr listing"
+mkdir -p "$TL/dualssd-pips-strict-2-id0a04-d8t22/4k-j2+16-both-RUN-0" &&
+    cp "$TL/dualssd-pips-strict-2-id0a04-d8t22/4k-j8-both-RUN-0/pips-log-id0a04.bin.gz" \
+       "$TL/dualssd-pips-strict-2-id0a04-d8t22/4k-j2+16-both-RUN-0/"
+mkdir -p "$TL/dualssd-pips-strict-2-id0a04-d8t22/datapath-4k-j1-RUN-0"
+run 0 "pips-seq-grab.sh ssd, every point: uneven co-runs in, datapath checks out" \
+    bash "$HERE/pips-seq-grab.sh" ssd --logs "$TL" --sweep dualssd-pips-strict-2-id0a04 --sets "d8t22 d8t22c1" \
+    --model self -o "$T/grab-all"
+    has '3 logs (2 points), 1 missing'; has '3 of 3 logs analysed'
+grep -q '^points: 4k-j2+16-both 4k-j8-both$' "$T/grab-all/manifest.txt" &&
+    grep -q '^missing  d8t22c1 4k-j2+16-both' "$T/grab-all/manifest.txt" && ok "  points found" ||
+    bad "  points: $(grep -E '^(points|missing)' "$T/grab-all/manifest.txt")"
 run 0 "pips-seq-grab.sh ssd on a v1 sweep" bash "$HERE/pips-seq-grab.sh" ssd --logs "$TL" \
     --sweep dualssd-pips-off-1 --sets d8t22 --points 4k-j1-both -o "$T/grab-ssd"
     has '1 of 1 logs analysed'
