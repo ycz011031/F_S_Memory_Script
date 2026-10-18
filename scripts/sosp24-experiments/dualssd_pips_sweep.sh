@@ -14,6 +14,7 @@
 #   ./dualssd_pips_sweep.sh --caps 0                       # cap off only (as before 0x0a03)
 #   ./dualssd_pips_sweep.sh --single --tmux
 #   ./dualssd_pips_sweep.sh "4k 1m" "1 4 16" 1             # block sizes, instances, runs
+#   ./dualssd_pips_sweep.sh --cfgs "1:0 8:106" --caps 1 --tag dsweep1
 #
 # Options:
 #   --cfgs "DEPTH:TIME[:MRD] ..."  batcher settings: DEPTH depth_threshold and
@@ -29,7 +30,11 @@
 #   --no-asy          the even grid only
 #   --asy-low "2 4 8", --asy-high "16 32", --no-swap, --single, --single-ssd N
 #                     as dualssd_cross_sweep.sh (--single = drive 0 alone)
+#   --datapath-once   the datapath check (both drives, 1 instance, first block
+#                     size) only before the first setting, not before every one
 #   -o NAME           name the sweep (default dualssd-pips-<iommu>-<N>)
+#   --tag LABEL       name it dualssd-pips-<iommu>-<LABEL> (a label no earlier
+#                     sweep used, e.g. dsweep1); refused if that name has results
 #   --tmux            run it in a new tmux session instead of this terminal
 # Runner options go in DUALSSD_ARGS, e.g. DUALSSD_ARGS="--membw 0"; this adds
 # --pips-log 1 (run-dualssd-experiment.sh -h). Arguments: block sizes
@@ -45,9 +50,18 @@
 # with the status: FULL, CUT, +DROPS, NO_TRAILER, BAD or FAILED. Then:
 #   ~/<NAME>.txt                       every setting side by side, the grids,
 #                                      and the log check (which runs not FULL);
-#                                      its first lines name the design ID
+#                                      its first lines name the design ID and
+#                                      the sweep ID
+#   ~/<NAME>.manifest.tsv              every run of this sweep, one row each:
+#                                      setting, point, folders, TLP log, status
 #   utils/logs/<NAME>/pips-sweep.log   this output
+#   utils/logs/<NAME>/manifest.tsv     the same manifest, as it grows
+#   utils/logs/<NAME>/sweep-id.txt     the sweep ID: <NAME>@<host>@<start time>
 #   utils/logs/<NAME>/cfg-<setting>.txt  the batcher registers as set
+# Every run of the sweep carries the sweep ID: sweep-id.txt in its log folder,
+# a sweep_id: line in pips-log.rpt, pips_sweep_id in its JSONL record. Logs
+# without them are from other runs; scripts/pips/SWEEP-LOGS.md says how to
+# read one sweep and nothing else.
 # On a build without a design ID (older than 0x0a02) names have no id<XXXX>.
 #
 # Time per setting: ~90 runs (30 even points + 60 uneven, + the datapath
@@ -67,24 +81,30 @@ PASS=(); IN_TMUX=0
 for a in "$@"; do if [ "$a" = --tmux ]; then IN_TMUX=1; else PASS+=( "$a" ); fi; done
 set -- ${PASS[@]+"${PASS[@]}"}
 
-CFGS="1:0 8:22"; CAPS="0 1"; NAME=""; ASY=1; SINGLE_SSD=""; OPTS=(); POS=()
+CFGS="1:0 8:22"; CAPS="0 1"; NAME=""; LABEL=""; ASY=1; SINGLE_SSD=""; DP_ONCE=0; OPTS=(); POS=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --cfgs)        CFGS="$2"; shift 2 ;;
         --caps)        CAPS="$2"; shift 2 ;;
         --no-asy)      ASY=0; shift ;;
+        --datapath-once) DP_ONCE=1; shift ;;
         -o|--out)      NAME="$2"; shift 2 ;;
+        --tag)         LABEL="$2"; shift 2 ;;
         --asy-low|--asy-high) OPTS+=( "$1" "$2" ); shift 2 ;;
         --no-swap)     OPTS+=( "$1" ); shift ;;
         --single)      SINGLE_SSD="${SINGLE_SSD:-0}"; shift ;;
         --single-ssd)  SINGLE_SSD="$2"; shift 2 ;;
-        -h|--help)     sed -n '2,58p' "$SELF"; exit 0 ;;
+        -h|--help)     sed -n '2,72p' "$SELF"; exit 0 ;;
         -*)            echo "unknown option: $1" >&2; exit 2 ;;
         *)             POS+=( "$1" ); shift ;;
     esac
 done
 [ "$ASY" = 1 ] && OPTS+=( --asy )
 [ -n "$SINGLE_SSD" ] && OPTS+=( --single-ssd "$SINGLE_SSD" )
+[ -n "$NAME" ] && [ -n "$LABEL" ] && { echo "-o and --tag: give one" >&2; exit 2; }
+case "$LABEL" in *[!A-Za-z0-9]*) echo "--tag: letters and digits only, not '$LABEL'" >&2; exit 2 ;; esac
+case "$LABEL" in d[0-9]*t[0-9]*|id[0-9a-f][0-9a-f][0-9a-f][0-9a-f]*)
+    echo "--tag: '$LABEL' reads like a setting or design tag; pick another" >&2; exit 2 ;; esac
 
 # Every setting checked before anything runs: "d:t" or "d:t:m", each with
 # every --caps value (cap off first by default).
@@ -149,6 +169,7 @@ taken() {   # <name> -> true if it or any of its settings has results in $DIR
     done
     return 1
 }
+[ -n "$LABEL" ] && NAME="dualssd-pips-$IOMMU-$LABEL"
 if [ -z "$NAME" ]; then
     n=1; while taken "dualssd-pips-$IOMMU-$n"; do n=$((n + 1)); done
     NAME="dualssd-pips-$IOMMU-$n"
@@ -171,21 +192,27 @@ restore() {
         echo "######## WARNING: could not restore the batcher setting $v:" \
              "$(tail -1 "$LOGDIR/cfg-restored.txt")" >&2
     fi
+    pips_sweep_save "$DIR"
 }
 trap restore EXIT
 STOP=0
 trap 'STOP=1' INT TERM
 
+SUBS=(); for tag in "${TAGS[@]}"; do SUBS+=( "$NAME${IDT:+-$IDT}-$tag" ); done
+pips_sweep_begin ssd "$NAME" "$LOGDIR" "$DIR" "$DESIGN" "${SUBS[@]}"
+
 echo "######## dual-SSD PIPS sweep $NAME"
+echo "######## sweep ID: $PIPS_SWEEP_ID   (in every run: sweep-id.txt, pips_sweep_id; manifest $LOGDIR/manifest.tsv)"
 echo "######## settings: ${TAGS[*]}   (each a full cross sweep$( [ "$ASY" = 1 ] && echo " with --asy"))"
-echo "######## grid: bs $BSIZES x instances $INSTANCES, $RUNS run(s)$( [ -n "$SINGLE_SSD" ] && echo ", drive $SINGLE_SSD alone too")"
+echo "######## grid: bs $BSIZES x instances $INSTANCES, $RUNS run(s)$( [ -n "$SINGLE_SSD" ] && echo ", drive $SINGLE_SSD alone too")," \
+     "datapath check $( [ "$DP_ONCE" = 1 ] && echo "before the first setting only" || echo "before every setting")"
 echo "######## PIPS: $USP, design ${DESIGN:-?}, batcher before: $(pips_tag "$CFG0" "$CAP0") ($CFG0)"
 echo "######## IOMMU: $IOMMU   kernel $(uname -r)   runner args: ${DUALSSD_ARGS:-} --pips-log 1"
 echo "######## per setting: $NAME${IDT:+-$IDT}-<setting>"
 echo "######## logs: $LOGDIR/"
 
 # ----------------------------------------------------------------- sweep
-DONE=(); NOTES=(); t0=$SECONDS
+DONE=(); NOTES=(); DP_OK=0; t0=$SECONDS
 for k in "${!TAGS[@]}"; do
     tag=${TAGS[$k]}; read -r d t m cap <<< "${VALS[$k]}"
     sub="$NAME${IDT:+-$IDT}-$tag"
@@ -199,11 +226,17 @@ for k in "${!TAGS[@]}"; do
         continue
     fi
     echo "######## set: $(grep -E '^(cfg|drain|design_id)=' "$LOGDIR/cfg-$tag.txt" | xargs)"
+    DP=(); [ "$DP_ONCE" = 1 ] && [ "$DP_OK" = 1 ] && DP=( --no-datapath )
+    export PIPS_SWEEP_SUB="$sub"
     DUALSSD_ARGS="${DUALSSD_ARGS:-} --pips-log 1" \
-        bash "$HERE/dualssd_sweep.sh" -o "$sub" ${OPTS[@]+"${OPTS[@]}"} \
+        bash "$HERE/dualssd_sweep.sh" -o "$sub" ${OPTS[@]+"${OPTS[@]}"} ${DP[@]+"${DP[@]}"} \
         "$INSTANCES" "$BSIZES" "$RUNS"
     rc=$?
+    # The datapath check passed if it ran and is not among the failed points.
+    [ ${#DP[@]} = 0 ] && [ -s "$DIR/$sub.jsonl" ] && ! grep -q '^datapath-' "$UTILS/logs/$sub/failed.txt" 2>/dev/null &&
+        DP_OK=1
     DONE+=( "$sub" )
+    pips_sweep_save "$DIR"
     P cfg > "$LOGDIR/cfg-$tag-after.txt" 2>/dev/null
     now=$(cfg_of "$LOGDIR/cfg-$tag-after.txt")
     if [ -n "$now" ] && [ "$(pips_tag "$now" "$(cap_of "$LOGDIR/cfg-$tag-after.txt")")" != "$tag" ]; then
@@ -223,10 +256,12 @@ for s in ${DONE[@]+"${DONE[@]}"}; do [ -s "$DIR/$s.jsonl" ] && FILES+=( "$DIR/$s
 {
     echo "dual-SSD PIPS sweep $NAME  $(date '+%F %T')  host $(hostname)"
     echo "design_id=${DESIGN:-none}"
+    echo "sweep_id=$PIPS_SWEEP_ID"
     echo "IOMMU $IOMMU  kernel $(uname -r)  PIPS design ${DESIGN:-?}"
     echo "settings: ${TAGS[*]}   bs: $BSIZES   instances: $INSTANCES   runs: $RUNS" \
          "$( [ "$ASY" = 1 ] && echo "  + uneven co-runs")"
     echo "per setting: ~/$NAME${IDT:+-$IDT}-<setting>.jsonl/.txt, utils/logs/$NAME${IDT:+-$IDT}-<setting>/"
+    echo "every run: ~/$NAME.manifest.tsv (scripts/pips/SWEEP-LOGS.md)"
     for x in ${NOTES[@]+"${NOTES[@]}"}; do echo "NOTE: $x"; done
     echo
     if [ ${#FILES[@]} -gt 0 ]; then
@@ -251,7 +286,9 @@ echo "=============================================================="
 echo "  log check:"
 sed -n '/^PIPS TLP log per configuration/,/^  logs: /p' "$DIR/$NAME.txt" | grep -E 'NOT ALL FULL|^  logs: '
 for x in ${NOTES[@]+"${NOTES[@]}"}; do echo "  NOTE: $x"; done
+pips_sweep_save "$DIR"
 echo "  everything side by side: $DIR/$NAME.txt   (design ${DESIGN:-?})"
 echo "  per setting: $DIR/$NAME${IDT:+-$IDT}-<setting>.{jsonl,txt}, $UTILS/logs/$NAME${IDT:+-$IDT}-<setting>/"
+echo "  every run:   $DIR/$NAME.manifest.tsv   sweep ID $PIPS_SWEEP_ID"
 [ "$STOP" = 1 ] && exit 130
 exit 0

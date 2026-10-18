@@ -14,6 +14,7 @@
 #   ./dualnic_pips_sweep.sh --caps 0                       # cap off only (as before 0x0a03)
 #   ./dualnic_pips_sweep.sh --single --tmux                # also each NIC alone, in tmux
 #   ./dualnic_pips_sweep.sh "5 10 30" "30 uncapped" 3      # flows/NIC, rates, runs
+#   ./dualnic_pips_sweep.sh --cfgs "1:0 8:88" --caps 1 --datapath-once --tag dsweep1
 #
 # Options:
 #   --cfgs "DEPTH:TIME[:MRD] ..."  batcher settings: DEPTH depth_threshold and
@@ -29,7 +30,11 @@
 #   --single          also each NIC alone (modes "nic0only nic1only both");
 #                     the summary's CONTENTION needs them
 #   --modes "..."     the modes outright (default "both", the co-run)
+#   --datapath-once   the datapath check (NIC0 alone, lowest flow count) only
+#                     before the first setting, not before every one
 #   -o NAME           name the sweep (default dualnic-pips-<iommu>-<N>)
+#   --tag LABEL       name it dualnic-pips-<iommu>-<LABEL> (a label no earlier
+#                     sweep used, e.g. dsweep1); refused if that name has results
 #   --tmux            run it in a new tmux session instead of this terminal
 # Runner options go in DUALNIC_ARGS, e.g. DUALNIC_ARGS="--cca cubic"; this
 # adds --pips-log 1 (run-dualnic-experiment.sh -h). Arguments: flows per NIC
@@ -45,8 +50,17 @@
 # with the status: FULL, CUT, +DROPS, NO_TRAILER, BAD or FAILED. Then:
 #   ~/<NAME>.txt                       every setting side by side and the log
 #                                      check; its first lines name the design ID
+#                                      and the sweep ID
+#   ~/<NAME>.manifest.tsv              every run of this sweep, one row each:
+#                                      setting, point, folders, TLP log, status
 #   utils/logs/<NAME>/pips-sweep.log   this output
+#   utils/logs/<NAME>/manifest.tsv     the same manifest, as it grows
+#   utils/logs/<NAME>/sweep-id.txt     the sweep ID: <NAME>@<host>@<start time>
 #   utils/logs/<NAME>/cfg-<setting>.txt  the batcher registers as set
+# Every run of the sweep carries the sweep ID: sweep-id.txt in its log folder,
+# a sweep_id: line in pips-log.rpt, pips_sweep_id in its JSONL record. Logs
+# without them are from other runs; scripts/pips/SWEEP-LOGS.md says how to
+# read one sweep and nothing else.
 # On a build without a design ID (older than 0x0a02) names have no id<XXXX>.
 #
 # Time per setting: each run is ~2.5 min (NIC setup, 12 s warm-up, the 20 s
@@ -66,15 +80,17 @@ PASS=(); IN_TMUX=0
 for a in "$@"; do if [ "$a" = --tmux ]; then IN_TMUX=1; else PASS+=( "$a" ); fi; done
 set -- ${PASS[@]+"${PASS[@]}"}
 
-CFGS="1:0 8:22"; CAPS="0 1"; NAME=""; MODES="both"; POS=()
+CFGS="1:0 8:22"; CAPS="0 1"; NAME=""; LABEL=""; MODES="both"; DP_ONCE=0; POS=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --cfgs)        CFGS="$2"; shift 2 ;;
         --caps)        CAPS="$2"; shift 2 ;;
         --single)      MODES="nic0only nic1only both"; shift ;;
         --modes)       MODES="$2"; shift 2 ;;
+        --datapath-once) DP_ONCE=1; shift ;;
         -o|--out)      NAME="$2"; shift 2 ;;
-        -h|--help)     sed -n '2,57p' "$SELF"; exit 0 ;;
+        --tag)         LABEL="$2"; shift 2 ;;
+        -h|--help)     sed -n '2,71p' "$SELF"; exit 0 ;;
         -*)            echo "unknown option: $1" >&2; exit 2 ;;
         *)             POS+=( "$1" ); shift ;;
     esac
@@ -82,6 +98,10 @@ done
 for m in $MODES; do
     case "$m" in nic0only|nic1only|both) ;; *) echo "--modes: '$m' is not nic0only, nic1only or both" >&2; exit 2 ;; esac
 done
+[ -n "$NAME" ] && [ -n "$LABEL" ] && { echo "-o and --tag: give one" >&2; exit 2; }
+case "$LABEL" in *[!A-Za-z0-9]*) echo "--tag: letters and digits only, not '$LABEL'" >&2; exit 2 ;; esac
+case "$LABEL" in d[0-9]*t[0-9]*|id[0-9a-f][0-9a-f][0-9a-f][0-9a-f]*)
+    echo "--tag: '$LABEL' reads like a setting or design tag; pick another" >&2; exit 2 ;; esac
 
 # Every setting checked before anything runs: "d:t" or "d:t:m", each with
 # every --caps value (cap off first by default).
@@ -154,6 +174,7 @@ taken() {   # <name> -> true if it or any of its settings has results in $DIR
     done
     return 1
 }
+[ -n "$LABEL" ] && NAME="dualnic-pips-$IOMMU-$LABEL"
 if [ -z "$NAME" ]; then
     n=1; while taken "dualnic-pips-$IOMMU-$n"; do n=$((n + 1)); done
     NAME="dualnic-pips-$IOMMU-$n"
@@ -176,14 +197,20 @@ restore() {
         echo "######## WARNING: could not restore the batcher setting $v:" \
              "$(tail -1 "$LOGDIR/cfg-restored.txt")" >&2
     fi
+    pips_sweep_save "$DIR"
 }
 trap restore EXIT
 STOP=0
 trap 'STOP=1' INT TERM
 
+SUBS=(); for tag in "${TAGS[@]}"; do SUBS+=( "$NAME${IDT:+-$IDT}-$tag" ); done
+pips_sweep_begin nic "$NAME" "$LOGDIR" "$DIR" "$DESIGN" "${SUBS[@]}"
+
 echo "######## dual-NIC PIPS sweep $NAME"
+echo "######## sweep ID: $PIPS_SWEEP_ID   (in every run: sweep-id.txt, pips_sweep_id; manifest $LOGDIR/manifest.tsv)"
 echo "######## settings: ${TAGS[*]}   (each a full flow sweep)"
-echo "######## flows/NIC $FLOWS, rates $RATES, modes $MODES, $RUNS run(s)"
+echo "######## flows/NIC $FLOWS, rates $RATES, modes $MODES, $RUNS run(s)," \
+     "datapath check $( [ "$DP_ONCE" = 1 ] && echo "before the first setting only" || echo "before every setting")"
 echo "######## PIPS: $USP, design ${DESIGN:-?}, batcher before: $(pips_tag "$CFG0" "$CAP0") ($CFG0)"
 echo "######## NICs: ${SERVER_INTFS[*]} (${BDFS[*]:-?})"
 echo "######## IOMMU: $IOMMU   kernel $(uname -r)   runner args: ${DUALNIC_ARGS:-} --pips-log 1"
@@ -191,7 +218,7 @@ echo "######## per setting: $NAME${IDT:+-$IDT}-<setting>"
 echo "######## logs: $LOGDIR/"
 
 # ----------------------------------------------------------------- sweep
-DONE=(); NOTES=(); t0=$SECONDS
+DONE=(); NOTES=(); DP_OK=0; t0=$SECONDS
 for k in "${!TAGS[@]}"; do
     tag=${TAGS[$k]}; read -r d t m cap <<< "${VALS[$k]}"
     sub="$NAME${IDT:+-$IDT}-$tag"
@@ -205,11 +232,16 @@ for k in "${!TAGS[@]}"; do
         continue
     fi
     echo "######## set: $(grep -E '^(cfg|drain|design_id)=' "$LOGDIR/cfg-$tag.txt" | xargs)"
+    DP=(); [ "$DP_ONCE" = 1 ] && [ "$DP_OK" = 1 ] && DP=( --no-datapath )
+    export PIPS_SWEEP_SUB="$sub"
     # The PIPS lock is this sweep's; the flow sweep and runner do not take it.
     DUALNIC_ARGS="${DUALNIC_ARGS:-} --pips-log 1" \
-        bash "$HERE/dualnic_flow_sweep.sh" -o "$sub" -p "$sub" "$FLOWS" "$RATES" "$RUNS" "$MODES"
+        bash "$HERE/dualnic_flow_sweep.sh" -o "$sub" -p "$sub" ${DP[@]+"${DP[@]}"} \
+        "$FLOWS" "$RATES" "$RUNS" "$MODES"
     rc=$?
+    [ "$rc" = 0 ] && DP_OK=1          # the datapath check passed (or was not needed)
     DONE+=( "$sub" )
+    pips_sweep_save "$DIR"
     [ "$rc" = 0 ] || NOTES+=( "$tag: the flow sweep stopped early (exit $rc): see $LOGDIR/pips-sweep.log" )
     P cfg > "$LOGDIR/cfg-$tag-after.txt" 2>/dev/null
     now=$(cfg_of "$LOGDIR/cfg-$tag-after.txt")
@@ -230,9 +262,11 @@ for s in ${DONE[@]+"${DONE[@]}"}; do [ -s "$DIR/$s.jsonl" ] && FILES+=( "$DIR/$s
 {
     echo "dual-NIC PIPS sweep $NAME  $(date '+%F %T')  host $(hostname)"
     echo "design_id=${DESIGN:-none}"
+    echo "sweep_id=$PIPS_SWEEP_ID"
     echo "IOMMU $IOMMU  kernel $(uname -r)  PIPS design ${DESIGN:-?}"
     echo "settings: ${TAGS[*]}   flows/NIC: $FLOWS   rates: $RATES   modes: $MODES   runs: $RUNS"
     echo "per setting: ~/$NAME${IDT:+-$IDT}-<setting>.jsonl/.txt, utils/logs/$NAME${IDT:+-$IDT}-<setting>-*"
+    echo "every run: ~/$NAME.manifest.tsv (scripts/pips/SWEEP-LOGS.md)"
     for x in ${NOTES[@]+"${NOTES[@]}"}; do echo "NOTE: $x"; done
     echo
     if [ ${#FILES[@]} -gt 0 ]; then
@@ -253,7 +287,9 @@ echo "=============================================================="
 echo "  log check:"
 sed -n '/^PIPS TLP log per configuration/,/^  logs: /p' "$DIR/$NAME.txt" | grep -E 'NOT ALL FULL|^  logs: '
 for x in ${NOTES[@]+"${NOTES[@]}"}; do echo "  NOTE: $x"; done
+pips_sweep_save "$DIR"
 echo "  everything side by side: $DIR/$NAME.txt   (design ${DESIGN:-?})"
 echo "  per setting: $DIR/$NAME${IDT:+-$IDT}-<setting>.{jsonl,txt}, $UTILS/logs/$NAME${IDT:+-$IDT}-<setting>-*"
+echo "  every run:   $DIR/$NAME.manifest.tsv   sweep ID $PIPS_SWEEP_ID"
 [ "$STOP" = 1 ] && exit 130
 exit 0

@@ -43,7 +43,8 @@
 # pkill in HANDOFF §7). A point that fails for any reason -- including the
 # datapath check, one short run of both drives at the lowest instance count
 # -- is logged with the runner's first error in utils/logs/<name>/failed.txt
-# and at the top of the summary, and the sweep moves on.
+# and at the top of the summary, and the sweep moves on. --no-datapath skips
+# the check (dualssd_pips_sweep.sh --datapath-once: after its first setting).
 #
 # Run it once per IOMMU setting: boot with the IOMMU on, run; reboot with it
 # off, run again. The mode is read from sysfs and put in the sweep's name.
@@ -81,10 +82,12 @@ ASY=0
 ASY_LOW="2 4 8"
 ASY_HIGH="16 32"
 SWAP=1
+DATAPATH=1
 POS=()
 while [ $# -gt 0 ]; do
     case "$1" in
         -o|--out)  NAME="$2"; shift 2 ;;
+        --no-datapath) DATAPATH=0; shift ;;
         --single)  SINGLE=1; shift ;;
         --single-ssd)
             case "$2" in 0|1) SINGLE_SSD="$2" ;;
@@ -94,7 +97,7 @@ while [ $# -gt 0 ]; do
         --asy-low)   ASY=1; ASY_LOW="$2"; shift 2 ;;
         --asy-high)  ASY=1; ASY_HIGH="$2"; shift 2 ;;
         --no-swap)   SWAP=0; shift ;;
-        -h|--help) sed -n '2,67p' "$SELF"; exit 0 ;;
+        -h|--help) sed -n '2,68p' "$SELF"; exit 0 ;;
         -*)        echo "unknown option: $1" >&2; exit 2 ;;
         *)         POS+=( "$1" ); shift ;;
     esac
@@ -249,22 +252,26 @@ low=$(printf '%s\n' $INSTANCES | sort -n | head -1)
 b0="${BSIZES%% *}"
 e="datapath-$b0-j$low"
 echo
-echo "######## datapath check: both drives, $low instance(s) each, bs $b0, 1 run"
-run "$e" "$LOGDIR/datapath.jsonl" --ssds 2 -J "$low" --bs "$b0" --runs 1
-rc=$?
-stop_if_asked "$rc"
-if [ "$rc" != 0 ]; then
-    fail "$e" "exit $rc: $(first_error "$e")"
+if [ "$DATAPATH" = 0 ]; then
+    echo "######## datapath check skipped (--no-datapath)"
 else
-    for i in 0 1; do
-        got=$(awk '/^IOPS:/{print $2}' "$UTILS/reports/$NAME/$e-RUN-0-ssd$i/fio.rpt" 2>/dev/null)
-        case "${got:-}" in ''|*[!0-9.]*) got=0 ;; esac
-        if awk -v t="$got" 'BEGIN{exit !(t > 1000)}'; then
-            echo "######## datapath OK: $got IOPS on SSD$i"
-        else
-            fail "$e" "SSD$i moved only $got IOPS; see $UTILS/reports/$NAME/$e-RUN-0-ssd$i/"
-        fi
-    done
+    echo "######## datapath check: both drives, $low instance(s) each, bs $b0, 1 run"
+    run "$e" "$LOGDIR/datapath.jsonl" --ssds 2 -J "$low" --bs "$b0" --runs 1
+    rc=$?
+    stop_if_asked "$rc"
+    if [ "$rc" != 0 ]; then
+        fail "$e" "exit $rc: $(first_error "$e")"
+    else
+        for i in 0 1; do
+            got=$(awk '/^IOPS:/{print $2}' "$UTILS/reports/$NAME/$e-RUN-0-ssd$i/fio.rpt" 2>/dev/null)
+            case "${got:-}" in ''|*[!0-9.]*) got=0 ;; esac
+            if awk -v t="$got" 'BEGIN{exit !(t > 1000)}'; then
+                echo "######## datapath OK: $got IOPS on SSD$i"
+            else
+                fail "$e" "SSD$i moved only $got IOPS; see $UTILS/reports/$NAME/$e-RUN-0-ssd$i/"
+            fi
+        done
+    fi
 fi
 
 total=$(( $(echo $BSIZES | wc -w) * ( $(echo $INSTANCES | wc -w) * $(echo $MODES | wc -w) + ${#ASY_PAIRS[@]} ) ))

@@ -247,12 +247,77 @@ $(printf '%s\n' "$out" | tail -2 | sed 's/^/      /')
     fi
 }
 
+# Sweep identity (SWEEP-LOGS.md). A PIPS sweep exports PIPS_SWEEP_ID (unique:
+# <name>@<host>@<start time>), PIPS_SWEEP (its name), PIPS_SWEEP_SUB (the
+# current setting's sweep, <name>-id<XXXX>-<setting>) and PIPS_MANIFEST (its
+# manifest.tsv). Then each run's folder gets sweep-id.txt, its .rpt a
+# sweep_id: line, each result pips_sweep_id, and the manifest a row per run.
+# Runs outside a PIPS sweep have none of these.
+pips_setting_known() { if [ -n "$pips_cfg" ]; then pips_setting; else echo unknown; fi; }
+pips_point() {   # the run's point: $RUN without the setting's sweep name and -RUN-<j>
+    local p="${RUN%-RUN-*}"
+    [ -n "${PIPS_SWEEP_SUB:-}" ] && p="${p#"$PIPS_SWEEP_SUB"}"
+    p="${p#/}"; echo "${p#-}"
+}
+pips_sweep_mark() {
+    [ -n "${PIPS_SWEEP_ID:-}" ] || return 0
+    printf 'sweep_id=%s\nsweep=%s\nsweep_setting=%s\nsetting=%s\npoint=%s\nrun=%s\nstarted=%s\n' \
+        "$PIPS_SWEEP_ID" "${PIPS_SWEEP:-}" "${PIPS_SWEEP_SUB:-}" "$(pips_setting_known)" "$(pips_point)" "$RUN" \
+        "$(date '+%F %T')" > "$L/sweep-id.txt"
+}
+pips_manifest_add() {   # <report file> <TLP log or ""> <status>
+    local rel_l rel_r role=point
+    [ -n "${PIPS_SWEEP_ID:-}" ] && [ -n "${PIPS_MANIFEST:-}" ] || return 0
+    rel_l="${L#"$PIPS_REPO"/}"; rel_r="${1%/*}"; rel_r="${rel_r#"$PIPS_REPO"/}"
+    case "$(pips_point)" in *datapath*) role=datapath ;; esac
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$PIPS_SWEEP_ID" "$(pips_setting_known)" "$(pips_point)" \
+        "$role" "$RUN" "$rel_l" "$rel_r" "${2:+${2#"$PIPS_REPO"/}}" "$3" "${pips_design:-none}" \
+        "$(date '+%F %T')" >> "$PIPS_MANIFEST"
+}
+
+# pips_sweep_begin <kind ssd|nic> <name> <logdir> <results dir> <design> <sub>...:
+# in a PIPS sweep, before its first run. <sub> are the per-setting sweep names
+# (<name>-id<XXXX>-<setting>). Exports the identity above, writes
+# <logdir>/sweep-id.txt and starts <logdir>/manifest.tsv: "#" lines, then a
+# header row, then one row per run as it ends (pips_manifest_add).
+pips_sweep_begin() {
+    local kind="$1" name="$2" logdir="$3" dir="$4" design="$5" s
+    shift 5
+    export PIPS_SWEEP="$name"
+    export PIPS_SWEEP_ID="$name@$(hostname -s)@$(date +%Y%m%d-%H%M%S)"
+    export PIPS_MANIFEST="$logdir/manifest.tsv"
+    export PIPS_SWEEP_SUB=""
+    {
+        echo "# pips sweep manifest v1: one row per run of this sweep (scripts/pips/SWEEP-LOGS.md)"
+        echo "# sweep_id=$PIPS_SWEEP_ID"
+        echo "# sweep=$name"
+        echo "# kind=$kind"
+        echo "# host=$(hostname)"
+        echo "# design_id=${design:-none}"
+        echo "# started=$(date '+%F %T')"
+        echo "# repo_revision=$(git -C "$PIPS_REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+        for s in "$@"; do echo "# setting_sweep=$s results=$dir/$s.jsonl"; done
+        printf 'sweep_id\tsetting\tpoint\trole\trun\tlog_dir\treport_dir\ttlp_log\tstatus\tdesign_id\tfinished\n'
+    } > "$PIPS_MANIFEST"
+    printf 'sweep_id=%s\nsweep=%s\nkind=%s\nhost=%s\ndesign_id=%s\nstarted=%s\nmanifest=%s\n' \
+        "$PIPS_SWEEP_ID" "$name" "$kind" "$(hostname)" "${design:-none}" "$(date '+%F %T')" \
+        "$PIPS_MANIFEST" > "$logdir/sweep-id.txt"
+}
+
+# pips_sweep_save <results dir>: the manifest so far, also as
+# <results dir>/<name>.manifest.tsv (after each setting, and at the end).
+pips_sweep_save() {
+    [ -n "${PIPS_MANIFEST:-}" ] && [ -s "$PIPS_MANIFEST" ] || return 0
+    cp "$PIPS_MANIFEST" "$1/$PIPS_SWEEP.manifest.tsv" 2>/dev/null
+}
+
 # pips_run_cfg: at the start of each run, before the load. The run's folder
 # keeps the `pips cfg` readout it ran with (pips-cfg.txt: setting, drain cap,
-# design ID, log format); with --pips-log 1 the log region is zeroed, so
-# leftovers never pass for data.
+# design ID, log format) and, inside a PIPS sweep, sweep-id.txt; with
+# --pips-log 1 the log region is zeroed, so leftovers never pass for data.
 pips_run_cfg() {
     local now
+    pips_sweep_mark
     if [ -n "$pips_cfg" ]; then
         pipsc cfg > "$L/pips-cfg.txt" 2>&1
         now=$(cfg_of "$L/pips-cfg.txt")
@@ -300,7 +365,11 @@ pips_collect() {
         [ "$pips_gzip" = 1 ] && gzip -f "$bin"
     fi
     [ -s "$rpt" ] || printf 'status: FAILED\ndesign_id: %s\n' "${pips_design:-none}" > "$rpt"
+    [ -n "${PIPS_SWEEP_ID:-}" ] && printf 'sweep_id: %s\n' "$PIPS_SWEEP_ID" >> "$rpt"
     PIPS_STATUS+=( "$(awk '/^status:/{print $2; exit}' "$rpt")" )
+    local got=""
+    for got in "$bin.gz" "$bin"; do [ -s "$got" ] && break; got=""; done
+    pips_manifest_add "$rpt" "$got" "${PIPS_STATUS[-1]}"
     echo "   PIPS log: $(awk '/^status:/{print $2; exit}' "$rpt")," \
          "$(awk '/^pips_records:/{r=$2} /^pips_dropped:/{d=$2} END{printf "%s records, %s dropped", r, d}' "$rpt")" \
          "(logs: pips-log-*.txt)"
@@ -317,6 +386,8 @@ pips_meta() {
                      --meta pips_drain_cap="$pips_cap" --meta pips_design_id="${pips_design:-unknown}" )
     fi
     [ "$pips_log" = 1 ] && PIPS_META+=( --meta pips_log="$(IFS=,; echo "${PIPS_STATUS[*]}")" )
+    [ -n "${PIPS_SWEEP_ID:-}" ] && PIPS_META+=( --meta pips_sweep_id="$PIPS_SWEEP_ID"
+                                                --meta pips_sweep="${PIPS_SWEEP:-}" )
     return 0
 }
 

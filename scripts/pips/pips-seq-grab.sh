@@ -9,14 +9,22 @@
 # that holds the logs, and packs the results.
 #
 #   bash scripts/pips/pips-seq-grab.sh ssd|nic [options]
+#   bash scripts/pips/pips-seq-grab.sh --manifest ~/<sweep>.manifest.tsv [options]
 #
+#   --manifest FILE  a PIPS sweep's manifest (SWEEP-LOGS.md): its runs and only
+#                    those, the TLP log each row names, rows of other sweep IDs
+#                    and datapath checks left out. Kind, sweep and settings
+#                    come from it (--sets, --points still narrow them); the
+#                    model default becomes "self,<every setting of the sweep>"
+#                    and the output ~/seq-<sweep>
 #   --sweep NAME     sweep name before the setting (default
 #                    dualssd-pips-strict-1-id0a04 / dualnic-pips-strict-1-id0a04)
 #   --sets "S ..."   batcher settings (default: the eight 0x0A04 ones,
 #                    d1t0 d1t0c1 d4t22 d4t22c1 d8t22 d8t22c1 d16t64 d16t64c1)
 #   --points "P ..." run names, or "all" (default): every run of the sweep's
 #                    first setting that has a log, uneven co-runs (4k-j2+16-both)
-#                    and one-NIC runs included, datapath checks left out
+#                    and one-NIC runs included, datapath checks (any name with
+#                    "datapath") left out
 #   --model LIST     batcher model settings, as pips-page-seq.py --model
 #                    (default self,std,sweep; "" for none)
 #   --show N         runs of each sequence to list per log, from record 100000
@@ -47,23 +55,34 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; }
 
-KIND=${1:-}
+KIND=${1:-}; MANIFEST=""
 case "$KIND" in
     ssd|nic) shift ;;
+    --manifest) MANIFEST="${2:-}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
-    *) usage >&2; echo "pips-seq-grab: first argument must be ssd or nic" >&2; exit 2 ;;
+    *) usage >&2; echo "pips-seq-grab: first argument must be ssd, nic or --manifest FILE" >&2; exit 2 ;;
 esac
+# A manifest's "# key=value" header lines: sweep_id, sweep, kind, ...
+mhead() { sed -n "s/^# $1=//p" "$MANIFEST" | head -1; }
+if [ -n "$MANIFEST" ]; then
+    [ -s "$MANIFEST" ] || { echo "pips-seq-grab: no manifest $MANIFEST" >&2; exit 1; }
+    KIND=$(mhead kind)
+    case "$KIND" in ssd|nic) ;; *) echo "pips-seq-grab: $MANIFEST names no kind (ssd|nic)" >&2; exit 1 ;; esac
+fi
 SWEEP="dual${KIND}-pips-strict-1-id0a04"
 SETS="d1t0 d1t0c1 d4t22 d4t22c1 d8t22 d8t22c1 d16t64 d16t64c1"
 POINTS=all
 MODEL="self,std,sweep"
+SET_GIVEN=0; MODEL_GIVEN=0
 SHOW=600; JOBS=4; OUT=""; LOGS="$REPO/utils/logs"
 while [ $# -gt 0 ]; do
     case "$1" in
+        --manifest) MANIFEST="$2"; shift 2
+            echo "pips-seq-grab: --manifest goes first, in place of ssd|nic" >&2; exit 2 ;;
         --sweep) SWEEP="$2"; shift 2 ;;
-        --sets) SETS="$2"; shift 2 ;;
+        --sets) SETS="$2"; SET_GIVEN=1; shift 2 ;;
         --points) POINTS="$2"; shift 2 ;;
-        --model) MODEL="$2"; shift 2 ;;
+        --model) MODEL="$2"; MODEL_GIVEN=1; shift 2 ;;
         --show) SHOW="$2"; shift 2 ;;
         --logs) LOGS="$2"; shift 2 ;;
         -j) JOBS="$2"; shift 2 ;;
@@ -72,13 +91,27 @@ while [ $# -gt 0 ]; do
         *) echo "pips-seq-grab: unknown option $1 (--help)" >&2; exit 2 ;;
     esac
 done
+ROWS=""
+if [ -n "$MANIFEST" ]; then
+    SWEEP_ID=$(mhead sweep_id); SWEEP=$(mhead sweep)
+    [ -n "$SWEEP_ID" ] && [ -n "$SWEEP" ] || { echo "pips-seq-grab: $MANIFEST has no sweep_id/sweep" >&2; exit 1; }
+    # setting, point, TLP log of this sweep's measured runs (not datapath checks)
+    ROWS=$(awk -F'\t' -v id="$SWEEP_ID" '/^#/ || $1 == "sweep_id" { next }
+                                         $1 == id && $4 == "point" && $8 != "" { print $2, $3, $8 }' "$MANIFEST")
+    other=$(awk -F'\t' -v id="$SWEEP_ID" '!/^#/ && $1 != "sweep_id" && $1 != id' "$MANIFEST" | wc -l)
+    [ "$other" -gt 0 ] && echo "pips-seq-grab: WARNING: $other row(s) of $MANIFEST carry another sweep ID; left out" >&2
+    [ -n "$ROWS" ] || { echo "pips-seq-grab: $MANIFEST lists no runs with a TLP log" >&2; exit 1; }
+    msets=$(printf '%s\n' "$ROWS" | awk '!seen[$1]++ { print $1 }' | tr '\n' ' ')
+    [ "$SET_GIVEN" = 1 ] || SETS=${msets% }
+    [ "$MODEL_GIVEN" = 1 ] || MODEL="self,$(echo $msets | tr ' ' ',')"
+fi
 OUT=${OUT:-$HOME/seq-$SWEEP}
 OUT=${OUT%/}
 if [ -e "$OUT" ] || [ -e "$OUT.tar.gz" ]; then
     echo "pips-seq-grab: $OUT or $OUT.tar.gz exists; remove it or pass -o" >&2
     exit 1
 fi
-[ -d "$LOGS" ] || { echo "pips-seq-grab: no log folder $LOGS (--logs)" >&2; exit 1; }
+[ -n "$MANIFEST" ] || [ -d "$LOGS" ] || { echo "pips-seq-grab: no log folder $LOGS (--logs)" >&2; exit 1; }
 mkdir -p "$OUT"
 
 STRICT=""
@@ -88,7 +121,10 @@ SEQ="$HERE/pips-page-seq.py"
 MODEL_ARG=""
 [ -n "$MODEL" ] && MODEL_ARG="--model $MODEL"
 
-if [ "$POINTS" = all ]; then                   # every run of the first setting with a log
+if [ -n "$MANIFEST" ] && [ "$POINTS" = all ]; then   # every measured point the manifest lists
+    POINTS=$(printf '%s\n' "$ROWS" | awk '!seen[$2]++ { print $2 }' | tr '\n' ' ')
+    POINTS=${POINTS% }
+elif [ "$POINTS" = all ]; then                 # every run of the first setting with a log
     first=${SETS%% *}
     if [ "$KIND" = ssd ]; then
         cands=$(ls -d "$LOGS/$SWEEP-$first"/*-RUN-* 2>/dev/null | sed 's#.*/##; s#-RUN-.*##')
@@ -96,7 +132,7 @@ if [ "$POINTS" = all ]; then                   # every run of the first setting 
         cands=$(ls -d "$LOGS/$SWEEP-$first"-uncapped-*-RUN-* 2>/dev/null \
                 | sed "s#.*/$SWEEP-$first-uncapped-##; s#-RUN-.*##")
     fi
-    POINTS=$(printf '%s\n' $cands | grep -v '^datapath' | sort -u | tr '\n' ' ')
+    POINTS=$(printf '%s\n' $cands | grep -v 'datapath' | sort -u | tr '\n' ' ')
     POINTS=${POINTS% }
     [ -n "$POINTS" ] || { echo "pips-seq-grab: no runs under $LOGS for $SWEEP-$first" >&2; exit 1; }
 fi
@@ -107,6 +143,7 @@ jobs_file="$OUT/.jobs"
     echo "pips-seq-grab $KIND  $(date '+%F %T')  host $(hostname)"
     echo "repo revision $(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)"
     echo "sweep $SWEEP  sets: $SETS"
+    [ -n "$MANIFEST" ] && echo "manifest $MANIFEST  sweep_id $SWEEP_ID"
     echo "points: $POINTS"
     echo "pips-page-seq.py --kind $KIND --iotlb 1x64,16x4,64x1 $STRICT $MODEL_ARG --show $SHOW --from 100000 --port out,arr"
     echo
@@ -120,9 +157,16 @@ for set in $SETS; do
             pat="$LOGS/$SWEEP-$set-uncapped-$point-RUN-*/pips-log*.bin*"
         fi
         log=""
-        for f in $pat; do
-            [ -e "$f" ] && { log=$f; break; }
-        done
+        if [ -n "$MANIFEST" ]; then            # the manifest's own row, relative to the repo
+            pat="manifest row $set $point"
+            f=$(printf '%s\n' "$ROWS" | awk -v s="$set" -v p="$point" '$1 == s && $2 == p { print $3; exit }')
+            [ -n "$f" ] && case "$f" in /*) ;; *) f="$REPO/$f" ;; esac
+            [ -n "$f" ] && [ -e "$f" ] && log=$f
+        else
+            for f in $pat; do
+                [ -e "$f" ] && { log=$f; break; }
+            done
+        fi
         if [ -z "$log" ]; then
             echo "missing  $set $point  ($pat)" >> "$OUT/manifest.txt"
             missing=$((missing + 1))

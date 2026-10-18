@@ -16,7 +16,8 @@
 # DUALNIC_ARGS="--pips-log 1" (run-dualnic-experiment.sh -h).
 #
 # Before the sweep, one single run of NIC0 alone at the lowest flow count checks
-# the datapath; the sweep stops there if it carries no traffic.
+# the datapath; the sweep stops there if it carries no traffic. --no-datapath
+# skips it (dualnic_pips_sweep.sh --datapath-once: after its first setting).
 #
 # Uncapped, the two NICs together hit the ~126 Gbps shared uplink, so 'both'
 # rows are link-bound and read as throughput loss that is not the IOMMU's.
@@ -41,11 +42,13 @@ cd "$(dirname "$0")/.."
 
 NAME=""
 PREFIX=""
+DATAPATH=1
 POS=()
 while [ $# -gt 0 ]; do
     case "$1" in
         -o|--out) NAME="$2"; shift 2 ;;
         -p|--exp-prefix) PREFIX="$2"; shift 2 ;;
+        --no-datapath) DATAPATH=0; shift ;;
         *)        POS+=( "$1" ); shift ;;
     esac
 done
@@ -107,20 +110,24 @@ low=$(printf '%s\n' $FLOWS | sort -n | head -1)
 rate_args "${RATES%% *}"
 e="$PREFIX-$tag-f$low-datapath"
 echo
-echo "######## datapath check: NIC0 alone, $low flows/NIC, $tag, 1 run"
-if ! ./run-dualnic-experiment.sh -E "$e" --nics 1 --nic-index 0 \
-        -S "$low" -C "$low" -b "$bwarg" --runs 1 --results "$JSONL" ${EXTRA[@]+"${EXTRA[@]}"}; then
-    echo "######## ABORTING: datapath check failed" >&2
-    exit 1
+if [ "$DATAPATH" = 0 ]; then
+    echo "######## datapath check skipped (--no-datapath)"
+else
+    echo "######## datapath check: NIC0 alone, $low flows/NIC, $tag, 1 run"
+    if ! ./run-dualnic-experiment.sh -E "$e" --nics 1 --nic-index 0 \
+            -S "$low" -C "$low" -b "$bwarg" --runs 1 --results "$JSONL" ${EXTRA[@]+"${EXTRA[@]}"}; then
+        echo "######## ABORTING: datapath check failed" >&2
+        exit 1
+    fi
+    got=$(awk '{print $NF}' "../utils/reports/$e-RUN-server-0-nic0/iperf.bw.rpt" 2>/dev/null)
+    case "${got:-}" in ''|*[!0-9.]*) got=0 ;; esac
+    if ! awk -v t="$got" 'BEGIN{exit !(t > 1)}'; then
+        echo "######## ABORTING: datapath check carried $got Gbps on NIC0." >&2
+        echo "######## See utils/reports/$e-RUN-server-0-nic0/ and utils/logs/$e-*" >&2
+        exit 1
+    fi
+    echo "######## datapath OK: $got Gbps on NIC0"
 fi
-got=$(awk '{print $NF}' "../utils/reports/$e-RUN-server-0-nic0/iperf.bw.rpt" 2>/dev/null)
-case "${got:-}" in ''|*[!0-9.]*) got=0 ;; esac
-if ! awk -v t="$got" 'BEGIN{exit !(t > 1)}'; then
-    echo "######## ABORTING: datapath check carried $got Gbps on NIC0." >&2
-    echo "######## See utils/reports/$e-RUN-server-0-nic0/ and utils/logs/$e-*" >&2
-    exit 1
-fi
-echo "######## datapath OK: $got Gbps on NIC0"
 
 for r in $RATES; do
     rate_args "$r"

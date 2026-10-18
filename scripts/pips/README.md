@@ -292,10 +292,18 @@ credit stalls included) is the median over back-to-back pairs of one drain
 in this log. `--model self` runs the log's own setting (from its path, or
 `--setting`) and prints it beside the recorded order and wait: the check of
 the model. `std` adds the eight 0x0A04 settings, `sweep` depths 1–64 at time
-255 (the longest the 8-bit field allows), or name any `dDtT[m1][c1]`. Per
+255 (the longest the 8-bit field allows), `deep` the eight settings of the
+10-17 depth sweep, or name any `dDtT[m1][c1]`. Per
 setting: page switches per I/O as sent, with each drain regrouped by page
 (between completion entries, and ignoring ordering), IOTLB misses for the
-first `--iotlb` geometry, and the time each TLP would spend in the switch.
+first `--iotlb` geometry, the time each TLP would spend in the switch, TLPs
+per drain, and what asked for each drain: `depth`, `time`, `full` or a read's
+`flush` (JSON `triggers`, per input `triggers_in`, and the median cycles from
+the batch's start to its trigger, `trig_p50`). A depth trigger also counts
+when a drain's leftovers already hold DEPTH packets, which is how a full
+uplink meets any depth. A FIFO holds 109 beats and asks for a drain above 93
+(the full trigger), so a depth above 93 / (beats per TLP) never asks: 18 for
+256 B TLPs (5 beats), 10 for 512 B ones (9 beats).
 The arrival order is the switch's input acceptance: where a FIFO was full or
 a read held its input, the device was already held back. A test log written
 by the model itself checks the rebuild and the model end to end.
@@ -323,10 +331,40 @@ setting, uneven co-runs and one-NIC runs included, datapath checks left out);
 sweeps (v1 logs: no arrival order or model). A 4k point whose run was dropped
 for missing `pcm-iio` rows still has its log and is used.
 
+`--manifest ~/<sweep>.manifest.tsv` (in place of `ssd|nic`) takes a sweep
+from its manifest instead ([SWEEP-LOGS.md](SWEEP-LOGS.md)): exactly the runs
+it lists under its own sweep ID, datapath checks left out, kind, sweep name
+and settings from its header, and the model default `self,<every setting of
+the sweep>`. Use it for every sweep from 10-17 on.
+
 ```bash
 bash scripts/pips/pips-seq-grab.sh ssd -j 8     # bigserver, ~/seq-dualssd-pips-strict-1-id0a04.tar.gz (720 logs)
 bash scripts/pips/pips-seq-grab.sh nic          # icx, ~/seq-dualnic-pips-strict-1-id0a04.tar.gz (96 logs)
 bash scripts/pips/pips-seq-grab.sh ssd --sweep dualssd-pips-strict-1 --sets "d1t0 d16t64" --points 4k-j8-both
+bash scripts/pips/pips-seq-grab.sh --manifest ~/dualnic-pips-strict-dsweep1.manifest.tsv   # one sweep, by its manifest
+```
+
+**Time thresholds for a depth.** `pips-timeout-pick.py JSONL...` picks, for
+each depth, a `time_threshold` the depth trigger can beat. From a sweep's
+results (fio IOPS or each NIC's write rate, and the TLPs per input in its log
+summary) it builds per point an arrival stream (a drive's I/O as block/256
+back-to-back 256 B TLPs, one every `--gap` cycles, its completion entry and
+interrupt, 0.8 reads per I/O; a NIC packet as 8 TLPs; Poisson I/Os or packets
+at the measured rate), runs `pips-page-seq.py`'s batcher on it for a grid of
+times, and per depth takes the smallest time at which the depth trigger asks
+for `--target` (0.5) of the drains at the median light point (output below
+85% of the uplink; on a full uplink the backlog meets any depth the FIFO
+holds). Depths the FIFO can't reach get 255. `--eval "2:22 8:106"` reports
+given settings only; `--validate` compares the model's mean wait with each
+record's logged `pips_out_wait_mean`. Synthetic arrivals: the shares are
+estimates. On a sweep's own logs, `pips-page-seq.py --model self` gives the
+trigger shares from the real arrival order.
+
+```bash
+python3 scripts/pips/pips-timeout-pick.py ~/dualssd-pips-strict-1-id0a04-d1t0.jsonl -j 8
+python3 scripts/pips/pips-timeout-pick.py ~/dualnic-pips-strict-1-id0a04-d1t0.jsonl \
+    --eval "1:0 2:22 4:50 8:106 16:218 24:255 36:255 64:255"
+python3 scripts/pips/pips-timeout-pick.py ~/dualssd-pips-strict-1-id0a04-*.jsonl --validate --points '^4k'
 ```
 
 **Write sizes: can a completion entry be told by its size?**
@@ -385,7 +423,23 @@ sudo -v
 DUALSSD_ARGS="--membw 0" ./scripts/sosp24-experiments/dualssd_pips_sweep.sh --cfgs "1:0 4:22 8:22 16:64" --tmux
 # NICs: the dual-NIC flow sweep per setting (the server whose NICs are behind PIPS)
 ./scripts/sosp24-experiments/dualnic_pips_sweep.sh --cfgs "1:0 4:22 8:22 16:64" --single --tmux
+# the 10-17 depth sweep: cap on only, a label in the name, NIC datapath check once
+CFGS="1:0 2:22 4:50 8:106 16:218 24:255 36:255 64:255"
+DUALSSD_ARGS="--membw 0" ./scripts/sosp24-experiments/dualssd_pips_sweep.sh --cfgs "$CFGS" --caps 1 --tag dsweep1 --tmux
+./scripts/sosp24-experiments/dualnic_pips_sweep.sh --cfgs "$CFGS" --caps 1 --datapath-once --tag dsweep1 --tmux
 ```
+
+`--tag LABEL` names the sweep `<kind>-pips-<iommu>-<LABEL>` instead of the
+next free number; `--datapath-once` runs the datapath check (NIC0 alone, or
+both drives at 1 instance) before the first setting only.
+
+**Sweep ID and manifest.** Each sweep has an ID, `<NAME>@<host>@<start time>`,
+in every run it makes (`sweep-id.txt` in the run's folder, `sweep_id:` in its
+`.rpt`, `pips_sweep_id` in its record, `sweep_id=` in `~/<NAME>.txt`), and a
+manifest with a row per run (setting, point, datapath or point, folders, TLP
+log, status): `utils/logs/<NAME>/manifest.tsv`, copied to
+`~/<NAME>.manifest.tsv`. A parser reads the manifest, not `utils/logs`:
+[SWEEP-LOGS.md](SWEEP-LOGS.md).
 
 For each `DEPTH:TIME[:MRD]` setting, in order, and each `--caps` value (default
 `"0 1"`: drain depth cap off, then on, which doubles the runs), it sets the

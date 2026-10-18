@@ -8,7 +8,13 @@ together, [LOCAL-SETUP.md](LOCAL-SETUP.md) for first-time provisioning.
 - **Branch:** `icx-dualnic` on `ycz011031/F_S_Memory_Script`
 - **Upstream:** `host-architecture/Fast-and-Safe-IO-Memory-Protection` (remote `upstream`)
 - `master` is a pristine mirror. `git diff master..icx-dualnic` is the whole delta.
-- **Last updated:** 2026-10-16: `pips-page-seq.py` rebuilds the arrival order
+- **Last updated:** 2026-10-17: the **depth sweep** is set up (§8, "Depth
+  sweep"): depths 1–64, cap on only, timeouts picked so depth can win
+  (`pips-timeout-pick.py`); on `0x0A04` a FIFO can't reach depth > 18 (drives)
+  / > 10 (NICs), so d24/d36/d64 (and d16 on the NICs) are capped by the full
+  trigger. Every PIPS sweep now has a sweep ID and a manifest of its runs;
+  log parsers read the manifest ([scripts/pips/SWEEP-LOGS.md](scripts/pips/SWEEP-LOGS.md)).
+  2026-10-16: `pips-page-seq.py` rebuilds the arrival order
   and models the batcher on it; regrab pending (§8, "Next" item 0). Page order
   on the `0x0A04` logs, drives and
   NICs (§8, "0x0A04 results" item 8; the cap at depth 1 doubles page switches,
@@ -1514,23 +1520,86 @@ drain cap on. A name without `c1` has the cap off, as every name from before.
 git pull; sudo -v
 sudo bash scripts/pips/pips-bringup.sh        # after programming a new design: hwtest now checks reg1
 
+# the depth sweep (below): cap on only, depths 1-64 with their timeouts
+CFGS="1:0 2:22 4:50 8:106 16:218 24:255 36:255 64:255"
 # drives (bigserver): the cross sweep + uneven co-runs per setting
 DUALSSD_ARGS="--membw 0" ./scripts/sosp24-experiments/dualssd_pips_sweep.sh \
-    --cfgs "1:0 4:22 8:22 16:64" --tmux
+    --cfgs "$CFGS" --caps 1 --tag dsweep1 --tmux
+# NICs (icx, behind PIPS): the flow sweep per setting, co-run only, one datapath check
+./scripts/sosp24-experiments/dualnic_pips_sweep.sh --cfgs "$CFGS" --caps 1 --datapath-once --tag dsweep1 --tmux
 
-# NICs (the server whose NICs are behind PIPS): the flow sweep per setting
-./scripts/sosp24-experiments/dualnic_pips_sweep.sh --cfgs "1:0 4:22 8:22 16:64" --single --tmux
+# the 10-15/16 sweeps were:  ... dualssd_pips_sweep.sh --cfgs "1:0 4:22 8:22 16:64" --tmux
+#                            ... dualnic_pips_sweep.sh --cfgs "1:0 4:22 8:22 16:64" --single --tmux
 ```
 
 Both take each `--cfgs` setting with the drain cap off and then on (`--caps
 "0 1"`, the default; twice the runs of the 10-13 sweeps; `--caps 0` for the old
-set). Cap on needs design `0x0A03` or later; on an older build they refuse to
-start. Each setting is a full sweep named `<NAME>-id<XXXX>-<setting>`, with a
-TLP log in every run checked FULL / CUT; `~/<NAME>.txt` has every setting side
-by side, the log check, and the time in the batcher (`WAIT_us`, v2 logs).
-Defaults: `dualnic_pips_sweep.sh` 5/10/15/30 flows per NIC, uncapped, 1 run,
-co-run only (`--single` adds each NIC alone, for CONTENTION); about 15 min per
-setting without `--single`. Stop and restore as their `-h` says.
+set, `--caps 1` for cap on only). Cap on needs design `0x0A03` or later; on an
+older build they refuse to start. Each setting is a full sweep named
+`<NAME>-id<XXXX>-<setting>`, with a TLP log in every run checked FULL / CUT;
+`~/<NAME>.txt` has every setting side by side, the log check, and the time in
+the batcher (`WAIT_us`, v2 logs). `--tag LABEL` names the sweep
+`<kind>-pips-<iommu>-<LABEL>` (else the next free `-<N>`); `--datapath-once`
+runs the datapath check before the first setting only. Defaults:
+`dualnic_pips_sweep.sh` 5/10/15/30 flows per NIC, uncapped, 1 run, co-run only
+(`--single` adds each NIC alone, for CONTENTION); about 11 min per setting
+without `--single` and with `--datapath-once`. Stop and restore as their `-h` says.
+
+**Every sweep has a sweep ID** (`<NAME>@<host>@<start time>`) in each of its
+runs and a manifest of them (`~/<NAME>.manifest.tsv`, also
+`utils/logs/<NAME>/manifest.tsv`). Parse a sweep from its manifest, never by
+globbing `utils/logs`: [scripts/pips/SWEEP-LOGS.md](scripts/pips/SWEEP-LOGS.md)
+(format, rules, this campaign's names and counts, earlier runs to ignore).
+
+### Depth sweep (set up 2026-10-17; strict, design `0x0A04`)
+
+Changes from the 10-15/16 sweeps, nothing else: depths 1, 2, 4, 8, 16, 24, 36,
+64; drain cap on only; NICs co-run only (no NIC-alone runs) with one datapath
+check, before `d1t0c1`; names `dualssd-pips-strict-dsweep1` and
+`dualnic-pips-strict-dsweep1`. Drives ~12 h (8 × 1.5 h), NICs ~1.5 h.
+
+**Times.** On the 10-15/16 logs the timeout, not the depth, ended most batches
+wherever the uplink had room: at 4 KiB 1 + 1, d4t22 and d8t22 waited alike
+(0.14 / 0.16 µs) and d16t64 0.34 µs, because 22 or 64 cycles is shorter than D
+TLPs take to arrive. A burst comes at about link rate: a drive's 256 B TLP
+(Gen4 x4) or a NIC's 512 B TLP (the 512-bit datapath) every ~9 cycles of 4 ns.
+The drives' recorded waits fit 9–14 cycles (`pips-timeout-pick.py
+--validate`), so depth D needs about gap × (D − 1) plus the last TLP's beats,
+and T = 14 (D − 1) + 8 is just past that for either gap: `2:22 4:50 8:106
+16:218`; 255 (the 8-bit maximum, 1.02 µs) from depth 24. Modelled share of
+drains the depth trigger asks for (`pips-timeout-pick.py --eval` on the 10-16
+d1t0 records; synthetic arrivals, so estimates):
+
+| Setting | Drives, light points (gap 9.2 / 14) | NICs, both at 30 flows | Same depth before |
+|---|---|---|---|
+| `d2t22c1` | 97 / 97% | 85% | – |
+| `d4t50c1` | 86 / 86% | 71% | `d4t22c1`: 73 / 53%, NICs 44% |
+| `d8t106c1` | 72 / 72% | 56% | `d8t22c1`: 32 / 4%, NICs 2% |
+| `d16t218c1` | 55 / 53% | never (full trigger) | `d16t64c1`: 19 / 2% |
+| `d24t255c1`, `d36t255c1`, `d64t255c1` | never (d24: 17–19% on a full uplink, drive 1's 144 B writes) | never | – |
+
+Light points are those whose output is below 85% of the uplink (drives: 4 KiB,
+and 8 KiB at 1 + 1; NICs: both at 30 flows). On a full uplink the FIFO backlog
+meets any depth the FIFO can hold (drives ≥ 97%, NICs 89–98%). The rest time
+out (a 4 KiB read is 16 data TLPs, its completion entry and an interrupt) or
+are flushed by a read (0.8 per drive I/O).
+
+**The FIFO caps the depth on `0x0A04`.** Each input FIFO holds 128 beats of
+64 B; it stops taking packets at 109 and its full trigger asks for a drain
+above 93 (`axi4_mwr_batch.v`: FIFO_DEPTH 128, MAX_PKT_BEATS 16). A 256 B TLP is
+5 beats and a 512 B one 9, so a drive batch can't reach more than 18 packets
+and a NIC batch more than 10. d24, d36 and d64 on the drives, and d16 up on the
+NICs, are batches ended by the full trigger or the timeout, never by depth,
+and their cap never binds. **d36 and d64 are the same setting in effect on
+both testbeds, and d24 is too on the NICs.** The model on the NICs' real
+arrivals agrees: d16t255, d32t255 and d64t255 came out identical at every
+point (`dualnic/1016/seq-dualnic-0a04-arr`). Going deeper needs a build with a
+larger FIFO_DEPTH; the time field also stops at 255 cycles.
+
+After the sweep: page order and trigger shares on the real arrival order,
+`bash scripts/pips/pips-seq-grab.sh --manifest ~/<sweep>.manifest.tsv -j 8`
+(the model runs each log's own setting and the sweep's other seven;
+`model[].triggers` in `seq.jsonl`).
 
 Compare cap off against on per setting:
 
@@ -1639,9 +1708,40 @@ The cap and the v2 log work on hardware: all 804 logs FULL, no drops,
      the log) run on it; `--model self` checks it against each log. Needs the
      regrab below; the 0x0A04 page's Figures 4 and 6 are still the old ones.
 
+9. **Arrival order and the batcher model, NICs (regrab 10-16 21:45, repo
+   2c5c8a367, `dualnic/1016/seq-dualnic-0a04-arr/`, 104 logs = 12 points +
+   `f5-datapath` × 8; the grab filter now drops any name with "datapath"):**
+   - Model vs recorded page switches: on each log's own arrival order −1% to
+     +5% (single NIC exact: one input can't be reordered), except d1t0c1 at
+     15/30 flows (+6%, +11%). From d1t0's arrival order, both NICs: every
+     setting within −1%/+5%, d1t0c1 −3%/−8%.
+   - **Model limit:** output cycles per TLP come from back-to-back same-input
+     pairs; in d1t0c1 logs every drain is 1 TLP, so the pairs include the
+     ~3-cycle gap before the RTL re-grants the same input (data/128 reads 12
+     cycles, not 9) and the model backs up (absurd waits). Model waits also
+     omit the fixed pipeline latency (up to 0.13 µs low). Fix if needed: model
+     the re-grant gap and count a packet for the depth trigger at its EOP, then
+     regrab. The page leaves d1t0c1 out as a starting order.
+   - Both NICs arrive interleaved (4.4–5.8 page switches per packet in d1t0
+     logs); d1t0 sends 2.8–3.1 (queueing on a full link groups them). Depth
+     8 at time 255: −7% to −16% from depth 1; flat beyond (full trigger at ~10
+     NIC TLPs); bound at 64: 2.62–2.68.
+   - One NIC: arrival order = order sent in all 64 logs; d1t0 2.3–2.6, cap at
+     depth 1/4 7.9–9.2, d8t22/d16t64 2.6–3.5 / 5.9–6.5 at 5 flows, 5.3–9.2
+     from 10. NIC1 like NIC0. All of it is the NIC's own reaction.
+   - Page "PIPS 0x0A04 Sweeps" v3 (2026-10-17): Figures 3–6 rebuilt from this
+     (generator `dualssd/report-gen/seqarr.py` + `seqarr.js`; per-point data
+     files `dualssd/seqdata/<kind>/<point>.json`, published beside the page as
+     `seq/<kind>/<point>.json` via the Artifact `files` map). Drives pending.
+
 ### Next
 
-0. **Regrab page order with arrival order and the batcher model, every point**
+0. **Drive regrab running on bigserver** (started 10-16 evening,
+   `~/seq-grab-ssd.log`, output `~/seq-dualssd-0a04-arr.tar.gz`). When in:
+   copy to `dualssd/1016/`, `tar -xzf` there, write `seqarr.drive_points()`
+   (the drive bullets under Figure 4, slot DRIVEWI) from `py -3 seqarr.py`,
+   rebuild `page4.py`, publish with the `seq/ssd/*.json` files added.
+   Earlier plan for reference: **Regrab page order with arrival order and the batcher model, every point**
    (uneven co-runs and NIC1-alone included; the 10-16 grab had 7 + 5 points):
    on bigserver `bash scripts/pips/pips-seq-grab.sh ssd -j 8` (720 logs, about
    a minute each; ~1.5 h at -j 8), on icx `bash scripts/pips/pips-seq-grab.sh nic`

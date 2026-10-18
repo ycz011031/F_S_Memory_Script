@@ -61,14 +61,19 @@ starts from; out is what the setting made of it.
 
 --model runs the batcher of axi4_mwr_batch.v on the arrival order, for the
 log's own setting (self: checks the model against the log), the 0x0A04
-settings (std), a depth sweep at time 255 (sweep) or any dDtT[m1][c1]. Per
+settings (std), a depth sweep at time 255 (sweep), the 10-17 depth sweep's
+settings (deep: depths 1-64, cap on, times from pips-timeout-pick.py) or any
+dDtT[m1][c1]. Per
 input a FIFO of writes asks for the output at DEPTH packets, after TIME
 cycles non-empty, or when nearly full; a grant sends what the FIFO holds then
 (with c1, at most DEPTH) as one run; the inputs alternate; a read waits until
 its input's writes are out and then goes first. How long each TLP holds the
 output is measured from this log (back-to-back pairs of one drain). Reported:
 page switches per I/O as sent, with each drain regrouped by page (with and
-without ordering), simulated misses, and the time in the switch.
+without ordering), simulated misses, the time in the switch, TLPs per drain,
+and what asked for each drain: depth (also when a drain's leftovers already
+held DEPTH packets), time, full (a FIFO holds 109 beats and asks above 93, so
+a depth of more than 93 / beats per TLP never asks) or a read's flush.
 """
 import argparse
 import collections
@@ -95,6 +100,9 @@ WAIT_SAT = 65535
 # 8-bit field allows, for --model std / sweep.
 STD_SETS = ("d1t0", "d1t0c1", "d4t22", "d4t22c1", "d8t22", "d8t22c1", "d16t64", "d16t64c1")
 SWEEP_SETS = tuple(f"d{d}t255" for d in (1, 2, 4, 8, 16, 32, 64))
+# The 10-17 depth sweep (HANDOFF §8): cap on, each time just past what D
+# back-to-back TLPs take to arrive (pips-timeout-pick.py), 255 past the FIFO.
+DEEP_SETS = ("d1t0c1", "d2t22c1", "d4t50c1", "d8t106c1", "d16t218c1", "d24t255c1", "d36t255c1", "d64t255c1")
 SET_RE = re.compile(r"^d(\d+)t(\d+)(m1)?(c1)?$")
 SET_IN_PATH = re.compile(r"-(d\d+t\d+(?:m1)?(?:c1)?)(?=[/-]|$)")
 # axi4_mwr_batch.v at its build parameters: FIFO_DEPTH 128 beats, MAX_PKT_BEATS 16,
@@ -358,7 +366,10 @@ def cycles(svc, per_beat, cls, pdw, beats):
     return v if v is not None else max(beats, round(per_beat * beats))
 
 
-def batcher(arr, depth, time, cap, mrd_batched):
+TRIGGERS = ("depth", "time", "full", "flush")
+
+
+def batcher(arr, depth, time, cap, mrd_batched, stats=None):
     """The batcher of axi4_mwr_batch.v on TLPs in arrival order. arr: (t_in,
     src, cls, beats, cycles) per TLP. Per input a FIFO of writes (reads too
     with batch_mrd) that asks for the output once it holds `depth` packets,
@@ -369,7 +380,13 @@ def batcher(arr, depth, time, cap, mrd_batched):
     once its input's FIFO is empty, which flushes that FIFO and holds back
     the input behind it, and then goes out ahead of the next batched packet.
     An input stops taking packets at 109 beats. Returns the TLPs in output
-    order as (arr index, start cycle, drain number)."""
+    order as (arr index, start cycle, drain number).
+    stats, a dict, gets per drain what asked for it: "depth" (the FIFO held
+    DEPTH packets; also when a drain's leftovers already did), "full",
+    "time", or "flush" (a read behind the writes), counted per input in
+    stats["triggers"][input][reason], and the cycles from the batch's start
+    (FIFO non-empty, or the last drain's end) to the trigger in
+    stats["trig_cycles"][reason]."""
     n = len(arr)
     trig_depth = max(depth, 1)
     take_cap = trig_depth if cap else None
@@ -378,7 +395,11 @@ def batcher(arr, depth, time, cap, mrd_batched):
     fill = [0, 0]
     tmr = [None, None]                                 # timer start: FIFO non-empty / drain end
     latch = [False, False]
+    why = [None, None]                                 # what latched the request, and when
     snap = [0, 0]                                      # packets left in the granted drain; -1: flush
+    if stats is not None:
+        stats["triggers"] = [{k: 0 for k in TRIGGERS} for _ in (0, 1)]
+        stats["trig_cycles"] = {k: [] for k in TRIGGERS}
     f2 = collections.deque()
     owner, rr_last, drain_no = None, 1, 0
     nxt, t, out = 0, 0, []
@@ -417,8 +438,11 @@ def batcher(arr, depth, time, cap, mrd_batched):
             return False
         if inq[c] and passes(inq[c][0]):
             return True                                # flush request
-        if not latch[c] and (len(fifo[c]) >= trig_depth or now - tmr[c] >= time or fill[c] > FULL_BEATS):
-            latch[c] = True
+        if not latch[c]:
+            r = ("depth" if len(fifo[c]) >= trig_depth else "full" if fill[c] > FULL_BEATS
+                 else "time" if now - tmr[c] >= time else None)
+            if r:
+                latch[c], why[c] = True, (r, now - tmr[c])
         return latch[c]
 
     def serve(c, now):
@@ -459,6 +483,10 @@ def batcher(arr, depth, time, cap, mrd_batched):
         owner, rr_last = c, c
         drain_no += 1
         flush = bool(inq[c]) and passes(inq[c][0])
+        if stats is not None:
+            r, dt = why[c] if latch[c] else ("flush", t - tmr[c])
+            stats["triggers"][c][r] += 1
+            stats["trig_cycles"][r].append(dt)
         k = len(fifo[c])
         snap[c] = -1 if flush else (min(k, take_cap) if take_cap else k)
         t = serve(c, t)
@@ -481,7 +509,8 @@ def model(events, tl, names, svc, per_beat, geoms, strict, kind):
     res = []
     for name in names:
         depth, time, cap, mrd = parse_setting(name)
-        sent = batcher(arr, depth, time, cap, mrd)
+        st = {}
+        sent = batcher(arr, depth, time, cap, mrd, st)
         items, flags, groups, waits = [], [], [], []
         for j, start, d in sent:
             _i, _p, c, addr, _pdw, src, _s, _w = arr_ev[j]
@@ -508,8 +537,18 @@ def model(events, tl, names, svc, per_beat, geoms, strict, kind):
                         miss=miss, miss_geom=f"{geoms[0][0]}x{geoms[0][1]}" if geoms else None,
                         wait_mean_us=mean(waits) * us if waits else None,
                         wait_p99_us=pct(waits, 99) * us if waits else None,
-                        drains=len({d for _j, _s, d in sent if d >= 0})))
+                        drains=len({d for _j, _s, d in sent if d >= 0}),
+                        batched=sum(1 for _j, _s, d in sent if d >= 0),
+                        triggers={k: st["triggers"][0][k] + st["triggers"][1][k] for k in TRIGGERS},
+                        triggers_in=st["triggers"],
+                        trig_p50={k: pct(v, 50) for k, v in st["trig_cycles"].items()}))
     return res
+
+
+def trig_share(m):
+    """'depth 62% time 30% full 0% flush 8%' from a model() result."""
+    tot = sum(m["triggers"].values())
+    return " ".join(f"{k} {100 * v / tot:.0f}%" for k, v in m["triggers"].items()) if tot else "-"
 
 
 def show(rows, port, start, count):
@@ -557,7 +596,8 @@ def main():
     ap.add_argument("--model", metavar="LIST",
                     help="v2: run the batcher model on the arrival order for these settings, "
                          "comma-separated: self (the log's own, from its path or --setting), std "
-                         f"({' '.join(STD_SETS)}), sweep ({' '.join(SWEEP_SETS)}), or dDtT[m1][c1]")
+                         f"({' '.join(STD_SETS)}), sweep ({' '.join(SWEEP_SETS)}), deep "
+                         f"({' '.join(DEEP_SETS)}), or dDtT[m1][c1]")
     ap.add_argument("--setting", metavar="dDtT[c1]",
                     help="the log's own batcher setting for --model self (default: from the path)")
     ap.add_argument("--csv", help="write every TLP to this CSV")
@@ -586,7 +626,8 @@ def main():
         own = m.group(1) if m else None
     names = []
     for x in (a.model.split(",") if a.model else []):
-        add = STD_SETS if x == "std" else SWEEP_SETS if x == "sweep" else (own,) if x == "self" else (x,)
+        add = (STD_SETS if x == "std" else SWEEP_SETS if x == "sweep" else DEEP_SETS if x == "deep"
+               else (own,) if x == "self" else (x,))
         if x == "self" and own is None:
             ap.error("--model self: no setting in the log's path; give --setting")
         for nm in add:
@@ -682,11 +723,12 @@ def main():
                   + ", ".join(f"{c} {p} DW {v}" for (c, p), v in sorted(svc.items(), key=lambda kv: str(kv[0])))
                   + f"; else {per_beat:.2f} per beat")
             print(f"{'setting':>10} {'runs per I/O: as sent':>22} {'by page':>8} {'bound':>7} "
-                  f"{'misses/I/O':>11} {'wait us mean/p99':>17}")
+                  f"{'misses/I/O':>11} {'wait us mean/p99':>17} {'TLPs/drain':>10}  drains asked for by")
             for m_ in mod:
                 print(f"{m_['setting']:>10} {fmt(m_['runs']['drive'], '22.2f')} {fmt(m_['runs']['page'], '8.2f')} "
                       f"{fmt(m_['runs']['ideal'], '7.2f')} {fmt(m_['miss'], '11.3f')} "
-                      f"{fmt(m_['wait_mean_us'], '8.2f')}/{fmt(m_['wait_p99_us'], '<8.2f')}")
+                      f"{fmt(m_['wait_mean_us'], '8.2f')}/{fmt(m_['wait_p99_us'], '<8.2f')} "
+                      f"{fmt(m_['batched'] / m_['drains'] if m_['drains'] else None, '10.1f')}  {trig_share(m_)}")
             print(f"{'recorded':>10} {fmt(recorded['runs'], '22.2f')} {'':>8} {'':>7} {fmt(recorded['miss'], '11.3f')} "
                   f"{fmt(recorded['wait_mean_us'], '8.2f')}   ({own or 'setting unknown'}, as logged on out)")
 

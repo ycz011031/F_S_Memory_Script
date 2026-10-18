@@ -332,6 +332,7 @@ run 0 "model on the rebuilt arrival order: self (d16t64, from the path), std, sw
     --show 40 --from 5000 --port out,arr --json "$T/mb.jsonl"
     has '^arr: the sequence'; has '^out: the sequence'; has '^Arrival order (arr)'
     has '^ *d16t64 '; has '^ *d64t255 '; has '^ *recorded .*(d16t64, as logged on out)'
+    has 'drains asked for by'; has '^ *d64t255 .* depth 0% time'
 run 0 "  json: d16t64 on the arrival order gives back the logged order and waits; arrivals were interleaved" python3 -c "
 import json; r = json.loads(open('$T/mb.jsonl').readline())
 m = {x['setting']: x for x in r['model']}; rec = r['recorded']
@@ -341,6 +342,16 @@ assert abs(m['d16t64']['wait_mean_us'] - rec['wait_mean_us']) < 1e-9, (m['d16t64
 assert r['interleave']['arr']['run_mean'] < 2 < r['interleave']['out']['run_mean'], r['interleave']
 assert r['windows_arr'][0]['runs']['drive'] > m['d1t0']['runs']['drive'] > m['d16t64']['runs']['drive'], m
 assert r['arrival']['segments'] == 1 and r['arrival']['moved'] > 0.5, r['arrival']"
+run 0 "  json: what asked for each drain (depth, time, full, read flush), counted per drain" python3 -c "
+import json; r = json.loads(open('$T/mb.jsonl').readline())
+m = {x['setting']: x for x in r['model']}
+for x in m.values():
+    assert sum(x['triggers'].values()) == x['drains'], (x['setting'], x['triggers'], x['drains'])
+    assert x['triggers'] == {k: x['triggers_in'][0][k] + x['triggers_in'][1][k] for k in x['triggers']}, x
+t = m['d1t0']['triggers']; assert t['depth'] > 0.9 * m['d1t0']['drains'] and t['time'] == 0, t
+t = m['d16t64']['triggers']; assert t['time'] > t['depth'], t          # 16 TLPs take 135+ cycles
+t = m['d64t255']['triggers']; assert t['depth'] == 0 and t['flush'] > 0, t  # 64 x 5 beats never fit
+assert m['d4t255']['triggers']['depth'] > m['d4t22']['triggers']['depth'], (m['d4t255'], m['d4t22'])"
 run 2 "  --model self without a setting in the path is refused" \
     python3 "$HERE/pips-page-seq.py" "$T/synth-nosetting.bin.gz" --model self
     has 'no setting in the'
@@ -372,6 +383,23 @@ run 0 "pips-seq-grab.sh ssd on a v1 sweep" bash "$HERE/pips-seq-grab.sh" ssd --l
     --sweep dualssd-pips-off-1 --sets d8t22 --points 4k-j1-both -o "$T/grab-ssd"
     has '1 of 1 logs analysed'
 grep -q 'record format v1' "$T/grab-ssd/seq-d8t22-4k-j1-both.txt" && ok "  v1 log read" || bad "  v1: $(head -3 "$T/grab-ssd/seq-d8t22-4k-j1-both.txt")"
+MF="$T/G1.manifest.tsv"
+NICLOG1="$TL/dualnic-pips-strict-1-id0a04-d8t22c1-uncapped-f5-both-RUN-server-0/pips-log-id0a04.bin.gz"
+{
+    printf '# pips sweep manifest v1\n# sweep_id=G1@h@1\n# sweep=dualnic-pips-strict-G1\n# kind=nic\n'
+    printf 'sweep_id\tsetting\tpoint\trole\trun\tlog_dir\treport_dir\ttlp_log\tstatus\tdesign_id\tfinished\n'
+    printf 'G1@h@1\td8t22\tuncapped-f5-both\tpoint\tr\tl\tr\t%s\tFULL\t0x0a04\tt\n' "$NICLOG"
+    printf 'G1@h@1\td8t22c1\tuncapped-f5-both\tpoint\tr\tl\tr\t%s\tFULL\t0x0a04\tt\n' "$NICLOG1"
+    printf 'G1@h@1\td8t22\tuncapped-f5-datapath\tdatapath\tr\tl\tr\t%s\tFULL\t0x0a04\tt\n' "$NICLOG"
+    printf 'OLD@h@0\td16t64\tuncapped-f30-both\tpoint\tr\tl\tr\t%s\tFULL\t0x0a04\tt\n' "$NICLOG"
+} > "$MF"
+run 0 "pips-seq-grab.sh --manifest: that sweep's measured runs, nothing else" \
+    bash "$HERE/pips-seq-grab.sh" --manifest "$MF" -j 2 -o "$T/grab-m"
+    has 'carry another sweep ID; left out'; has '2 logs (1 points), 0 missing'; has '2 of 2 logs analysed'
+grep -q '^manifest .* sweep_id G1@h@1$' "$T/grab-m/manifest.txt" && grep -q -- '--model self,d8t22,d8t22c1 ' "$T/grab-m/manifest.txt" &&
+    grep -q '^sweep dualnic-pips-strict-G1  sets: d8t22 d8t22c1$' "$T/grab-m/manifest.txt" &&
+    [ -s "$T/grab-m/seq-d8t22c1-uncapped-f5-both.txt" ] && ! grep -q 'f30\|datapath\|d16t64' "$T/grab-m/manifest.txt" &&
+    ok "  sweep, settings and model from the manifest" || bad "  $(cat "$T/grab-m/manifest.txt")"
 
 echo "-- run-dualssd-experiment.sh / run-dualnic-experiment.sh hooks (pips-lib.sh)"
 # The runners' own functions, run against the model.
@@ -380,7 +408,7 @@ runner_pips() {   # <want status> <records> [fail] [design]
         . "$HERE/pips-lib.sh"
         if [ "${3:-}" = fail ]; then pipsc() { return 1; }; else pipsc() { "$P" "$@"; }; fi
         sudo() { [ "$1" = -n ] && shift; "$@"; }
-        setup_dir="$T/u$1"; RUN=r0; L="$setup_dir/logs/r0"
+        setup_dir="$T/u$1"; RUN=${RUN_NAME:-r0}; L="$setup_dir/logs/$RUN"
         pips_log=1; pips_region=0x400000; pips_gzip=1; PIPS_STATUS=()
         pips_cfg=0x00000001; pips_cap=0; pips_design=${4:-0x0a04}; pips_idt=$(pips_idtag "$pips_design")
         mkdir -p "$L" "$setup_dir/reports/$RUN"
@@ -404,6 +432,25 @@ run 0 "FULL" runner_pips FULL 300000;  has 'STATUS=FULL$'; has 'log_enable=0'
 run 0 "CUT: the region did not fill in 5 s" runner_pips CUT 1000; has 'STATUS=CUT$'; has 'log_enable=0'
 run 0 "FAILED: the switch does not answer" runner_pips FAILED 1000 fail; has 'STATUS=FAILED$'
 grep -qx 'design_id: 0x0a04' "$T/uFAILED/reports/r0/pips-log.rpt" && ok "  FAILED rpt names the design" || bad "  $(cat "$T/uFAILED/reports/r0/pips-log.rpt")"
+[ ! -e "$T/uFULL/logs/r0/sweep-id.txt" ] && ! grep -q 'sweep_id' "$T/uFULL/reports/r0/pips-log.rpt" &&
+    ok "  outside a PIPS sweep: no sweep ID anywhere" || bad "  sweep ID outside a sweep"
+SID="SW1@host@20261017-000000"
+export PIPS_SWEEP_ID="$SID" PIPS_SWEEP=SW1 PIPS_SWEEP_SUB=SW1-id0a04-d1t0 PIPS_MANIFEST="$T/man.tsv"
+: > "$PIPS_MANIFEST"
+RUN_NAME=SW1-id0a04-d1t0/4k-j1-both-RUN-0 run 0 "inside a PIPS sweep: the sweep ID in the result" runner_pips SW 300000
+    has "META=.* --meta pips_log=FULL --meta pips_sweep_id=$SID --meta pips_sweep=SW1$"
+RUN_NAME=SW1-id0a04-d1t0/datapath-4k-j1-RUN-0 run 0 "  and a datapath check" runner_pips SW 1000
+SL="$T/uSW/logs/SW1-id0a04-d1t0/4k-j1-both-RUN-0"
+grep -qx "sweep_id=$SID" "$SL/sweep-id.txt" && grep -qx 'point=4k-j1-both' "$SL/sweep-id.txt" &&
+    grep -qx 'setting=d1t0' "$SL/sweep-id.txt" && grep -qx 'sweep_setting=SW1-id0a04-d1t0' "$SL/sweep-id.txt" &&
+    grep -qx "sweep_id: $SID" "$T/uSW/reports/SW1-id0a04-d1t0/4k-j1-both-RUN-0/pips-log.rpt" &&
+    ok "  sweep-id.txt in the run's folder, sweep_id: in its rpt" || bad "  $(cat "$SL/sweep-id.txt")"
+run 0 "  manifest: a row per run, point and role, the TLP log, its status" python3 -c "
+rows = [l.rstrip('\n').split('\t') for l in open('$T/man.tsv')]
+assert len(rows) == 2 and all(len(r) == 11 and r[0] == '$SID' and r[1] == 'd1t0' and r[9] == '0x0a04' for r in rows), rows
+assert rows[0][2:4] == ['4k-j1-both', 'point'] and rows[0][8] == 'FULL' and rows[0][7].endswith('4k-j1-both-RUN-0/pips-log-id0a04.bin.gz'), rows[0]
+assert rows[1][2:4] == ['datapath-4k-j1', 'datapath'] and rows[1][8] == 'CUT', rows[1]"
+unset PIPS_SWEEP_ID PIPS_SWEEP PIPS_SWEEP_SUB PIPS_MANIFEST
 export PIPS_SIM_DESIGN=0x0a02
 run 0 "0x0a02 build: v1 log, named id0a02" runner_pips OLD 300000 "" 0x0a02; has 'STATUS=FULL$'
 [ -s "$T/uOLD/logs/r0/pips-log-id0a02.bin.gz" ] && grep -qx 'log_format: v1' "$T/uOLD/reports/r0/pips-log.rpt" &&
@@ -521,11 +568,26 @@ printf '#!/bin/bash\n[ "$1" = -n ] && shift\nexec "$@"\n' > "$T/bin/sudo"; chmod
 for s in dualssd_sweep dualnic_flow_sweep; do
     cat > "$R/scripts/sosp24-experiments/$s.sh" <<'EOF'
 #!/bin/bash
-name=""; while [ $# -gt 0 ]; do [ "$1" = -o ] && name="$2"; shift; done
+name=""; dp=1
+while [ $# -gt 0 ]; do [ "$1" = -o ] && name="$2"; [ "$1" = --no-datapath ] && dp=0; shift; done
 c=$("$PIPS_TOOL" cfg)
-echo "$(basename "$0") $name ARGS=${DUALSSD_ARGS:-}${DUALNIC_ARGS:-} $(printf '%s\n' "$c" | grep -E '^(cfg|drain)=' | xargs)" >> "$RESULTS_DIR/calls.txt"
+echo "$(basename "$0") $name ARGS=${DUALSSD_ARGS:-}${DUALNIC_ARGS:-} $(printf '%s\n' "$c" | grep -E '^(cfg|drain)=' | xargs) DP=$dp" >> "$RESULTS_DIR/calls.txt"
 design=$(printf '%s\n' "$c" | sed -n 's/^design_id=//p')
-echo "{\"iommu\": \"off\", \"pips_batch\": \"${name##*-}\", \"pips_design_id\": \"$design\", \"mode\": \"both\", \"bs\": \"4k\", \"instances_per_ssd\": 1, \"flows_per_nic\": 5, \"bandwidth_per_nic\": \"uncapped\", \"pips_log\": \"FULL\", \"active_ssds\": [0, 1], \"mean\": {\"iops_total\": 1000.0}, \"sd\": {}, \"per_run\": []}" > "$RESULTS_DIR/$name.jsonl"
+# The runners' sweep hooks (pips-lib.sh) for a datapath check and one point.
+. "$(dirname "$0")/../pips/pips-lib.sh"
+pips_cfg=$(cfg_of <(printf '%s\n' "$c")); pips_cap=$(cap_of <(printf '%s\n' "$c")); pips_design=$design
+for p in $( [ "$dp" = 1 ] && echo datapath ) point; do
+    case "$(basename "$0")-$p" in
+        dualssd_sweep.sh-datapath) RUN="$name/datapath-4k-j1-RUN-0" ;;
+        dualssd_sweep.sh-point)    RUN="$name/4k-j1-both-RUN-0" ;;
+        *-datapath)                RUN="$name-uncapped-f5-datapath-RUN-server-0" ;;
+        *)                         RUN="$name-uncapped-f5-both-RUN-server-0" ;;
+    esac
+    L="$PIPS_REPO/utils/logs/$RUN"; mkdir -p "$L" "$PIPS_REPO/utils/reports/$RUN"
+    pips_sweep_mark
+    pips_manifest_add "$PIPS_REPO/utils/reports/$RUN/pips-log.rpt" "$L/pips-log-id0a04.bin.gz" FULL
+done
+echo "{\"iommu\": \"off\", \"pips_batch\": \"${name##*-}\", \"pips_design_id\": \"$design\", \"pips_sweep_id\": \"${PIPS_SWEEP_ID:-}\", \"mode\": \"both\", \"bs\": \"4k\", \"instances_per_ssd\": 1, \"flows_per_nic\": 5, \"bandwidth_per_nic\": \"uncapped\", \"pips_log\": \"FULL\", \"active_ssds\": [0, 1], \"mean\": {\"iops_total\": 1000.0}, \"sd\": {}, \"per_run\": []}" > "$RESULTS_DIR/$name.jsonl"
 EOF
 done
 sweep() {   # <script> <args...>
@@ -566,6 +628,63 @@ run 1 "0x0a02: cap on is refused before anything runs" sweep dualnic_pips_sweep.
 run 0 "0x0a02: --caps 0 runs, names id0a02, no cap written" sweep dualssd_pips_sweep.sh -o S3 --caps 0 --cfgs 4:22
 run 0 "  calls" cat "$T/res/calls.txt"; has '^dualssd_sweep.sh S3-id0a02-d4t22 ARGS=.* cfg=0x00001604 .* drain=none'
 unset PIPS_SIM_DESIGN
+
+: > "$T/res/calls.txt"
+run 0 "dualnic_pips_sweep.sh --tag, --caps 1, --datapath-once" \
+    sweep dualnic_pips_sweep.sh --tag dsweep1 --cfgs "1:0 2:22 4:50" --caps 1 --datapath-once
+    has 'dual-NIC PIPS sweep dualnic-pips-off-dsweep1$'; has 'settings: d1t0c1 d2t22c1 d4t50c1 '
+    has 'sweep ID: dualnic-pips-off-dsweep1@'; has 'datapath check before the first setting only'
+run 0 "  calls: the datapath check before the first setting only" cat "$T/res/calls.txt"
+    has 'dualnic-pips-off-dsweep1-id0a04-d1t0c1 .*DP=1$'; has 'dualnic-pips-off-dsweep1-id0a04-d2t22c1 .*DP=0$'
+    has 'dualnic-pips-off-dsweep1-id0a04-d4t50c1 .*DP=0$'
+M="$T/res/dualnic-pips-off-dsweep1.manifest.tsv"
+run 0 "  manifest (~/<name>.manifest.tsv): header, a row per run, one sweep ID, one datapath row" python3 -c "
+lines = open('$M').read().splitlines()
+head = dict(l[2:].split('=', 1) for l in lines if l.startswith('# ') and '=' in l and ' ' not in l[2:].split('=', 1)[0])
+rows = [l.split('\t') for l in lines if not l.startswith('#')]
+assert rows[0][:4] == ['sweep_id', 'setting', 'point', 'role'] and len(rows[0]) == 11, rows[0]
+sid = head['sweep_id']; data = rows[1:]
+assert sid.startswith('dualnic-pips-off-dsweep1@') and head['kind'] == 'nic' and head['design_id'] == '0x0a04', head
+assert {r[0] for r in data} == {sid}, data
+assert [r[1] for r in data if r[3] == 'point'] == ['d1t0c1', 'd2t22c1', 'd4t50c1'], data
+assert [(r[1], r[2]) for r in data if r[3] == 'datapath'] == [('d1t0c1', 'uncapped-f5-datapath')], data
+assert all(r[2] == 'uncapped-f5-both' and r[5].startswith('utils/logs/dualnic-pips-off-dsweep1-id0a04-') for r in data if r[3] == 'point'), data
+assert sum(1 for l in lines if l.startswith('# setting_sweep=')) == 3, lines"
+SR="$R/utils/logs/dualnic-pips-off-dsweep1-id0a04-d2t22c1-uncapped-f5-both-RUN-server-0"
+grep -q '^sweep_id=dualnic-pips-off-dsweep1@' "$SR/sweep-id.txt" && grep -qx 'point=uncapped-f5-both' "$SR/sweep-id.txt" &&
+    grep -q '^sweep_id=dualnic-pips-off-dsweep1@' "$R/utils/logs/dualnic-pips-off-dsweep1/sweep-id.txt" &&
+    grep -q '^sweep_id=dualnic-pips-off-dsweep1@' "$T/res/dualnic-pips-off-dsweep1.txt" &&
+    cmp -s "$M" "$R/utils/logs/dualnic-pips-off-dsweep1/manifest.tsv" &&
+    ok "  sweep-id.txt in run and sweep folders, sweep_id= in ~/<name>.txt" || bad "  $(cat "$SR/sweep-id.txt")"
+run 1 "  the same --tag again is refused" sweep dualnic_pips_sweep.sh --tag dsweep1 --caps 1
+run 2 "  --tag that reads like a setting is refused" sweep dualssd_pips_sweep.sh --tag d8t22
+    has 'reads like a setting'
+run 2 "  -o and --tag together are refused" sweep dualssd_pips_sweep.sh -o X --tag y1
+: > "$T/res/calls.txt"
+run 0 "dualssd_pips_sweep.sh --tag, --caps 1, --datapath-once" \
+    sweep dualssd_pips_sweep.sh --tag dsweep1 --cfgs "1:0 8:106" --caps 1 --datapath-once --no-asy
+run 0 "  calls" cat "$T/res/calls.txt"
+    has '^dualssd_sweep.sh dualssd-pips-off-dsweep1-id0a04-d1t0c1 .* drain=0x00000001 .*DP=1$'
+    has '^dualssd_sweep.sh dualssd-pips-off-dsweep1-id0a04-d8t106c1 .* cfg=0x00006a08 .* DP=0$'
+awk -F'\t' '!/^#/ && $4 == "point" { print $2, $3 }' "$T/res/dualssd-pips-off-dsweep1.manifest.tsv" | tr '\n' ' ' |
+    grep -qx 'd1t0c1 4k-j1-both d8t106c1 4k-j1-both ' && ok "  manifest rows: setting, point" ||
+    bad "  $(cat "$T/res/dualssd-pips-off-dsweep1.manifest.tsv")"
+
+echo "-- pips-timeout-pick.py: time thresholds for depths, from a sweep's results"
+cat > "$T/tp.jsonl" <<'EOF'
+{"exp": "x-d1t0/4k-j1-both", "bs": "4k", "pips_batch": "d1t0", "mean": {"iops_ssd0": 158000, "iops_ssd1": 211000, "pips_in0_tlp": 57000, "pips_in1_tlp": 73000, "pips_duration_us": 19000, "pips_out_tlp": 130000, "pips_out_wait_mean": 15}}
+{"exp": "x-d1t0/64k-j8-both", "bs": "64k", "pips_batch": "d1t0", "mean": {"iops_ssd0": 51700, "iops_ssd1": 23900, "pips_in0_tlp": 100000, "pips_in1_tlp": 136000, "pips_duration_us": 7500, "pips_out_tlp": 236000, "pips_out_wait_mean": 390}}
+EOF
+run 0 "pick: a time per depth; depths the FIFO can't hold get 255" \
+    python3 "$HERE/pips-timeout-pick.py" "$T/tp.jsonl" --depths "4 24" --tlps 3000 -j 2 --json "$T/tp.json"
+    has '^\[ *2/2\]'; has '1 light point(s)'; has 'picked (--cfgs, with --caps 1): "4:[0-9]* 24:255"'
+    has 'd24t255c1 .*depth unreachable'
+run 0 "  --eval: given settings, what asks for the drains" \
+    python3 "$HERE/pips-timeout-pick.py" "$T/tp.jsonl" --eval "2:22 8:106" --tlps 3000 -j 2
+    has '^d2t22c1 '; has '^d8t106c1 '
+run 0 "  --validate: the recorded waits against the model" \
+    python3 "$HERE/pips-timeout-pick.py" "$T/tp.jsonl" --validate --tlps 3000 -j 2
+    has 'pipeline latency'; has '^4k-j1-both  *d1t0 '
 
 echo
 [ "$fails" -eq 0 ] && echo "test-sim: PASS" || echo "test-sim: $fails FAILED"
