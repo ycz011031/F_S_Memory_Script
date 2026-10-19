@@ -35,6 +35,7 @@ every FPGA design update (`pips.tcl` `pips_design_id`).
 | `0x0a02` | `e389cca` (10-11) | DESIGN_ID register; the 10-13 dual-SSD PIPS sweeps ran on it |
 | `0x0a03` | `2c6c3f5` (10-14) | **drain config register**, regfile reg1 (`0xA4000004`) bit 0 `drain_depth_cap`: 0 = one drain sends every packet in the FIFO (reset value, and what older builds always did), 1 = at most `depth_threshold` packets (0 counts as 1), the rest in the next batch. Safe to change at any time. Older builds read 0 there and ignore writes |
 | `0x0a04` | `591d854` (10-15) | **log record format v2**: one record per TLP leaving the batcher, in output order; `port` = the input it came in on; new `pkt_wait` (u16 at 0x0C, cycles in the batcher); `pkt_tag` moved 0x0C → 0x0F; AT moved from byte 0x0D into `pkt_type[5:4]`. No more separate in0/in1/out records |
+| `0x0a05` | `64193c6` (10-17) | **batching FIFOs of 512 beats** (`FIFO_DEPTH`, was the RTL default 128), FIFO 2 too. An input stops taking beats at 493 and asks for a drain above 477 (109 / 93 before): up to 95 drive or 53 NIC TLPs per batch. Registers and log format as 0x0a04. The 10-17 depth sweep (`dsweep1`) ran on it |
 
 The trailer is the same in both log formats, so **a log cannot tell its own
 format**: a v1 decoder reads a v2 log without an error but with wrong tags.
@@ -287,13 +288,25 @@ of its 109 admit beats are left; a grant sends the packets present at the
 grant (with the cap, at most DEPTH) as one run; when both inputs ask they
 alternate; a read waits until its input's writes have left (which flushes
 that FIFO and holds the input behind it) and then goes ahead of the next
-batched packet. How many cycles each kind of TLP holds the output (link and
-credit stalls included) is the median over back-to-back pairs of one drain
-in this log. `--model self` runs the log's own setting (from its path, or
+batched packet. How many cycles each kind of TLP holds the output is the
+median over back-to-back pairs of one drain in this log, but no less than
+the uplink takes to carry it (`--link`, default `gen3x8` for drives, the
+bigserver uplink, and `gen4x8` for NICs, icx's; `none` for the datapath rate
+only): payload + 22 bytes at 96% of the link's raw rate. The pairs alone run
+at the 512-bit datapath's rate, 5 cycles per 256 B TLP; a Gen3 x8 link takes
+9.2, and its stalls fall between the pairs. Before 2026-10-19 the model had
+no link limit, which on the drives kept its FIFOs too empty (+21% page
+switches against the recorded ones, median; waits 0.15–0.26 µs where the
+logs show 0.6–1.5 µs on a full link). The NICs' datapath is slower than
+their Gen4 x8 uplink, so their model did not change. `--model self` runs the log's own setting (from its path, or
 `--setting`) and prints it beside the recorded order and wait: the check of
 the model. `std` adds the eight 0x0A04 settings, `sweep` depths 1–64 at time
-255 (the longest the 8-bit field allows), `deep` the eight settings of the
-10-17 depth sweep, or name any `dDtT[m1][c1]`. Per
+255 (the longest the 8-bit field allows), `sweepc1` the same with the cap on,
+`deep` the eight settings of the 10-17 depth sweep, or name any
+`dDtT[m1][c1][fBEATS]`. A group or setting ending in `fBEATS` runs with a
+FIFO of that many beats instead of the log's own (`sweepc1f512`: the cap-on
+sweep as 0x0A05 would batch; `sweepc1f128` on a 0x0A05 log, as 0x0A04
+would). The log's own size comes from its design ID (`--fifo` overrides it). Per
 setting: page switches per I/O as sent, with each drain regrouped by page
 (between completion entries, and ignoring ordering), IOTLB misses for the
 first `--iotlb` geometry, the time each TLP would spend in the switch, TLPs
@@ -301,9 +314,12 @@ per drain, and what asked for each drain: `depth`, `time`, `full` or a read's
 `flush` (JSON `triggers`, per input `triggers_in`, and the median cycles from
 the batch's start to its trigger, `trig_p50`). A depth trigger also counts
 when a drain's leftovers already hold DEPTH packets, which is how a full
-uplink meets any depth. A FIFO holds 109 beats and asks for a drain above 93
-(the full trigger), so a depth above 93 / (beats per TLP) never asks: 18 for
-256 B TLPs (5 beats), 10 for 512 B ones (9 beats).
+uplink meets any depth. Up to 0x0A04 a FIFO holds 109 beats and asks for a
+drain above 93 (the full trigger), so a depth above 93 / (beats per TLP)
+never asks: 18 for 256 B TLPs (5 beats), 10 for 512 B ones (9 beats). On
+0x0A05 that is 477: 95 and 53. With the cap off a drain sends the whole
+FIFO, so on a backlog the depth only decides when an idle FIFO asks; the
+`sweepc1` lines are where the depth sets the drain size.
 The arrival order is the switch's input acceptance: where a FIFO was full or
 a read held its input, the device was already held back. A test log written
 by the model itself checks the rebuild and the model end to end.
@@ -314,12 +330,13 @@ python3 scripts/pips/pips-page-seq.py \
     --iotlb 1x64,16x4,64x1 --strict --show 200 --from 100000
 python3 scripts/pips/pips-page-seq.py \
     utils/logs/dualssd-pips-strict-1-id0a04-d16t64/4k-j8-both-RUN-0/pips-log-id0a04.bin.gz \
-    --iotlb 1x64 --strict --model self,std,sweep --show 200 --from 100000 --port out,arr
+    --iotlb 1x64 --strict --model self,std,sweep,sweepc1,sweepc1f512 --show 200 --from 100000 --port out,arr
 ```
 
 **Page order for a whole sweep.** `pips-seq-grab.sh ssd|nic` runs
 `pips-page-seq.py --json --show 600 --from 100000 --port out,arr --iotlb
-1x64,16x4,64x1 --model self,std,sweep` (plus `--strict` on strict sweeps) on
+1x64,16x4,64x1 --model self,std,sweep,sweepc1,sweepc1f512` (plus `--strict`
+on strict sweeps; `PIPS_LINK=gen3x8` in the environment passes `--link`) on
 one log per point and batcher setting, 4 at a time (`-j`), and packs the
 reports, one JSON line per log and a manifest into `~/seq-<sweep>.tar.gz`:
 what the report's page-sequence and batching figures are built from. A line
@@ -335,7 +352,9 @@ for missing `pcm-iio` rows still has its log and is used.
 from its manifest instead ([SWEEP-LOGS.md](SWEEP-LOGS.md)): exactly the runs
 it lists under its own sweep ID, datapath checks left out, kind, sweep name
 and settings from its header, and the model default `self,<every setting of
-the sweep>`. Use it for every sweep from 10-17 on.
+the sweep>,sweep,sweepc1` plus the cap-on sweep with the other build's FIFO
+(`sweepc1f128` for a 0x0a05 sweep, else `sweepc1f512`). Use it for every
+sweep from 10-17 on.
 
 ```bash
 bash scripts/pips/pips-seq-grab.sh ssd -j 8     # bigserver, ~/seq-dualssd-pips-strict-1-id0a04.tar.gz (720 logs)
@@ -354,7 +373,8 @@ at the measured rate), runs `pips-page-seq.py`'s batcher on it for a grid of
 times, and per depth takes the smallest time at which the depth trigger asks
 for `--target` (0.5) of the drains at the median light point (output below
 85% of the uplink; on a full uplink the backlog meets any depth the FIFO
-holds). Depths the FIFO can't reach get 255. `--eval "2:22 8:106"` reports
+holds). Depths the FIFO can't reach get 255; `--fifo 512` models 0x0A05's
+FIFOs (settings named `dDtTc1f512`). `--eval "2:22 8:106"` reports
 given settings only; `--validate` compares the model's mean wait with each
 record's logged `pips_out_wait_mean`. Synthetic arrivals: the shares are
 estimates. On a sweep's own logs, `pips-page-seq.py --model self` gives the
@@ -485,6 +505,15 @@ prints the same `drain=`, `design_id=` and `log_format=` lines as `pips cfg`;
 cross-check the host. The log region is hard-coded there (XSCT cannot read
 BAR0), so keep it in step with `pips.tcl`. Not run since the cap and design
 ID procedures were added.
+
+**When the switch stops answering** (completion timeouts through it, then
+`ID reads 0xffffffff`, as the NIC depth sweep on 0x0A05 did at d24t255c1 on
+2026-10-17), before reprogramming or rescanning run
+`bash scripts/pips/pips-hang-snapshot.sh`. It only reads: the Xilinx and
+Mellanox functions and every bridge above them (sysfs links, `lspci -vvv`
+with LnkSta and the AER status), the kernel's AER counters, `pips cfg` with a
+timeout, the kernel log, `devlink health`, the newest sweep logs, into
+`~/pips-hang-<host>-<time>.tar.gz`. Then read the switch over JTAG here.
 
 ## Testing without hardware
 

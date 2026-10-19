@@ -4,7 +4,8 @@
 # batcher, v2 logs) and as it left (one block per run of a page), page
 # switches per I/O when either is regrouped in windows of W TLPs, the IOTLB
 # simulation, and the batcher model run on the arrival order (the log's own
-# setting, to check the model, the eight 0x0A04 settings and a depth sweep).
+# setting, to check the model, the eight 0x0A04 settings and a depth sweep,
+# cap off and on, also with the other build's FIFO size).
 # Runs pips-page-seq.py on one log per point and batcher setting, on the host
 # that holds the logs, and packs the results.
 #
@@ -15,8 +16,10 @@
 #                    those, the TLP log each row names, rows of other sweep IDs
 #                    and datapath checks left out. Kind, sweep and settings
 #                    come from it (--sets, --points still narrow them); the
-#                    model default becomes "self,<every setting of the sweep>"
-#                    and the output ~/seq-<sweep>
+#                    model default becomes "self,<every setting of the
+#                    sweep>,sweep,sweepc1" plus the cap-on sweep with the other
+#                    FIFO size (sweepc1f128 on a 0x0a05 sweep, else
+#                    sweepc1f512), and the output ~/seq-<sweep>
 #   --sweep NAME     sweep name before the setting (default
 #                    dualssd-pips-strict-1-id0a04 / dualnic-pips-strict-1-id0a04)
 #   --sets "S ..."   batcher settings (default: the eight 0x0A04 ones,
@@ -26,7 +29,10 @@
 #                    and one-NIC runs included, datapath checks (any name with
 #                    "datapath") left out
 #   --model LIST     batcher model settings, as pips-page-seq.py --model
-#                    (default self,std,sweep; "" for none)
+#                    (default self,std,sweep,sweepc1,sweepc1f512; "" for none).
+#                    The model sends no faster than the uplink: gen3x8 for
+#                    ssd, gen4x8 for nic (pips-page-seq.py --link; PIPS_LINK
+#                    in the environment overrides it)
 #   --show N         runs of each sequence to list per log, from record 100000
 #                    (default 600)
 #   --logs DIR       where the sweep logs are (default utils/logs)
@@ -72,7 +78,7 @@ fi
 SWEEP="dual${KIND}-pips-strict-1-id0a04"
 SETS="d1t0 d1t0c1 d4t22 d4t22c1 d8t22 d8t22c1 d16t64 d16t64c1"
 POINTS=all
-MODEL="self,std,sweep"
+MODEL="self,std,sweep,sweepc1,sweepc1f512"
 SET_GIVEN=0; MODEL_GIVEN=0
 SHOW=600; JOBS=4; OUT=""; LOGS="$REPO/utils/logs"
 while [ $# -gt 0 ]; do
@@ -103,7 +109,9 @@ if [ -n "$MANIFEST" ]; then
     [ -n "$ROWS" ] || { echo "pips-seq-grab: $MANIFEST lists no runs with a TLP log" >&2; exit 1; }
     msets=$(printf '%s\n' "$ROWS" | awk '!seen[$1]++ { print $1 }' | tr '\n' ' ')
     [ "$SET_GIVEN" = 1 ] || SETS=${msets% }
-    [ "$MODEL_GIVEN" = 1 ] || MODEL="self,$(echo $msets | tr ' ' ',')"
+    other_fifo=sweepc1f512
+    [ "$(mhead design_id)" = 0x0a05 ] && other_fifo=sweepc1f128
+    [ "$MODEL_GIVEN" = 1 ] || MODEL="self,$(echo $msets | tr ' ' ','),sweep,sweepc1,$other_fifo"
 fi
 OUT=${OUT:-$HOME/seq-$SWEEP}
 OUT=${OUT%/}
@@ -120,6 +128,7 @@ PY=${PYTHON:-python3}
 SEQ="$HERE/pips-page-seq.py"
 MODEL_ARG=""
 [ -n "$MODEL" ] && MODEL_ARG="--model $MODEL"
+[ -n "$MODEL" ] && [ -n "${PIPS_LINK:-}" ] && MODEL_ARG="$MODEL_ARG --link $PIPS_LINK"
 
 if [ -n "$MANIFEST" ] && [ "$POINTS" = all ]; then   # every measured point the manifest lists
     POINTS=$(printf '%s\n' "$ROWS" | awk '!seen[$2]++ { print $2 }' | tr '\n' ' ')

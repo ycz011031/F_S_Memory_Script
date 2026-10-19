@@ -45,6 +45,7 @@ run by hand when needed · **orphan** = no caller and superseded · **data** /
 | PIPS switch: one register / test point / log by hand | `sudo scripts/pips/pips <command>` ([scripts/pips/README.md](scripts/pips/README.md)) | PIPS host |
 | PIPS switch: which build, which log format | `sudo scripts/pips/pips cfg` (`design_id=`, `log_format=`; design IDs: [scripts/pips/README.md](scripts/pips/README.md) "Design IDs") | PIPS host |
 | PIPS switch: same over JTAG | `source scripts/pips/pips-xsct.tcl` in XSCT | XSCT host |
+| PIPS switch stopped answering: save the state first | `bash scripts/pips/pips-hang-snapshot.sh` (read-only), then XSCT | PIPS host |
 | PIPS tools: test without hardware | `make -C scripts/pips check` | any Linux |
 
 Per-host config lives in `utils/setup-server.sh`, which is **git-ignored**.
@@ -327,6 +328,7 @@ falls back to default events and every column shifts.
 | `pips-mwr-sizes.py` | manual: TLP logs or sweep log folders → per-drive map of MWr payload sizes (DW), with size-free checks of the "≤ 4 DW = completion entry" rule (mixed pages, interrupt after, bytes per entry); summed per sweep / IOMMU / setting / block size; long CSV; `--show` size sequence. Imports `pips-addr-pattern.py` |
 | `pips-traffic.py` | manual: every TLP log under `utils/logs` (or the paths given), either format, drives and NICs → per device: writes classed by address behaviour (ring entries, payload bursts, MSI), the size rule that splits them and how reliable it is, payload-length motifs per completion, time in the batcher per class (v2); a progress line per log, tables summed per kind / design / IOMMU / setting, CSV, JSONL. Imports `pips-log-decode.py` |
 | `pips-xsct.tcl` | manual: config and drain registers, design ID, DMA and log over JTAG (XSCT) |
+| `pips-hang-snapshot.sh` | manual, when the switch stops answering, before reprogramming: read-only capture of the Xilinx/Mellanox functions and the bridges above them (`lspci -vvv`, AER counters), `pips cfg`, the kernel log, `devlink health`, the newest sweep log → `~/pips-hang-<host>-<time>.tar.gz` |
 | `pips_sim.c` | data: BAR0 model for `make check`, any design (`PIPS_SIM_DESIGN`); never on a testbed |
 | `test-sim.sh` | called: by `make check` |
 | `Makefile` | builds `pips`; `check` builds `pips-sim` and runs `test-sim.sh` |

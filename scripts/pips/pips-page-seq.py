@@ -61,19 +61,26 @@ starts from; out is what the setting made of it.
 
 --model runs the batcher of axi4_mwr_batch.v on the arrival order, for the
 log's own setting (self: checks the model against the log), the 0x0A04
-settings (std), a depth sweep at time 255 (sweep), the 10-17 depth sweep's
-settings (deep: depths 1-64, cap on, times from pips-timeout-pick.py) or any
-dDtT[m1][c1]. Per
+settings (std), a depth sweep at time 255 with the drain cap off (sweep) or
+on (sweepc1), the 10-17 depth sweep's settings (deep: depths 1-64, cap on,
+times from pips-timeout-pick.py) or any dDtT[m1][c1][fBEATS]. Per
 input a FIFO of writes asks for the output at DEPTH packets, after TIME
 cycles non-empty, or when nearly full; a grant sends what the FIFO holds then
 (with c1, at most DEPTH) as one run; the inputs alternate; a read waits until
 its input's writes are out and then goes first. How long each TLP holds the
-output is measured from this log (back-to-back pairs of one drain). Reported:
-page switches per I/O as sent, with each drain regrouped by page (with and
-without ordering), simulated misses, the time in the switch, TLPs per drain,
-and what asked for each drain: depth (also when a drain's leftovers already
-held DEPTH packets), time, full (a FIFO holds 109 beats and asks above 93, so
-a depth of more than 93 / beats per TLP never asks) or a read's flush.
+output is measured from this log (back-to-back pairs of one drain), but no
+less than the uplink takes to carry it (--link; a Gen3 x8 uplink is slower
+than the 512-bit datapath, and its stalls fall between those pairs).
+Reported: page switches per I/O as sent, with each drain regrouped by page
+(with and without ordering), simulated misses, the time in the switch, TLPs
+per drain, and what asked for each drain: depth (also when a drain's
+leftovers already held DEPTH packets), time, full (a FIFO stops taking beats
+at FIFO_DEPTH - 19 and asks 16 beats before that: 109 / 93 of 128 beats up to
+0x0A04, 493 / 477 of 512 on 0x0A05, so a depth of more than 93 or 477 / beats
+per TLP never asks) or a read's flush. The FIFO size comes from the log's
+design ID (--fifo overrides it); a setting named ...fBEATS runs with that
+size instead, e.g. sweepc1f512 is the cap-on sweep with 0x0A05's FIFO on any
+log.
 """
 import argparse
 import collections
@@ -97,19 +104,58 @@ PORTS = ("in0", "in1", "out", "arr")
 ARR = 3                                    # port index of the arrival-order stream (v2 logs)
 WAIT_SAT = 65535
 # The 0x0A04 sweeps' settings, and a depth sweep at the longest time limit the
-# 8-bit field allows, for --model std / sweep.
+# 8-bit field allows, cap off and on, for --model std / sweep / sweepc1.
 STD_SETS = ("d1t0", "d1t0c1", "d4t22", "d4t22c1", "d8t22", "d8t22c1", "d16t64", "d16t64c1")
-SWEEP_SETS = tuple(f"d{d}t255" for d in (1, 2, 4, 8, 16, 32, 64))
+SWEEP_DEPTHS = (1, 2, 4, 8, 16, 32, 64)
+SWEEP_SETS = tuple(f"d{d}t255" for d in SWEEP_DEPTHS)
+SWEEPC1_SETS = tuple(f"d{d}t255c1" for d in SWEEP_DEPTHS)
 # The 10-17 depth sweep (HANDOFF §8): cap on, each time just past what D
 # back-to-back TLPs take to arrive (pips-timeout-pick.py), 255 past the FIFO.
 DEEP_SETS = ("d1t0c1", "d2t22c1", "d4t50c1", "d8t106c1", "d16t218c1", "d24t255c1", "d36t255c1", "d64t255c1")
-SET_RE = re.compile(r"^d(\d+)t(\d+)(m1)?(c1)?$")
+GROUPS = {"std": STD_SETS, "sweep": SWEEP_SETS, "sweepc1": SWEEPC1_SETS, "deep": DEEP_SETS}
+GROUP_RE = re.compile(r"^(std|sweep|sweepc1|deep)(f\d+)?$")
+SET_RE = re.compile(r"^d(\d+)t(\d+)(m1)?(c1)?(?:f(\d+))?$")
 SET_IN_PATH = re.compile(r"-(d\d+t\d+(?:m1)?(?:c1)?)(?=[/-]|$)")
-# axi4_mwr_batch.v at its build parameters: FIFO_DEPTH 128 beats, MAX_PKT_BEATS 16,
-# so prog_full stops the input at 109 beats and the full trigger fires once fewer
-# than 16 beats of that are left.
-ADMIT_BEATS = 109
-FULL_BEATS = ADMIT_BEATS - 16
+# axi4_mwr_batch.v at its build parameters: FIFO_DEPTH beats of 64 B per input,
+# MAX_PKT_BEATS 16, so prog_full stops the input at FIFO_DEPTH - 19 beats and
+# the full trigger fires once fewer than 16 beats of that are left. FIFO_DEPTH
+# is the RTL default of 128 up to 0x0A04 (109 / 93 beats); 0x0A05 builds it
+# with 512 (493 / 477; pips.tcl, FPGA commit 64193c6).
+MAX_PKT_BEATS = 16
+FIFO_DEFAULT = 128
+FIFO_BY_DESIGN = {"0x0a05": 512}
+
+
+def fifo_limits(fifo):
+    """(beats at which prog_full stops an input, fill above which it asks for a drain)."""
+    admit = fifo - MAX_PKT_BEATS - 3
+    return admit, admit - MAX_PKT_BEATS
+
+
+ADMIT_BEATS, FULL_BEATS = fifo_limits(FIFO_DEFAULT)
+# The uplink. The batcher hands the PCIe IP a 64-byte beat per cycle, faster
+# than a Gen3 x8 link carries them: on a busy link the output runs back to back
+# until the IP's buffer is full and then stalls, so the pairs service() measures
+# are the fast ones. The model takes no less than the link's time per TLP:
+# payload + 22 bytes (3DW header 12, sequence number 2, LCRC 4, framing 4) at
+# LINK_EFF of the raw rate after 128b/130b coding. LINK_EFF covers DLLPs and SKP
+# sets and is measured: bigserver's full-link drive logs (Gen3 x8) take 9.2
+# cycles per 256 B TLP. icx's PIPS uplink is Gen4 x8, which the 512-bit
+# datapath, not the link, limits.
+LINK_GTS = {"gen3": 8.0, "gen4": 16.0, "gen5": 32.0}
+LINK_DEFAULT = {"ssd": "gen3x8", "nic": "gen4x8"}
+LINK_EFF = 0.96
+TLP_OVERHEAD = 22
+
+
+def link_bpc(name):
+    """Bytes per 4 ns cycle a link carries ('gen3x8'), None for 'none' (no link limit)."""
+    if name is None or name.lower() == "none":
+        return None
+    m = re.match(r"^(gen[345])x(1|2|4|8|16)$", name.lower())
+    if not m:
+        raise ValueError(f"not a link: {name} (gen3x8, gen4x16, ... or none)")
+    return LINK_GTS[m.group(1)] * 1e9 * int(m.group(2)) * 128 / 130 / 8 / dec.CLOCK_HZ * LINK_EFF
 
 
 def pct(vals, p):
@@ -319,11 +365,20 @@ def arrival(recs, events):
 
 
 def parse_setting(name):
-    """'d16t64c1' -> (depth 16, time 64, cap 1, batch_mrd 0)."""
+    """'d16t64c1' -> (depth 16, time 64, cap 1, batch_mrd 0). A trailing fBEATS
+    (FIFO size) is allowed and left to setting_fifo()."""
     m = SET_RE.match(name)
     if not m:
-        raise ValueError(f"not a batcher setting: {name} (dDEPTHtTIME[m1][c1])")
+        raise ValueError(f"not a batcher setting: {name} (dDEPTHtTIME[m1][c1][fBEATS])")
+    if m.group(5) and fifo_limits(int(m.group(5)))[1] < MAX_PKT_BEATS:
+        raise ValueError(f"{name}: a FIFO of {m.group(5)} beats can't hold a {MAX_PKT_BEATS}-beat packet")
     return int(m.group(1)), int(m.group(2)), int(bool(m.group(4))), int(bool(m.group(3)))
+
+
+def setting_fifo(name):
+    """The FIFO size in beats a setting names ('d24t255c1f512' -> 512), or None."""
+    m = SET_RE.match(name)
+    return int(m.group(5)) if m and m.group(5) else None
 
 
 BATCHED = ("data", "cqe", "msi")             # memory writes: they wait in the batching FIFOs
@@ -357,30 +412,36 @@ def service(out_items):
     return table, (pct(per_beat, 50) if per_beat else 1.0)
 
 
-def cycles(svc, per_beat, cls, pdw, beats):
+def cycles(svc, per_beat, cls, pdw, beats, bpc=None):
     """Output cycles of one TLP: its own kind's median, a read or other single
-    beat as the cheapest single-beat write, else per beat."""
+    beat as the cheapest single-beat write, else per beat; with bpc (link
+    bytes per cycle), at least the link's time for it (a read carries no
+    payload)."""
     v = svc.get((cls, pdw))
     if v is None and beats == 1:
         v = svc.get(("one-beat", 0))
-    return v if v is not None else max(beats, round(per_beat * beats))
+    v = v if v is not None else max(beats, round(per_beat * beats))
+    if bpc:
+        v = max(v, ((0 if cls == "mrd" else 4 * pdw) + TLP_OVERHEAD) / bpc)
+    return v
 
 
 TRIGGERS = ("depth", "time", "full", "flush")
 
 
-def batcher(arr, depth, time, cap, mrd_batched, stats=None):
+def batcher(arr, depth, time, cap, mrd_batched, stats=None, fifo_beats=FIFO_DEFAULT):
     """The batcher of axi4_mwr_batch.v on TLPs in arrival order. arr: (t_in,
-    src, cls, beats, cycles) per TLP. Per input a FIFO of writes (reads too
-    with batch_mrd) that asks for the output once it holds `depth` packets,
-    has been non-empty for `time` cycles (restarted when a drain ends), or
-    has fewer than 16 of its 109 admit beats left. A grant sends the packets
-    in the FIFO at that moment (with the cap: at most `depth`), as one run;
-    when both inputs ask, they alternate. A read (pass-through) enters only
-    once its input's FIFO is empty, which flushes that FIFO and holds back
-    the input behind it, and then goes out ahead of the next batched packet.
-    An input stops taking packets at 109 beats. Returns the TLPs in output
-    order as (arr index, start cycle, drain number).
+    src, cls, beats, cycles) per TLP. Per input a FIFO of `fifo_beats` beats that
+    takes writes (reads too with batch_mrd) and asks for the output once it
+    holds `depth` packets, has been non-empty for `time` cycles (restarted
+    when a drain ends), or has fewer than 16 of its admit beats left (fifo_beats -
+    19: 109 of 128). A grant sends the packets in the FIFO at that moment
+    (with the cap: at most `depth`), as one run; when both inputs ask, they
+    alternate. A read (pass-through) enters only once its input's FIFO is
+    empty, which flushes that FIFO and holds back the input behind it, and
+    then goes out ahead of the next batched packet. An input stops taking
+    packets at its admit limit. Returns the TLPs in output order as (arr
+    index, start cycle, drain number).
     stats, a dict, gets per drain what asked for it: "depth" (the FIFO held
     DEPTH packets; also when a drain's leftovers already did), "full",
     "time", or "flush" (a read behind the writes), counted per input in
@@ -388,6 +449,7 @@ def batcher(arr, depth, time, cap, mrd_batched, stats=None):
     (FIFO non-empty, or the last drain's end) to the trigger in
     stats["trig_cycles"][reason]."""
     n = len(arr)
+    admit_beats, full_beats = fifo_limits(fifo_beats)
     trig_depth = max(depth, 1)
     take_cap = trig_depth if cap else None
     inq = [collections.deque(), collections.deque()]  # arrived, not admitted (blocked)
@@ -416,7 +478,7 @@ def batcher(arr, depth, time, cap, mrd_batched, stats=None):
                     return                             # ordering barrier: flush first
                 f2.append(j)
             else:
-                if fill[c] >= ADMIT_BEATS:
+                if fill[c] >= admit_beats:
                     return                             # prog_full
                 if not fifo[c]:
                     tmr[c] = max(now, arr[j][0])
@@ -439,7 +501,7 @@ def batcher(arr, depth, time, cap, mrd_batched, stats=None):
         if inq[c] and passes(inq[c][0]):
             return True                                # flush request
         if not latch[c]:
-            r = ("depth" if len(fifo[c]) >= trig_depth else "full" if fill[c] > FULL_BEATS
+            r = ("depth" if len(fifo[c]) >= trig_depth else "full" if fill[c] > full_beats
                  else "time" if now - tmr[c] >= time else None)
             if r:
                 latch[c], why[c] = True, (r, now - tmr[c])
@@ -493,24 +555,28 @@ def batcher(arr, depth, time, cap, mrd_batched, stats=None):
     return out
 
 
-def model(events, tl, names, svc, per_beat, geoms, strict, kind):
+def model(events, tl, names, svc, per_beat, geoms, strict, kind, bpc=None, fifo=FIFO_DEFAULT):
     """Each named batcher setting run on the arrival order (batcher()); page
     switches per I/O as it would send them, and with each drain regrouped by
     page (with barriers, and without: the bound), simulated IOTLB misses of
-    the first geometry, and the time each TLP would spend in the switch."""
+    the first geometry, and the time each TLP would spend in the switch.
+    bpc: the uplink's bytes per cycle (cycles()); fifo: the FIFO size in beats
+    for settings that don't name one. Also returns the mean output cycles per
+    TLP the model charges."""
     arr_ev = [e for e in events if e[1] == ARR and e[5] is not None]
     arr, prev = [], None
     for e in arr_ev:
         _out_sop, in_sop, beats, _seg = tl[e[0]]
         prev = in_sop if prev is None else max(in_sop, prev)   # past a saturated gap times are bounds
-        arr.append((prev, e[5], e[2], beats, cycles(svc, per_beat, e[2], e[4], beats)))
+        arr.append((prev, e[5], e[2], beats, cycles(svc, per_beat, e[2], e[4], beats, bpc)))
     t0 = arr[0][0] if arr else 0
     arr = [(a[0] - t0,) + a[1:] for a in arr]
     res = []
     for name in names:
         depth, time, cap, mrd = parse_setting(name)
+        fb = setting_fifo(name) or fifo
         st = {}
-        sent = batcher(arr, depth, time, cap, mrd, st)
+        sent = batcher(arr, depth, time, cap, mrd, st, fb)
         items, flags, groups, waits = [], [], [], []
         for j, start, d in sent:
             _i, _p, c, addr, _pdw, src, _s, _w = arr_ev[j]
@@ -533,7 +599,7 @@ def model(events, tl, names, svc, per_beat, geoms, strict, kind):
             runs[pol] = count_runs(seq) / ios if ios else None
         miss = (simulate(items, geoms[0][0], geoms[0][1], strict, flags) / ios) if geoms and ios else None
         us = 1e6 / dec.CLOCK_HZ
-        res.append(dict(setting=name, depth=depth, time=time, cap=cap, batch_mrd=mrd, runs=runs,
+        res.append(dict(setting=name, depth=depth, time=time, cap=cap, batch_mrd=mrd, fifo=fb, runs=runs,
                         miss=miss, miss_geom=f"{geoms[0][0]}x{geoms[0][1]}" if geoms else None,
                         wait_mean_us=mean(waits) * us if waits else None,
                         wait_p99_us=pct(waits, 99) * us if waits else None,
@@ -542,7 +608,7 @@ def model(events, tl, names, svc, per_beat, geoms, strict, kind):
                         triggers={k: st["triggers"][0][k] + st["triggers"][1][k] for k in TRIGGERS},
                         triggers_in=st["triggers"],
                         trig_p50={k: pct(v, 50) for k, v in st["trig_cycles"].items()}))
-    return res
+    return res, (mean([a[4] for a in arr]) if arr else None)
 
 
 def trig_share(m):
@@ -596,8 +662,17 @@ def main():
     ap.add_argument("--model", metavar="LIST",
                     help="v2: run the batcher model on the arrival order for these settings, "
                          "comma-separated: self (the log's own, from its path or --setting), std "
-                         f"({' '.join(STD_SETS)}), sweep ({' '.join(SWEEP_SETS)}), deep "
-                         f"({' '.join(DEEP_SETS)}), or dDtT[m1][c1]")
+                         f"({' '.join(STD_SETS)}), sweep ({' '.join(SWEEP_SETS)}), sweepc1 (the same "
+                         f"with the cap on), deep ({' '.join(DEEP_SETS)}), or dDtT[m1][c1][fBEATS]; a "
+                         "group followed by fBEATS (sweepc1f512) runs each of its settings with a FIFO "
+                         "of that many beats")
+    ap.add_argument("--link", metavar="genGxW",
+                    help="the uplink the model's output can't outrun: gen3x8, gen4x8, ... or none (the "
+                         "datapath rate measured from the log only). Default: "
+                         + ", ".join(f"{k} {v}" for k, v in LINK_DEFAULT.items()))
+    ap.add_argument("--fifo", type=int, metavar="BEATS",
+                    help="batching FIFO size for the model, in 64-byte beats (default: from the design "
+                         f"ID: {FIFO_DEFAULT}, 0x0a05 512)")
     ap.add_argument("--setting", metavar="dDtT[c1]",
                     help="the log's own batcher setting for --model self (default: from the path)")
     ap.add_argument("--csv", help="write every TLP to this CSV")
@@ -626,7 +701,8 @@ def main():
         own = m.group(1) if m else None
     names = []
     for x in (a.model.split(",") if a.model else []):
-        add = (STD_SETS if x == "std" else SWEEP_SETS if x == "sweep" else DEEP_SETS if x == "deep"
+        g = GROUP_RE.match(x)
+        add = (tuple(s + (g.group(2) or "") for s in GROUPS[g.group(1)]) if g
                else (own,) if x == "self" else (x,))
         if x == "self" and own is None:
             ap.error("--model self: no setting in the log's path; give --setting")
@@ -639,7 +715,15 @@ def main():
                 names.append(nm)
 
     kind = a.kind or ("nic" if "dualnic" in os.path.abspath(a.log) else "ssd")
+    link = a.link or LINK_DEFAULT[kind]
+    try:
+        bpc = link_bpc(link)
+    except ValueError as err:
+        ap.error(f"--link: {err}")
     fi = dec.detect(a.log, a.design_id)
+    fifo = a.fifo or FIFO_BY_DESIGN.get(str(fi["design"]).lower(), FIFO_DEFAULT)
+    if fifo_limits(fifo)[1] < MAX_PKT_BEATS:
+        ap.error(f"--fifo {fifo}: too small for a {MAX_PKT_BEATS}-beat packet")
     recs, trailer, _pads, _nbytes, problem = dec.load(a.log, False, fi["format"])
     dur_us = trailer["duration_cycles"] / dec.CLOCK_HZ * 1e6 if trailer else None
     events, ms = ap_mod.tlp_events(recs, fi["format"], 16 if kind == "nic" else 4)
@@ -697,7 +781,7 @@ def main():
         for r in wi["rows"]:
             print(f"{r['w']:4d} " + "".join(f"{fmt(r['miss'][(pol, g)], '14.3f')}" for g in geoms for pol in POLICIES))
 
-    wa, svc, per_beat, mod, recorded = None, {}, None, [], None
+    wa, svc, per_beat, mod, recorded, mod_cyc = None, {}, None, [], None, None
     if tl is not None:
         print(f"\nArrival order (arr): each TLP's output start minus its pkt_wait. {ainfo['tlps']} TLPs, "
               f"{ainfo['segments']} segment(s), {ainfo['wait_saturated']} saturated waits; "
@@ -716,20 +800,26 @@ def main():
                         miss=wi["rows"][0]["miss"][("drive", geoms[0])] if geoms else None,
                         wait_mean_us=mean(waits) * 1e6 / dec.CLOCK_HZ if waits else None)
         if names:
-            mod = model(events, tl, names, svc, per_beat, geoms, a.strict, kind)
+            mod, mod_cyc = model(events, tl, names, svc, per_beat, geoms, a.strict, kind, bpc, fifo)
             print(f"\nBatcher model on the arrival order (axi4_mwr_batch.v: depth/time/full triggers, drains of "
                   f"the packets present at the grant, cap, inputs alternating, reads after their input's writes). "
                   f"Output cycles per TLP when queued, from this log: "
                   + ", ".join(f"{c} {p} DW {v}" for (c, p), v in sorted(svc.items(), key=lambda kv: str(kv[0])))
                   + f"; else {per_beat:.2f} per beat")
-            print(f"{'setting':>10} {'runs per I/O: as sent':>22} {'by page':>8} {'bound':>7} "
+            print(f"  ... and no faster than the uplink, {link}"
+                  + (f" ({bpc:.1f} bytes per cycle: {(256 + TLP_OVERHEAD) / bpc:.2f} cycles per 256 B TLP)" if bpc else "")
+                  + f": {fmt(mod_cyc, '.2f')} cycles per TLP on average; the log's output took "
+                  + f"{fmt(wi['us_per_tlp'] and wi['us_per_tlp'] * dec.CLOCK_HZ / 1e6, '.2f')}. "
+                  + f"FIFO {fifo} beats per input (design {fi['design']}"
+                  + (", --fifo" if a.fifo else "") + f"), unless a setting names its own (fBEATS)")
+            print(f"{'setting':>13} {'runs per I/O: as sent':>22} {'by page':>8} {'bound':>7} "
                   f"{'misses/I/O':>11} {'wait us mean/p99':>17} {'TLPs/drain':>10}  drains asked for by")
             for m_ in mod:
-                print(f"{m_['setting']:>10} {fmt(m_['runs']['drive'], '22.2f')} {fmt(m_['runs']['page'], '8.2f')} "
+                print(f"{m_['setting']:>13} {fmt(m_['runs']['drive'], '22.2f')} {fmt(m_['runs']['page'], '8.2f')} "
                       f"{fmt(m_['runs']['ideal'], '7.2f')} {fmt(m_['miss'], '11.3f')} "
                       f"{fmt(m_['wait_mean_us'], '8.2f')}/{fmt(m_['wait_p99_us'], '<8.2f')} "
                       f"{fmt(m_['batched'] / m_['drains'] if m_['drains'] else None, '10.1f')}  {trig_share(m_)}")
-            print(f"{'recorded':>10} {fmt(recorded['runs'], '22.2f')} {'':>8} {'':>7} {fmt(recorded['miss'], '11.3f')} "
+            print(f"{'recorded':>13} {fmt(recorded['runs'], '22.2f')} {'':>8} {'':>7} {fmt(recorded['miss'], '11.3f')} "
                   f"{fmt(recorded['wait_mean_us'], '8.2f')}   ({own or 'setting unknown'}, as logged on out)")
 
     if a.json:
@@ -746,7 +836,8 @@ def main():
                        windows_arr=[dict(w=r["w"], wait_mean=r["wait_mean"], pages_mean=r["pages_mean"],
                                          pages_p99=r["pages_p99"], runs=r["runs"]) for r in wa["rows"]],
                        service={f"{c}/{p}": v for (c, p), v in svc.items()}, service_per_beat=per_beat,
-                       model=mod)
+                       link=dict(name=link, bytes_per_cycle=bpc, eff=LINK_EFF, overhead=TLP_OVERHEAD),
+                       fifo=fifo, model_cycles_per_tlp=mod_cyc, model=mod)
         with open(a.json, "a") as f:
             f.write(json.dumps(rec) + "\n")
 

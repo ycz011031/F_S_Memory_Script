@@ -116,7 +116,7 @@ folders: give them the `log_dir`s from the manifest, not `utils/logs`.
   digits, not shaped like a setting or design tag), else `-<N>`, the first
   number with no results in `~`. Use a new label per campaign.
 - **Per setting:** `<name>-id<XXXX>-<setting>`, e.g.
-  `dualssd-pips-strict-dsweep1-id0a04-d8t106c1`.
+  `dualssd-pips-strict-dsweep1-id0a05-d8t106c1`.
 - **Run folders:** drives `utils/logs/<name>-id<XXXX>-<setting>/<point>-RUN-<j>/`,
   NICs `utils/logs/<name>-id<XXXX>-<setting>-<point>-RUN-server-<j>/`.
 - **Settings:** `d8t106c1` = depth 8, time 106 cycles (4 ns each), drain cap
@@ -124,7 +124,9 @@ folders: give them the `log_dir`s from the manifest, not `utils/logs`.
 
 ## The 10-17 depth sweep
 
-Strict, design `0x0a04`, cap on only, eight settings in this order:
+Strict, design `0x0a05` (0x0a04 with 512-beat batching FIFOs; the sweep was
+planned on 0x0a04 and ran on the newer build), cap on only, eight settings in
+this order:
 `d1t0c1 d2t22c1 d4t50c1 d8t106c1 d16t218c1 d24t255c1 d36t255c1 d64t255c1`
 (why these times: HANDOFF §8, "Depth sweep").
 
@@ -134,7 +136,12 @@ Strict, design `0x0a04`, cap on only, eight settings in this order:
 | points per setting | 90: 5 block sizes × 18 co-runs | 4: 5, 10, 15, 30 flows per NIC, both NICs |
 | datapath checks | one per setting (8) | one, before `d1t0c1` only |
 | manifest rows | 728, of them 720 points | 33, of them 32 points |
+| ran (10-17/18) | 702 of 720 points, all logs FULL (18 dropped at 4 KiB for missing `pcm-iio` rows) | 22 of 32 points + the datapath check: stopped during `d24t255c1` (after f10) when the switch stopped answering; `d24` f15/f30, `d36`, `d64` not run |
 
+The NIC sweep's missing settings go in a new sweep (`--tag dsweep1b`), not
+under `dsweep1`: its manifest and sweep ID stay as they ended. A page-order
+grab of `dsweep1` reads its manifest and so takes the 22 NIC runs that have a
+log (`pips-seq-grab.sh --manifest`).
 If the hosts are booted with the IOMMU off, `strict` reads `off` in the names.
 
 ## Earlier runs on the hosts (none has a sweep ID)
@@ -146,4 +153,7 @@ If the hosts are booted with the IOMMU off, `strict` reads `off` in the names.
   `datapath-*` runs.
 - icx: `dualnic-pips-strict-1-id0a04-*-RUN-server-0` (10-15/16, with one-NIC
   runs and datapath checks); `dnflows-*`, `dualnic-flowsweep-*` (no switch).
-- `~` on both: `seq-*` page-order grabs, `traffic*` reports.
+- `~` on both: `seq-*` page-order grabs, `traffic*` reports. The grabs from
+  before 2026-10-19 (`seq-dualssd-0a04-arr`, `seq-dualnic-0a04-arr`) ran the
+  batcher model without the uplink limit (`pips-page-seq.py --link`); regrab
+  under a new `-o` name.

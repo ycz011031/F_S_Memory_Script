@@ -39,9 +39,11 @@ on a full uplink the FIFO backlog meets any depth the FIFO can hold). If no T
 gets there, 255. A FIFO holds 109 beats and its full trigger fires above 93,
 so a depth above 93 / (beats per data TLP) can't trigger: about 18 for 256 B
 TLPs and 10 for 512 B ones. Those depths get T = 255 and are marked.
+--fifo 512 models design 0x0A05's FIFOs instead (493 / 477 beats: 95 and 53
+TLPs); the settings are then named dDtTc1f512.
 
---validate runs the settings each record was recorded with (pips_batch) and
-compares the modelled mean wait (plus the pipeline latency, the light-load
+--validate runs the settings each record was recorded with (pips_batch, with
+the FIFO size of its pips_design_id) and compares the modelled mean wait (plus the pipeline latency, the light-load
 d1t0 wait) with the log's pips_out_wait_mean.
 Python 3, standard library only; a line per point as it finishes.
 """
@@ -72,10 +74,15 @@ KIND = {
 DEPTHS = (1, 2, 4, 8, 16, 24, 36, 64)
 
 
-def reachable(kind, depth):
-    """Whether a FIFO of full data TLPs reaches `depth` packets before its full
-    trigger (fill above FULL_BEATS)."""
-    return depth * KIND[kind]["data"][0] <= FULL_BEATS
+def reachable(kind, depth, fifo=seq.FIFO_DEFAULT):
+    """Whether a FIFO of `fifo` beats of full data TLPs reaches `depth` packets
+    before its full trigger (FULL_BEATS at the default 128)."""
+    return depth * KIND[kind]["data"][0] <= seq.fifo_limits(fifo)[1]
+
+
+def fifo_suffix(fifo):
+    """'' for the 0x0A04 FIFO, else 'f<beats>' to append to a setting name."""
+    return "" if fifo == seq.FIFO_DEFAULT else f"f{fifo}"
 
 
 def load_points(paths, kind):
@@ -101,7 +108,8 @@ def load_points(paths, kind):
                     else:
                         wr = m.get(f"pips_in{c}_mwr_gbps", 0) * 1e9 / 8
                         ins.append(dict(rate=wr / (4032 + 64 * 1.1), tlps=tlps))
-                pts.append(dict(name=name, setting=r.get("pips_batch"), path=p, ins=ins,
+                fifo = seq.FIFO_BY_DESIGN.get(str(r.get("pips_design_id", "")).lower(), seq.FIFO_DEFAULT)
+                pts.append(dict(name=name, setting=r.get("pips_batch"), fifo=fifo, path=p, ins=ins,
                                 out_tlps=m.get("pips_out_tlp", 0) / dur * 1e6,
                                 wait=m.get("pips_out_wait_mean"), src=os.path.basename(p)))
     return pts
@@ -171,7 +179,7 @@ def arrivals(pt, kind, n_target, gap, seed):
 def run_setting(arr, name):
     d, t, cap, mrd = seq.parse_setting(name)
     st = {}
-    sent = seq.batcher(arr, d, t, cap, mrd, st)
+    sent = seq.batcher(arr, d, t, cap, mrd, st, seq.setting_fifo(name) or seq.FIFO_DEFAULT)
     waits = [s - arr[j][0] for j, s, _d in sent]
     trig = {k: st["triggers"][0][k] + st["triggers"][1][k] for k in seq.TRIGGERS}
     drains = sum(trig.values())
@@ -224,7 +232,10 @@ def main():
     ap.add_argument("-j", type=int, default=os.cpu_count() or 2, help="points at a time")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--json", help="write the per-point, per-setting results here")
+    ap.add_argument("--fifo", type=int, default=seq.FIFO_DEFAULT,
+                    help=f"batching FIFO in beats ({seq.FIFO_DEFAULT}; 512 for design 0x0A05)")
     a = ap.parse_args()
+    fx = fifo_suffix(a.fifo)
     kind = a.kind or ("nic" if any("dualnic" in p for p in a.jsonl) else "ssd")
     gap = a.gap or KIND[kind]["gap"]
     pts = load_points(a.jsonl, kind)
@@ -244,13 +255,14 @@ def main():
     if a.eval:
         for c in a.eval.split():
             d, t = (int(x) for x in c.split(":")[:2])
-            evals.append(f"d{d}t{t}c1")
+            evals.append(f"d{d}t{t}c1{fx}")
     if a.validate:
-        jobs = [(p, kind, [p["setting"], "d1t0"], a.tlps, gap, a.seed) for p in pts if p["setting"]]
+        jobs = [(p, kind, [p["setting"] + fifo_suffix(p["fifo"]), "d1t0" + fifo_suffix(p["fifo"])],
+                 a.tlps, gap, a.seed) for p in pts if p["setting"]]
     elif evals:
         jobs = [(p, kind, evals, a.tlps, gap, a.seed) for p in pts]
     else:
-        names = sorted({f"d{d}t{t}c1" for d in depths for t in (candidates(d) if d > 1 else (0,))},
+        names = sorted({f"d{d}t{t}c1{fx}" for d in depths for t in (candidates(d) if d > 1 else (0,))},
                        key=lambda s: seq.parse_setting(s)[:2])
         jobs = [(p, kind, names, a.tlps, gap, a.seed) for p in pts]
     print(f"pips-timeout-pick: {len(jobs)} point(s), kind {kind}, {a.tlps} TLPs each, "
@@ -303,8 +315,8 @@ def main():
             print(f"{nm:10} {4 * t:5d}  {'':22}" + " ".join(med(light, nm, k) for k in seq.TRIGGERS)
                   + f"  {statistics.median(tpd) if tpd else 0:10.1f}  {statistics.median(wl) * 4 if wl else 0:4.0f} ns"
                   + f"  {'':12}" + " ".join(med(full, nm, k) for k in seq.TRIGGERS)
-                  + ("" if reachable(kind, d) else "   depth unreachable"))
-            rows.append(dict(setting=nm, depth=d, time=t, reachable=reachable(kind, d),
+                  + ("" if reachable(kind, d, a.fifo) else "   depth unreachable"))
+            rows.append(dict(setting=nm, depth=d, time=t, reachable=reachable(kind, d, a.fifo),
                              light={k: statistics.median([share(rs[nm], k) for _p, rs in light]) if light else None
                                     for k in seq.TRIGGERS},
                              full={k: statistics.median([share(rs[nm], k) for _p, rs in full]) if full else None
@@ -313,7 +325,7 @@ def main():
                              wait_light_ns=statistics.median(wl) * 4 if wl else None))
         if a.json:
             with open(a.json, "w") as f:
-                json.dump(dict(kind=kind, gap=gap, light=a.light, tlps=a.tlps, eval=rows,
+                json.dump(dict(kind=kind, gap=gap, light=a.light, tlps=a.tlps, fifo=a.fifo, eval=rows,
                                points=[dict(name=pt["name"], src=pt["src"], out_share=pt["out_tlps"] / uplink,
                                             results=res) for pt, res in out]), f)
             print(f"results: {a.json}")
@@ -323,7 +335,7 @@ def main():
         ts = candidates(d) if d > 1 else [0]
         rows = []
         for t in ts:
-            nm = f"d{d}t{t}c1"
+            nm = f"d{d}t{t}c1{fx}"
             dl = [share(rs[nm]) for _p, rs in light] or [0.0]
             tl = [share(rs[nm], "time") for _p, rs in light] or [0.0]
             df = [share(rs[nm]) for _p, rs in full] or [0.0]
@@ -331,7 +343,7 @@ def main():
             rows.append(dict(t=t, setting=nm, depth_light_p50=statistics.median(dl), depth_light_min=min(dl),
                              depth_light_max=max(dl), time_light_p50=statistics.median(tl),
                              depth_full_p50=statistics.median(df), wait_light_p50=statistics.median(wl)))
-        ok = reachable(kind, d)
+        ok = reachable(kind, d, a.fifo)
         if d == 1:
             pick = rows[0]
         elif ok:
@@ -356,7 +368,7 @@ def main():
               f"{100 * r['depth_full_p50']:.0f}% on a full uplink" + ("" if p["reachable"] else "; depth unreachable"))
     if a.json:
         with open(a.json, "w") as f:
-            json.dump(dict(kind=kind, gap=gap, target=a.target, light=a.light, tlps=a.tlps, cfgs=cfgs, picks=picks,
+            json.dump(dict(kind=kind, gap=gap, target=a.target, light=a.light, tlps=a.tlps, fifo=a.fifo, cfgs=cfgs, picks=picks,
                            points=[dict(name=pt["name"], src=pt["src"], out_share=pt["out_tlps"] / uplink,
                                         results=res) for pt, res in out]), f)
         print(f"results: {a.json}")

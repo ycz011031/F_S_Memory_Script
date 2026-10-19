@@ -327,9 +327,9 @@ with gzip.open(sys.argv[2], "wb") as f:
 EOF
 BL="$T/tlb/dualssd-pips-strict-3-id0a04-d16t64/4k-j8-both-RUN-0"
 mkdir -p "$BL" && python3 "$T/synthb.py" "$HERE/pips-page-seq.py" "$BL/pips-log-id0a04.bin.gz"
-run 0 "model on the rebuilt arrival order: self (d16t64, from the path), std, sweep" \
+run 0 "model on the rebuilt arrival order: self (d16t64, from the path), std, sweep (no link limit)" \
     python3 "$HERE/pips-page-seq.py" "$BL/pips-log-id0a04.bin.gz" --iotlb 1x64 --strict --model self,std,sweep \
-    --show 40 --from 5000 --port out,arr --json "$T/mb.jsonl"
+    --link none --show 40 --from 5000 --port out,arr --json "$T/mb.jsonl"
     has '^arr: the sequence'; has '^out: the sequence'; has '^Arrival order (arr)'
     has '^ *d16t64 '; has '^ *d64t255 '; has '^ *recorded .*(d16t64, as logged on out)'
     has 'drains asked for by'; has '^ *d64t255 .* depth 0% time'
@@ -351,7 +351,38 @@ for x in m.values():
 t = m['d1t0']['triggers']; assert t['depth'] > 0.9 * m['d1t0']['drains'] and t['time'] == 0, t
 t = m['d16t64']['triggers']; assert t['time'] > t['depth'], t          # 16 TLPs take 135+ cycles
 t = m['d64t255']['triggers']; assert t['depth'] == 0 and t['flush'] > 0, t  # 64 x 5 beats never fit
-assert m['d4t255']['triggers']['depth'] > m['d4t22']['triggers']['depth'], (m['d4t255'], m['d4t22'])"
+assert m['d4t255']['triggers']['depth'] > m['d4t22']['triggers']['depth'], (m['d4t255'], m['d4t22'])
+assert all(x['fifo'] == 128 for x in m.values()) and r['fifo'] == 128 and r['link']['bytes_per_cycle'] is None, r['link']"
+run 0 "  the uplink: a drive log's default is gen3x8, 9.2 cycles per 256 B TLP; sweepc1, f512 suffixes" \
+    python3 "$HERE/pips-page-seq.py" "$BL/pips-log-id0a04.bin.gz" --strict --model self,sweepc1,sweepc1f512,d24t255c1f512 \
+    --json "$T/ml.jsonl"
+    has 'no faster than the uplink, gen3x8 (30.2 bytes per cycle: 9.19 cycles per 256 B TLP)'
+    has '^ *d64t255c1f512 '; has 'FIFO 128 beats per input (design 0x0a04)'
+run 0 "  json: the link slows the output and lengthens the waits; FIFO sizes per setting" python3 -c "
+import json
+r = json.loads(open('$T/mb.jsonl').readline()); l = json.loads(open('$T/ml.jsonl').readline())
+m0 = {x['setting']: x for x in r['model']}; m1 = {x['setting']: x for x in l['model']}
+assert abs(l['link']['bytes_per_cycle'] - 30.25) < 0.05 and l['link']['name'] == 'gen3x8', l['link']
+assert l['model_cycles_per_tlp'] > r['model_cycles_per_tlp'] + 1, (l['model_cycles_per_tlp'], r['model_cycles_per_tlp'])
+assert m1['d16t64']['wait_mean_us'] > m0['d16t64']['wait_mean_us'], (m1['d16t64'], m0['d16t64'])
+assert len(m1) == 1 + 7 + 7 + 1 and m1['d8t255c1']['fifo'] == 128 and m1['d8t255c1f512']['fifo'] == 512, list(m1)
+assert m1['d24t255c1f512']['cap'] == 1 and m1['d24t255c1f512']['depth'] == 24, m1['d24t255c1f512']"
+run 0 "  batcher: depth 24 of 5-beat packets asks on the full trigger in 128 beats, on depth in 512" python3 -c "
+import importlib.util
+spec = importlib.util.spec_from_file_location('ps', '$HERE/pips-page-seq.py'); ps = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(ps)
+arr = [(5 * i, 0, 'data', 5, 9) for i in range(200)]
+for fb, want in ((128, 'full'), (512, 'depth')):
+    st = {}; out = ps.batcher(arr, 24, 255, 1, 0, st, fb)
+    t = st['triggers'][0]; assert len(out) == 200 and max(t, key=t.get) == want, (fb, t)
+assert ps.fifo_limits(128) == (109, 93) and ps.fifo_limits(512) == (493, 477)
+assert ps.cycles({}, 1.0, 'data', 64, 5, ps.link_bpc('gen3x8')) > 9.1
+assert ps.cycles({('data', 128): 9}, 1.0, 'data', 128, 9, ps.link_bpc('gen4x8')) == 9   # icx: the datapath binds
+assert ps.parse_setting('d24t255c1f512') == (24, 255, 1, 0) and ps.setting_fifo('d24t255c1f512') == 512
+assert ps.setting_fifo('d24t255c1') is None"
+run 2 "  --link with no such link is refused" \
+    python3 "$HERE/pips-page-seq.py" "$BL/pips-log-id0a04.bin.gz" --model self --link gen3x9
+    has 'not a link'
 run 2 "  --model self without a setting in the path is refused" \
     python3 "$HERE/pips-page-seq.py" "$T/synth-nosetting.bin.gz" --model self
     has 'no setting in the'
