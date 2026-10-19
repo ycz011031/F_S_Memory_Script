@@ -53,8 +53,10 @@
 #   seq.jsonl               one JSON line per log (--json), with its path
 #   manifest.txt            the log used for each point, missing ones, the
 #                           git revision and the command line
-# A line per log as it finishes ([done/total], seconds). Copy DIR.tar.gz back
-# next to the sweep results (dualssd/1016/, dualnic/1016/).
+# A line per log as it finishes ([done/total], seconds), and every HEARTBEAT
+# seconds (default 60) a line with the count done and, for each log still
+# running, the stage it is in (pips-page-seq.py --progress). Copy DIR.tar.gz
+# back next to the sweep results (dualssd/1016/, dualnic/1016/).
 set -u
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -192,10 +194,10 @@ one() {
     local set=$1 point=$2 log=$3
     local base="$set-$point" t0=$SECONDS st
     if $PY "$SEQ" "$log" --kind "$KIND" --iotlb 1x64,16x4,64x1 $STRICT $MODEL_ARG --json "$OUT/.$base.json" \
-           --show "$SHOW" --from 100000 --port out,arr > "$OUT/seq-$base.txt" 2> "$OUT/.$base.err"; then
+           --show "$SHOW" --from 100000 --port out,arr --progress > "$OUT/seq-$base.txt" 2> "$OUT/.$base.err"; then
         st="done"
     else
-        st="FAIL ($(tail -n 1 "$OUT/.$base.err"))"
+        st="FAIL ($(grep -v '^pips-page-seq: +' "$OUT/.$base.err" | tail -n 1))"
     fi
     echo "$base" >> "$OUT/.finished"
     echo "  [$(wc -l < "$OUT/.finished")/$TOTAL] $st  $base  $((SECONDS - t0)) s"
@@ -204,12 +206,32 @@ export -f one
 TOTAL=$n
 : > "$OUT/.finished"
 export PY SEQ KIND STRICT OUT SHOW MODEL_ARG TOTAL
+T0=$SECONDS
+heartbeat() {                                  # liveness: what each running log is doing
+    while sleep "${HEARTBEAT:-60}"; do
+        local d run="" e b
+        d=$(wc -l < "$OUT/.finished" 2>/dev/null || echo 0)
+        for e in "$OUT"/.*.err; do
+            [ -e "$e" ] || continue
+            b=$(basename "$e" .err); b=${b#.}
+            grep -qxF "$b" "$OUT/.finished" 2>/dev/null && continue
+            run="$run | $b: $(tail -n 1 "$e" | sed 's/^pips-page-seq: //' | cut -c1-48)"
+        done
+        echo "  ... $(date +%T) $d/$TOTAL done, $(( (SECONDS - T0) / 60 )) min${run}"
+    done
+}
+heartbeat &
+HB=$!
+trap 'kill $HB 2>/dev/null' EXIT
 xargs -P "$JOBS" -n 3 bash -c 'one "$@"' _ < "$jobs_file"
+kill $HB 2>/dev/null
 
 cat "$OUT"/.*.json > "$OUT/seq.jsonl" 2>/dev/null
 done_n=$(wc -l < "$OUT/seq.jsonl")
-for e in "$OUT"/.*.err; do
-    [ -s "$e" ] && { echo "--- $(basename "$e")"; cat "$e"; } >> "$OUT/manifest.txt"
+for e in "$OUT"/.*.err; do                   # errors only: the progress lines are left out
+    grep -v '^pips-page-seq: +' "$e" > "$e.x" 2>/dev/null
+    [ -s "$e.x" ] && { echo "--- $(basename "$e")"; cat "$e.x"; } >> "$OUT/manifest.txt"
+    rm -f "$e.x"
 done
 rm -f "$OUT"/.*.json "$OUT"/.*.err "$jobs_file" "$OUT/.finished"
 echo "analysed $done_n of $n logs" >> "$OUT/manifest.txt"

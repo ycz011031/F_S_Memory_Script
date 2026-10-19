@@ -155,5 +155,6 @@ If the hosts are booted with the IOMMU off, `strict` reads `off` in the names.
   runs and datapath checks); `dnflows-*`, `dualnic-flowsweep-*` (no switch).
 - `~` on both: `seq-*` page-order grabs, `traffic*` reports. The grabs from
   before 2026-10-19 (`seq-dualssd-0a04-arr`, `seq-dualnic-0a04-arr`) ran the
-  batcher model without the uplink limit (`pips-page-seq.py --link`); regrab
-  under a new `-o` name.
+  batcher model without the uplink limit (`pips-page-seq.py --link`) or the
+  grant gap; regrab with `pips-analyze.sh` (one run per host, both designs,
+  its own output name).

@@ -67,10 +67,13 @@ times from pips-timeout-pick.py) or any dDtT[m1][c1][fBEATS]. Per
 input a FIFO of writes asks for the output at DEPTH packets, after TIME
 cycles non-empty, or when nearly full; a grant sends what the FIFO holds then
 (with c1, at most DEPTH) as one run; the inputs alternate; a read waits until
-its input's writes are out and then goes first. How long each TLP holds the
-output is measured from this log (back-to-back pairs of one drain), but no
+its input's writes are out and then goes first. A TLP holds the output one
+cycle per 64-byte beat (the 512-bit datapath; what back-to-back pairs within
+a drain take in every log), plus a grant gap of 3 cycles whenever the output
+takes a new drain or a pass-through packet (--grant-gap; d1t0c1 logs, where
+every drain is one TLP, take 3 more cycles per TLP than its beats), but no
 less than the uplink takes to carry it (--link; a Gen3 x8 uplink is slower
-than the 512-bit datapath, and its stalls fall between those pairs).
+than the datapath). --progress prints each stage to stderr.
 Reported: page switches per I/O as sent, with each drain regrouped by page
 (with and without ordering), simulated misses, the time in the switch, TLPs
 per drain, and what asked for each drain: depth (also when a drain's
@@ -84,6 +87,7 @@ log.
 """
 import argparse
 import collections
+import time as time_mod
 import csv
 import importlib.util
 import json
@@ -146,6 +150,12 @@ LINK_GTS = {"gen3": 8.0, "gen4": 16.0, "gen5": 32.0}
 LINK_DEFAULT = {"ssd": "gen3x8", "nic": "gen4x8"}
 LINK_EFF = 0.96
 TLP_OVERHEAD = 22
+# Cycles the output loses when it takes a new drain (or a pass-through packet):
+# the master FSM re-arbitrates at the packet boundary. In d1t0c1 logs every
+# drain is one TLP, and back-to-back TLPs of one input are 3 cycles further
+# apart than their beats (drives: 256 B data 8-9 vs 5, entries 4 vs 1; NICs:
+# 512 B data 12 vs 9, 64 B entries 5 vs 2); in multi-TLP drains they are not.
+GRANT_GAP = 3
 
 
 def link_bpc(name):
@@ -412,15 +422,13 @@ def service(out_items):
     return table, (pct(per_beat, 50) if per_beat else 1.0)
 
 
-def cycles(svc, per_beat, cls, pdw, beats, bpc=None):
-    """Output cycles of one TLP: its own kind's median, a read or other single
-    beat as the cheapest single-beat write, else per beat; with bpc (link
-    bytes per cycle), at least the link's time for it (a read carries no
-    payload)."""
-    v = svc.get((cls, pdw))
-    if v is None and beats == 1:
-        v = svc.get(("one-beat", 0))
-    v = v if v is not None else max(beats, round(per_beat * beats))
+def cycles(cls, pdw, beats, bpc=None):
+    """Output cycles of one TLP within a drain: one per 64-byte beat on the
+    512-bit datapath (back-to-back pairs of one drain take exactly that in
+    every log, service()), and with bpc (link bytes per cycle) at least the
+    link's time for it (a read carries no payload). batcher() adds the grant
+    gap."""
+    v = beats
     if bpc:
         v = max(v, ((0 if cls == "mrd" else 4 * pdw) + TLP_OVERHEAD) / bpc)
     return v
@@ -429,7 +437,7 @@ def cycles(svc, per_beat, cls, pdw, beats, bpc=None):
 TRIGGERS = ("depth", "time", "full", "flush")
 
 
-def batcher(arr, depth, time, cap, mrd_batched, stats=None, fifo_beats=FIFO_DEFAULT):
+def batcher(arr, depth, time, cap, mrd_batched, stats=None, fifo_beats=FIFO_DEFAULT, grant_gap=0):
     """The batcher of axi4_mwr_batch.v on TLPs in arrival order. arr: (t_in,
     src, cls, beats, cycles) per TLP. Per input a FIFO of `fifo_beats` beats that
     takes writes (reads too with batch_mrd) and asks for the output once it
@@ -440,8 +448,10 @@ def batcher(arr, depth, time, cap, mrd_batched, stats=None, fifo_beats=FIFO_DEFA
     alternate. A read (pass-through) enters only once its input's FIFO is
     empty, which flushes that FIFO and holds back the input behind it, and
     then goes out ahead of the next batched packet. An input stops taking
-    packets at its admit limit. Returns the TLPs in output order as (arr
-    index, start cycle, drain number).
+    packets at its admit limit. A TLP holds the output its `cycles`; the
+    first TLP of a drain, and a pass-through packet, at least its beats +
+    `grant_gap`. Returns the TLPs in output order as (arr index, start cycle,
+    drain number).
     stats, a dict, gets per drain what asked for it: "depth" (the FIFO held
     DEPTH packets; also when a drain's leftovers already did), "full",
     "time", or "flush" (a read behind the writes), counted per input in
@@ -465,6 +475,16 @@ def batcher(arr, depth, time, cap, mrd_batched, stats=None, fifo_beats=FIFO_DEFA
     f2 = collections.deque()
     owner, rr_last, drain_no = None, 1, 0
     nxt, t, out = 0, 0, []
+    prev_d = None                                      # drain of the TLP last sent; -1 pass-through
+
+    def occ(j, d):
+        """Cycles TLP j holds the output; a new source costs the grant gap."""
+        nonlocal prev_d
+        x = arr[j][4]
+        if grant_gap and (d != prev_d or d < 0):
+            x = max(x, arr[j][3] + grant_gap)
+        prev_d = d
+        return x
 
     def passes(j):
         return arr[j][2] not in BATCHED and not mrd_batched
@@ -512,7 +532,7 @@ def batcher(arr, depth, time, cap, mrd_batched, stats=None, fifo_beats=FIFO_DEFA
         j = fifo[c].popleft()
         fill[c] -= arr[j][3]
         out.append((j, now, drain_no))
-        end = now + arr[j][4]
+        end = now + occ(j, drain_no)
         if snap[c] > 0:
             snap[c] -= 1
         if not fifo[c]:
@@ -528,7 +548,7 @@ def batcher(arr, depth, time, cap, mrd_batched, stats=None, fifo_beats=FIFO_DEFA
         if f2:
             j = f2.popleft()
             out.append((j, t, -1))
-            t += arr[j][4]
+            t += occ(j, -1)
             continue
         a = [asks(0, t), asks(1, t)]
         if owner is not None and a[owner] and (snap[owner] != 0):
@@ -555,28 +575,32 @@ def batcher(arr, depth, time, cap, mrd_batched, stats=None, fifo_beats=FIFO_DEFA
     return out
 
 
-def model(events, tl, names, svc, per_beat, geoms, strict, kind, bpc=None, fifo=FIFO_DEFAULT):
+def model(events, tl, names, geoms, strict, kind, bpc=None, fifo=FIFO_DEFAULT, grant_gap=GRANT_GAP,
+          progress=None):
     """Each named batcher setting run on the arrival order (batcher()); page
     switches per I/O as it would send them, and with each drain regrouped by
     page (with barriers, and without: the bound), simulated IOTLB misses of
     the first geometry, and the time each TLP would spend in the switch.
     bpc: the uplink's bytes per cycle (cycles()); fifo: the FIFO size in beats
-    for settings that don't name one. Also returns the mean output cycles per
-    TLP the model charges."""
+    for settings that don't name one; grant_gap: batcher(). progress(msg), if
+    given, hears of each setting. Also returns the mean output cycles per TLP
+    the model charges within a drain."""
     arr_ev = [e for e in events if e[1] == ARR and e[5] is not None]
     arr, prev = [], None
     for e in arr_ev:
         _out_sop, in_sop, beats, _seg = tl[e[0]]
         prev = in_sop if prev is None else max(in_sop, prev)   # past a saturated gap times are bounds
-        arr.append((prev, e[5], e[2], beats, cycles(svc, per_beat, e[2], e[4], beats, bpc)))
+        arr.append((prev, e[5], e[2], beats, cycles(e[2], e[4], beats, bpc)))
     t0 = arr[0][0] if arr else 0
     arr = [(a[0] - t0,) + a[1:] for a in arr]
     res = []
-    for name in names:
+    for k, name in enumerate(names, 1):
         depth, time, cap, mrd = parse_setting(name)
         fb = setting_fifo(name) or fifo
         st = {}
-        sent = batcher(arr, depth, time, cap, mrd, st, fb)
+        if progress:
+            progress(f"model {k}/{len(names)} {name}")
+        sent = batcher(arr, depth, time, cap, mrd, st, fb, grant_gap)
         items, flags, groups, waits = [], [], [], []
         for j, start, d in sent:
             _i, _p, c, addr, _pdw, src, _s, _w = arr_ev[j]
@@ -650,7 +674,7 @@ def _line(first, last, n):
     print(f"{run:7d} {rec:7d} {drive:>5} {c:5} {page:>12} {offs:>11} {n:5d} {visit:6} {o0:4d}/{o1:<4d}")
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("log", help="one pips-log[-id<XXXX>].bin or .bin.gz")
     ap.add_argument("--show", type=int, metavar="N", help="print N runs of the sequence")
@@ -670,6 +694,10 @@ def main():
                     help="the uplink the model's output can't outrun: gen3x8, gen4x8, ... or none (the "
                          "datapath rate measured from the log only). Default: "
                          + ", ".join(f"{k} {v}" for k, v in LINK_DEFAULT.items()))
+    ap.add_argument("--grant-gap", type=int, default=GRANT_GAP, metavar="CYCLES",
+                    help=f"cycles the model's output loses at each new drain (default {GRANT_GAP}, from the d1t0c1 logs)")
+    ap.add_argument("--progress", action="store_true",
+                    help="print each stage to stderr as it starts (liveness for long runs)")
     ap.add_argument("--fifo", type=int, metavar="BEATS",
                     help="batching FIFO size for the model, in 64-byte beats (default: from the design "
                          f"ID: {FIFO_DEFAULT}, 0x0a05 512)")
@@ -685,7 +713,12 @@ def main():
     ap.add_argument("--design-id", metavar="ID",
                     help="design ID of the build that wrote the log (0x0a04, or none); default: "
                          "found from its name or folder (pips-log-decode.py --help)")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
+    t_start = time_mod.time()
+
+    def progress(msg):
+        if a.progress:
+            print(f"pips-page-seq: +{time_mod.time() - t_start:.0f}s {msg}", file=sys.stderr, flush=True)
     geoms = []
     if a.iotlb:
         for g in a.iotlb.split(","):
@@ -720,6 +753,7 @@ def main():
         bpc = link_bpc(link)
     except ValueError as err:
         ap.error(f"--link: {err}")
+    progress(f"decoding {a.log}")
     fi = dec.detect(a.log, a.design_id)
     fifo = a.fifo or FIFO_BY_DESIGN.get(str(fi["design"]).lower(), FIFO_DEFAULT)
     if fifo_limits(fifo)[1] < MAX_PKT_BEATS:
@@ -734,6 +768,7 @@ def main():
     elif names or "arr" in show_ports:
         print(f"pips-page-seq: {fi['format']} log has no pkt_wait: no arrival order or model", file=sys.stderr)
         names = []
+    progress(f"{len(recs)} records decoded; following the pages")
     rows = annotate(events, kind)
     print(f"log {a.log}: {len(recs)} records, {fmt(dur_us, '.0f')} us"
           + (f" ({problem})" if problem else "")
@@ -764,6 +799,7 @@ def main():
               f"{x['visits']:7d} {fmt(100 * x['single_run'] if x['single_run'] is not None else None, '6.1f')}% "
               f"{fmt(x['runs_per_visit'], '10.2f')} {of[0]:>31} {of[1]:>16}")
 
+    progress("what-if on out" + (" with the IOTLB simulation" if geoms else ""))
     wi = whatif(events, dur_us, geoms, a.strict)
     print(f"\nBatching what-if on out: {wi['items']} translated TLPs, {wi['ios']} I/Os, "
           f"{fmt(wi['us_per_tlp'] and 1000 * wi['us_per_tlp'], '.1f')} ns per TLP")
@@ -786,6 +822,7 @@ def main():
         print(f"\nArrival order (arr): each TLP's output start minus its pkt_wait. {ainfo['tlps']} TLPs, "
               f"{ainfo['segments']} segment(s), {ainfo['wait_saturated']} saturated waits; "
               f"{fmt(ainfo['moved'] and 100 * ainfo['moved'], '.1f')}% left in another position than they arrived")
+        progress("what-if on the arrival order")
         wa = whatif(events, dur_us, [], a.strict, ARR)
         print(f"Batching what-if on arr (windows of the arrival order): {wa['ios']} I/Os")
         print(f"{'W':>4} {'runs per I/O: as arrived':>25} {'drive':>7} {'page':>7} {'ideal':>7}")
@@ -800,12 +837,13 @@ def main():
                         miss=wi["rows"][0]["miss"][("drive", geoms[0])] if geoms else None,
                         wait_mean_us=mean(waits) * 1e6 / dec.CLOCK_HZ if waits else None)
         if names:
-            mod, mod_cyc = model(events, tl, names, svc, per_beat, geoms, a.strict, kind, bpc, fifo)
+            mod, mod_cyc = model(events, tl, names, geoms, a.strict, kind, bpc, fifo, a.grant_gap, progress)
             print(f"\nBatcher model on the arrival order (axi4_mwr_batch.v: depth/time/full triggers, drains of "
                   f"the packets present at the grant, cap, inputs alternating, reads after their input's writes). "
                   f"Output cycles per TLP when queued, from this log: "
                   + ", ".join(f"{c} {p} DW {v}" for (c, p), v in sorted(svc.items(), key=lambda kv: str(kv[0])))
-                  + f"; else {per_beat:.2f} per beat")
+                  + f"; else {per_beat:.2f} per beat. The model takes 1 cycle per 64-byte beat, "
+                  + f"+{a.grant_gap} per new drain")
             print(f"  ... and no faster than the uplink, {link}"
                   + (f" ({bpc:.1f} bytes per cycle: {(256 + TLP_OVERHEAD) / bpc:.2f} cycles per 256 B TLP)" if bpc else "")
                   + f": {fmt(mod_cyc, '.2f')} cycles per TLP on average; the log's output took "
@@ -837,10 +875,11 @@ def main():
                                          pages_p99=r["pages_p99"], runs=r["runs"]) for r in wa["rows"]],
                        service={f"{c}/{p}": v for (c, p), v in svc.items()}, service_per_beat=per_beat,
                        link=dict(name=link, bytes_per_cycle=bpc, eff=LINK_EFF, overhead=TLP_OVERHEAD),
-                       fifo=fifo, model_cycles_per_tlp=mod_cyc, model=mod)
+                       fifo=fifo, grant_gap=a.grant_gap, model_cycles_per_tlp=mod_cyc, model=mod)
         with open(a.json, "a") as f:
             f.write(json.dumps(rec) + "\n")
 
+    progress("done")
     if a.show:
         for p in show_ports:
             if p == "arr" and tl is None:

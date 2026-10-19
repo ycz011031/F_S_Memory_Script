@@ -294,15 +294,17 @@ assert r['open']['0'][3] == 2 and r['open']['0'][0] > 1.5 and r['run_mean'] < 1.
 
 echo "-- pips-page-seq.py: arrival order and the batcher model"
 # A v2 log written by the model itself: two drives whose TLPs arrive
-# interleaved one by one, sent as d16t64 would. Rebuilding the arrival order
-# from gap and pkt_wait and running the model on it as d16t64 must give back
-# the logged order and waits.
+# interleaved one by one, sent as d16t64 would (a cycle per beat, the 3-cycle
+# grant gap, no link limit). Rebuilding the arrival order from gap and
+# pkt_wait and running the model on it as d16t64 (default grant gap, --link
+# none) must give back the logged order and waits.
 cat > "$T/synthb.py" <<'EOF'
 import gzip, importlib.util, random, struct, sys
 spec = importlib.util.spec_from_file_location("ps", sys.argv[1]); ps = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ps)
 rng, MSI = random.Random(7), 0xFEE00000
-CYC, BEATS, PDW = dict(data=6, cqe=2, msi=2, mrd=2), dict(data=5, cqe=1, msi=1, mrd=1), dict(data=64, cqe=4, msi=1, mrd=16)
+BEATS, PDW = dict(data=5, cqe=1, msi=1, mrd=1), dict(data=64, cqe=4, msi=1, mrd=16)
+CYC = BEATS                                    # the datapath: a cycle per 64-byte beat
 def device(src):
     base, t, k = 0x10000000 * (src + 1), rng.randrange(50), 0
     while True:
@@ -316,7 +318,7 @@ gens = [device(0), device(1)]; heads = [next(g) for g in gens]; tlps = []
 while len(tlps) < 20000:
     s = 0 if heads[0][0] <= heads[1][0] else 1
     tlps.append(heads[s]); heads[s] = next(gens[s])
-sent = ps.batcher([(t, s, c, BEATS[c], CYC[c]) for t, s, c, _a in tlps], 16, 64, 0, 0)
+sent = ps.batcher([(t, s, c, BEATS[c], CYC[c]) for t, s, c, _a in tlps], 16, 64, 0, 0, None, 128, ps.GRANT_GAP)
 recs, eop = [], None
 for j, start, _d in sent:
     t, s, c, addr = tlps[j]
@@ -352,7 +354,8 @@ t = m['d1t0']['triggers']; assert t['depth'] > 0.9 * m['d1t0']['drains'] and t['
 t = m['d16t64']['triggers']; assert t['time'] > t['depth'], t          # 16 TLPs take 135+ cycles
 t = m['d64t255']['triggers']; assert t['depth'] == 0 and t['flush'] > 0, t  # 64 x 5 beats never fit
 assert m['d4t255']['triggers']['depth'] > m['d4t22']['triggers']['depth'], (m['d4t255'], m['d4t22'])
-assert all(x['fifo'] == 128 for x in m.values()) and r['fifo'] == 128 and r['link']['bytes_per_cycle'] is None, r['link']"
+assert all(x['fifo'] == 128 for x in m.values()) and r['fifo'] == 128 and r['link']['bytes_per_cycle'] is None, r['link']
+assert r['grant_gap'] == 3 and r['model_cycles_per_tlp'] < 5, r['model_cycles_per_tlp']"
 run 0 "  the uplink: a drive log's default is gen3x8, 9.2 cycles per 256 B TLP; sweepc1, f512 suffixes" \
     python3 "$HERE/pips-page-seq.py" "$BL/pips-log-id0a04.bin.gz" --strict --model self,sweepc1,sweepc1f512,d24t255c1f512 \
     --json "$T/ml.jsonl"
@@ -376,8 +379,17 @@ for fb, want in ((128, 'full'), (512, 'depth')):
     st = {}; out = ps.batcher(arr, 24, 255, 1, 0, st, fb)
     t = st['triggers'][0]; assert len(out) == 200 and max(t, key=t.get) == want, (fb, t)
 assert ps.fifo_limits(128) == (109, 93) and ps.fifo_limits(512) == (493, 477)
-assert ps.cycles({}, 1.0, 'data', 64, 5, ps.link_bpc('gen3x8')) > 9.1
-assert ps.cycles({('data', 128): 9}, 1.0, 'data', 128, 9, ps.link_bpc('gen4x8')) == 9   # icx: the datapath binds
+assert ps.cycles('data', 64, 5, ps.link_bpc('gen3x8')) > 9.1
+assert ps.cycles('data', 128, 9, ps.link_bpc('gen4x8')) == 9   # icx: the datapath binds
+# the grant gap: depth 1 with the cap, two backed-up inputs of 512 B TLPs, one drain each in turn
+arr = [(0, i % 2, 'data', 9, 9) for i in range(40)]
+out = ps.batcher(arr, 1, 0, 1, 0, None, 128, 3)
+gaps = {b[1] - a[1] for a, b in zip(out, out[1:])}
+assert gaps == {12}, gaps                                       # 9 beats + 3, as d1t0c1 logs show
+assert len({d for _j, _s, d in out}) == 40 and [arr[j][1] for j, _s, _d in out[:4]] == [0, 1, 0, 1]
+out = ps.batcher([(0, 0, 'data', 9, 9) for _ in range(16)], 16, 0, 0, 0, None, 512, 3)
+assert [b[1] - a[1] for a, b in zip(out, out[1:])] == [12] + [9] * 14, out   # the gap at the grant only
+assert ps.cycles('data', 64, 5, ps.link_bpc('gen3x8')) > 5 + 3  # bigserver: the link hides the gap
 assert ps.parse_setting('d24t255c1f512') == (24, 255, 1, 0) and ps.setting_fifo('d24t255c1f512') == 512
 assert ps.setting_fifo('d24t255c1') is None"
 run 2 "  --link with no such link is refused" \

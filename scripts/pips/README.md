@@ -288,9 +288,13 @@ of its 109 admit beats are left; a grant sends the packets present at the
 grant (with the cap, at most DEPTH) as one run; when both inputs ask they
 alternate; a read waits until its input's writes have left (which flushes
 that FIFO and holds the input behind it) and then goes ahead of the next
-batched packet. How many cycles each kind of TLP holds the output is the
-median over back-to-back pairs of one drain in this log, but no less than
-the uplink takes to carry it (`--link`, default `gen3x8` for drives, the
+batched packet. A TLP holds the output one cycle per 64-byte beat (the
+512-bit datapath: what back-to-back pairs within a drain take in every log),
+plus a grant gap of 3 cycles at each new drain or pass-through packet
+(`--grant-gap`; in d1t0c1 logs every drain is one TLP and each takes 3
+cycles more than its beats, e.g. a NIC's 512 B TLP 12 instead of 9, which is
+what holds one NIC to about 80 Gbps there), but no less than the uplink
+takes to carry it (`--link`, default `gen3x8` for drives, the
 bigserver uplink, and `gen4x8` for NICs, icx's; `none` for the datapath rate
 only): payload + 22 bytes at 96% of the link's raw rate. The pairs alone run
 at the 512-bit datapath's rate, 5 cycles per 256 B TLP; a Gen3 x8 link takes
@@ -331,6 +335,22 @@ python3 scripts/pips/pips-page-seq.py \
 python3 scripts/pips/pips-page-seq.py \
     utils/logs/dualssd-pips-strict-1-id0a04-d16t64/4k-j8-both-RUN-0/pips-log-id0a04.bin.gz \
     --iotlb 1x64 --strict --model self,std,sweep,sweepc1,sweepc1f512 --show 200 --from 100000 --port out,arr
+```
+
+**Everything for one testbed in one run.** `pips-analyze.sh ssd|nic` runs
+the page order and the model (`pips-seq-grab.sh`, below) on each of the
+host's sweeps (default: the 10-15/16 sweep on 0x0A04 and the 10-17/18 depth
+sweep on 0x0A05, from its manifest), then payload or control by TLP length
+(`pips-traffic.py --list`, below) over every log of them together, so each
+design gets its own size rule and verdict, and packs it all into
+`~/pips-analyze-<kind>-<date>.tar.gz`. A line per log as each finishes in
+both phases, and every `HEARTBEAT` seconds (60) a line with the count done
+and what each running log is doing (`pips-page-seq.py --progress`: decoding,
+what-if, `model k/N <setting>`). `--tmux` runs it in a tmux session.
+
+```bash
+bash scripts/pips/pips-analyze.sh ssd --tmux     # bigserver: ~1,400 drive logs, about 4-6 h at -j 8
+bash scripts/pips/pips-analyze.sh nic --tmux     # icx: ~120 NIC logs, under an hour
 ```
 
 **Page order for a whole sweep.** `pips-seq-grab.sh ssd|nic` runs
@@ -409,7 +429,7 @@ python3 scripts/pips/pips-mwr-sizes.py utils/logs/dualssd-pips-strict-2-id0a04-d
     utils/logs/dualssd-pips-strict-2-id0a04-d8t22c1 --by cfg,bs     # cap off against on
 ```
 
-**Payload or control, by size? On every log.** `pips-traffic.py [PATH ...]`
+**Payload or control, by size? On every log.** `pips-traffic.py [PATH ...] [--list FILE]`
 (default: everything under `utils/logs`) reads every sweep and fio-log trace,
 both formats, both drives and NICs, and prints a line as each log is done. Per
 device it classes each write by address behaviour: `ring` (a page written as a

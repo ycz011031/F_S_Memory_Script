@@ -8,7 +8,12 @@ together, [LOCAL-SETUP.md](LOCAL-SETUP.md) for first-time provisioning.
 - **Branch:** `icx-dualnic` on `ycz011031/F_S_Memory_Script`
 - **Upstream:** `host-architecture/Fast-and-Safe-IO-Memory-Protection` (remote `upstream`)
 - `master` is a pristine mirror. `git diff master..icx-dualnic` is the whole delta.
-- **Last updated:** 2026-10-19: the depth sweep ran on design **`0x0A05`**
+- **Last updated:** 2026-10-19 (later): the model charges a 3-cycle grant gap
+  per drain, the page's Figures 4/6 average each point's logs and draw an
+  ideal line that only fits the window; one host script, `pips-analyze.sh`,
+  reruns page order and payload-or-control by length on both designs (§8,
+  "0x0A04 results" item 10, "Next" item 0).
+  2026-10-19: the depth sweep ran on design **`0x0A05`**
   (`0x0A04` with 512-beat batching FIFOs): drives all eight settings, NICs
   stopped during `d24t255c1` when the switch stopped answering (§8, "0x0A05
   depth sweep"). Depth doesn't move throughput; the bigger FIFO triples the
@@ -1778,6 +1783,28 @@ The cap and the v2 log work on hardware: all 804 logs FULL, no drops,
     both-NIC points only: in all 64 one-NIC logs the by-NIC line is flat
     (one input can't be reordered); their by-page and bound lines fall up
     to 43% only where the NIC itself interleaved packets.
+    Same day, after user review: (a) **grant gap**: the model now charges one
+    cycle per 64-byte beat and 3 cycles per new drain (`--grant-gap`), not
+    the measured pair median. d1t0c1 logs show the gap (drive 256 B TLPs 8-9
+    cycles vs 5, NIC 512 B 12 vs 9) because every drain there is one TLP; the
+    old model took 12 for every TLP when run from a d1t0c1 log (the "absurd
+    waits") and 9 per one-TLP drain when predicting d1t0c1 from others. (b)
+    **Depth 1 is round robin only with the cap on**: the plotted sweep is cap
+    off (a grant drains the whole FIFO); at 16 KiB its depth 1 gives 5.05-8.56
+    page switches per page vs 8.72-12.71 recorded with d1t0c1, the model's
+    own d1t0c1 8.39-11.41 (rest: the uplink). The regrab's `sweepc1` starts
+    at round robin. (c) **Ideal line = windows only**: the arrival order in
+    windows of D TLPs per device (n x D in all), each grouped by page, no
+    FIFO, time limit, link or ordering (from each log's `windows_arr`,
+    `seqarr.window_ideal`); falls from as-arrived to 1.6-2.1 at 64. It can sit
+    above the cap-off model at small D (a cap-off drain is the whole
+    backlog). (d) **Lines averaged over every log of a point** (runs of the
+    same flow); old-grab d1t0c1 logs count for as-arrived and the ideal only.
+    (e) **NIC by-NIC = by-page is real**: with both NICs each NIC writes one
+    packet at a time (own stream 7.1-7.7 TLPs per run, 86-97% of packets
+    whole; listing `seq-d1t0-f10-both.txt`: offsets 000-e00 of one page, then
+    its entry), except d1t0c1 at 5 flows (1.01 TLPs per run), where by-page
+    falls below. Page v6.
 
 ### 0x0A05 depth sweep (2026-10-17/18, strict, cap on)
 
@@ -1835,18 +1862,18 @@ The cap and the v2 log work on hardware: all 804 logs FULL, no drops,
 
 ### Next
 
-0. **Regrab page order with the uplink in the model (commit after
-   0941772b2), both builds, both hosts.** Run the four grabs (the commands
-   are in the 2026-10-19 session's answer and below): bigserver
-   `PIPS_LINK=gen3x8 bash scripts/pips/pips-seq-grab.sh ssd -j 8 -o
-   ~/seq-dualssd-0a04-link` and `... --manifest
-   ~/dualssd-pips-strict-dsweep1.manifest.tsv -j 8 -o ~/seq-dualssd-dsweep1`;
-   icx `bash scripts/pips/pips-seq-grab.sh nic -o ~/seq-dualnic-0a04-link`
-   and `... --manifest ~/dualnic-pips-strict-dsweep1.manifest.tsv -o
-   ~/seq-dualnic-dsweep1`. Then check `model self` (`py -3 seqarr.py`: want
-   the drives within a few % like the NICs), point `seqarr.DIRS` at the new
-   folders, add the 0x0A05 grabs to the page (diamonds at the dsweep depths:
-   `seqarr.js` reads depths from `DEPTH`, extend it), rebuild, publish.
+0. **Rerun the analysis on both hosts with `pips-analyze.sh`** (one run per
+   host: page order with the fixed model on the 0x0A04 sweep and the 0x0A05
+   depth sweep, then payload or control by length over all their logs):
+   bigserver `bash scripts/pips/pips-analyze.sh ssd --tmux` (~4-6 h), icx
+   `bash scripts/pips/pips-analyze.sh nic --tmux` (<1 h). Copy
+   `~/pips-analyze-<kind>-*.tar.gz` back, unpack in `dualssd/1019/` and
+   `dualnic/1019/`. Then: `py -3 seqarr.py` (model self: want the drives
+   within a few % like the NICs, and d1t0c1 now usable), point
+   `seqarr.DIRS` at the new `seq-*` folders (and add the 0x0A05 ones: their
+   diamonds sit at the dsweep depths, `seqarr.js` reads depth from the
+   setting name), rebuild, publish; the length verdict per design goes in
+   the 0x0A05 section (`traffic.txt`, end).
 0b. **Finish the NIC depth sweep** after reprogramming 0x0A05: first
    `--cfgs "24:255" --caps 1 --tag d24repro "10 15"` to see if the stop
    repeats (snapshot if it does), then `--cfgs "24:255 36:255 64:255" --caps

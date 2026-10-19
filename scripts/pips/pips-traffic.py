@@ -11,6 +11,8 @@ tell a device's payload writes from its control writes by size alone?
     ... --csv sizes.csv --jsonl traffic.jsonl        every log's numbers
     ... -j 8                                         logs decoded in parallel (default 4)
     pips-traffic.py LOG --detail                     one log's size table and motifs
+    pips-traffic.py --list logs.txt                  the logs named in a file, one path per line
+                                                     (pips-analyze.sh: exactly a sweep's runs)
 
 It reads every pips-log[-id<XXXX>].bin(.gz) (the sweeps' runs) and
 log[-id<XXXX>].bin (pips-fio-log.sh) under the folders given, in either record
@@ -97,7 +99,7 @@ CLASSES = ("payload", "ring", "unclear")
 WAIT_CLASSES = ("payload", "ring", "unclear", "msi", "mrd")
 SRC = ("in0", "in1")
 LOG_NAME = re.compile(r"^(?:pips-)?log(?:-id[0-9a-fA-F]{4})?\.bin(?:\.gz)?$")
-SWEEP_RE = re.compile(r"(?P<sweep>dual(?P<kind>ssd|nic)-pips-(?P<iommu>[^/]+?)-\d+"
+SWEEP_RE = re.compile(r"(?P<sweep>dual(?P<kind>ssd|nic)-pips-(?P<iommu>[^/]+?)-(?:\d+|[A-Za-z][A-Za-z0-9]*?)"
                       r"(?:-id(?P<design>[0-9a-fA-F]{4}))?-(?P<cfg>d\d+t\d+(?:m1)?(?:c1)?))(?=[-/]|$)")
 SSD_RUN_RE = re.compile(r"^(?P<dp>datapath-)?(?P<bs>\d+[kmgKMG]?)-j(?P<j>[\d+]+)(?:-(?P<mode>[a-z0-9]+))?"
                         r"-RUN-\d+$")
@@ -493,6 +495,7 @@ def print_group(title, accs, v2):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("paths", nargs="*", help=f"logs, or folders searched for them (default {DEFAULT_ROOT})")
+    ap.add_argument("--list", metavar="FILE", help="also every log named in FILE, one path per line")
     ap.add_argument("--match", help="only run folders whose name matches this glob")
     ap.add_argument("--format", choices=("v1", "v2"), help="only logs in this record format")
     ap.add_argument("--design-id", metavar="ID",
@@ -511,15 +514,19 @@ def main():
     if bad:
         ap.error(f"--by: unknown {', '.join(bad)}; choose from {', '.join(GROUP_KEYS)}")
 
-    paths = a.paths or [DEFAULT_ROOT]
-    logs = list(find_logs(paths, a.match))
+    listed = []
+    if a.list:
+        with open(a.list) as f:
+            listed = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+    paths = a.paths or ([] if listed else [DEFAULT_ROOT])
+    logs = list(find_logs(paths + listed, a.match))
     if a.format:
         logs = [p for p in logs if dec.detect(p, a.design_id)["format"] == a.format]
     if not logs:
         sys.exit(f"pips-traffic: no logs found under {' '.join(paths)}"
                  + (f" in format {a.format}" if a.format else ""))
-    print(f"pips-traffic: {len(logs)} log(s) under {' '.join(paths)}, {max(1, a.jobs)} at a time",
-          flush=True)
+    print(f"pips-traffic: {len(logs)} log(s)" + (f" under {' '.join(paths)}" if paths else "")
+          + (f" from {a.list}" if a.list else "") + f", {max(1, a.jobs)} at a time", flush=True)
 
     groups = collections.OrderedDict()             # group key -> {src: acc}, and its formats
     gformats = collections.defaultdict(set)
