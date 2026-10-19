@@ -1,13 +1,17 @@
 # File map
 
 Which file does what, and which file calls, sources or reads which. Read this
-instead of scanning the repo. It covers every tracked file (as of 2026-10-15,
-branch `icx-dualnic`).
+instead of scanning the repo. It covers every tracked file (as of 2026-10-19,
+branch `icx-dualnic`), and in §7 the git-ignored analysis tree (`dualssd/`,
+`dualnic/`, the report generators) on the machine where results are analysed.
 
 - Testbed state, results and how to run: [HANDOFF.md](HANDOFF.md)
   (§1–6 dual-NIC on icx, §7 dual-SSD on bigserver)
 - Background on the upstream artifact and its traps: [KNOWLEDGE-MAP.md](KNOWLEDGE-MAP.md)
 - First-time provisioning of the icx pair: [LOCAL-SETUP.md](LOCAL-SETUP.md)
+- PIPS tools, design IDs, the batcher model: [scripts/pips/README.md](scripts/pips/README.md);
+  reading one sweep's logs: [scripts/pips/SWEEP-LOGS.md](scripts/pips/SWEEP-LOGS.md);
+  the switch itself: [scripts/pips/PIO-MANUAL.md](scripts/pips/PIO-MANUAL.md)
 
 When you add, rename or rewire a script, update this file in the same commit.
 
@@ -47,6 +51,12 @@ run by hand when needed · **orphan** = no caller and superseded · **data** /
 | PIPS switch: same over JTAG | `source scripts/pips/pips-xsct.tcl` in XSCT | XSCT host |
 | PIPS switch stopped answering: save the state first | `bash scripts/pips/pips-hang-snapshot.sh` (read-only), then XSCT | PIPS host |
 | PIPS tools: test without hardware | `make -C scripts/pips check` | any Linux |
+| PIPS analysis, everything one testbed needs in one run (page order + model, then payload or control by length, both designs) | `bash scripts/pips/pips-analyze.sh ssd\|nic --tmux` | the host with the logs |
+| PIPS: page order of one sweep | `bash scripts/pips/pips-seq-grab.sh ssd\|nic` or `--manifest ~/<sweep>.manifest.tsv` | the host with the logs |
+| PIPS: one log's page order, arrival order and batcher model | `python3 scripts/pips/pips-page-seq.py LOG --model self,std,sweepc1 --show 200 --port out,arr` | any (needs the log) |
+| PIPS: payload or control writes, by TLP length | `python3 scripts/pips/pips-traffic.py [LOG\|DIR ...] [--list FILE]` | any (needs the logs) |
+| PIPS: batcher time limits for a depth sweep | `python3 scripts/pips/pips-timeout-pick.py ~/<sweep>-d1t0.jsonl [--fifo 512]` | any (JSONL only) |
+| PIPS: rebuild a report page | `cd dualssd/report-gen && py -3 page4.py` (§7) | the analysis machine |
 
 Per-host config lives in `utils/setup-server.sh`, which is **git-ignored**.
 Create it from `utils/setup-server.sh.example` (upstream / icx) or
@@ -212,6 +222,27 @@ scripts/pips/Makefile  check ─ pips-sim (pips.c + pips_sim.c; PIPS_SIM_DESIGN 
                                  ─ dualssd_pips_sweep.sh, dualnic_pips_sweep.sh with stand-in sweeps
 ```
 
+### 2.6 PIPS analysis (`scripts/pips/`, on the host with the logs)
+
+```
+scripts/pips/pips-analyze.sh ssd|nic         one run per testbed, both designs, heartbeat
+ ─ pips-seq-grab.sh ssd | --manifest F       per sweep (default: the 0x0A04 sweep from utils/logs,
+ │                                             the 0x0A05 depth sweep from ~/<sweep>.manifest.tsv)
+ │    ─ pips-page-seq.py LOG --json --show --port out,arr --iotlb --model ... --progress   (xargs -P)
+ │         · pips-addr-pattern.py (tlp_events) · pips-log-decode.py (detect, load)
+ │         model: batcher() = axi4_mwr_batch.v; FIFO by design ID; output = 1 cycle/beat,
+ │         +3 per grant, no faster than the uplink (--link gen3x8 drives, gen4x8 NICs)
+ │    heartbeat: done/total + each running log's --progress stage, every HEARTBEAT s
+ ─ pips-traffic.py --list logs.txt           every log of those sweeps: payload / ring / MSI by
+                                               address, the size rule and verdict per kind and design
+scripts/pips/pips-timeout-pick.py            · pips-page-seq.py (batcher, parse_setting, fifo_limits)
+scripts/pips/pips-mwr-sizes.py, pips-addr-pattern.py   · pips-log-decode.py
+scripts/pips/pips-hang-snapshot.sh           read-only state capture when the switch stops answering
+```
+
+Outputs come back to the analysis machine as tarballs and feed the report
+generators in `dualssd/report-gen/` (§7).
+
 ---
 
 ## 3. Shared pieces and who uses them
@@ -251,7 +282,7 @@ falls back to default events and every column shifts.
 | `FILE-MAP.md` | doc: this file |
 | `fands.patch` | data: the F&S kernel patch |
 | `Fast & Safe IO Memory Protection.pdf` | doc: the paper |
-| `.gitignore` | the Linux kernel's ignore file plus repo entries; ignores `.*`, `utils/setup-server.sh`, `utils/logs/`, `utils/reports/`, `/dualnic/`, `/dualssd/` |
+| `.gitignore` | the Linux kernel's ignore file plus repo entries; ignores `.*`, `utils/setup-server.sh`, `utils/logs/`, `utils/reports/`, `/dualnic/`, `/dualssd/`, `claude.md` (local Claude Code instructions and pointers) |
 | `.gitattributes` | pins LF line endings |
 | `LICENSE` | upstream license |
 
@@ -322,11 +353,11 @@ falls back to default events and every column shifts.
 | `pips_regs.h` | data: register map, verbatim from the FPGA repo's `sw_handoff/` (design 0x0a04) |
 | `pips-log-decode.py` | called/entry: TLP log (`.bin` or `.gz`) → whole-or-cut status, per-port summary, CSV, JSON, `.rpt`. Record format v1 or v2 by design ID (`--design-id`, `-id<XXXX>` in the name, `pips-cfg.txt` beside it, else v1); `detect()`/`load()` serve the three tools below |
 | `pips-addr-pattern.py` | manual: TLP logs or sweep log folders → address width, page spread, IOVA reuse, out-stream runs and hold, LRU reuse distance and predicted IOTLB misses; one table line and one JSON line per log. Imports `pips-log-decode.py`'s loader |
-| `pips-page-seq.py` | manual: one TLP log → page access sequence run by run, per-drive interleaving, batching what-if (windows regrouped by drive / page), optional set-associative IOTLB simulation, CSV of every TLP. v2 logs: the arrival order rebuilt from `pkt_wait` (stream `arr`), and `--model` runs the `axi4_mwr_batch.v` batcher on it (self = the log's own setting as a check, std, a depth sweep, deep = the 10-17 depth sweep), counting what asked for each drain (depth, time, full, read flush). `--kind nic` (default for `dualnic` paths): 16 DW writes are the completions, a packet's visit ends at its short last TLP. Imports `pips-addr-pattern.py` (`tlp_events`) |
-| `pips-seq-grab.sh` | manual, on the host with the logs: `ssd`/`nic` → `pips-page-seq.py --json --show` on one log per point and batcher setting of a sweep (default the 0x0A04 sweeps, every point), with both orders and the batcher model, packed as `~/seq-<sweep>.tar.gz` for the report's page-order figures; `--manifest` takes exactly one sweep's runs from its manifest. Calls `pips-page-seq.py` |
+| `pips-page-seq.py` | manual: one TLP log → page access sequence run by run, per-drive interleaving, batching what-if (windows regrouped by drive / page / ideal, on the output and on the arrival order), optional set-associative IOTLB simulation, CSV of every TLP. v2 logs: the arrival order rebuilt from `pkt_wait` (stream `arr`), and `--model` runs the `axi4_mwr_batch.v` batcher on it (groups self, std, sweep, sweepc1, deep, each with an optional `fBEATS` FIFO size; or any `dDtT[m1][c1][fBEATS]`), counting what asked for each drain. Output timing: 1 cycle per beat, `--grant-gap` (3) per new drain, no faster than `--link` (gen3x8 drives, gen4x8 NICs); FIFO size from the design ID (`--fifo`). `--progress` prints stages to stderr. `--kind nic` (default for `dualnic` paths): 16 DW writes are the completions, a packet's visit ends at its short last TLP. Imports `pips-addr-pattern.py` (`tlp_events`) |
+| `pips-seq-grab.sh` | manual, on the host with the logs: `ssd`/`nic` → `pips-page-seq.py --json --show` on one log per point and batcher setting of a sweep (default the 0x0A04 sweeps, every point), with both orders and the batcher model (default `self,std,sweep,sweepc1,sweepc1f512`; on a manifest the sweep's settings and the other build's FIFO), packed as `~/seq-<sweep>.tar.gz`; `--manifest` takes exactly one sweep's runs. A line per log and a heartbeat (`HEARTBEAT` s) with each running log's stage. Calls `pips-page-seq.py` |
 | `pips-timeout-pick.py` | manual: a sweep's results JSONL → per depth, the time threshold the depth trigger can beat, from synthetic per-input arrivals run through `pips-page-seq.py`'s batcher (`--eval` given settings, `--validate` against the logged waits). Imports `pips-page-seq.py` |
 | `pips-mwr-sizes.py` | manual: TLP logs or sweep log folders → per-drive map of MWr payload sizes (DW), with size-free checks of the "≤ 4 DW = completion entry" rule (mixed pages, interrupt after, bytes per entry); summed per sweep / IOMMU / setting / block size; long CSV; `--show` size sequence. Imports `pips-addr-pattern.py` |
-| `pips-traffic.py` | manual: every TLP log under `utils/logs` (or the paths given), either format, drives and NICs → per device: writes classed by address behaviour (ring entries, payload bursts, MSI), the size rule that splits them and how reliable it is, payload-length motifs per completion, time in the batcher per class (v2); a progress line per log, tables summed per kind / design / IOMMU / setting, CSV, JSONL. Imports `pips-log-decode.py` |
+| `pips-traffic.py` | manual: every TLP log under `utils/logs` (or the paths given, or `--list FILE`), either format, drives and NICs → per device: writes classed by address behaviour (ring entries, payload bursts, MSI), the size rule that splits them and how reliable it is, payload-length motifs per completion, time in the batcher per class (v2); a progress line per log, tables summed per kind / design / IOMMU / setting, CSV, JSONL. Labels sweeps named `-<N>` or by tag (`dsweep1`). Imports `pips-log-decode.py` |
 | `pips-xsct.tcl` | manual: config and drain registers, design ID, DMA and log over JTAG (XSCT) |
 | `pips-analyze.sh` | manual, on the host with the logs: everything the report needs from one testbed in one run: `pips-seq-grab.sh` on each sweep (default the 0x0A04 sweep and the 0x0A05 depth sweep by its manifest), then `pips-traffic.py --list` over all their logs (payload or control by length, per design), with liveness lines, into `~/pips-analyze-<kind>-<date>.tar.gz`. Calls both |
 | `pips-hang-snapshot.sh` | manual, when the switch stops answering, before reprogramming: read-only capture of the Xilinx/Mellanox functions and the bridges above them (`lspci -vvv`, AER counters), `pips cfg`, the kernel log, `devlink health`, the newest sweep log → `~/pips-hang-<host>-<time>.tar.gz` |
@@ -378,7 +409,7 @@ falls back to default events and every column shifts.
 | `utils/logs/<sweep>/`, `utils/reports/<sweep>/` | sweeps group their runs here (`-E <sweep>/<config>`), plus `sweep.log`, `datapath.jsonl` and, for the dual-SSD sweeps, `failed.txt` | no |
 | `utils/logs/<exp>.console.log` | `run-dualssd-experiment.sh`: its full console output | no |
 | `~/<sweep>.jsonl`, `~/<sweep>.txt` | `*-results.py dump` / the sweeps' summary step, on the host that ran them | no |
-| `/dualssd/`, `/dualnic/` | copies of `~/*.jsonl` / `.txt` brought back for analysis; `dualssd/` keeps one folder per batch (`1006/`, `1010/`; sweep names repeat across batches) and `dualssd-xsweeps-report.html`, the local copy of the cross-sweep report (HANDOFF §7) | no (ignored) |
+| `/dualssd/`, `/dualnic/` | copies of `~/*.jsonl` / `.txt` and the analysis tarballs brought back for analysis, one folder per batch (MMDD; sweep names repeat across batches), the report generators and the built pages: §7 | no (ignored) |
 | `/tmp/dualssd-experiment.lock` | `run-dualssd-experiment.sh`: one run at a time | no |
 | `utils/logs/pips-bringup-<date>-<time>/`, `utils/logs/pips-fio-<date>-<time>/` (or `-o` / `-E` name) | `pips-bringup.sh`, `pips-fio-log.sh`: lspci, dmesg, register readouts (`cfg*.txt` with `design_id=`), `hwtest.txt`, fio JSON, `log-id<XXXX>.bin` / `log-smoke-id<XXXX>.bin` + its decode | no |
 | `/tmp/pips-run.lock`, `/tmp/pips-bar0.lock` | the PIPS scripts and both PIPS sweeps (one at a time) and the `pips` tool (one BAR0 user at a time) | no |
@@ -386,6 +417,11 @@ falls back to default events and every column shifts.
 | `utils/logs/<exp>-RUN-server-<j>/pips-log-id<XXXX>.bin.gz`, ...; `utils/reports/<exp>-RUN-server-<j>/pips-log.rpt` | `run-dualnic-experiment.sh --pips-log 1`: the same, per dual-NIC run | no |
 | `~/<NAME>.txt`, `~/<NAME>-id<XXXX>-<setting>.{jsonl,txt}`, `utils/logs/<NAME>/pips-sweep.log`, `cfg-<setting>.txt` | `dualssd_pips_sweep.sh`, `dualnic_pips_sweep.sh`: every setting side by side with the log check (first lines name the design ID); one cross / flow sweep per setting. Before design IDs: `~/<NAME>-<setting>.*` | no |
 | `scripts/pips/pips`, `scripts/pips/pips-sim` | `make` in `scripts/pips/` | no (ignored) |
+| `~/<NAME>.manifest.tsv`, `utils/logs/<NAME>/manifest.tsv`, `.../sweep-id.txt` | both PIPS sweeps (from 10-17): every run of the sweep with its setting, point, folders, TLP log and status; parse a sweep only through it (SWEEP-LOGS.md) | no |
+| `~/seq-<sweep>/` + `.tar.gz` | `pips-seq-grab.sh`: `seq-<setting>-<point>.txt` (report + listings), `seq.jsonl` (one line per log: interleave, what-ifs, `windows_arr`, `model[]`, `link`, `fifo`, `grant_gap`), `manifest.txt` | no |
+| `~/pips-analyze-<kind>-<date>/` + `.tar.gz` | `pips-analyze.sh`: `seq-<sweep>/` per sweep, `logs.txt`, `traffic.txt/.jsonl`, `traffic-sizes.csv`, `analyze.log` | no |
+| `~/pips-hang-<host>-<time>/` + `.tar.gz` | `pips-hang-snapshot.sh` | no |
+| `~/traffic*.txt/.jsonl/.csv` | `pips-traffic.py` run by hand (10-16: `traffic-ssd.txt`, `traffic-nic.txt`) | no |
 
 Sweep names never repeat: `<prefix>-<iommu>-<N>` with the first unused `N`
 (prefixes `dualssd-sweep`, `dualssd-bssweep`, `dualssd-xsweep`,
@@ -406,3 +442,52 @@ names its runs after each setting (`-p`).
 - fio must stay read-only (`--readonly`, `readonly=1`). Drive 0 on bigserver
   holds a filesystem with data, the host is shared, and its other NVMe drives
   (an md RAID) must never be touched (HANDOFF §7).
+- Scripts that run for hours print liveness: a line per unit of work and a
+  periodic heartbeat (see `pips-seq-grab.sh`, `pips-analyze.sh`).
+
+---
+
+## 7. The local analysis tree (git-ignored)
+
+Results are copied from the hosts to the machine where they are analysed
+(here: the Windows checkout) into `dualssd/` and `dualnic/`, both ignored
+by git. One folder per batch, named by the date the copy was made (MMDD);
+sweep names repeat across batches, so the folder says which. Raw TLP logs
+stay on the hosts; only results, grabs and reports come back.
+
+### `dualssd/` (drives, bigserver)
+
+| Folder / file | Holds | Design, sweep | Read by |
+|---|---|---|---|
+| `1006/` | `dualssd-sweep-*`, `-bssweep-*`, `-xsweep-*` JSONL/TXT, IOMMU off and strict, no switch | — (direct, then designs A-D) | HANDOFF §7; the cross-sweep page |
+| `1010/` | `dualssd-xsweep-{off,strict}-*` on switch designs C/D | design D | HANDOFF §7 "Fifth result" |
+| `1013/` | `dualssd-pips-{off,strict}-1-<setting>` (4 settings), `addr-pattern-1013.jsonl`, `iotlb-fit-1013.jsonl`, `seq-1013*.jsonl`, `seq-*.txt` | `0x0A02`, 10-13 | `report-gen/build.py` (0x0A02 page) |
+| `1016/` | `dualssd-pips-strict-1-id0a04-<setting>` (8: cap off/on), `traffic-ssd.*`, `seq-dualssd-pips-strict-1-id0a04/` (first grab, 7 points), `seq-dualssd-0a04-arr/` (regrab, all 90 points, arrival order + model before the uplink fix) | `0x0A04`, 10-15/16 | `report-gen/load4.py`, `build4.py`, `seq4.py`, `seqarr.py` |
+| `1019/` | `dualssd-pips-strict-dsweep1-id0a05-<setting>` (8 depths, cap on), `dualssd-pips-strict-dsweep1.txt`; the `pips-analyze.sh` output goes here when it arrives | `0x0A05`, depth sweep 10-17/18 | `report-gen/a05.py` |
+| `report-gen/` | the page generators (below) | | |
+| `seqdata/<kind>/<point>.json` | per-point data for the 0x0A04–0x0A05 page's Figures 3-6 (`seqarr.export`), published beside the page as `seq/<kind>/` | | the page (fetch) |
+| `dualssd-pips-0a04-report.html` | "PIPS 0x0A04–0x0A05 Sweeps", https://claude.ai/artifact/MbNxzaJ5KgmuM59PPC4NcA | | |
+| `dualssd-pips-report.html` | "PIPS Batcher Sweeps" (0x0A02), https://claude.ai/artifact/XsrLugEhsaMzY6vwARSLGU | | |
+| `dualssd-xsweeps-report.html` | "Dual-SSD Cross Sweeps" (designs A-D), https://claude.ai/artifact/AcYH8Ff2Drt5kon44un3gX; its generator was not kept | | |
+
+### `dualnic/` (NICs, icx)
+
+| Folder / file | Holds | Design, sweep | Read by |
+|---|---|---|---|
+| `1001/` | `dualnic-flowsweep-{off,strict}-*` (09-29, no switch) | — | HANDOFF §4.1; `build4.py` table10 (09-29 comparison) |
+| `1016/` | `dualnic-pips-strict-1-id0a04-<setting>` (8), `traffic-nic.*`, `seq-dualnic-pips-strict-1-id0a04/` (first grab), `seq-dualnic-0a04-arr/` (regrab, 12 points, before the uplink fix) | `0x0A04`, 10-15/16 | `load4.py`, `build4.py`, `seq4.py`, `seqarr.py` |
+| `1019/` | `dualnic-pips-strict-dsweep1-id0a05-<setting>` (6 settings ran), `.manifest.tsv`, `jounalctl.txt` (the kernel log of the switch's stop) | `0x0A05`, depth sweep 10-17 | `a05.py`; HANDOFF §8 "0x0A05 depth sweep" item 7 |
+
+### `dualssd/report-gen/` (the generators; `README.txt` there has the commands)
+
+| File | Role |
+|---|---|
+| `page4.py` | entry: writes `dualssd-pips-0a04-report.html` from `template4.html`, filling `{{SLOTS}}` from the modules below; prints the quoted numbers. Move the HTML to `dualssd/` and publish with the `seq/<kind>/*.json` files |
+| `template4.html` | the 0x0A04–0x0A05 page: CSS, prose, slots; the explorer JS |
+| `load4.py` | loaders: `dualssd/1016`, `dualnic/1016` JSONL (0x0A04) |
+| `build4.py` | 0x0A04 figures and tables: cap heatmaps (Figure 1), link split, waits, pcm-iio samples, NIC heatmap (Figure 2), icx PCM, 09-29 comparison |
+| `seq4.py` | Tables 6-7 (page order as sent, first grab) |
+| `seqarr.py` + `seqarr.js` | Figures 3-6: per-point data files (arrival/out listings, model sweeps, window ideal, recorded), the drive bullets; JS draws them averaged over each point's logs |
+| `deep4.py` + `deep/` | Figure 7, Table 8: time limits per depth, from `pips-timeout-pick.py` output (`pick-*`, `eval-*`, `eval-*-f512` = 0x0A05 FIFO) |
+| `a05.py` | the 0x0A05 section: Figure 8 (each depth vs d1t0c1), Table 9 (waits, link split), Table 10 (NICs) |
+| `build.py`, `load.py`, `template.html`, `seqfigs.py`, `seqtabs.py`, `seqruns.json`, `seq14.json`, `seq/` | the 0x0A02 page ("PIPS Batcher Sweeps") from `dualssd/1013` (+1006, 1010); `seq/` holds three small 0x0A02 logs and a CSV it was built from |

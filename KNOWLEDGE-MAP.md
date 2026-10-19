@@ -33,6 +33,11 @@ each other, what was added on top, and where the traps are.
 | Find out why a metric is wrong | §4, especially the Ice Lake counter mismatch |
 | Tune MTU / ring / DDIO / offloads | [utils/setup-envir.sh](utils/setup-envir.sh) |
 | Find where a number came from | §2.5 data flow table |
+| Know what is running, what is known, what to do next | [HANDOFF.md](HANDOFF.md): "Last updated" at the top, §8 "Next" for the PIPS work |
+| Work with the PIPS switch (design IDs, registers, TLP log) | [scripts/pips/README.md](scripts/pips/README.md), [scripts/pips/PIO-MANUAL.md](scripts/pips/PIO-MANUAL.md); the RTL is in the separate FPGA repo (`Programmable-Intelligent-PCIe-Switch`, `src/Utilities/axi4_mwr_batch.v`, build params in `pips.tcl`) |
+| Read one PIPS sweep's logs and nothing else | [scripts/pips/SWEEP-LOGS.md](scripts/pips/SWEEP-LOGS.md) (sweep ID, manifest) |
+| Find a result file, a report generator, a published page | [FILE-MAP.md §7](FILE-MAP.md) (the git-ignored `dualssd/`, `dualnic/` tree) |
+| Model what the batcher does to the page order | `scripts/pips/pips-page-seq.py --model` (README "Page sequence"); its history and checks in HANDOFF §8 "0x0A04 results" items 8-10 |
 
 ---
 
@@ -395,6 +400,16 @@ read as "the IOMMU is free" when the regime under test was never reached.
 
 ## 5. This testbed
 
+Three testbeds by now (details: HANDOFF §1, §7, §8):
+
+| Testbed | Host | What | Behind PIPS since |
+|---|---|---|---|
+| Dual-NIC | `icx` (Ice Lake-SP), client `styx-tower` | two 100 GbE NICs, TCP receive | 2026-10-15 (Gen4 x8 uplink) |
+| Dual-SSD | `bigserver` (Skylake-SP) | two NVMe drives, fio random reads, read-only | 2026-10-11 (Gen3 x8 uplink) |
+| PIPS | VCK190 FPGA switch in front of either | batcher (depth, time, drain cap), TLP log with time in the batcher | designs `0x0A02`–`0x0A05` |
+
+The original icx pair:
+
 | | Receiver / server | Sender / client |
 |---|---|---|
 | Host | `icx` | `styx-tower` |
@@ -417,14 +432,25 @@ measured path.
 
 ## 6. Status
 
-**Done**
+The live status is [HANDOFF.md](HANDOFF.md) ("Last updated", and §8 "Next").
+As of 2026-10-19: strict and off give the same throughput everywhere so far
+(icx, bigserver); the PIPS switch's batcher (designs 0x0A02-0x0A05, depth up
+to 64 with a 512-beat FIFO on 0x0A05) changes how a full link is shared and
+the page order the IOMMU sees, not the throughput or the IOTLB misses; the
+page-order model is being rerun on the hosts with its uplink and grant-gap
+fixes (`pips-analyze.sh`).
+
+The early-October plan below is kept for its history; its items 1-4 are done
+(HANDOFF §2-4).
+
+**Done (early October)**
 
 - Fork created, `master` pushed as a pristine mirror, `local-setup` pushed
 - Minimal traffic path written; all five scripts syntax-checked, error paths tested
 - Testbed config written for the 192.168.10.0/24 link
 - LF endings pinned so scripts survive a Windows-authored round trip
 
-**Next**
+**Next (as planned then)**
 
 1. Run `preflight.sh` on icx, fix what it flags, then `run-traffic.sh`
 2. Establish the Broadwell's sender ceiling — raise `NUM_FLOWS` until it plateaus

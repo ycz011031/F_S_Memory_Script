@@ -8,6 +8,15 @@ together, [LOCAL-SETUP.md](LOCAL-SETUP.md) for first-time provisioning.
 - **Branch:** `icx-dualnic` on `ycz011031/F_S_Memory_Script`
 - **Upstream:** `host-architecture/Fast-and-Safe-IO-Memory-Protection` (remote `upstream`)
 - `master` is a pristine mirror. `git diff master..icx-dualnic` is the whole delta.
+- **Where things are:** [FILE-MAP.md](FILE-MAP.md) for every script, call
+  graph and output (§2.6 the PIPS analysis chain), and §7 for the
+  git-ignored analysis tree (`dualssd/`, `dualnic/`: which batch folder holds
+  which sweep and design, which report generator reads what, the published
+  pages). On the Windows analysis machine `claude.md` (git-ignored) adds its
+  local paths, tools and editing gotchas.
+- **Running (2026-10-19):** `scripts/pips/pips-analyze.sh ssd` on bigserver
+  and `... nic` on icx (§8 "Next" item 0); the results come back as
+  `~/pips-analyze-<kind>-*.tar.gz`.
 - **Last updated:** 2026-10-19 (later): the model charges a 3-cycle grant gap
   per drain, the page's Figures 4/6 average each point's logs and draw an
   ideal line that only fits the window; one host script, `pips-analyze.sh`,
@@ -1510,9 +1519,11 @@ points: [scripts/pips/README.md](scripts/pips/README.md).
   the page order (Figures 3–6, Tables 6–7), the depth sweep's times (Figure
   7, Table 8) and 0x0A05's results (Figure 8, Tables 9–10, the NIC stop;
   generator `a05.py`). Both generators are in the git-ignored `dualssd/report-gen/` (README
-  there: `py -3 build.py` for 0x0A02, `py -3 page4.py` for 0x0A04, from the
-  local copies; the 0x0A04 page order is `seq4.py` + `seq4.js`, reading the
-  `pips-seq-grab.sh` output unpacked in `dualssd/1016/` and `dualnic/1016/`).
+  there: `py -3 build.py` for 0x0A02, `py -3 page4.py` for 0x0A04–0x0A05,
+  from the local copies; Tables 6-7 come from `seq4.py` (first grab),
+  Figures 3-6 from `seqarr.py` + `seqarr.js` reading the `pips-seq-grab.sh`
+  output unpacked in `dualssd/1016/` and `dualnic/1016/`; every generator and
+  input is listed in FILE-MAP §7).
 
 ### Switch designs (design ID)
 
@@ -1862,9 +1873,11 @@ The cap and the v2 log work on hardware: all 804 logs FULL, no drops,
 
 ### Next
 
-0. **Rerun the analysis on both hosts with `pips-analyze.sh`** (one run per
-   host: page order with the fixed model on the 0x0A04 sweep and the 0x0A05
-   depth sweep, then payload or control by length over all their logs):
+0. **RUNNING since 2026-10-19: the analysis on both hosts with
+   `pips-analyze.sh`** (one run per host: page order with the fixed model on
+   the 0x0A04 sweep and the 0x0A05 depth sweep, then payload or control by
+   length over all their logs; watch with `tmux attach -t pips-analyze-ssd` /
+   `-nic`, or `tail ~/pips-analyze-<kind>-*/analyze.log`):
    bigserver `bash scripts/pips/pips-analyze.sh ssd --tmux` (~4-6 h), icx
    `bash scripts/pips/pips-analyze.sh nic --tmux` (<1 h). Copy
    `~/pips-analyze-<kind>-*.tar.gz` back, unpack in `dualssd/1019/` and
@@ -1873,23 +1886,14 @@ The cap and the v2 log work on hardware: all 804 logs FULL, no drops,
    `seqarr.DIRS` at the new `seq-*` folders (and add the 0x0A05 ones: their
    diamonds sit at the dsweep depths, `seqarr.js` reads depth from the
    setting name), rebuild, publish; the length verdict per design goes in
-   the 0x0A05 section (`traffic.txt`, end).
+   the 0x0A05 section (`traffic.txt`, end). Compare the verdict per design
+   with 0x0A04's `traffic-ssd.txt` / `traffic-nic.txt` in `*/1016/`.
 0b. **Finish the NIC depth sweep** after reprogramming 0x0A05: first
    `--cfgs "24:255" --caps 1 --tag d24repro "10 15"` to see if the stop
    repeats (snapshot if it does), then `--cfgs "24:255 36:255 64:255" --caps
    1 --datapath-once --tag dsweep1b`.
-   Earlier plan for the 10-16 regrab, for reference: **Regrab page order with arrival order and the batcher model, every point**
-   (uneven co-runs and NIC1-alone included; the 10-16 grab had 7 + 5 points):
-   on bigserver `bash scripts/pips/pips-seq-grab.sh ssd -j 8` (720 logs, about
-   a minute each; ~1.5 h at -j 8), on icx `bash scripts/pips/pips-seq-grab.sh nic`
-   (96 logs, ~25 min). Move the old `~/seq-*` folder/tarball aside first (the
-   script refuses to overwrite). Copy the tarballs to `dualssd/1016/` and
-   `dualnic/1016/` (unpack next to the 10-16 grab, which they replace). Then:
-   Figures 4/6 from the model on the arrival order (x = depth, lines from the
-   chosen log's arrivals, diamonds = recorded, model-self beside them as the
-   check), and Figures 3/5 with each panel's point, setting and order (arrival
-   or output) chosen freely; with ~800 logs the sequences go in per-point data
-   files loaded on demand, not in the page.
+   (The 10-16 regrab this replaces is in `*/1016/seq-*-0a04-arr/`; its
+   model ran without the uplink limit and the grant gap: items 9-10.)
 1. **IOMMU off on `0x0A04`** (or `0x0A05`), drives and NICs, cap off and on. Completes the
    comparison with 0x0A02, and tells whether drive 0's single-instance drop
    needs the IOMMU. Check first that both NICs are behind the same DMAR unit
