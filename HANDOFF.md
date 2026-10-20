@@ -28,7 +28,9 @@ together, [LOCAL-SETUP.md](LOCAL-SETUP.md) for first-time provisioning.
   `pips-page-seq.py` (stalls put back, link rate fitted per log and
   calibrated per sweep, each input's order kept); rerun pending. The NIC run
   left out the 0x0A05 sweep (no manifest in `~`; `pips-analyze.sh` now also
-  looks in `utils/logs/<sweep>/`).
+  looks in `utils/logs/<sweep>/`). Page v7: Table 11 (payload or control by
+  size, `report-gen/sizes.py`) and the drive-model caveat in the TL;DR and
+  Limits.
   2026-10-19 (later): the model charges a 3-cycle grant gap
   per drain, the page's Figures 4/6 average each point's logs and draw an
   ideal line that only fits the window; one host script, `pips-analyze.sh`,

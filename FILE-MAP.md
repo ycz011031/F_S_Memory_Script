@@ -463,7 +463,7 @@ stay on the hosts; only results, grabs and reports come back.
 | `1010/` | `dualssd-xsweep-{off,strict}-*` on switch designs C/D | design D | HANDOFF §7 "Fifth result" |
 | `1013/` | `dualssd-pips-{off,strict}-1-<setting>` (4 settings), `addr-pattern-1013.jsonl`, `iotlb-fit-1013.jsonl`, `seq-1013*.jsonl`, `seq-*.txt` | `0x0A02`, 10-13 | `report-gen/build.py` (0x0A02 page) |
 | `1016/` | `dualssd-pips-strict-1-id0a04-<setting>` (8: cap off/on), `traffic-ssd.*`, `seq-dualssd-pips-strict-1-id0a04/` (first grab, 7 points), `seq-dualssd-0a04-arr/` (regrab, all 90 points, arrival order + model before the uplink fix) | `0x0A04`, 10-15/16 | `report-gen/load4.py`, `build4.py`, `seq4.py`, `seqarr.py` |
-| `1019/` | `dualssd-pips-strict-dsweep1-id0a05-<setting>` (8 depths, cap on), `dualssd-pips-strict-dsweep1.txt`; `pips-analyze-ssd-20261019-1723/` (+ `.tar.gz`): the 10-19 analysis of both drive sweeps (`seq-dualssd-pips-strict-1-id0a04/`, `seq-dualssd-pips-strict-dsweep1/`, 720 logs each; `traffic.txt` = payload or control by size, verdicts per design at its end). Its page-order model is unusable (HANDOFF §8 item 11); the lengths stand | `0x0A05`, depth sweep 10-17/18 (and the 0x0A04 sweep's reanalysis) | `report-gen/a05.py`; the analysis not on the page yet |
+| `1019/` | `dualssd-pips-strict-dsweep1-id0a05-<setting>` (8 depths, cap on), `dualssd-pips-strict-dsweep1.txt`; `pips-analyze-ssd-20261019-1723/` (+ `.tar.gz`): the 10-19 analysis of both drive sweeps (`seq-dualssd-pips-strict-1-id0a04/`, `seq-dualssd-pips-strict-dsweep1/`, 720 logs each; `traffic.txt` = payload or control by size, verdicts per design at its end). Its page-order model is unusable (HANDOFF §8 item 11); the lengths stand | `0x0A05`, depth sweep 10-17/18 (and the 0x0A04 sweep's reanalysis) | `report-gen/a05.py`; `sizes.py` reads its `traffic.jsonl` (Table 11) |
 | `report-gen/` | the page generators (below) | | |
 | `seqdata/<kind>/<point>.json` | per-point data for the 0x0A04–0x0A05 page's Figures 3-6 (`seqarr.export`), published beside the page as `seq/<kind>/` | | the page (fetch) |
 | `dualssd-pips-0a04-report.html` | "PIPS 0x0A04–0x0A05 Sweeps", https://claude.ai/artifact/MbNxzaJ5KgmuM59PPC4NcA | | |
@@ -476,7 +476,7 @@ stay on the hosts; only results, grabs and reports come back.
 |---|---|---|---|
 | `1001/` | `dualnic-flowsweep-{off,strict}-*` (09-29, no switch) | — | HANDOFF §4.1; `build4.py` table10 (09-29 comparison) |
 | `1016/` | `dualnic-pips-strict-1-id0a04-<setting>` (8), `traffic-nic.*`, `seq-dualnic-pips-strict-1-id0a04/` (first grab), `seq-dualnic-0a04-arr/` (regrab, 12 points, before the uplink fix) | `0x0A04`, 10-15/16 | `load4.py`, `build4.py`, `seq4.py`, `seqarr.py` |
-| `1019/` | `dualnic-pips-strict-dsweep1-id0a05-<setting>` (6 settings ran), `.manifest.tsv`, `jounalctl.txt` (the kernel log of the switch's stop); `pips-analyze-nic-20261019-1723/` (+ `.tar.gz`): the 10-19 analysis, 0x0A04 sweep only (`seq-dualnic-pips-strict-1-id0a04/`, 96 logs, model matches; `traffic.txt`) | `0x0A05`, depth sweep 10-17 | `a05.py`; HANDOFF §8 "0x0A05 depth sweep" item 7, "0x0A04 results" item 11 |
+| `1019/` | `dualnic-pips-strict-dsweep1-id0a05-<setting>` (6 settings ran), `.manifest.tsv`, `jounalctl.txt` (the kernel log of the switch's stop); `pips-analyze-nic-20261019-1723/` (+ `.tar.gz`): the 10-19 analysis, 0x0A04 sweep only (`seq-dualnic-pips-strict-1-id0a04/`, 96 logs, model matches; `traffic.txt`, read by `sizes.py`) | `0x0A05`, depth sweep 10-17 | `a05.py`; HANDOFF §8 "0x0A05 depth sweep" item 7, "0x0A04 results" item 11 |
 
 ### `dualssd/report-gen/` (the generators; `README.txt` there has the commands)
 
@@ -490,4 +490,5 @@ stay on the hosts; only results, grabs and reports come back.
 | `seqarr.py` + `seqarr.js` | Figures 3-6: per-point data files (arrival/out listings, model sweeps, window ideal, recorded), the drive bullets; JS draws them averaged over each point's logs |
 | `deep4.py` + `deep/` | Figure 7, Table 8: time limits per depth, from `pips-timeout-pick.py` output (`pick-*`, `eval-*`, `eval-*-f512` = 0x0A05 FIFO) |
 | `a05.py` | the 0x0A05 section: Figure 8 (each depth vs d1t0c1), Table 9 (waits, link split), Table 10 (NICs) |
+| `sizes.py` | the "Payload or control, by size" section: Table 11 and its `SZ*` slots, from the 10-19 analyses' `traffic.jsonl` (`FILES`; add the NICs' 0x0A05 one when it comes) |
 | `build.py`, `load.py`, `template.html`, `seqfigs.py`, `seqtabs.py`, `seqruns.json`, `seq14.json`, `seq/` | the 0x0A02 page ("PIPS Batcher Sweeps") from `dualssd/1013` (+1006, 1010); `seq/` holds three small 0x0A02 logs and a CSV it was built from |
