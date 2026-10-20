@@ -19,6 +19,11 @@ together, [LOCAL-SETUP.md](LOCAL-SETUP.md) for first-time provisioning.
   length verdicts stand. Until it is back, the page's Figures 4/6 come from
   the listing-based recovery (item 12). Results come back as
   `~/pips-analyze-<kind>-*.tar.gz`.
+- **2026-10-20 (NIC splitting):** why one NIC alone splits its packets and
+  two together don't is in §8 item 13: the gap between a NIC's packets on
+  its wire decides it; styx's shared dual-port card is the suspect
+  (untested; tests in §8 "Next" item 5). Dual-NIC runs never recorded
+  retransmits.
 - **Last updated:** 2026-10-20 (later): page order **recovered from the
   10-19 listings** without the raw logs (§8 item 12): each device's own order
   is exact from the order as sent; the batcher model runs on it with I/O
@@ -1942,8 +1947,8 @@ The cap and the v2 log work on hardware: all 804 logs FULL, no drops,
     falls 9.18 -> 4.95 and by NIC stays 9.18. One NIC alone is chaotic
     (cap-on settings and d16t64: 1.0-1.9 TLPs per run, 0-49% whole), but
     single-NIC points are out of Figure 6 by request. Why alone and not
-    together is not established (alone 75-96 Gbps and held; together about
-    half each); the logs don't record NIC stalls. Drives are the more
+    together: item 13 (the NIC's packet rate on its wire; styx suspected,
+    untested). Drives are the more
     interleaved: drive 0 always two pages at once, drive 1 at 64 KiB
     1.6-1.9 TLPs per run.
     **v10: floor and raw (user: "the ideal was supposed to represent the
@@ -1964,6 +1969,53 @@ The cap and the v2 log work on hardware: all 804 logs FULL, no drops,
     drive's I/O bursts. Per log (d1t0c1's own listing) raw was slightly above
     d1t0c1 everywhere (12.75 vs 12.35 at 16 KiB); the average over all 16
     logs is lower. The host rerun measures the arrival order and settles it.
+13. **Why one NIC alone splits its packets and two together don't
+    (2026-10-20).** From the 10-16 JSONL and the 10-19 grab's listings
+    (`dualssd/report-gen/nicorder.py`, output `dualnic/1019/nicorder.txt`;
+    no raw logs).
+    - **The NIC's packet rate decides it, not the wait.** Alone (93-96
+      Gbps) a NIC splits (1.0-1.9 TLPs per run, 0-49% of packets whole)
+      where its wait is pinned, p50 about p99 (d4t22c1 0.46/0.48 µs, d16t64
+      0.43/0.45, d1t0c1 0.60/0.63): its FIFO stays full and it is held TLP
+      by TLP. Under d1t0 (0.12/0.29 µs) it writes whole packets. Together
+      (49-54 Gbps each) the waits are longer (p50 0.68-0.88, p99 1.1-1.4 µs)
+      and the FIFOs fill (on 0x0A05 the waits grow with the FIFO), the
+      output never idles 1 µs (one segment, out gap 0.04 cycles per TLP at
+      111 Gbps: the switch is the limit), yet each NIC writes whole packets
+      (7.1-7.3 TLPs per run, 86-91% whole).
+    - **One rule fits every point:** a NIC opens its next packet when the
+      current one takes longer to get into the switch than the gap to the
+      next packet on its wire. It then writes one TLP of each open packet
+      in turn, one packet per receive queue (4-5 open; their completions go
+      to different CQs), and stays split until the wire idles (alone logs
+      have 27-225 output gaps of 1 µs or more; d4t22c1 f5 NIC0's 600-run
+      sample is whole, 6.5 TLPs per run, its whole log 1.11). Alone the gap
+      is one 100G frame time (4,038 B, 0.32 µs) and an unheld packet needs
+      about 0.3 µs; together the gap is about 0.6 µs. The co-run exception
+      fits: d1t0c1 at 5 flows splits (1.01), where a packet alternates TLP
+      by TLP with the other NIC (about 16 slots, 0.6 µs, its gap). Where
+      packets stay whole the share still follows the rate (d1t0: 83-87%
+      alone, 86-91% at 49-54 Gbps, 95-96% at 24 Gbps).
+    - **Styx's order is the same in both cases.** Each packet's completion
+      address names its receive queue: at 5-10 flows consecutive packets on
+      a wire come from different queues 92-99% of the time, alone and
+      together (styx's card turns its send queues per packet). The
+      difference is when styx's frames arrive, not their order.
+    - **Suspect on styx (not tested):** both test ports are one dual-port
+      card on one Gen3 link (width never checked), so one PCIe read path
+      and TX engine feed both ports. Alone it sends one port back to back
+      at 100G. Together it can't feed two ports at line rate (Gen3 x16 raw
+      is 126 Gbps, the same as icx's uplink); turning send queues per
+      packet across both ports, it puts a frame on each wire about every
+      other frame time. Other styx-side candidates: pause frames (global
+      pause left at the driver default on both hosts, PFC off; never
+      counted), the sender CPU (14 cores busy together, 7 alone; the
+      same-queue share rises to 0.18/0.34 at 15/30 flows together only),
+      TCP (DCTCP with nothing marking ECN, fixed 1 MB send / 2 MB receive
+      buffers). **Retransmits were never recorded:** client mode of
+      `run-netapp-tput.sh` writes no `retx.rpt`, so the runner's copy-back
+      fails silently in every dual-NIC run.
+    - Tests: "Next" item 5.
 
 ### 0x0A05 depth sweep (2026-10-17/18, strict, cap on)
 
@@ -2060,3 +2112,32 @@ The cap and the v2 log work on hardware: all 804 logs FULL, no drops,
    the summaries flag runs with `pcie_samples` < 10.
 4. **One input through d1t0c1:** one drive alone at 1m, d1t0 vs d1t0c1, to
    see whether the per-drain limit that holds one NIC to 78 Gbps binds a drive.
+5. **Styx and the NICs' packet splitting** (§8 item 13). All on a cap-on
+   setting where one NIC splits (d4t22c1), 5 flows:
+   - Read-only, styx (user confirmed 10-20: both icx NICs are cabled to
+     the one dual-port card): `bash scripts/nic-host-snapshot.sh ens1f0np0
+     ens1f1np1` (PCIe path with link, MPS/MRRS, the kernel's bandwidth
+     line; pause, offloads, rings, coalescing, mlnx_qos, qdisc; TCP
+     sysctls; counters). Run it again around a NIC0-alone and a both run
+     for the pause/retransmit deltas; on icx the same for
+     `tx_pause_ctrl_phy`, `rx_discards_phy`, `rx_out_of_buffer`. Styx
+     reached 96 Gbps on one port, so its card can't be Gen3 x8 (63 Gbps
+     raw); Gen3 x16 (126 raw) feeds about one port, not two.
+   - Decisive: NIC0 alone while styx loads its other port without touching
+     PIPS (pktgen or UDP on `ens1f0np0` to a MAC icx's NIC1 filters in
+     hardware). If NIC0's rate drops and its packets turn whole, the shared
+     card spaces the frames. Second: NIC0 alone held to ~53 Gbps by a
+     hardware shaper on styx's port (`mlnx_qos --ratelimit`, even frame
+     spacing) vs `iperf3 -b` at the same rate (bursts).
+   - Fix the harness: write `retx.rpt` on the client (`nstat` delta per run).
+   - Proposed with the user (10-20), now that page order is the topic: cap
+     each NIC so alone and together run at the same per-NIC rate (about
+     45-50 Gbps: two together under the switch's 107 and styx's card), so
+     alone vs together differs only by the other NIC. The cap has to space
+     frames the way the card does in co-run. `iperf3 -b` (the runner's
+     `--bandwidth`) paces in bursts, with frames back to back at 100G
+     inside each; `--fq-rate` with the fq qdisc spaces 64 KB TSO bursts,
+     not frames; a hardware shaper on styx's port (`mlnx_qos -r`) may space
+     frames (untested). Check first: one NIC0-alone run per method at the
+     cap, grab its order, look for 7+ TLPs per run. The uncapped sweeps
+     stay as the full-link case.

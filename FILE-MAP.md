@@ -39,6 +39,7 @@ run by hand when needed · **orphan** = no caller and superseded · **data** /
 | Dual-NIC through PIPS: the flow sweep once per batcher depth/time, drain cap off and on, TLP log checked in every run | `scripts/sosp24-experiments/dualnic_pips_sweep.sh --cfgs "1:0 8:22"` | NIC host behind PIPS |
 | Dual-NIC: one configuration | `scripts/run-dualnic-experiment.sh` (`--pips-log 1` behind PIPS) | icx |
 | Dual-NIC: map NIC → pcm-iio row | `sudo bash utils/discover-pcie-topology.sh` | icx |
+| NIC host's PCIe path, NIC settings, TCP settings, counters (read-only) | `bash scripts/nic-host-snapshot.sh [IFACE ...]` → `~/nic-snapshot-<host>-<time>.tar.gz` | styx (sender), icx |
 | Dual-NIC: tables from results | `python3 scripts/dualnic-results.py summary ~/<sweep>.jsonl` | any |
 | Which IOMMU mode a device got | `bash utils/iommu-mode.sh <intf\|nvme dev\|BDF>` | any |
 | Reproduce a SOSP'24 figure | `scripts/sosp24-experiments/{flows_exp,ringbuffer_exp,latency_fig7,no_hcc_fig8,hcc_fig8}.sh` | receiver |
@@ -292,6 +293,7 @@ falls back to default events and every column shifts.
 |---|---|
 | `run-dualssd-experiment.sh` | driver: dual-SSD, one configuration (§2.1) |
 | `run-dualnic-experiment.sh` | driver: dual-NIC, one configuration (§2.2) |
+| `nic-host-snapshot.sh` | manual, read-only, on the host itself: each NIC's PCIe path to its root port (link status and capability, raw Gbps, MPS/MRRS, relaxed ordering, RCB), the kernel's "available PCIe bandwidth" lines, NIC settings (pause, offloads, channels, rings, coalescing, mlnx_qos, qdisc, IRQ CPUs), TCP sysctls, counters (`ethtool -S`, `nstat`); prints a summary → `~/nic-snapshot-<host>-<time>.tar.gz`. For styx's shared card (HANDOFF §8 item 13) |
 | `dualssd-results.py` | called: fio summing, JSONL records, summary and grid tables |
 | `dualnic-results.py` | called: JSONL records, summary table |
 | `run-dctcp-tput-experiment.sh` | driver: upstream throughput |
@@ -491,5 +493,6 @@ stay on the hosts; only results, grabs and reports come back.
 | `seqarr.py` + `seqarr.js` | Figures 3-6: per-point data files (listing as sent, recorded, seqrec's lines for both FIFOs), the bullets under Figures 4 and 6 (`order_points()`), the TL;DR numbers; JS draws each device's own order and the lines averaged over each point's logs (both designs' for the drives) |
 | `deep4.py` + `deep/` | Figure 7, Table 8: time limits per depth, from `pips-timeout-pick.py` output (`pick-*`, `eval-*`, `eval-*-f512` = 0x0A05 FIFO) |
 | `a05.py` | the 0x0A05 section: Figure 8 (each depth vs d1t0c1), Table 9 (waits, link split), Table 10 (NICs) |
+| `nicorder.py` | not a page part: why one NIC alone splits its packets and two together don't (HANDOFF §8 item 13). Per NIC: rate, wait p50/p99, own order over the whole log (`dualnic/1016` JSONL + the 10-19 grab's headers), and each packet's receive queue from its completion address (the listings); `py -3 nicorder.py > ../../dualnic/1019/nicorder.txt` |
 | `sizes.py` | the "Payload or control, by size" section: Table 11 and its `SZ*` slots, from the 10-19 analyses' `traffic.jsonl` (`FILES`; add the NICs' 0x0A05 one when it comes) |
 | `build.py`, `load.py`, `template.html`, `seqfigs.py`, `seqtabs.py`, `seqruns.json`, `seq14.json`, `seq/` | the 0x0A02 page ("PIPS Batcher Sweeps") from `dualssd/1013` (+1006, 1010); `seq/` holds three small 0x0A02 logs and a CSV it was built from |
