@@ -28,6 +28,10 @@ together, [LOCAL-SETUP.md](LOCAL-SETUP.md) for first-time provisioning.
   `pips-page-seq.py` now charges it only on a re-grant to the same input.
   Page v8 (Figures 3-6 redrawn: each device's own order instead of "as
   arrived", both designs' logs, FIFO 128/512 lines; TL;DR, Limits, bullets).
+  Page v9 (after user review): the ideal line now starts from d1t0c1's
+  recorded order (whole-log windows of 2D TLPs, from `seq.jsonl`), so depth
+  1 is d1t0c1 itself; why d1t0c1 is below strict alternation, and why the
+  NICs' by-NIC and by-page lines coincide, are in §8 item 12.
   2026-10-20: the 10-19 analysis came back
   (`dualssd/1019/pips-analyze-ssd-20261019-1723/`, `dualnic/1019/pips-analyze-nic-20261019-1723/`).
   Payload or control by size: a size rule holds (drives: ring = 4 DW,
@@ -1913,6 +1917,33 @@ The cap and the v2 log work on hardware: all 804 logs FULL, no drops,
     `batcher()` now charges it only for a new drain from the input served
     last (or the very first, or a pass-through packet); `test-sim.sh` asserts
     9 cycles alternating, 12 for one input.
+    **After user review (v9).** (a) "Recorded is below the ideal at low
+    depth": v8's ideal took windows of D TLPs per device from each device's
+    own order, which at D = 1 is strict alternation (16.6-17.5 page switches
+    per page at 16 KiB). Recorded d1t0c1 is 9.3-12.7 on 0x0A04 and 6.9-8.2 on
+    0x0A05 (whole logs, not a sampling artifact): the RTL alternates only
+    when both channels request at the packet boundary (round-robin
+    tie-break, `axi4_mwr_batch.v` ~l.1561); otherwise the requesting channel
+    gets the next drain, and a flush holds the grant. In d1t0c1's recorded
+    order at 16 KiB, 8% of TLPs leave in a flush before a read and 49% in
+    other one-drive stretches of one-TLP drains (0x0A05: 5% and 78%, which
+    the model doesn't reproduce: +39%). The v8 bullet that said "a quarter
+    of the TLPs leave in flush drains" came from one model run and was
+    wrong. The ideal is now d1t0c1's recorded order regrouped in windows of
+    2D TLPs (`windows` in `seq.jsonl`, ideal policy: whole log, exact),
+    0x0A04's or 0x0A05's d1t0c1 by the FIFO selector: at 16 KiB 9.3-12.7 at
+    1 (d1t0c1 itself), 2.5-2.9 at 16, 1.8-2.0 at 64. (b) "NICs should be more
+    chaotic than drives, but by NIC = by page": with both NICs each NIC's
+    own order has 6.8-7.7 TLPs per run, 85-97% of packets in one run (whole
+    logs), so grouping a drain by page has nothing to undo; exception
+    d1t0c1 at 5 flows (1.0 TLPs per run), where the recovered by-page line
+    falls 9.18 -> 4.95 and by NIC stays 9.18. One NIC alone is chaotic
+    (cap-on settings and d16t64: 1.0-1.9 TLPs per run, 0-49% whole), but
+    single-NIC points are out of Figure 6 by request. Why alone and not
+    together is not established (alone 75-96 Gbps and held; together about
+    half each); the logs don't record NIC stalls. Drives are the more
+    interleaved: drive 0 always two pages at once, drive 1 at 64 KiB
+    1.6-1.9 TLPs per run.
 
 ### 0x0A05 depth sweep (2026-10-17/18, strict, cap on)
 
