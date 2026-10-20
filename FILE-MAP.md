@@ -418,7 +418,7 @@ falls back to default events and every column shifts.
 | `~/<NAME>.txt`, `~/<NAME>-id<XXXX>-<setting>.{jsonl,txt}`, `utils/logs/<NAME>/pips-sweep.log`, `cfg-<setting>.txt` | `dualssd_pips_sweep.sh`, `dualnic_pips_sweep.sh`: every setting side by side with the log check (first lines name the design ID); one cross / flow sweep per setting. Before design IDs: `~/<NAME>-<setting>.*` | no |
 | `scripts/pips/pips`, `scripts/pips/pips-sim` | `make` in `scripts/pips/` | no (ignored) |
 | `~/<NAME>.manifest.tsv`, `utils/logs/<NAME>/manifest.tsv`, `.../sweep-id.txt` | both PIPS sweeps (from 10-17): every run of the sweep with its setting, point, folders, TLP log and status; parse a sweep only through it (SWEEP-LOGS.md) | no |
-| `~/seq-<sweep>/` + `.tar.gz` | `pips-seq-grab.sh`: `seq-<setting>-<point>.txt` (report + listings), `seq.jsonl` (one line per log: interleave, what-ifs, `windows_arr`, `model[]`, `link`, `fifo`, `grant_gap`), `manifest.txt` | no |
+| `~/seq-<sweep>/` + `.tar.gz` | `pips-seq-grab.sh`: `seq-<setting>-<point>.txt` (report + listings), `seq.jsonl` (one line per log: interleave, what-ifs, `windows_arr`, `model[]`, `link` (`fitted`, `rate_given`), `fifo`, `grant_gap`, `arrival` (`lost`: share of the log's time missing from the logged output, `link_fit`, `held`)), `calibrate.txt` (the uplink fit per log, `segments lost fit clean`; the median of the clean ones is every log's `--link-rate`, also in `manifest.txt`), `manifest.txt` | no |
 | `~/pips-analyze-<kind>-<date>/` + `.tar.gz` | `pips-analyze.sh`: `seq-<sweep>/` per sweep, `logs.txt`, `traffic.txt/.jsonl`, `traffic-sizes.csv`, `analyze.log` | no |
 | `~/pips-hang-<host>-<time>/` + `.tar.gz` | `pips-hang-snapshot.sh` | no |
 | `~/traffic*.txt/.jsonl/.csv` | `pips-traffic.py` run by hand (10-16: `traffic-ssd.txt`, `traffic-nic.txt`) | no |
@@ -463,7 +463,7 @@ stay on the hosts; only results, grabs and reports come back.
 | `1010/` | `dualssd-xsweep-{off,strict}-*` on switch designs C/D | design D | HANDOFF §7 "Fifth result" |
 | `1013/` | `dualssd-pips-{off,strict}-1-<setting>` (4 settings), `addr-pattern-1013.jsonl`, `iotlb-fit-1013.jsonl`, `seq-1013*.jsonl`, `seq-*.txt` | `0x0A02`, 10-13 | `report-gen/build.py` (0x0A02 page) |
 | `1016/` | `dualssd-pips-strict-1-id0a04-<setting>` (8: cap off/on), `traffic-ssd.*`, `seq-dualssd-pips-strict-1-id0a04/` (first grab, 7 points), `seq-dualssd-0a04-arr/` (regrab, all 90 points, arrival order + model before the uplink fix) | `0x0A04`, 10-15/16 | `report-gen/load4.py`, `build4.py`, `seq4.py`, `seqarr.py` |
-| `1019/` | `dualssd-pips-strict-dsweep1-id0a05-<setting>` (8 depths, cap on), `dualssd-pips-strict-dsweep1.txt`; the `pips-analyze.sh` output goes here when it arrives | `0x0A05`, depth sweep 10-17/18 | `report-gen/a05.py` |
+| `1019/` | `dualssd-pips-strict-dsweep1-id0a05-<setting>` (8 depths, cap on), `dualssd-pips-strict-dsweep1.txt`; `pips-analyze-ssd-20261019-1723/` (+ `.tar.gz`): the 10-19 analysis of both drive sweeps (`seq-dualssd-pips-strict-1-id0a04/`, `seq-dualssd-pips-strict-dsweep1/`, 720 logs each; `traffic.txt` = payload or control by size, verdicts per design at its end). Its page-order model is unusable (HANDOFF §8 item 11); the lengths stand | `0x0A05`, depth sweep 10-17/18 (and the 0x0A04 sweep's reanalysis) | `report-gen/a05.py`; the analysis not on the page yet |
 | `report-gen/` | the page generators (below) | | |
 | `seqdata/<kind>/<point>.json` | per-point data for the 0x0A04–0x0A05 page's Figures 3-6 (`seqarr.export`), published beside the page as `seq/<kind>/` | | the page (fetch) |
 | `dualssd-pips-0a04-report.html` | "PIPS 0x0A04–0x0A05 Sweeps", https://claude.ai/artifact/MbNxzaJ5KgmuM59PPC4NcA | | |
@@ -476,7 +476,7 @@ stay on the hosts; only results, grabs and reports come back.
 |---|---|---|---|
 | `1001/` | `dualnic-flowsweep-{off,strict}-*` (09-29, no switch) | — | HANDOFF §4.1; `build4.py` table10 (09-29 comparison) |
 | `1016/` | `dualnic-pips-strict-1-id0a04-<setting>` (8), `traffic-nic.*`, `seq-dualnic-pips-strict-1-id0a04/` (first grab), `seq-dualnic-0a04-arr/` (regrab, 12 points, before the uplink fix) | `0x0A04`, 10-15/16 | `load4.py`, `build4.py`, `seq4.py`, `seqarr.py` |
-| `1019/` | `dualnic-pips-strict-dsweep1-id0a05-<setting>` (6 settings ran), `.manifest.tsv`, `jounalctl.txt` (the kernel log of the switch's stop) | `0x0A05`, depth sweep 10-17 | `a05.py`; HANDOFF §8 "0x0A05 depth sweep" item 7 |
+| `1019/` | `dualnic-pips-strict-dsweep1-id0a05-<setting>` (6 settings ran), `.manifest.tsv`, `jounalctl.txt` (the kernel log of the switch's stop); `pips-analyze-nic-20261019-1723/` (+ `.tar.gz`): the 10-19 analysis, 0x0A04 sweep only (`seq-dualnic-pips-strict-1-id0a04/`, 96 logs, model matches; `traffic.txt`) | `0x0A05`, depth sweep 10-17 | `a05.py`; HANDOFF §8 "0x0A05 depth sweep" item 7, "0x0A04 results" item 11 |
 
 ### `dualssd/report-gen/` (the generators; `README.txt` there has the commands)
 

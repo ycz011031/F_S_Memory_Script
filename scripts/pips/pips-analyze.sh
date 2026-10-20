@@ -12,7 +12,8 @@
 #   bash scripts/pips/pips-analyze.sh ssd --tmux   # the same in a tmux session
 #
 #   --sweeps "a04 dsweep1"  which default sweeps (a04: dual<kind>-pips-strict-1-id0a04
-#                     from utils/logs; dsweep1: ~/dual<kind>-pips-strict-dsweep1.manifest.tsv)
+#                     from utils/logs; dsweep1: ~/dual<kind>-pips-strict-dsweep1.manifest.tsv,
+#                     else utils/logs/dual<kind>-pips-strict-dsweep1/manifest.tsv)
 #   --manifest FILE   also this sweep, by its manifest (repeatable)
 #   --no-lengths      page order only
 #   -j N              logs at a time in both phases (default 8)
@@ -84,10 +85,11 @@ LABELS=(); GRABARGS=()
 for s in $SWEEPS; do
     case "$s" in
         a04) LABELS+=("dual$KIND-pips-strict-1-id0a04"); GRABARGS+=("$KIND") ;;
-        dsweep1)
+        dsweep1)                                     # the copy in ~, else the one the sweep grows
             m="$HOME/dual$KIND-pips-strict-dsweep1.manifest.tsv"
+            [ -s "$m" ] || m="$REPO/utils/logs/dual$KIND-pips-strict-dsweep1/manifest.tsv"
             if [ -s "$m" ]; then LABELS+=("dual$KIND-pips-strict-dsweep1"); GRABARGS+=("--manifest $m")
-            else say "WARNING: no $m: the 0x0A05 depth sweep is left out"; fi ;;
+            else say "WARNING: no ~/dual$KIND-pips-strict-dsweep1.manifest.tsv or $m: the 0x0A05 depth sweep is left out"; fi ;;
         *) echo "pips-analyze: --sweeps: '$s' is not a04 or dsweep1 (other sweeps: --manifest)" >&2; exit 2 ;;
     esac
 done

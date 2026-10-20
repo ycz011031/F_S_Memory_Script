@@ -392,6 +392,84 @@ assert [b[1] - a[1] for a, b in zip(out, out[1:])] == [12] + [9] * 14, out   # t
 assert ps.cycles('data', 64, 5, ps.link_bpc('gen3x8')) > 5 + 3  # bigserver: the link hides the gap
 assert ps.parse_setting('d24t255c1f512') == (24, 255, 1, 0) and ps.setting_fifo('d24t255c1f512') == 512
 assert ps.setting_fifo('d24t255c1') is None"
+# A busy Gen3 x8 uplink: the output stalls inside packets, which neither pkt_length nor pkt_gap counts
+# (pkt_wait does), so the logged output runs short of the trailer's duration. synths.py writes such a log:
+# the true output holds a TLP for max(beats, its time on a 30.89 B/cycle link), the records keep the beats.
+cat > "$T/synths.py" <<'EOF'
+import gzip, importlib.util, random, struct, sys
+spec = importlib.util.spec_from_file_location("ps", sys.argv[1]); ps = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(ps)
+out, setting, n, pause = sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5])
+rng, MSI = random.Random(11), 0xFEE00000
+BEATS, PDW = dict(data=5, cqe=1, msi=1, mrd=1), dict(data=64, cqe=4, msi=1, mrd=0)
+CPB = 9.0 / 278                                # cycles per wire byte: 9 cycles per 256 B TLP
+COST = {c: max(BEATS[c], ((0 if c == "mrd" else 4 * PDW[c]) + 22) * CPB) for c in BEATS}
+def device(src):                               # drive 0: two pages two TLPs at a time; drive 1: four pages one at a time
+    base, t, k = 0x10000000 * (src + 1), rng.randrange(50), 0
+    while True:
+        npg, step = (2, 2) if src == 0 else (4, 1)
+        pages = [base + 0x1000 * rng.randrange(1 << 16) for _ in range(npg)]
+        yield (t, src, "mrd", base + 0x8000000 + 64 * (k % 64)); t += 3
+        for i in range(0, 16, step):
+            for pg in pages:
+                for j in range(step):
+                    yield (t, src, "data", pg + 256 * (i + j)); t += COST["data"] * 2 / 0.97 * rng.uniform(0.6, 1.4)
+        for _ in pages:
+            yield (t, src, "cqe", base + 0x9000000 + 16 * (k % 256)); t += 2; k += 1
+        yield (t, src, "msi", MSI + 0x1000 * src); t += 20
+gens = [device(0), device(1)]; heads = [next(g) for g in gens]; tlps = []
+while len(tlps) < n:
+    s = 0 if heads[0][0] <= heads[1][0] else 1
+    tlps.append(heads[s]); heads[s] = next(gens[s])
+tlps = [(int(t) + pause * (k // 6000), s, c, a) for k, (t, s, c, a) in enumerate(tlps)]   # pauses: saturated gaps
+d, tm, cap, m = ps.parse_setting(setting)
+sent = ps.batcher([(t, s, c, BEATS[c], COST[c]) for t, s, c, _a in tlps], d, tm, cap, m, None, 128, ps.GRANT_GAP)
+recs, eop = [], None
+for j, start, _d in sent:
+    t, s, c, addr = tlps[j]; start = int(round(start))
+    gap = 0 if eop is None else max(0, min(255, start - eop - 1)); eop = start + int(round(COST[c])) - 1
+    recs.append(struct.pack("<QBBBBHBB", addr, BEATS[c], gap, 0 if c == "mrd" else 1, PDW[c], max(4, start - t), 0x80 | s, 0))
+with gzip.open(out, "wb") as f:
+    f.write(b"".join(recs) + struct.pack("<IIIBBBB", len(recs), 0, eop + 1, 2, 0, 0x88, 0))
+EOF
+SL="$T/tls"
+for set in d1t0c1 d4t22 d16t64c1; do
+    mkdir -p "$SL/dualssd-pips-strict-4-id0a04-$set/1m-j8-both-RUN-0" &&
+        python3 "$T/synths.py" "$HERE/pips-page-seq.py" "$SL/dualssd-pips-strict-4-id0a04-$set/1m-j8-both-RUN-0/pips-log-id0a04.bin.gz" $set 24000 0
+done
+mkdir -p "$SL/dualssd-pips-strict-4-id0a04-d16t64c1/1m-j1-both-RUN-0" &&
+    python3 "$T/synths.py" "$HERE/pips-page-seq.py" "$SL/dualssd-pips-strict-4-id0a04-d16t64c1/1m-j1-both-RUN-0/pips-log-id0a04.bin.gz" d16t64c1 24000 3000
+SLOG="$SL/dualssd-pips-strict-4-id0a04-d16t64c1/1m-j8-both-RUN-0/pips-log-id0a04.bin.gz"
+PLOG="$SL/dualssd-pips-strict-4-id0a04-d16t64c1/1m-j1-both-RUN-0/pips-log-id0a04.bin.gz"
+run 0 "stalls inside packets: --calibrate fits the link (30.89 B/cycle) on a clean full-link log" \
+    python3 "$HERE/pips-page-seq.py" "$SLOG" --calibrate
+    has '^calibrate: segments 1 lost 0\.[34][0-9]* fit 3[01]\.[0-9]* clean 1$'
+python3 -c "
+import re, sys; v = float(re.search(r'fit (\S+)', open('$T/out').read()).group(1))
+sys.exit(0 if abs(v / 30.89 - 1) < 0.01 else 1)" && ok "  fit within 1% of the true link" || bad "  fit: $(cat "$T/out")"
+run 0 "  ... and a log whose output idles past saturated gaps is not clean" \
+    python3 "$HERE/pips-page-seq.py" "$PLOG" --calibrate
+    has '^calibrate: segments [0-9]* lost .* clean 0$'
+run 0 "  the model on the rebuilt arrivals gives back the logged order and waits" \
+    python3 "$HERE/pips-page-seq.py" "$SLOG" --model self,d16t255c1 --json "$T/ms.jsonl"
+    has 'stalls inside packets put back with the link at 30\.9 bytes per cycle'; has 'gen3x8 fitted above'
+run 0 "  json: fitted link, no input reordered, the model's own setting within 2% (and its waits within 15%)" python3 -c "
+import json; r = json.loads(open('$T/ms.jsonl').readline())
+m = {x['setting']: x for x in r['model']}; rec = r['recorded']; a = r['arrival']
+assert r['link']['fitted'] and abs(r['link']['bytes_per_cycle'] / 30.89 - 1) < 0.01, r['link']
+assert a['lost'] > 0.3 and a['held'] < 0.001 and a['segments'] == 1, a
+assert abs(m['d16t64c1']['runs']['drive'] / rec['runs'] - 1) < 0.02, (m['d16t64c1']['runs'], rec)
+assert abs(m['d16t64c1']['wait_mean_us'] / rec['wait_mean_us'] - 1) < 0.15, (m['d16t64c1'], rec)"
+run 0 "  --link-rate: the paused log keeps the measured link, its idle goes to the saturated gaps" \
+    python3 "$HERE/pips-page-seq.py" "$PLOG" --model self --link-rate 30.9
+    has 'link at 30\.9 bytes per cycle'; has 'more idle cycles at each saturated gap'
+run 0 "pips-seq-grab.sh: a calibration pass first, the median of the clean logs passed on as --link-rate" \
+    bash "$HERE/pips-seq-grab.sh" ssd --logs "$SL" --sweep dualssd-pips-strict-4-id0a04 --sets "d1t0c1 d4t22 d16t64c1" \
+    --points "1m-j8-both 1m-j1-both" --model self -j 2 -o "$T/grab-cal"
+    has 'calibrating the uplink on 4 logs'; has 'calibrate \[4/4\]'; has 'median fit of 3 clean logs'
+grep -q '^uplink rate 3[01]\.[0-9]* bytes per cycle: the median fit of 3 clean logs' "$T/grab-cal/manifest.txt" &&
+    [ "$(wc -l < "$T/grab-cal/calibrate.txt")" -eq 4 ] && grep -q '"rate_given": 3[01]\.' "$T/grab-cal/seq.jsonl" &&
+    ok "  manifest, calibrate.txt, --link-rate in every log" || bad "  grab-cal: $(cat "$T/grab-cal/manifest.txt")"
 run 2 "  --link with no such link is refused" \
     python3 "$HERE/pips-page-seq.py" "$BL/pips-log-id0a04.bin.gz" --model self --link gen3x9
     has 'not a link'

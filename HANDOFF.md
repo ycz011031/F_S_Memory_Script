@@ -14,10 +14,22 @@ together, [LOCAL-SETUP.md](LOCAL-SETUP.md) for first-time provisioning.
   which sweep and design, which report generator reads what, the published
   pages). On the Windows analysis machine `claude.md` (git-ignored) adds its
   local paths, tools and editing gotchas.
-- **Running (2026-10-19):** `scripts/pips/pips-analyze.sh ssd` on bigserver
-  and `... nic` on icx (§8 "Next" item 0); the results come back as
-  `~/pips-analyze-<kind>-*.tar.gz`.
-- **Last updated:** 2026-10-19 (later): the model charges a 3-cycle grant gap
+- **To run (2026-10-20):** `scripts/pips/pips-analyze.sh` again on both hosts
+  (§8 "Next" item 0): the 10-19 run's drive model ran away (item 11); its
+  length verdicts stand. Results come back as `~/pips-analyze-<kind>-*.tar.gz`.
+- **Last updated:** 2026-10-20: the 10-19 analysis came back
+  (`dualssd/1019/pips-analyze-ssd-20261019-1723/`, `dualnic/1019/pips-analyze-nic-20261019-1723/`).
+  Payload or control by size: a size rule holds (drives: ring = 4 DW,
+  RELIABLE on drive 0, 99.88% on drive 1, which also writes small payload
+  pieces; NICs: ring = 16 DW, 100%), the same on 0x0A04 and 0x0A05. The drive
+  page-order model failed: its waits ran to ~1,400 µs because the output's
+  logged times lack the stalls inside packets on the Gen3 x8 uplink, which
+  `pkt_wait` counts (§8 "0x0A04 results" item 11). Fixed in
+  `pips-page-seq.py` (stalls put back, link rate fitted per log and
+  calibrated per sweep, each input's order kept); rerun pending. The NIC run
+  left out the 0x0A05 sweep (no manifest in `~`; `pips-analyze.sh` now also
+  looks in `utils/logs/<sweep>/`).
+  2026-10-19 (later): the model charges a 3-cycle grant gap
   per drain, the page's Figures 4/6 average each point's logs and draw an
   ideal line that only fits the window; one host script, `pips-analyze.sh`,
   reruns page order and payload-or-control by length on both designs (§8,
@@ -1816,6 +1828,42 @@ The cap and the v2 log work on hardware: all 804 logs FULL, no drops,
     whole; listing `seq-d1t0-f10-both.txt`: offsets 000-e00 of one page, then
     its entry), except d1t0c1 at 5 flows (1.01 TLPs per run), where by-page
     falls below. Page v6.
+11. **The 10-19 grab: the drive model ran away; the arrival rebuild lacked
+    the uplink's stalls (2026-10-20).** `pips-analyze.sh` on both hosts
+    (repo 8a00e1f74; `dualssd/1019/pips-analyze-ssd-20261019-1723/`, 1,440
+    logs, both sweeps; `dualnic/1019/pips-analyze-nic-20261019-1723/`, the
+    0x0A04 sweep only). NICs: the model matches (self median 0.0%, waits
+    within 0.02 µs except d1t0c1 0.85 vs 0.45). Drives: every setting's
+    model wait ~1,000-1,450 µs against 1.4-1.9 recorded, from a nominal load
+    (model cycles over the log's true time per TLP) of 0.78 up, and
+    page-switch self check +15% (0x0A04) / +18% (0x0A05) median. Cause: the
+    output's times are rebuilt from `pkt_length` (beats) and `pkt_gap`, and a
+    stall **inside** a packet is in neither (PIO-MANUAL §8.4), while
+    `pkt_wait` counts it. On a Gen3 x8 uplink the 512-bit datapath stalls
+    about a third of the time (synthetic: 35-42% at 80-97% load), so the
+    logged output covers ~60% of the recording, in_sop = out_sop - wait came
+    out early by the stalls of the packets that left during the wait, the
+    arrivals ran faster than the link, and the model (now charging the link)
+    never drained. The same error swapped one drive's TLPs: drive 1 "arrived"
+    with ~480 open pages, sent with ~34 (`seq-d16t64c1-1m-j32-both.txt`,
+    `arr` listing: offsets 300-200 of one page). The 10-16 grab had it too
+    (its model, at the datapath rate, matched the compressed clock instead),
+    so Figure 4's as-arrived/ideal start and Table 6's as-arrived numbers
+    for the drives are inflated. Fix (`pips-page-seq.py`): put the stalls
+    back (each packet holds the output for max(beats, link time), the
+    model's rule; link rate fitted so the rebuilt output ends at the
+    trailer's duration; `out_times()`, `fit_stalls()`), keep each input's
+    output order (the batcher never reorders an input), and run the model at
+    the fitted rate. Logs with saturated gaps would pull the fit slow (idle
+    past the gap looks like stalls), so `pips-seq-grab.sh` first calibrates:
+    `--calibrate` on every log, the median of the clean ones (one segment,
+    >= 10% lost) is the floor `--link-rate` for all (`calibrate.txt`).
+    Checked on synthetic logs written the way the hardware logs (stalls
+    dropped): the fit recovers the link to 0.1%, the model's own setting
+    matches the logged order (12.99 vs 13.00) and wait (0.73 vs 0.72 µs);
+    the committed code gave 200-400 µs waits on the same logs
+    (`test-sim.sh`, "stalls inside packets"). The NICs (Gen4 x8, ~no stalls)
+    are not expected to change.
 
 ### 0x0A05 depth sweep (2026-10-17/18, strict, cap on)
 
@@ -1873,21 +1921,26 @@ The cap and the v2 log work on hardware: all 804 logs FULL, no drops,
 
 ### Next
 
-0. **RUNNING since 2026-10-19: the analysis on both hosts with
-   `pips-analyze.sh`** (one run per host: page order with the fixed model on
-   the 0x0A04 sweep and the 0x0A05 depth sweep, then payload or control by
-   length over all their logs; watch with `tmux attach -t pips-analyze-ssd` /
-   `-nic`, or `tail ~/pips-analyze-<kind>-*/analyze.log`):
-   bigserver `bash scripts/pips/pips-analyze.sh ssd --tmux` (~4-6 h), icx
-   `bash scripts/pips/pips-analyze.sh nic --tmux` (<1 h). Copy
-   `~/pips-analyze-<kind>-*.tar.gz` back, unpack in `dualssd/1019/` and
-   `dualnic/1019/`. Then: `py -3 seqarr.py` (model self: want the drives
-   within a few % like the NICs, and d1t0c1 now usable), point
-   `seqarr.DIRS` at the new `seq-*` folders (and add the 0x0A05 ones: their
-   diamonds sit at the dsweep depths, `seqarr.js` reads depth from the
-   setting name), rebuild, publish; the length verdict per design goes in
-   the 0x0A05 section (`traffic.txt`, end). Compare the verdict per design
-   with 0x0A04's `traffic-ssd.txt` / `traffic-nic.txt` in `*/1016/`.
+0. **Rerun the analysis on both hosts with the stall rebuild** (item 11;
+   the 10-19 run is in `*/1019/pips-analyze-*-20261019-1723/`, its drive
+   model unusable, its length verdicts fine). bigserver: `bash
+   scripts/pips/pips-analyze.sh ssd --no-lengths -j 16 --tmux` (page order
+   only: the lengths are in; calibration ~5 min per sweep, then ~3 h at -j
+   16); icx: `bash scripts/pips/pips-analyze.sh nic --tmux` (both sweeps now
+   that the 0x0A05 manifest is found under `utils/logs/`, and lengths for
+   0x0A05; <1 h). Watch: `tmux attach -t pips-analyze-<kind>` or `tail
+   ~/pips-analyze-<kind>-*/analyze.log`; check each sweep's `uplink rate ...
+   median fit of N clean logs` line (bigserver: expect ~30-31 B/cycle, about
+   98% of Gen3 x8's raw 31.5; icx: few or no clean logs, fine). Copy the
+   tarballs back, unpack in `dualssd/1020/` and `dualnic/1020/`. Then:
+   `py -3 seqarr.py` (model self: want the drives within a few %, waits
+   near the recorded 1.5 µs; JSON `arrival.lost`, `arrival.held`,
+   `link.fitted`), point `seqarr.DIRS` at the new `seq-*` folders (and add
+   the 0x0A05 ones: their diamonds sit at the dsweep depths, `seqarr.js`
+   reads depth from the setting name), redo Figure 4's as-arrived/ideal and
+   Table 6 for the drives, rebuild, publish; the length verdicts per design
+   go in the 0x0A05 section (10-19 `traffic.txt`, end; NIC 0x0A05 from the
+   rerun).
 0b. **Finish the NIC depth sweep** after reprogramming 0x0A05: first
    `--cfgs "24:255" --caps 1 --tag d24repro "10 15"` to see if the stop
    repeats (snapshot if it does), then `--cfgs "24:255 36:255 64:255" --caps

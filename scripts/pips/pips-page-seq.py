@@ -57,7 +57,19 @@ Arrival order (v2 logs). Each record's gap and pkt_wait rebuild when the TLP
 entered the batcher (in_sop = out_sop - pkt_wait), so the out TLPs sorted by
 it are the order the two inputs handed them over: stream "arr" (--port arr,
 interleaving, and a windowed what-if from it). That is the order batching
-starts from; out is what the setting made of it.
+starts from; out is what the setting made of it. Two corrections make it
+hold on a busy uplink. (1) A stall inside a packet on the output is in
+neither pkt_length nor pkt_gap, while pkt_wait counts it, so the output's
+times are rebuilt with those stalls put back: each packet holds the output
+for its beats or the link's time for it, whichever is longer (the model's own
+rule), with the link's rate fitted so the rebuilt output ends at the
+trailer's duration (a full Gen3 x8 drive log loses about a third of its time
+otherwise). The fitted link is no slower than --link-rate (the uplink's rate
+measured on clean logs: --calibrate, which pips-seq-grab.sh runs first); time
+still missing then is idle past saturated gaps. (2) The batcher never
+reorders one input's TLPs (a FIFO, and a read waits for it to empty), so each
+input's arrivals keep their output order. The model then charges the fitted
+link rate, so arrivals and output run on one clock.
 
 --model runs the batcher of axi4_mwr_batch.v on the arrival order, for the
 log's own setting (self: checks the model against the log), the 0x0A04
@@ -158,14 +170,67 @@ TLP_OVERHEAD = 22
 GRANT_GAP = 3
 
 
-def link_bpc(name):
+# Stalls inside a packet on the output (arrival()): a packet's last beat goes
+# in once the link is no more than TX_BUF_BYTES behind. 0, the model's rule
+# (a TLP holds the output for the longer of its beats and its link time): with
+# a buffer the rebuild and the model disagree on the link they fit, and a
+# model a few percent slower than the arrivals never drains its queue. With
+# --calibrate the fitted link may be as slow as LINK_EFF_MIN of the raw rate;
+# otherwise no slower than --link-rate, or LINK_EFF of the raw rate.
+TX_BUF_BYTES = 0
+LINK_EFF_MIN = 0.80
+# Logs --calibrate counts as clean: one segment (no saturated gap, so all the
+# missing time is stalls) and at least this share of the time lost (a full link)
+CAL_LOST_MIN = 0.10
+
+
+def link_bpc(name, eff=LINK_EFF):
     """Bytes per 4 ns cycle a link carries ('gen3x8'), None for 'none' (no link limit)."""
     if name is None or name.lower() == "none":
         return None
     m = re.match(r"^(gen[345])x(1|2|4|8|16)$", name.lower())
     if not m:
         raise ValueError(f"not a link: {name} (gen3x8, gen4x16, ... or none)")
-    return LINK_GTS[m.group(1)] * 1e9 * int(m.group(2)) * 128 / 130 / 8 / dec.CLOCK_HZ * LINK_EFF
+    return LINK_GTS[m.group(1)] * 1e9 * int(m.group(2)) * 128 / 130 / 8 / dec.CLOCK_HZ * eff
+
+
+def wire_bytes(is_read, pdw):
+    """Bytes a TLP takes on the link: payload (none for a read) + TLP_OVERHEAD."""
+    return (0 if is_read else 4 * pdw) + TLP_OVERHEAD
+
+
+def out_times(pk, c, buf=TX_BUF_BYTES, extra=0.0):
+    """Output (sop, eop) per packet with the stalls inside packets put back.
+    pk: (length, gap, wire bytes, saturated gap) in output order; c: link cycles
+    per wire byte (0: no stalls, the times as logged); extra: idle cycles added
+    to each saturated gap. A packet's last beat goes in once the link is no more
+    than `buf` bytes behind."""
+    res, eop, link = [], None, 0.0
+    for length, gap, wire, sat in pk:
+        sop = 0.0 if eop is None else eop + 1 + gap + (extra if sat else 0.0)
+        link = max(link, sop) + wire * c
+        eop = max(sop + length, link - buf * c) - 1
+        res.append((sop, eop))
+    return res
+
+
+def fit_stalls(pk, duration, slowest_bpc, buf=TX_BUF_BYTES):
+    """(c, extra, span as logged): the link rate c (cycles per wire byte, 0 if
+    the log lost no time) that makes out_times() end at `duration` cycles,
+    no slower than slowest_bpc; time still missing at that bound goes to the
+    saturated gaps as `extra` each."""
+    span0 = out_times(pk, 0.0)[-1][1] + 1 if pk else 0
+    if not pk or not duration or not slowest_bpc or duration <= span0 * 1.002:
+        return 0.0, 0.0, span0
+    end = lambda c: out_times(pk, c, buf)[-1][1] + 1
+    lo, hi = 0.0, 1 / slowest_bpc
+    if end(hi) <= duration:
+        nsat = sum(1 for x in pk if x[3])
+        return hi, ((duration - end(hi)) / nsat if nsat else 0.0), span0
+    for _ in range(30):
+        mid = (lo + hi) / 2
+        lo, hi = (mid, hi) if end(mid) < duration else (lo, mid)
+    return hi, 0.0, span0
 
 
 def pct(vals, p):
@@ -343,16 +408,24 @@ def whatif(events, dur_us, geoms, strict, on=2):
     return dict(items=len(items), ios=ios, us_per_tlp=us_per_tlp, rows=rows)
 
 
-def arrival(recs, events):
+def arrival(recs, events, duration=None, slowest_bpc=None):
     """v2: rebuild when each TLP entered the batcher, as pips-log-decode.py does
     (telemetry_dma_format.md §4.3): out_sop = previous out EOP + 1 + gap, and
     in_sop = out_sop - pkt_wait. Returns the out events again as stream ARR, in
     order of (segment, in_sop): the order the two inputs handed the TLPs over.
     A segment ends at a saturated gap (255) or a dropped record, after which
     times are lower bounds; no TLP waits that long here, so the order holds.
-    Also returns per record index (out_sop, in_sop, beats) and counts."""
-    tl, out_eop, seg, wsat = {}, None, 0, 0
-    for i, (_addr, length, gap, _typ, _pdw, _tag, _at, info, wait) in enumerate(recs):
+    With the trailer's duration and the slowest the uplink can be, the stalls
+    inside packets, which neither field counts but pkt_wait does, are put back
+    (fit_stalls()); without them a TLP's in_sop is early by the stalls of the
+    packets that left during its wait, and one input's TLPs swap places. Each
+    input then keeps its output order (the batcher never reorders an input).
+    Also returns per record index (out_sop, in_sop, beats, segment, out_sop as
+    logged) and counts, with the fitted link (bytes per cycle, None if the log
+    lost no time)."""
+    idx, pk, ports, waits, segs = [], [], [], [], []
+    seg, wsat, first = 0, 0, True
+    for i, (_addr, length, gap, typ, pdw, _tag, _at, info, wait) in enumerate(recs):
         kind, port = (info >> 2) & 3, info & 3
         if port > 1:
             continue
@@ -361,17 +434,36 @@ def arrival(recs, events):
             continue
         if kind != dec.KIND_TLP:
             continue
-        out_sop = 0 if out_eop is None else out_eop + 1 + gap
-        seg += out_eop is not None and gap == 255
-        out_eop = out_sop + length - 1
+        sat = not first and gap == 255
+        seg += sat
+        first = False
         wsat += wait == WAIT_SAT
-        tl[i] = (out_sop, out_sop - wait, length, seg)
+        idx.append(i)
+        pk.append((length, gap, wire_bytes((typ & 0xF) == 0, pdw), sat))
+        ports.append(port)
+        waits.append(wait)
+        segs.append(seg)
+    c, extra, span0 = fit_stalls(pk, duration, slowest_bpc)
+    logged = out_times(pk, 0.0)
+    times = out_times(pk, c, TX_BUF_BYTES, extra) if c else logged
+    tl, last, held = {}, [None, None], 0
+    for k, i in enumerate(idx):
+        in_sop = times[k][0] - waits[k]
+        p = ports[k]
+        if last[p] is not None and in_sop < last[p]:
+            in_sop, held = last[p], held + 1          # an input's TLPs arrive in their output order
+        last[p] = in_sop
+        tl[i] = (times[k][0], in_sop, pk[k][0], segs[k], logged[k][0])
     out = [e for e in events if e[1] == 2 and e[0] in tl]
     order = sorted(range(len(out)), key=lambda k: (tl[out[k][0]][3], tl[out[k][0]][1], k))
     arr = [(e[0], ARR) + e[2:] for e in (out[k] for k in order)]
     moved = sum(1 for pos, k in enumerate(order) if pos != k)
     return arr, tl, dict(tlps=len(out), segments=seg + 1, wait_saturated=wsat,
-                         moved=moved / len(out) if out else None)
+                         moved=moved / len(out) if out else None,
+                         span_logged_cycles=span0, duration_cycles=duration,
+                         lost=(1 - span0 / duration) if duration else None,
+                         link_fit=(1 / c) if c else None, tx_buf=TX_BUF_BYTES if c else None,
+                         idle_extra=extra, held=held / len(out) if out else None)
 
 
 def parse_setting(name):
@@ -588,7 +680,7 @@ def model(events, tl, names, geoms, strict, kind, bpc=None, fifo=FIFO_DEFAULT, g
     arr_ev = [e for e in events if e[1] == ARR and e[5] is not None]
     arr, prev = [], None
     for e in arr_ev:
-        _out_sop, in_sop, beats, _seg = tl[e[0]]
+        _out_sop, in_sop, beats, _seg, _logged = tl[e[0]]
         prev = in_sop if prev is None else max(in_sop, prev)   # past a saturated gap times are bounds
         arr.append((prev, e[5], e[2], beats, cycles(e[2], e[4], beats, bpc)))
     t0 = arr[0][0] if arr else 0
@@ -694,6 +786,14 @@ def main(argv=None):
                     help="the uplink the model's output can't outrun: gen3x8, gen4x8, ... or none (the "
                          "datapath rate measured from the log only). Default: "
                          + ", ".join(f"{k} {v}" for k, v in LINK_DEFAULT.items()))
+    ap.add_argument("--link-rate", type=float, metavar="BPC",
+                    help="the uplink's measured rate in bytes per cycle (TLP_OVERHEAD included; "
+                         "from --calibrate on clean logs): the slowest the per-log fit may make the link, "
+                         "and the model's rate on a log that lost no time. Default: "
+                         f"{LINK_EFF} of the raw rate")
+    ap.add_argument("--calibrate", action="store_true",
+                    help="only fit the uplink's rate to this log (stalls inside packets, from the "
+                         "trailer's duration) and print it: 'calibrate: segments S lost L fit BPC clean 0|1'")
     ap.add_argument("--grant-gap", type=int, default=GRANT_GAP, metavar="CYCLES",
                     help=f"cycles the model's output loses at each new drain (default {GRANT_GAP}, from the d1t0c1 logs)")
     ap.add_argument("--progress", action="store_true",
@@ -762,9 +862,28 @@ def main(argv=None):
     dur_us = trailer["duration_cycles"] / dec.CLOCK_HZ * 1e6 if trailer else None
     events, ms = ap_mod.tlp_events(recs, fi["format"], 16 if kind == "nic" else 4)
     tl, ainfo = None, None
+    raw = link_bpc(link, 1.0)
+    slowest = None if not raw else raw * LINK_EFF_MIN if a.calibrate else (a.link_rate or raw * LINK_EFF)
+    if a.calibrate and fi["format"] != "v2":
+        print(f"calibrate: {fi['format']} log, no pkt_wait")
+        return 1
     if fi["format"] == "v2":
-        arr_events, tl, ainfo = arrival(recs, events)
+        progress("rebuilding the arrival order (stalls inside packets put back)")
+        arr_events, tl, ainfo = arrival(recs, events, trailer and trailer["duration_cycles"], slowest)
         events = events + arr_events
+        if a.calibrate:
+            lf, lost = ainfo["link_fit"], ainfo["lost"]
+            clean = int(bool(lf) and ainfo["segments"] == 1 and (lost or 0) >= CAL_LOST_MIN
+                        and lf > raw * LINK_EFF_MIN * 1.001)
+            print(f"calibrate: segments {ainfo['segments']} lost {fmt(lost, '.4f')} fit {fmt(lf, '.3f')} clean {clean}")
+            if a.json:
+                with open(a.json, "a") as f:
+                    f.write(json.dumps(dict(path=a.log, kind=kind, link=link, calibrate=dict(ainfo, clean=clean))) + "\n")
+            return 0
+        if ainfo["link_fit"] and bpc:
+            bpc = ainfo["link_fit"]                  # arrivals and the model on one clock
+        elif a.link_rate and bpc:
+            bpc = a.link_rate
     elif names or "arr" in show_ports:
         print(f"pips-page-seq: {fi['format']} log has no pkt_wait: no arrival order or model", file=sys.stderr)
         names = []
@@ -822,6 +941,15 @@ def main(argv=None):
         print(f"\nArrival order (arr): each TLP's output start minus its pkt_wait. {ainfo['tlps']} TLPs, "
               f"{ainfo['segments']} segment(s), {ainfo['wait_saturated']} saturated waits; "
               f"{fmt(ainfo['moved'] and 100 * ainfo['moved'], '.1f')}% left in another position than they arrived")
+        lf = ainfo["link_fit"]
+        print(f"  The output as logged spans {fmt(ainfo['lost'] is not None and 100 * (1 - ainfo['lost']), '.1f')}% "
+              f"of the recording; "
+              + (f"stalls inside packets put back with the link at {lf:.1f} bytes per cycle "
+                 f"({(256 + TLP_OVERHEAD) / lf:.2f} cycles per 256 B TLP, {100 * lf / link_bpc(link, 1.0):.1f}% "
+                 f"of {link}'s raw rate; transmit buffer {ainfo['tx_buf']} B)"
+                 + (f", {ainfo['idle_extra']:.0f} more idle cycles at each saturated gap" if ainfo['idle_extra'] else "")
+                 if lf else "no stalls put back")
+              + f"; {fmt(ainfo['held'] and 100 * ainfo['held'], '.2f')}% of TLPs held to their input's output order")
         progress("what-if on the arrival order")
         wa = whatif(events, dur_us, [], a.strict, ARR)
         print(f"Batching what-if on arr (windows of the arrival order): {wa['ios']} I/Os")
@@ -829,7 +957,7 @@ def main(argv=None):
         for r in wa["rows"]:
             print(f"{r['w']:4d} {fmt(wa['rows'][0]['runs']['drive'], '25.2f')} {fmt(r['runs']['drive'], '7.2f')} "
                   f"{fmt(r['runs']['page'], '7.2f')} {fmt(r['runs']['ideal'], '7.2f')}")
-        out_items = [(e[5], e[2], e[4], tl[e[0]][0], tl[e[0]][1], tl[e[0]][2])
+        out_items = [(e[5], e[2], e[4], tl[e[0]][4], tl[e[0]][4] - (tl[e[0]][0] - tl[e[0]][1]), tl[e[0]][2])
                      for e in events if e[1] == 2 and e[0] in tl and e[5] is not None]
         svc, per_beat = service(out_items)
         waits = [e[7] for e in events if e[1] == 2 and e[7] is not None and e[7] != WAIT_SAT]
@@ -845,6 +973,7 @@ def main(argv=None):
                   + f"; else {per_beat:.2f} per beat. The model takes 1 cycle per 64-byte beat, "
                   + f"+{a.grant_gap} per new drain")
             print(f"  ... and no faster than the uplink, {link}"
+                  + (" fitted above" if ainfo["link_fit"] and bpc == ainfo["link_fit"] else "")
                   + (f" ({bpc:.1f} bytes per cycle: {(256 + TLP_OVERHEAD) / bpc:.2f} cycles per 256 B TLP)" if bpc else "")
                   + f": {fmt(mod_cyc, '.2f')} cycles per TLP on average; the log's output took "
                   + f"{fmt(wi['us_per_tlp'] and wi['us_per_tlp'] * dec.CLOCK_HZ / 1e6, '.2f')}. "
@@ -874,7 +1003,9 @@ def main(argv=None):
                        windows_arr=[dict(w=r["w"], wait_mean=r["wait_mean"], pages_mean=r["pages_mean"],
                                          pages_p99=r["pages_p99"], runs=r["runs"]) for r in wa["rows"]],
                        service={f"{c}/{p}": v for (c, p), v in svc.items()}, service_per_beat=per_beat,
-                       link=dict(name=link, bytes_per_cycle=bpc, eff=LINK_EFF, overhead=TLP_OVERHEAD),
+                       link=dict(name=link, bytes_per_cycle=bpc, eff=LINK_EFF, overhead=TLP_OVERHEAD,
+                                 fitted=bool(ainfo["link_fit"]) and bpc == ainfo["link_fit"],
+                                 rate_given=a.link_rate),
                        fifo=fifo, grant_gap=a.grant_gap, model_cycles_per_tlp=mod_cyc, model=mod)
         with open(a.json, "a") as f:
             f.write(json.dumps(rec) + "\n")

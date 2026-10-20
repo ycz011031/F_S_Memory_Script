@@ -32,7 +32,9 @@
 #                    (default self,std,sweep,sweepc1,sweepc1f512; "" for none).
 #                    The model sends no faster than the uplink: gen3x8 for
 #                    ssd, gen4x8 for nic (pips-page-seq.py --link; PIPS_LINK
-#                    in the environment overrides it)
+#                    in the environment overrides it), at the rate measured
+#                    first on this sweep's logs: the calibration pass below
+#                    (PIPS_LINK_RATE=bytes-per-cycle in the environment skips it)
 #   --show N         runs of each sequence to list per log, from record 100000
 #                    (default 600)
 #   --logs DIR       where the sweep logs are (default utils/logs)
@@ -46,7 +48,16 @@
 # log, and is used. Sweeps with "-strict-" in the name get --strict (a page's
 # new visit always misses in the IOTLB simulation).
 #
+# Calibration (with a model, v2 logs): pips-page-seq.py --calibrate on every
+# log first (a few seconds each): each log's output as logged lacks the stalls
+# inside packets, and the uplink rate that puts them back is fitted to the
+# log's duration. The median over the clean logs (one segment, a full link)
+# is the uplink's rate, passed to every log as --link-rate. Too few clean logs
+# (light load, or the NICs, whose datapath and not the link limits): no
+# --link-rate, so LINK_EFF of the raw rate. A line per log as it finishes.
+#
 # Output in DIR, then DIR.tar.gz of it:
+#   calibrate.txt           the fit per log and the rate chosen
 #   seq-<set>-<point>.txt   pips-page-seq.py's report: interleaving, what-ifs,
 #                           simulated IOTLB misses, the model, and both
 #                           sequences (--show, --port out,arr)
@@ -189,6 +200,38 @@ for set in $SETS; do
 done
 n=$(wc -l < "$jobs_file")
 echo "pips-seq-grab: $n logs ($(echo "$POINTS" | wc -w) points), $missing missing, $JOBS at a time, into $OUT"
+
+LINK_ARG=""
+[ -n "$MODEL" ] && [ -n "${PIPS_LINK:-}" ] && LINK_ARG="--link $PIPS_LINK"
+if [ -n "$MODEL" ] && [ -n "${PIPS_LINK_RATE:-}" ]; then
+    MODEL_ARG="$MODEL_ARG --link-rate $PIPS_LINK_RATE"
+    echo "uplink rate $PIPS_LINK_RATE bytes per cycle (PIPS_LINK_RATE)" | tee -a "$OUT/manifest.txt"
+elif [ -n "$MODEL" ] && [ "$n" -gt 0 ]; then
+    echo "pips-seq-grab: calibrating the uplink on $n logs (a line per log)"
+    cal() {
+        local set=$1 point=$2 log=$3 line
+        line=$($PY "$SEQ" "$log" --kind "$KIND" $LINK_ARG --calibrate 2>/dev/null | sed -n 's/^calibrate: //p')
+        echo "$set $point ${line:-failed}" >> "$OUT/calibrate.txt"
+        echo "  calibrate [$(wc -l < "$OUT/calibrate.txt")/$CTOTAL] $set $point: ${line:-failed}"
+    }
+    export -f cal
+    export PY SEQ KIND OUT LINK_ARG
+    CTOTAL=$n; export CTOTAL
+    : > "$OUT/calibrate.txt"
+    xargs -P "$JOBS" -n 3 bash -c 'cal "$@"' _ < "$jobs_file"
+    # "<set> <point> segments S lost L fit F clean C": the median fit of the clean ones
+    rate=$(awk '$NF == 1 { print $(NF-2) }' "$OUT/calibrate.txt" | sort -g |
+           awk '{ v[NR] = $1 } END { if (NR >= 3) printf "%.3f %d %.3f %.3f", v[int((NR + 1) / 2)], NR, v[1], v[NR] }')
+    if [ -n "$rate" ]; then
+        set -- $rate
+        MODEL_ARG="$MODEL_ARG --link-rate $1"
+        msg="uplink rate $1 bytes per cycle: the median fit of $2 clean logs (range $3-$4; calibrate.txt)"
+    else
+        msg="uplink rate: fewer than 3 clean logs (calibrate.txt), so the default (pips-page-seq.py --link-rate)"
+    fi
+    echo "pips-seq-grab: $msg"
+    echo "$msg" >> "$OUT/manifest.txt"
+fi
 
 one() {
     local set=$1 point=$2 log=$3

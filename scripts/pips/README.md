@@ -275,7 +275,27 @@ NIC's sends (ACKs) complete too. Tested on synthetic logs (`make check`).
 
 The out order is already shaped by the setting, so in a v2 log (0x0A04 on)
 the tool also rebuilds the order the TLPs entered the switch: each record's
-output start (from the gaps and lengths) minus its `pkt_wait`. That stream,
+output start (from the gaps and lengths) minus its `pkt_wait`. On a busy
+uplink that needs two corrections (2026-10-19). A stall inside a packet on
+the output is in neither `pkt_length` nor `pkt_gap` (PIO-MANUAL §8.4), but
+`pkt_wait` counts it: a full Gen3 x8 drive log's output as logged covers
+about two thirds of its duration, so a TLP's start minus its wait came out
+early by the stalls of the packets that left while it waited, one drive's
+TLPs swapped places (drive 1 showed ~480 open pages as arrived against ~34
+as sent), and the model, charging the real link, saw arrivals faster than
+any link and never drained (waits of ~1,400 µs against 1.5 recorded, every
+setting). So the output's times are rebuilt with those stalls put back: each
+packet holds the output for its beats or its time on the link, whichever is
+longer (the model's own rule), with the link's rate fitted so the rebuilt
+output ends at the trailer's duration, and no slower than `--link-rate`
+(time still missing then is idle past saturated gaps). And each input keeps
+its output order, which the batcher never changes (a FIFO; a read waits for
+it to empty). The model then charges the fitted rate, so arrivals and output
+run on one clock. `--calibrate` prints only the fit (`calibrate: segments S
+lost L fit BPC clean 0|1`); `pips-seq-grab.sh` runs it on every log first
+and passes the median of the clean ones (one segment, at least 10% lost) as
+`--link-rate`. The report says how much was put back, the fitted link, and
+the share of TLPs held to their input's order. That stream,
 `arr`, gets the same interleaving figures and windowed what-if, and
 `--show --port out,arr` lists both. Batching starts from it. Regrouping
 windows of `out` (the what-if above) is not what the batcher does: it groups
@@ -296,13 +316,15 @@ cycles more than its beats, e.g. a NIC's 512 B TLP 12 instead of 9, which is
 what holds one NIC to about 80 Gbps there), but no less than the uplink
 takes to carry it (`--link`, default `gen3x8` for drives, the
 bigserver uplink, and `gen4x8` for NICs, icx's; `none` for the datapath rate
-only): payload + 22 bytes at 96% of the link's raw rate. The pairs alone run
-at the 512-bit datapath's rate, 5 cycles per 256 B TLP; a Gen3 x8 link takes
-9.2, and its stalls fall between the pairs. Before 2026-10-19 the model had
-no link limit, which on the drives kept its FIFOs too empty (+21% page
-switches against the recorded ones, median; waits 0.15–0.26 µs where the
-logs show 0.6–1.5 µs on a full link). The NICs' datapath is slower than
-their Gen4 x8 uplink, so their model did not change. `--model self` runs the log's own setting (from its path, or
+only, and no stall rebuild): payload + 22 bytes at the rate fitted to the
+log (above), else `--link-rate`, else 96% of the link's raw rate. The pairs
+alone run at the 512-bit datapath's rate, 5 cycles per 256 B TLP as logged;
+the link's stalls fall inside the packets. Before 2026-10-19 the model had no
+link limit (FIFOs too empty: +21% page switches against the recorded ones,
+waits 0.15–0.26 µs); the first grab with the limit (10-19, before the stall
+rebuild) ran away instead, as above. The NICs' datapath is slower than their
+Gen4 x8 uplink, so their model matched the recorded order in both (median
+0.0%). `--model self` runs the log's own setting (from its path, or
 `--setting`) and prints it beside the recorded order and wait: the check of
 the model. `std` adds the eight 0x0A04 settings, `sweep` depths 1–64 at time
 255 (the longest the 8-bit field allows), `sweepc1` the same with the cap on,
@@ -358,7 +380,11 @@ bash scripts/pips/pips-analyze.sh nic --tmux     # icx: ~120 NIC logs, under an 
 1x64,16x4,64x1 --model self,std,sweep,sweepc1,sweepc1f512` (plus `--strict`
 on strict sweeps; `PIPS_LINK=gen3x8` in the environment passes `--link`) on
 one log per point and batcher setting, 4 at a time (`-j`), and packs the
-reports, one JSON line per log and a manifest into `~/seq-<sweep>.tar.gz`:
+reports, one JSON line per log and a manifest into `~/seq-<sweep>.tar.gz`.
+With a model it first calibrates the uplink: `--calibrate` on every log (a
+line each, a few seconds), the median fit of the clean ones becomes every
+log's `--link-rate` (`calibrate.txt`, and a line in `manifest.txt`;
+`PIPS_LINK_RATE` in the environment skips it):
 what the report's page-sequence and batching figures are built from. A line
 per log as it finishes (`[done/total]`, seconds; about a minute each on
 bigserver with the model). Defaults are the 0x0A04 sweeps' eight settings and
