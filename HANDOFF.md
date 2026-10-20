@@ -28,10 +28,12 @@ together, [LOCAL-SETUP.md](LOCAL-SETUP.md) for first-time provisioning.
   `pips-page-seq.py` now charges it only on a re-grant to the same input.
   Page v8 (Figures 3-6 redrawn: each device's own order instead of "as
   arrived", both designs' logs, FIFO 128/512 lines; TL;DR, Limits, bullets).
-  Page v9 (after user review): the ideal line now starts from d1t0c1's
-  recorded order (whole-log windows of 2D TLPs, from `seq.jsonl`), so depth
-  1 is d1t0c1 itself; why d1t0c1 is below strict alternation, and why the
-  NICs' by-NIC and by-page lines coincide, are in §8 item 12.
+  Page v9 (after user review): why d1t0c1 is below strict alternation, and
+  why the NICs' by-NIC and by-page lines coincide (§8 item 12). Page v10:
+  the "ideal" is replaced by two reference lines the user asked for: a
+  **floor** (the best any batcher could do holding D TLPs per device, free
+  to reorder, no FIFO/time/link/ordering) and a flat **raw** line (the
+  arrival order, unbatched; modelled until the hosts rerun).
   2026-10-20: the 10-19 analysis came back
   (`dualssd/1019/pips-analyze-ssd-20261019-1723/`, `dualnic/1019/pips-analyze-nic-20261019-1723/`).
   Payload or control by size: a size rule holds (drives: ring = 4 DW,
@@ -1944,6 +1946,24 @@ The cap and the v2 log work on hardware: all 804 logs FULL, no drops,
     half each); the logs don't record NIC stalls. Drives are the more
     interleaved: drive 0 always two pages at once, drive 1 at 64 KiB
     1.6-1.9 TLPs per run.
+    **v10: floor and raw (user: "the ideal was supposed to represent the
+    floor").** Floor(D) = per device, its own order (exact, from the
+    listing) sent by a batcher holding the next D TLPs: stay on the current
+    page while any held TLP has it, else start the oldest held TLP's page or
+    the most-held page (the better of the two; an achievable floor, not a
+    proven minimum); the two devices never interleave within a run.
+    `seqrec.floor_runs()`, `raw_floor()`; cached in `rawfloor.json` by `py -3
+    seqrec.py --rawfloor` (seconds, 8 processes). At 16 KiB: 3.4-5.2 page
+    switches per page at depth 1 (each drive's own runs) to 1.1-1.4 at 64;
+    NICs 2.3-3.1 to 1.3-1.5. Raw = the modelled arrival order (seqrec's
+    I/O-burst arrivals merged by time), unbatched, averaged over the point's
+    logs: drives 8.5-10.6 at 16 KiB, 17.9-18.6 at 64 KiB, 14.2-17.5 at 1 MiB;
+    NICs 4.7-7.1. The user expected raw at or slightly above d1t0c1; that
+    holds at 64 KiB and 1 MiB, but at 16 KiB recorded d1t0c1 (9.3-12.7) is
+    above the modelled raw: with a queue, one TLP per drain splits each
+    drive's I/O bursts. Per log (d1t0c1's own listing) raw was slightly above
+    d1t0c1 everywhere (12.75 vs 12.35 at 16 KiB); the average over all 16
+    logs is lower. The host rerun measures the arrival order and settles it.
 
 ### 0x0A05 depth sweep (2026-10-17/18, strict, cap on)
 
