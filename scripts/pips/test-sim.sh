@@ -381,12 +381,15 @@ for fb, want in ((128, 'full'), (512, 'depth')):
 assert ps.fifo_limits(128) == (109, 93) and ps.fifo_limits(512) == (493, 477)
 assert ps.cycles('data', 64, 5, ps.link_bpc('gen3x8')) > 9.1
 assert ps.cycles('data', 128, 9, ps.link_bpc('gen4x8')) == 9   # icx: the datapath binds
-# the grant gap: depth 1 with the cap, two backed-up inputs of 512 B TLPs, one drain each in turn
+# the grant gap: depth 1 with the cap, one-TLP drains. Two backed-up inputs take turns: no gap (two NICs
+# carry ~105 Gbps under d1t0c1); one input alone pays it on every drain (9 beats + 3, ~80 Gbps for one NIC)
 arr = [(0, i % 2, 'data', 9, 9) for i in range(40)]
 out = ps.batcher(arr, 1, 0, 1, 0, None, 128, 3)
-gaps = {b[1] - a[1] for a, b in zip(out, out[1:])}
-assert gaps == {12}, gaps                                       # 9 beats + 3, as d1t0c1 logs show
+gaps = {b[1] - a[1] for a, b in zip(out[1:], out[2:])}         # after the first grant
+assert gaps == {9} and out[1][1] == 12, (gaps, out[:2])
 assert len({d for _j, _s, d in out}) == 40 and [arr[j][1] for j, _s, _d in out[:4]] == [0, 1, 0, 1]
+out = ps.batcher([(0, 0, 'data', 9, 9) for _ in range(20)], 1, 0, 1, 0, None, 128, 3)
+assert {b[1] - a[1] for a, b in zip(out, out[1:])} == {12}, out
 out = ps.batcher([(0, 0, 'data', 9, 9) for _ in range(16)], 16, 0, 0, 0, None, 512, 3)
 assert [b[1] - a[1] for a, b in zip(out, out[1:])] == [12] + [9] * 14, out   # the gap at the grant only
 assert ps.cycles('data', 64, 5, ps.link_bpc('gen3x8')) > 5 + 3  # bigserver: the link hides the gap

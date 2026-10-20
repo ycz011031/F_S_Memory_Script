@@ -487,7 +487,8 @@ stay on the hosts; only results, grabs and reports come back.
 | `load4.py` | loaders: `dualssd/1016`, `dualnic/1016` JSONL (0x0A04) |
 | `build4.py` | 0x0A04 figures and tables: cap heatmaps (Figure 1), link split, waits, pcm-iio samples, NIC heatmap (Figure 2), icx PCM, 09-29 comparison |
 | `seq4.py` | Tables 6-7 (page order as sent, first grab) |
-| `seqarr.py` + `seqarr.js` | Figures 3-6: per-point data files (arrival/out listings, model sweeps, window ideal, recorded), the drive bullets; JS draws them averaged over each point's logs |
+| `seqrec.py` | page order recovered from the 10-19 grabs' listings (no raw logs): each device's own order, the batcher model on it with I/O bursts and an output rate fitted to each log's wait, the window ideal, the check; `py -3 seqrec.py --write` (~15 min, 8 processes) caches `seqrec.json`, prints the checks (`seqrec-check.txt`) |
+| `seqarr.py` + `seqarr.js` | Figures 3-6: per-point data files (listing as sent, recorded, seqrec's lines for both FIFOs), the bullets under Figures 4 and 6 (`order_points()`), the TL;DR numbers; JS draws each device's own order and the lines averaged over each point's logs (both designs' for the drives) |
 | `deep4.py` + `deep/` | Figure 7, Table 8: time limits per depth, from `pips-timeout-pick.py` output (`pick-*`, `eval-*`, `eval-*-f512` = 0x0A05 FIFO) |
 | `a05.py` | the 0x0A05 section: Figure 8 (each depth vs d1t0c1), Table 9 (waits, link split), Table 10 (NICs) |
 | `sizes.py` | the "Payload or control, by size" section: Table 11 and its `SZ*` slots, from the 10-19 analyses' `traffic.jsonl` (`FILES`; add the NICs' 0x0A05 one when it comes) |

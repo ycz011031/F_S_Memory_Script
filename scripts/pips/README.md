@@ -310,10 +310,11 @@ alternate; a read waits until its input's writes have left (which flushes
 that FIFO and holds the input behind it) and then goes ahead of the next
 batched packet. A TLP holds the output one cycle per 64-byte beat (the
 512-bit datapath: what back-to-back pairs within a drain take in every log),
-plus a grant gap of 3 cycles at each new drain or pass-through packet
-(`--grant-gap`; in d1t0c1 logs every drain is one TLP and each takes 3
-cycles more than its beats, e.g. a NIC's 512 B TLP 12 instead of 9, which is
-what holds one NIC to about 80 Gbps there), but no less than the uplink
+plus a grant gap of 3 cycles at each new drain from the input it just
+served, or a pass-through packet (`--grant-gap`; one NIC alone under d1t0c1,
+every drain one TLP, takes 12 cycles per 512 B TLP instead of 9, which holds
+it to about 80 Gbps; two NICs taking turns under d1t0c1 carry ~105 Gbps, so
+a grant to the other input hides the gap, 2026-10-20), but no less than the uplink
 takes to carry it (`--link`, default `gen3x8` for drives, the
 bigserver uplink, and `gen4x8` for NICs, icx's; `none` for the datapath rate
 only, and no stall rebuild): payload + 22 bytes at the rate fitted to the

@@ -15,9 +15,20 @@ together, [LOCAL-SETUP.md](LOCAL-SETUP.md) for first-time provisioning.
   pages). On the Windows analysis machine `claude.md` (git-ignored) adds its
   local paths, tools and editing gotchas.
 - **To run (2026-10-20):** `scripts/pips/pips-analyze.sh` again on both hosts
-  (§8 "Next" item 0): the 10-19 run's drive model ran away (item 11); its
-  length verdicts stand. Results come back as `~/pips-analyze-<kind>-*.tar.gz`.
-- **Last updated:** 2026-10-20: the 10-19 analysis came back
+  (§8 "Next" item 0): the 10-19 run's models were wrong (items 11-12); its
+  length verdicts stand. Until it is back, the page's Figures 4/6 come from
+  the listing-based recovery (item 12). Results come back as
+  `~/pips-analyze-<kind>-*.tar.gz`.
+- **Last updated:** 2026-10-20 (later): page order **recovered from the
+  10-19 listings** without the raw logs (§8 item 12): each device's own order
+  is exact from the order as sent; the batcher model runs on it with I/O
+  bursts and an output rate fitted to each log's recorded wait; checks
+  within a few % from 16 KiB up. The NIC model's grant gap was wrong too
+  (charged at every drain; two NICs taking turns don't pay it):
+  `pips-page-seq.py` now charges it only on a re-grant to the same input.
+  Page v8 (Figures 3-6 redrawn: each device's own order instead of "as
+  arrived", both designs' logs, FIFO 128/512 lines; TL;DR, Limits, bullets).
+  2026-10-20: the 10-19 analysis came back
   (`dualssd/1019/pips-analyze-ssd-20261019-1723/`, `dualnic/1019/pips-analyze-nic-20261019-1723/`).
   Payload or control by size: a size rule holds (drives: ring = 4 DW,
   RELIABLE on drive 0, 99.88% on drive 1, which also writes small payload
@@ -1834,8 +1845,11 @@ The cap and the v2 log work on hardware: all 804 logs FULL, no drops,
     the uplink's stalls (2026-10-20).** `pips-analyze.sh` on both hosts
     (repo 8a00e1f74; `dualssd/1019/pips-analyze-ssd-20261019-1723/`, 1,440
     logs, both sweeps; `dualnic/1019/pips-analyze-nic-20261019-1723/`, the
-    0x0A04 sweep only). NICs: the model matches (self median 0.0%, waits
-    within 0.02 µs except d1t0c1 0.85 vs 0.45). Drives: every setting's
+    0x0A04 sweep only). NICs: the page-switch self check matched (median
+    0.0% over all 12 points), but at 5 and 10 flows with both NICs its waits
+    ran to 30-1,400 µs: the grant gap at every drain (item 12; an earlier
+    note here said the waits matched, which held only for the median per
+    setting over all points). Drives: every setting's
     model wait ~1,000-1,450 µs against 1.4-1.9 recorded, from a nominal load
     (model cycles over the log's true time per TLP) of 0.78 up, and
     page-switch self check +15% (0x0A04) / +18% (0x0A05) median. Cause: the
@@ -1865,7 +1879,40 @@ The cap and the v2 log work on hardware: all 804 logs FULL, no drops,
     matches the logged order (12.99 vs 13.00) and wait (0.73 vs 0.72 µs);
     the committed code gave 200-400 µs waits on the same logs
     (`test-sim.sh`, "stalls inside packets"). The NICs (Gen4 x8, ~no stalls)
-    are not expected to change.
+    are not expected to change by this fix; their grant gap is (item 12).
+12. **Recovered without the raw logs, and the grant gap (2026-10-20).**
+    The 10-19 grab's listings (`seq-<setting>-<point>.txt`, 600 runs as sent
+    from record 100,000, 600-3,500 TLPs) are exact, and the batcher never
+    reorders an input, so each device's own arrival order is the listing
+    filtered to it. `dualssd/report-gen/seqrec.py` (git-ignored) runs
+    pips-page-seq's `batcher()` on it: each I/O (drive command, NIC packet,
+    ending at its completion entry) arrives as a burst at the device's pace
+    (9 cycles per 256 B drive TLP, 10 per 512 B NIC TLP), idle between I/Os
+    so each device keeps its share of the log's true rate; I/Os over 64
+    TLPs arrive evenly (credit-paced); the output's rate is fitted (from the
+    raw link rate down) so the log's own setting waits as recorded; the
+    listing runs twice (warm-up). Lines scaled to the whole log by recorded
+    page switches. The check (own setting vs the log's own listing, not
+    fitted): drives 0x0A04 median per setting -4.5% to +7.8% from 16 KiB up,
+    -4% to +5% at 4-8 KiB; 0x0A05 depths 4-64 -3% to +4%; misses at 0x0A05
+    d1t0c1/d2t22c1 at 8-16 KiB (+15% to +39%); NICs -10% to +15% at 5-15
+    flows, +6% to +24% at 30. Evenly paced arrivals failed at 4 KiB (+73% to
+    +97%): bursts matter. A pure full-backlog model (no time) worked on
+    0x0A04 (FIFOs full) but not 0x0A05 (FIFOs half full). Findings (page v8,
+    Figure 4 bullets from `seqarr.order_points()`): depth 1 is round robin
+    only in the window ideal (16.6-17.5 page switches per page at 16 KiB);
+    recorded d1t0c1 is 9.3-12.7 because each I/O's read flushes its drive's
+    FIFO (a quarter of the TLPs at 16 KiB, 8 per drive, leave in such
+    drains) and an idle input lets the other go on; the model's cap-on line
+    follows the ideal to the FIFO's size (0x0A04: flat from 16 at 18 drive
+    TLPs; 0x0A05 goes on), the recorded 0x0A05 settings lie near it; the
+    model's waits (fixed arrival pace) don't reach 0x0A05's recorded
+    4.2-4.7 µs. **Grant gap**: two NICs carry ~105 Gbps under d1t0c1, which
+    12 cycles per 512 B TLP (85 Gbps max) can't, so the gap is hidden when
+    the grant goes to the other input; one NIC alone pays it (80 Gbps).
+    `batcher()` now charges it only for a new drain from the input served
+    last (or the very first, or a pass-through packet); `test-sim.sh` asserts
+    9 cycles alternating, 12 for one input.
 
 ### 0x0A05 depth sweep (2026-10-17/18, strict, cap on)
 
@@ -1923,9 +1970,10 @@ The cap and the v2 log work on hardware: all 804 logs FULL, no drops,
 
 ### Next
 
-0. **Rerun the analysis on both hosts with the stall rebuild** (item 11;
-   the 10-19 run is in `*/1019/pips-analyze-*-20261019-1723/`, its drive
-   model unusable, its length verdicts fine). bigserver: `bash
+0. **Rerun the analysis on both hosts with the stall rebuild and the new
+   grant gap** (items 11-12; the 10-19 run is in
+   `*/1019/pips-analyze-*-20261019-1723/`, its models unusable, its length
+   verdicts fine; the page shows the listing-based recovery meanwhile). bigserver: `bash
    scripts/pips/pips-analyze.sh ssd --no-lengths -j 16 --tmux` (page order
    only: the lengths are in; calibration ~5 min per sweep, then ~3 h at -j
    16); icx: `bash scripts/pips/pips-analyze.sh nic --tmux` (both sweeps now
@@ -1935,14 +1983,14 @@ The cap and the v2 log work on hardware: all 804 logs FULL, no drops,
    median fit of N clean logs` line (bigserver: expect ~30-31 B/cycle, about
    98% of Gen3 x8's raw 31.5; icx: few or no clean logs, fine). Copy the
    tarballs back, unpack in `dualssd/1020/` and `dualnic/1020/`. Then:
-   `py -3 seqarr.py` (model self: want the drives within a few %, waits
-   near the recorded 1.5 µs; JSON `arrival.lost`, `arrival.held`,
-   `link.fitted`), point `seqarr.DIRS` at the new `seq-*` folders (and add
-   the 0x0A05 ones: their diamonds sit at the dsweep depths, `seqarr.js`
-   reads depth from the setting name), redo Figure 4's as-arrived/ideal and
-   Table 6 for the drives, rebuild, publish; the length verdicts per design
-   go in the 0x0A05 section (10-19 `traffic.txt`, end; NIC 0x0A05 from the
-   rerun).
+   check the whole-log model against the recorded order (`seq.jsonl`:
+   `model[]` own setting vs `recorded`; waits near the recorded 1.5 µs;
+   `arrival.lost`, `arrival.held`, `link.fitted`) and against the
+   listing-based recovery (`report-gen/seqrec.json`). If it holds, give
+   `seqarr.py` a whole-log source (its `log_data()` now reads seqrec's
+   lines; the whole-log grab has `model[]` and `windows_arr` per log),
+   rebuild, publish; add the NICs' 0x0A05 `traffic.jsonl` to
+   `sizes.FILES`.
 0b. **Finish the NIC depth sweep** after reprogramming 0x0A05: first
    `--cfgs "24:255" --caps 1 --tag d24repro "10 15"` to see if the stop
    repeats (snapshot if it does), then `--cfgs "24:255 36:255 64:255" --caps

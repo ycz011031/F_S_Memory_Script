@@ -82,8 +82,10 @@ cycles non-empty, or when nearly full; a grant sends what the FIFO holds then
 its input's writes are out and then goes first. A TLP holds the output one
 cycle per 64-byte beat (the 512-bit datapath; what back-to-back pairs within
 a drain take in every log), plus a grant gap of 3 cycles whenever the output
-takes a new drain or a pass-through packet (--grant-gap; d1t0c1 logs, where
-every drain is one TLP, take 3 more cycles per TLP than its beats), but no
+takes a new drain from the input it just served, or a pass-through packet
+(--grant-gap: one NIC alone under d1t0c1, every drain one TLP, takes 12
+cycles per 512 B TLP instead of 9; two NICs alternating under d1t0c1 carry
+~105 Gbps, so a grant to the other input hides it), but no
 less than the uplink takes to carry it (--link; a Gen3 x8 uplink is slower
 than the datapath). --progress prints each stage to stderr.
 Reported: page switches per I/O as sent, with each drain regrouped by page
@@ -162,11 +164,13 @@ LINK_GTS = {"gen3": 8.0, "gen4": 16.0, "gen5": 32.0}
 LINK_DEFAULT = {"ssd": "gen3x8", "nic": "gen4x8"}
 LINK_EFF = 0.96
 TLP_OVERHEAD = 22
-# Cycles the output loses when it takes a new drain (or a pass-through packet):
-# the master FSM re-arbitrates at the packet boundary. In d1t0c1 logs every
-# drain is one TLP, and back-to-back TLPs of one input are 3 cycles further
-# apart than their beats (drives: 256 B data 8-9 vs 5, entries 4 vs 1; NICs:
-# 512 B data 12 vs 9, 64 B entries 5 vs 2); in multi-TLP drains they are not.
+# Cycles the output loses when it takes a new drain from the input it just
+# served (or a pass-through packet): the master FSM re-arbitrates at the packet
+# boundary. One NIC alone under d1t0c1 (every drain one TLP) sends a 512 B TLP
+# every 12 cycles instead of 9 (about 80 Gbps). A grant to the other input
+# costs nothing measurable: two NICs alternating under d1t0c1 carry ~105 Gbps,
+# which 12 cycles per TLP (85 Gbps at most) can't; charging it there made the
+# 10-19 grab's NIC model back up (HANDOFF section 8, item 11).
 GRANT_GAP = 3
 
 
@@ -541,8 +545,8 @@ def batcher(arr, depth, time, cap, mrd_batched, stats=None, fifo_beats=FIFO_DEFA
     empty, which flushes that FIFO and holds back the input behind it, and
     then goes out ahead of the next batched packet. An input stops taking
     packets at its admit limit. A TLP holds the output its `cycles`; the
-    first TLP of a drain, and a pass-through packet, at least its beats +
-    `grant_gap`. Returns the TLPs in output order as (arr index, start cycle,
+    first TLP of a drain from the input served last, and a pass-through
+    packet, at least its beats + `grant_gap`. Returns the TLPs in output order as (arr index, start cycle,
     drain number).
     stats, a dict, gets per drain what asked for it: "depth" (the FIFO held
     DEPTH packets; also when a drain's leftovers already did), "full",
@@ -567,15 +571,16 @@ def batcher(arr, depth, time, cap, mrd_batched, stats=None, fifo_beats=FIFO_DEFA
     f2 = collections.deque()
     owner, rr_last, drain_no = None, 1, 0
     nxt, t, out = 0, 0, []
-    prev_d = None                                      # drain of the TLP last sent; -1 pass-through
+    prev_d, prev_src = None, None                      # drain (-1 pass-through) and input of the TLP last sent
 
     def occ(j, d):
-        """Cycles TLP j holds the output; a new source costs the grant gap."""
-        nonlocal prev_d
+        """Cycles TLP j holds the output; a new drain from the same input, or a
+        pass-through packet, costs the grant gap."""
+        nonlocal prev_d, prev_src
         x = arr[j][4]
-        if grant_gap and (d != prev_d or d < 0):
+        if grant_gap and (d < 0 or (d != prev_d and (prev_src is None or arr[j][1] == prev_src))):
             x = max(x, arr[j][3] + grant_gap)
-        prev_d = d
+        prev_d, prev_src = d, arr[j][1]
         return x
 
     def passes(j):
@@ -795,7 +800,8 @@ def main(argv=None):
                     help="only fit the uplink's rate to this log (stalls inside packets, from the "
                          "trailer's duration) and print it: 'calibrate: segments S lost L fit BPC clean 0|1'")
     ap.add_argument("--grant-gap", type=int, default=GRANT_GAP, metavar="CYCLES",
-                    help=f"cycles the model's output loses at each new drain (default {GRANT_GAP}, from the d1t0c1 logs)")
+                    help=f"cycles the model's output loses at each new drain from the input it just served "
+                         f"(default {GRANT_GAP}, from one-NIC d1t0c1 logs)")
     ap.add_argument("--progress", action="store_true",
                     help="print each stage to stderr as it starts (liveness for long runs)")
     ap.add_argument("--fifo", type=int, metavar="BEATS",
@@ -971,7 +977,7 @@ def main(argv=None):
                   f"Output cycles per TLP when queued, from this log: "
                   + ", ".join(f"{c} {p} DW {v}" for (c, p), v in sorted(svc.items(), key=lambda kv: str(kv[0])))
                   + f"; else {per_beat:.2f} per beat. The model takes 1 cycle per 64-byte beat, "
-                  + f"+{a.grant_gap} per new drain")
+                  + f"+{a.grant_gap} per new drain from the same input")
             print(f"  ... and no faster than the uplink, {link}"
                   + (" fitted above" if ainfo["link_fit"] and bpc == ainfo["link_fit"] else "")
                   + (f" ({bpc:.1f} bytes per cycle: {(256 + TLP_OVERHEAD) / bpc:.2f} cycles per 256 B TLP)" if bpc else "")
