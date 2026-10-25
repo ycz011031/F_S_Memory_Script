@@ -553,10 +553,17 @@ NICLOG1="$TL/dualnic-pips-strict-1-id0a04-d8t22c1-uncapped-f5-both-RUN-server-0/
 run 0 "pips-seq-grab.sh --manifest: that sweep's measured runs, nothing else" \
     bash "$HERE/pips-seq-grab.sh" --manifest "$MF" -j 2 -o "$T/grab-m"
     has 'carry another sweep ID; left out'; has '2 logs (1 points), 0 missing'; has '2 of 2 logs analysed'
-grep -q '^manifest .* sweep_id G1@h@1$' "$T/grab-m/manifest.txt" && grep -q -- '--model self,d8t22,d8t22c1 ' "$T/grab-m/manifest.txt" &&
+grep -q '^manifest .* sweep_id G1@h@1$' "$T/grab-m/manifest.txt" &&
+    grep -q -- '--model self,d8t22,d8t22c1,sweep,sweepc1,sweepc1f512 ' "$T/grab-m/manifest.txt" &&
     grep -q '^sweep dualnic-pips-strict-G1  sets: d8t22 d8t22c1$' "$T/grab-m/manifest.txt" &&
     [ -s "$T/grab-m/seq-d8t22c1-uncapped-f5-both.txt" ] && ! grep -q 'f30\|datapath\|d16t64' "$T/grab-m/manifest.txt" &&
     ok "  sweep, settings and model from the manifest" || bad "  $(cat "$T/grab-m/manifest.txt")"
+# A 0x0a06 sweep (the page batcher): no batcher model, recorded order only.
+sed 's/^# kind=nic$/# kind=nic\n# design_id=0x0a06/' "$MF" > "$T/G6.manifest.tsv"
+run 0 "pips-seq-grab.sh --manifest of a 0x0a06 sweep: no model" \
+    bash "$HERE/pips-seq-grab.sh" --manifest "$T/G6.manifest.tsv" -j 2 -o "$T/grab-6"
+    has '2 of 2 logs analysed'; lacks 'calibrating the uplink'
+! grep -q -- '--model' "$T/grab-6/manifest.txt" && ok "  no --model in the command" || bad "  $(grep -- 'pips-page-seq.py' "$T/grab-6/manifest.txt")"
 
 echo "-- run-dualssd-experiment.sh / run-dualnic-experiment.sh hooks (pips-lib.sh)"
 # The runners' own functions, run against the model.
