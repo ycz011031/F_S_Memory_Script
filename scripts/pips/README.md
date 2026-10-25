@@ -604,6 +604,9 @@ If the switch stops answering, the campaign takes `pips-hang-snapshot.sh` at
 once, skips the switch phases still to come, says so in large letters, and
 still analyses and packs. `--only`, `--skip`, `--no-wire`, `--no-hw`,
 `--no-analysis`, `--no-pending`: `--help`.
+`--retire <stamp>` moves a failed campaign's files (results in `~`, its run
+folders in `utils/logs` and `utils/reports`) into `~/pips-retired/<stamp>/`
+and runs nothing; nothing is deleted.
 
 ## Without the host path: XSCT
 

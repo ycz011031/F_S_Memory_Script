@@ -24,6 +24,11 @@
 #   --no-hw           NIC: leave out the hardware-paced phase
 #   -j N              logs at a time in the analysis (default: half the CPUs, at most 16)
 #   --stamp S         the label prefix of this campaign's sweeps (default c<MMDDhhmm>)
+#   --retire S        run nothing: move campaign S's files out of the way into
+#                     ~/pips-retired/S/ (its ~/dual<kind>-pips-*-S* results and
+#                     manifests, ~/pips-campaign-<kind>-S[.tar.gz], and its run
+#                     folders in utils/logs and utils/reports, TLP logs included).
+#                     Nothing is deleted; rm -rf ~/pips-retired/S when sure
 # Environment: HEARTBEAT=seconds between liveness lines (default 300),
 # RESULTS_DIR (default ~), DUALSSD_ARGS (default "--membw 0").
 #
@@ -71,10 +76,11 @@ case "$KIND" in
 esac
 PASS=("$KIND"); IN_TMUX=0
 for a in "$@"; do if [ "$a" = --tmux ]; then IN_TMUX=1; else PASS+=("$a"); fi; done
-DRY=0; ONLY=""; SKIP=""; ANALYSIS=1; PENDING=1; WIRE=1; HW=1; JOBS=""; STAMP=""
+DRY=0; ONLY=""; SKIP=""; ANALYSIS=1; PENDING=1; WIRE=1; HW=1; JOBS=""; STAMP=""; RETIRE=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --tmux) shift ;;
+        --retire) RETIRE="$2"; shift 2 ;;
         --dry-run) DRY=1; shift ;;
         --only) ONLY="$2"; shift 2 ;;
         --skip) SKIP="$2"; shift 2 ;;
@@ -88,6 +94,29 @@ while [ $# -gt 0 ]; do
         *) echo "pips-campaign: unknown option $1 (--help)" >&2; exit 2 ;;
     esac
 done
+# --retire: move one earlier campaign's files aside, then stop. Never deletes.
+if [ -n "$RETIRE" ]; then
+    case "$RETIRE" in [A-Za-z]*[0-9]*) ;; *) echo "--retire: not a campaign stamp: '$RETIRE'" >&2; exit 2 ;; esac
+    case "$RETIRE" in *[!A-Za-z0-9]*) echo "--retire: letters and digits only" >&2; exit 2 ;; esac
+    if pgrep -f "pips-campaign.sh .*--stamp $RETIRE" >/dev/null 2>&1; then
+        echo "--retire: campaign $RETIRE is still running" >&2; exit 1
+    fi
+    R="$HOME/pips-retired/$RETIRE"
+    mkdir -p "$R/home" "$R/utils-logs" "$R/utils-reports" || exit 1
+    n=0
+    mv_some() {   # <destination> <paths...>: those that exist
+        local d="$1" p; shift
+        for p in "$@"; do [ -e "$p" ] && mv "$p" "$d/" && n=$((n + 1)); done
+    }
+    shopt -s nullglob
+    mv_some "$R/home" "${RESULTS_DIR:-$HOME}"/dual"$KIND"-pips-*-"$RETIRE"[a-z]* \
+        "$HOME/pips-campaign-$KIND-$RETIRE" "$HOME/pips-campaign-$KIND-$RETIRE.tar.gz"
+    mv_some "$R/utils-logs" "$REPO"/utils/logs/dual"$KIND"-pips-*-"$RETIRE"[a-z]*
+    mv_some "$R/utils-reports" "$REPO"/utils/reports/dual"$KIND"-pips-*-"$RETIRE"[a-z]*
+    shopt -u nullglob
+    echo "pips-campaign: retired $n item(s) of campaign $RETIRE ($KIND) into $R ($(du -sh "$R" 2>/dev/null | cut -f1))"
+    exit 0
+fi
 STAMP=${STAMP:-c$(date +%m%d%H%M)}
 case "$STAMP" in [A-Za-z]*) ;; *) echo "--stamp: must start with a letter" >&2; exit 2 ;; esac
 case "$STAMP" in *[!A-Za-z0-9]*) echo "--stamp: letters and digits only" >&2; exit 2 ;; esac
