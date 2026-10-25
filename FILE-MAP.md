@@ -309,6 +309,7 @@ falls back to default events and every column shifts.
 | File | Role |
 |---|---|
 | `run-dualssd-experiment.sh` | driver: dual-SSD, one configuration (§2.1) |
+| `ssd-irq-placement.sh` | manual / called by `pips-campaign.sh ssd`: for `SSD_CORES`, each fio core's queue and completion-interrupt CPU per drive; `--check` fails when both drives complete on one CPU or fio runs on an interrupt CPU (the 10-25 soft lockups). Run after every reboot |
 | `run-dualnic-experiment.sh` | driver: dual-NIC, one configuration (§2.2) |
 | `nic-host-snapshot.sh` | manual, read-only, on the host itself: each NIC's PCIe path to its root port (link status and capability, raw Gbps, MPS/MRRS, relaxed ordering, RCB), the kernel's "available PCIe bandwidth" lines, NIC settings (pause, offloads, channels, rings, coalescing, mlnx_qos, qdisc, IRQ CPUs), TCP sysctls, counters (`ethtool -S`, `nstat`); prints a summary → `~/nic-snapshot-<host>-<time>.tar.gz`. For styx's shared card (HANDOFF §8 item 13) |
 | `dualssd-results.py` | called: fio summing, JSONL records, summary and grid tables |

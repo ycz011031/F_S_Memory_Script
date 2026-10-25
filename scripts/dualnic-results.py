@@ -310,6 +310,9 @@ def summary(a):
                 cont = f'{100 * (both / (sum(b) / len(b)) - 1):+.1f}%'
         wr = m.get('PCIe_wr_tput')
         flag = '  <-- LINK BOUND' if (wr or 0) > 100 else ''
+        lk = sum(run.get('kernel_soft_lockups') or 0 for run in r.get('per_run', []))
+        if lk:
+            flag += f'  <-- {lk:.0f} SOFT LOCKUP(S)'
         print(f"{tag(r):<{tw}} {str(r.get('bandwidth_per_nic')):<9} "
               f"{str(r.get('flows_per_nic')):>5} {str(r.get('mode')):<9} "
               f"{fmt(m.get('tput_total_gbps'), s.get('tput_total_gbps'), '.2f'):>16} "

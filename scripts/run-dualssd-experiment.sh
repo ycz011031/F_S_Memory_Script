@@ -162,9 +162,14 @@ done
 # instances: the lighter drive keeps the head of its own list (fio off the
 # interrupt CPUs), the heavier one takes its own list plus the rest. With 18
 # cores, 4+32 gives 2 and 16 cores (2 instances each); 8+16 gives 6 and 12.
+# SSD_SPLIT_CORES=0 (setup-server.sh) keeps each drive on its own list in an
+# uneven co-run too: when the drives' queues for one CPU group interrupt the
+# same CPU (bigserver from the 10-25 boot: CPUs 36-40 and 41-45 complete both
+# drives on CPU 40 / 45), borrowing the other drive's cores puts both drives'
+# completions, and their strict-mode invalidations, on one CPU again.
 CORES=()
 for i in "${ACTIVE[@]}"; do CORES[$i]=${SSD_CORES[$i]}; done
-if [ "$ssds" -eq 2 ] && [ "${JOBS[0]}" != "${JOBS[1]}" ]; then
+if [ "$ssds" -eq 2 ] && [ "${JOBS[0]}" != "${JOBS[1]}" ] && [ "${SSD_SPLIT_CORES:-1}" = 1 ]; then
     lo=$(( JOBS[0] < JOBS[1] ? 0 : 1 )); hi=$(( 1 - lo ))
     IFS=',' read -r -a mine <<< "${SSD_CORES[$lo]}"
     IFS=',' read -r -a other <<< "${SSD_CORES[$hi]}"

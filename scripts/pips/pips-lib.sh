@@ -339,6 +339,7 @@ pips_sweep_save() {
 # --pips-log 1 the log region is zeroed, so leftovers never pass for data.
 pips_run_cfg() {
     local now
+    PIPS_RUN_T0=$(date +%s)            # for pips_lockups_collect
     pips_sweep_mark
     if [ -n "$pips_cfg" ]; then
         pipsc cfg > "$L/pips-cfg.txt" 2>&1
@@ -394,6 +395,7 @@ pips_collect() {
     [ -s "$rpt" ] || printf 'status: FAILED\ndesign_id: %s\n' "${pips_design:-none}" > "$rpt"
     [ -n "${PIPS_SWEEP_ID:-}" ] && printf 'sweep_id: %s\n' "$PIPS_SWEEP_ID" >> "$rpt"
     pips_status_collect "$rpt"
+    pips_lockups_collect "$rpt"
     PIPS_STATUS+=( "$(awk '/^status:/{print $2; exit}' "$rpt")" )
     local got=""
     for got in "$bin.gz" "$bin"; do [ -s "$got" ] && break; got=""; done
@@ -432,6 +434,21 @@ pips_status_collect() {
         echo "!!!!!!!! output idle with data held and forced a drain ($f)" >&2
     fi
     echo "   PIPS status: $(grep -E '^(stat_flags|ovf_count|mrd_wait_max_us)' "$f" | xargs)"
+}
+
+# pips_lockups_collect <rpt>: kernel soft lockups since this run began
+# (pips_run_cfg), as kernel_soft_lockups: in the .rpt (and so the record), with
+# a warning. A run with any is not clean data: on bigserver they came from
+# strict-mode IOTLB invalidations piling onto one interrupt CPU (HANDOFF §8
+# "0x0A06 campaign"), and they stall pcm-iio and sar as well.
+pips_lockups_collect() {
+    local n
+    [ -n "${PIPS_RUN_T0:-}" ] || return 0
+    n=$(sudo -n journalctl -k --since "@$PIPS_RUN_T0" 2>/dev/null | grep -c 'soft lockup')
+    echo "kernel_soft_lockups: ${n:-0}" >> "$1"
+    if [ "${n:-0}" -gt 0 ]; then
+        echo "!!!!!!!! WARNING: $n kernel soft lockup(s) during this run (journalctl -k): its numbers are not clean" >&2
+    fi
 }
 
 # pips_meta: PIPS_META = the --meta arguments for the results dump.

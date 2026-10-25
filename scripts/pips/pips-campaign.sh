@@ -275,7 +275,14 @@ sweep_run() {
     else
         note "sweep $label left no manifest (exit $rc): it did not start; see campaign.log"
     fi
-    [ "$rc" = 130 ] && { STOPPED=1; note "sweep $label stopped by hand"; }
+    if [ -e "$OUT/.lockup-stop" ]; then
+        STOPPED=1
+        note "sweep $label STOPPED by the soft-lockup guard ($(cat "$OUT/.lockup-stop")): see journalctl -k"
+        banner "KERNEL SOFT LOCKUPS: the campaign stopped its sweeps (soft-lockup guard)." \
+               "Check the drives' interrupt CPUs against SSD_CORES (HANDOFF §8 0x0A06 campaign)."
+    elif [ "$rc" = 130 ]; then
+        STOPPED=1; note "sweep $label stopped by hand"
+    fi
     [ "$rc" = 0 ] || [ "$rc" = 130 ] || note "sweep $label exited $rc"
     if grep -qs 'ID reads 0xffffffff' "$REPO/utils/logs/$nm/pips-sweep.log" || ! switch_ok; then
         switch_dead "during sweep $label"
@@ -425,6 +432,11 @@ sudo -n "$PIPS" status > "$OUT/status-at-start.txt" 2>&1 && say "status register
 free=$(df -Pk "$HOME" | awk 'NR == 2 { printf "%d", $4 / 1048576 }')
 [ "${free:-0}" -lt 20 ] && note "only ${free} GB free in $HOME: the TLP logs take ~1-2 MB per run"
 say "disk: ${free} GB free in $HOME; analysis -j $JOBS"
+if [ "$KIND" = ssd ]; then
+    # Both drives completing on one CPU livelocks it in strict mode (10-25).
+    bash "$REPO/scripts/ssd-irq-placement.sh" --check | tee "$OUT/irq-placement.txt" ||
+        { echo "ERROR: the drives' fio cores are unsafe for this boot's interrupt layout (above)." >&2; exit 1; }
+fi
 if [ "$KIND" = nic ]; then
     say "client: syncing styx's repo (git pull --ff-only), as run-dualnic-experiment.sh --sync-client"
     rsh_try "cd '$REPO' && git fetch -q origin && git checkout -q $(git -C "$REPO" rev-parse --abbrev-ref HEAD) && git pull -q --ff-only" ||
@@ -438,13 +450,28 @@ if [ "$KIND" = nic ]; then
     snapshot_nics before
 fi
 
+# The heartbeat also guards the host: LOCKUP_STOP (default 2) or more kernel
+# soft lockups within one heartbeat interval stop the campaign's sweeps, as
+# Ctrl-C would (each sweep puts the switch's setting back), and the campaign
+# goes on to the analysis and the packing. On bigserver (10-25) strict-mode
+# invalidations piled onto one interrupt CPU livelocked it for minutes at a
+# time; driving load into that spoils every run and risks a shared machine.
+CAMP_T0=$(date +%s)
 heartbeat() {
+    local prev=0 lk
     while sleep "${HEARTBEAT:-300}"; do
         local st n=0 m
         st=$(cat "$OUT/.state" 2>/dev/null)
         m=$(ls -t "$REPO"/utils/logs/dual"$KIND"-pips-*-"${st##* }"/manifest.tsv 2>/dev/null | head -1)
         [ -n "$m" ] && n=$(grep -vc '^#' "$m")
-        echo "  ... campaign alive $(date '+%H:%M'), +$(fmt_min $(( (SECONDS - T0) / 60 ))): ${st:-starting}, $(( n > 0 ? n - 1 : 0 )) runs in its manifest"
+        lk=$(sudo -n journalctl -k --since "@$CAMP_T0" 2>/dev/null | grep -c 'soft lockup')
+        echo "  ... campaign alive $(date '+%H:%M'), +$(fmt_min $(( (SECONDS - T0) / 60 ))): ${st:-starting}, $(( n > 0 ? n - 1 : 0 )) runs in its manifest, ${lk:-?} soft lockups so far"
+        if [ $(( ${lk:-0} - prev )) -ge "${LOCKUP_STOP:-2}" ] && [ ! -e "$OUT/.lockup-stop" ]; then
+            echo "!!!!!!!! $(( lk - prev )) kernel soft lockups in the last ${HEARTBEAT:-300} s: STOPPING the sweeps (soft-lockup guard)"
+            date '+%F %T' > "$OUT/.lockup-stop"
+            pkill -INT -f 'dual(ssd|nic)_pips_swee[p]|dualssd_swee[p]|dualnic_flow_swee[p]|run-dual(ssd|nic)-experimen[t]'
+        fi
+        prev=${lk:-$prev}
     done
 }
 heartbeat & HB=$!

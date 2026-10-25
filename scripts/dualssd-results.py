@@ -720,6 +720,9 @@ def summary(a):
         ns = [run.get('pcie_samples') for run in r.get('per_run', [])]
         if any(n is not None and 0 < n < FEW_SAMPLES for n in ns):
             flag += f"  <-- FEW pcm-iio SAMPLES ({min(n for n in ns if n is not None):.0f})"
+        lk = sum(run.get('kernel_soft_lockups') or 0 for run in r.get('per_run', []))
+        if lk:
+            flag += f'  <-- {lk:.0f} SOFT LOCKUP(S)'
         print(f"{tag(r):<{tw}} {str(r.get('bs')):<5} "
               f"{str(r.get('instances_per_ssd')):>5} {str(r.get('mode')):<9} "
               f"{fmt(iops / 1e3 if iops is not None else None, (s.get('iops_total') or 0) / 1e3, '.1f'):>15} "
@@ -751,6 +754,8 @@ def summary(a):
     print('  narrowest shared PCIe link, which then caps the run, not the IOMMU.')
     print(f'  FEW pcm-iio SAMPLES: a run\'s PCIe/IOTLB means rest on fewer than {FEW_SAMPLES}')
     print('               one-second samples (the minimum over its runs in brackets).')
+    print('  SOFT LOCKUP(S): the kernel reported CPUs stuck during the run (journalctl -k):')
+    print('               not clean data.')
     if any(r.get('pips_batch') for r in recs):
         print('  IOMMU <mode> d<D>t<T>[m1][c1][@<id>] = run through PIPS with batcher depth D,')
         print('               time T (m1: batch_mrd on; c1: drain depth cap on, a drain sends')

@@ -2133,9 +2133,24 @@ Decisions, with the user (10-25):
   window, the point FAILED. 6 more lockups after 13:48. The switch's status
   over that run was clean (no stuck, no spill, MRd wait max 13.6/11.4 us), no
   AER, no NVMe timeouts, no DMAR faults; no profiler running (`sep5`,
-  `socwatch2_16`, `vtsspp` loaded, 0 users). Open: why 0x0A04/0x0A05 ran the
-  same load clean and this setting doesn't. Test: one 4k 2+2 run at d1t0c1 vs
-  d2t22c1 (pb 0), counting lockups (HANDOFF Next).
+  `socwatch2_16`, `vtsspp` loaded, 0 users). **Cause: interrupt placement,
+  not the switch.** The lockups began with the campaign's first run (12:07,
+  170 by 14:00; nearly every point FAILED, mostly "pcm-iio logged no rows":
+  pcm-iio hangs behind the stuck CPUs), and d1t0c1 alone reproduces them. In
+  this boot (11:49) both drives' blk-mq queues for CPUs 36-40 interrupt CPU
+  40 and for 41-45 CPU 45 (nvme0 q4/q5, nvme1 q5/q6); only 46-49 and 50-53
+  have separate ones (49/53 drive 0, 48/52 drive 1). `SSD_CORES` put both
+  drives on 36-45 and fio on 40, 45, 48, 49, 52, 53, so CPUs 40/45 did every
+  strict invalidation of both drives' completions (one dmar7 queue) while
+  running fio: livelock. Fix (no reboot; managed IRQs can't move):
+  `SSD_CORES=( "36,41,37,42,38,43" "46,50,47,51,49,53" )`,
+  `SSD_SPLIT_CORES=0` (uneven runs no longer borrow the other drive's cores);
+  `scripts/ssd-irq-placement.sh --check` verifies it and the drive campaign
+  refuses to start without it. Every run now records `kernel_soft_lockups`
+  (summaries flag them), and the campaign stops its sweeps on 2+ lockups in
+  one heartbeat. Each drive now uses 2 queues (was 4 in §7's 10-05 layout):
+  not directly comparable with the 0x0A04/0x0A05 drive sweeps. Likely also
+  behind their "pcm-iio < 10 samples" runs (Next item 3).
 - **2026-10-25, icx:** `retx.rpt` permission denied: `record-host-metrics.sh`
   (sudo, retransmits on by default) writes its own root-owned `retx.rpt`;
   the client's nstat count is now `retx-client.rpt` (fixed; earlier runs of
