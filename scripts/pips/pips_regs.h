@@ -5,6 +5,7 @@
  *   BAR0 map and WIN_* semantics : src/pio_pips/pips_pio.v (header comment)
  *   AXI address map              : pips.tcl, assign_bd_address lines for pips_pio_0/m_axi
  *   Batcher config bit fields    : pips.tcl, comment above "Create instance: xlslice_0"
+ *   Page batcher reg2/reg3/status: src/switch/pips_batch_ctrl.v (header), design 0x0A06 on
  *   Telemetry log format         : AXI4-switch repo, telemetry_dma_format.md
  * If one of those changes, this file must change with it.
  */
@@ -109,13 +110,52 @@
 #define PIPS_BATCH_DRAIN_RESET      0x00000000u
 #define PIPS_DESIGN_ID_DRAIN_CFG    0x0A03u             /* first build with reg1 */
 
+/* Page batcher (design ID >= 0x0A06: axi4_mwr_batch_pp, PAGE_BATCH 1), decoded by
+ * pips_batch_ctrl_0 (FPGA repo src/switch/pips_batch_ctrl.v; pips.tcl above it).
+ * Every field's 0 is its power-on value, so writing 0 restores the default.
+ * reg2 at PIPS_AXI_REGFILE + 0x8: completion size per input. An MWr whose Dword Count
+ *   is <= the threshold is a completion (control lane; a fence: that input's older data
+ *   leaves first). 0 = 16 DW. Erring high only costs batching; a completion taken for
+ *   data would lose the fence. MSI writes are caught by address whatever the threshold.
+ * reg3 at PIPS_AXI_REGFILE + 0xC: mode and arbitration.
+ *   page_batch_en 1 = batch per page (address >> 12), with per-device age order, a
+ *                 completion lane and an overflow; 0 = one in-order FIFO per input with
+ *                 axi4_mwr_batch's rules (the FIFO is the whole 1536-row array). A change
+ *                 takes effect once that input's batcher is empty.
+ *   ctrl_push_off 0 = a waiting completion makes every batch ahead of it eligible to drain
+ *   grant_quantum beats one input may send in a turn while the other waits; 0 = no limit
+ * batch_mrd (reg0 [16]) is tied off inside axi4_mwr_batch_pp: writable, no effect. */
+#define PIPS_DESIGN_ID_PAGE_BATCH   0x0A06u   /* first build with reg2/reg3 and the status below */
+#define PIPS_PB_THR_OFF             0x8u
+#define PIPS_PB_THR0_SHIFT          0         /* ctrl_dw_thr_0, in0, 11 bits */
+#define PIPS_PB_THR1_SHIFT          16        /* ctrl_dw_thr_1, in1, 11 bits */
+#define PIPS_PB_THR_MAX             0x7FFu
+#define PIPS_PB_THR_DEFAULT         16u       /* what a 0 field means (CTRL_DW_THR_DEFAULT) */
+#define PIPS_PB_CFG_OFF             0xCu
+#define PIPS_PB_EN                  (1u << 0)                 /* page_batch_en */
+#define PIPS_PB_CTRL_PUSH_OFF       (1u << 8)                 /* ctrl_push_off */
+#define PIPS_PB_QUANTUM_SHIFT       16                        /* grant_quantum, 12 bits */
+#define PIPS_PB_QUANTUM_MAX         0xFFFu
+/* Status, read-only. Reading 0x24 returns the sticky flags and CLEARS them, clears the
+ * batcher's own status and latches 0x28/0x2C, so one 0x24 read closes a period; read
+ * 0x28/0x2C after it. Saturating 16-bit counts; waits in 250 MHz cycles (4 ns). */
+#define PIPS_PB_STAT_FLAGS_OFF      0x24u
+#define PIPS_PB_STAT_OVF0           (1u << 0)                 /* in0 spilled to its overflow */
+#define PIPS_PB_STAT_OVF1           (1u << 1)
+#define PIPS_PB_STAT_STUCK          (1u << 2)                 /* liveness watchdog fired */
+#define PIPS_PB_STAT_OVF_COUNT_OFF  0x28u                     /* [15:0] in0, [31:16] in1 */
+#define PIPS_PB_STAT_MRD_WAIT_OFF   0x2Cu                     /* [15:0] in0, [31:16] in1 */
+
 /* axil4_regfile_0 layout (pips.tcl, comment above axil4_regfile_0):
  *   0x00        batcher config, RW (above)
  *   0x04        batcher drain config, RW (above)
- *   0x08 - 0x1C reserved, read 0
+ *   0x08        page batcher thresholds, RW (design >= 0x0A06; before, reserved, read 0)
+ *   0x0C        page batcher config, RW (design >= 0x0A06; before, reserved, read 0)
+ *   0x10 - 0x1C reserved, read 0
  *   0x20 - 0x3F read-only range; writes are ignored (OKAY, WIN_STATUS stays 0)
  *     0x20      DESIGN_ID: [15:0] build identifier (pips.tcl pips_design_id), [31:16] 0
- *     0x24-0x3C reserved, read 0
+ *     0x24-0x2C page batcher status (design >= 0x0A06, above; before, reserved, read 0)
+ *     0x30-0x3C reserved, read 0
  * The design ID goes up by one with every FPGA design update: compare it with the build you expect. */
 #define PIPS_REGFILE_RO_OFF     0x20u
 #define PIPS_DESIGN_ID_OFF      0x20u

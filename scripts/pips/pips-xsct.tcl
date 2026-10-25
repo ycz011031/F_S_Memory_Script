@@ -11,6 +11,8 @@
 #                                             ;#   the design ID and its TLP log format
 #   xsct% pips_cfg_set depth 8 time 0x16      ;# read-modify-write: depth time mrd log raw
 #   xsct% pips_cfg_set cap 1                  ;# reg1 drain_depth_cap (design 0x0a03 on)
+#   xsct% pips_status                         ;# page batcher status at +0x24-0x2C (0x0a06 on;
+#                                             ;#   reading clears it): spills, stuck, MRd wait
 #   xsct% pips_dma                            ;# S2MM registers at 0xA4010000, decoded
 #   xsct% pips_log_start                      ;# arm the DMA on the log region, log_enable 0 -> 1
 #   xsct% pips_log_stop                       ;# log_enable 1 -> 0, wait for the DMA, print the trailer
@@ -65,9 +67,32 @@ proc pips_cfg {} {
     } else {
         puts "drain=none drain_depth_cap=0"
     }
+    if {$id ne "none" && $id >= 0x0a06} {
+        set p [pips_rd [expr {$::pips_regfile + 0xC}]]
+        set t [pips_rd [expr {$::pips_regfile + 0x8}]]
+        puts [format "pb=0x%08x page_batch_en=%d ctrl_push_off=%d grant_quantum=%d" $p \
+            [expr {$p & 1}] [expr {($p >> 8) & 1}] [expr {($p >> 16) & 0xFFF}]]
+        puts [format "thr=0x%08x ctrl_dw_thr_0=%d ctrl_dw_thr_1=%d" $t [expr {$t & 0x7FF}] [expr {($t >> 16) & 0x7FF}]]
+    }
     puts "design_id=$id"
     puts "log_format=[expr {$id ne "none" && $id >= 0x0a04 ? "v2" : "v1"}]"
     return $v
+}
+
+# The page batcher's status (design 0x0a06 on), as `pips status` reads it:
+# reading 0x24 returns the sticky flags and CLEARS them, and latches 0x28/0x2C.
+# Over JTAG it works when PCIe does not: read it before reprogramming a hung
+# switch. A stuck bit or a huge MRd wait points at the batcher.
+proc pips_status {} {
+    set id [pips_design]
+    if {$id eq "none" || $id < 0x0a06} { puts "status=none (design $id)"; return }
+    set f [pips_rd [expr {$::pips_regfile + 0x24}]]
+    set c [pips_rd [expr {$::pips_regfile + 0x28}]]
+    set w [pips_rd [expr {$::pips_regfile + 0x2C}]]
+    puts [format "stat_flags=0x%08x ovf0=%d ovf1=%d stuck=%d" $f [expr {$f & 1}] [expr {($f >> 1) & 1}] [expr {($f >> 2) & 1}]]
+    puts [format "ovf_count_0=%d ovf_count_1=%d" [expr {$c & 0xFFFF}] [expr {$c >> 16}]]
+    puts [format "mrd_wait_max_us_0=%.2f mrd_wait_max_us_1=%.2f (cycles %d %d)" \
+        [expr {($w & 0xFFFF) * 0.004}] [expr {($w >> 16) * 0.004}] [expr {$w & 0xFFFF}] [expr {$w >> 16}]]
 }
 
 proc pips_cfg_set {args} {

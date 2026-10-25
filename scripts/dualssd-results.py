@@ -620,6 +620,38 @@ def pips_table(recs):
 
 # The logger's clock (pips-log-decode.py CLOCK_HZ): pkt_wait is in its cycles.
 LOG_CLOCK_MHZ = 250.0
+# A pcm-iio mean of fewer one-second samples than this is flagged (the report
+# pages leave such runs out).
+FEW_SAMPLES = 10
+
+
+def status_table(recs):
+    """The page batcher's status over each run (design 0x0a06 on): overflow
+    spills, the watchdog's stuck bit, the longest MRd wait. Means over runs."""
+    rs = [r for r in recs if r['mean'].get('pips_stat_valid')]
+    if not rs:
+        return
+    tw = tag_w(rs)
+    hdr = (f"{'IOMMU':<{tw}} {'BS':<5} {'INST':>5} {'MODE':<9} {'OVF0':>6} {'OVF1':>6} {'STUCK':>5} "
+           f"{'MRD_WAIT_us in0/in1':>20}")
+    print()
+    print('PIPS page batcher status per configuration (design 0x0a06 on; means over runs)')
+    print(hdr)
+    print('-' * len(hdr))
+    for r in sorted(rs, key=sort_key):
+        m = r['mean']
+        w = f"{fmt(m.get('pips_stat_mrd_wait_max_us_0'), None, '.2f')}/" \
+            f"{fmt(m.get('pips_stat_mrd_wait_max_us_1'), None, '.2f')}"
+        flag = '  <-- STUCK' if (m.get('pips_stat_stuck') or 0) > 0 else ''
+        print(f"{tag(r):<{tw}} {str(r.get('bs')):<5} {str(r.get('instances_per_ssd')):>5} "
+              f"{str(r.get('mode')):<9} {fmt(m.get('pips_stat_ovf_count_0'), None, '.0f'):>6} "
+              f"{fmt(m.get('pips_stat_ovf_count_1'), None, '.0f'):>6} "
+              f"{fmt(m.get('pips_stat_stuck'), None, '.0f'):>5} {w:>20}{flag}")
+    print()
+    print('  OVF0/1 = times input 0/1 spilled to its overflow (per-page mode: no free page')
+    print('  segment); STUCK = the watchdog forced a drain (should be 0); MRD_WAIT = the')
+    print('  longest time a read waited at the switch (a device\'s completion timeout is')
+    print('  50 us at the least).')
 
 
 def wait_us(m):
@@ -683,6 +715,11 @@ def summary(a):
         flag = '  <-- LINK BOUND' if link_bound(r) else ''
         if any(run.get('window_covered') == 0 for run in r.get('per_run', [])):
             flag += '  <-- fio DID NOT COVER THE WINDOW'
+        # pcm-iio averages one-second samples; a few of them make a noisy mean
+        # (HANDOFF §8 "Next" item 3). 0 = no rows at all, already shown as n/a.
+        ns = [run.get('pcie_samples') for run in r.get('per_run', [])]
+        if any(n is not None and 0 < n < FEW_SAMPLES for n in ns):
+            flag += f"  <-- FEW pcm-iio SAMPLES ({min(n for n in ns if n is not None):.0f})"
         print(f"{tag(r):<{tw}} {str(r.get('bs')):<5} "
               f"{str(r.get('instances_per_ssd')):>5} {str(r.get('mode')):<9} "
               f"{fmt(iops / 1e3 if iops is not None else None, (s.get('iops_total') or 0) / 1e3, '.1f'):>15} "
@@ -712,12 +749,17 @@ def summary(a):
     print('  IOMMU off/pt has no translation, so compare IOPS and CPU_us/IO across')
     print('  modes at the same BS/INST. LINK BOUND: PCIe write above 85% of the')
     print('  narrowest shared PCIe link, which then caps the run, not the IOMMU.')
+    print(f'  FEW pcm-iio SAMPLES: a run\'s PCIe/IOTLB means rest on fewer than {FEW_SAMPLES}')
+    print('               one-second samples (the minimum over its runs in brackets).')
     if any(r.get('pips_batch') for r in recs):
         print('  IOMMU <mode> d<D>t<T>[m1][c1][@<id>] = run through PIPS with batcher depth D,')
         print('               time T (m1: batch_mrd on; c1: drain depth cap on, a drain sends')
         print('               at most D packets) on FPGA design 0x<id>; see the PIPS log table.')
+        print('               From 0x0a06: p1 per-page batching, o1 ctrl_push off, q<N> grant')
+        print('               quantum N beats, w<N> completion threshold N DW.')
     asym_table(recs)
     pips_table(recs)
+    status_table(recs)
     pcm_tables(recs)
 
 

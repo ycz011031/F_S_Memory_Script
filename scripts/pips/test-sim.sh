@@ -149,6 +149,39 @@ run 0 "no DESIGN_ID: hwtest regfile warns" "$P" hwtest regfile; has 'no DESIGN_I
 run 1 "no DESIGN_ID: cap refused" "$P" cfg set cap=1
 unset PIPS_SIM_DESIGN
 
+echo "-- design 0x0a06: page batcher registers (reg2, reg3) and status (0x24-0x2c)"
+export PIPS_SIM_DESIGN=0x0a06
+run 0 "0x0a06: cfg shows pb and thr" "$P" cfg
+    has '^pb=0x00000000 page_batch_en=0 ctrl_push_off=0 grant_quantum=0'; has '^thr=0x00000000 ctrl_dw_thr_0=0'
+    has 'ctrl_dw_thr 0 = 16 DW'
+run 0 "0x0a06: cfg set pb, pushoff, quantum, thr" "$P" cfg set pb=1 pushoff=1 quantum=256 thr=31
+    has '^pb=0x01000101 page_batch_en=1 ctrl_push_off=1 grant_quantum=256'
+    has '^thr=0x001f001f ctrl_dw_thr_0=31 ctrl_dw_thr_1=31'
+run 0 "0x0a06: thr0 and thr1 apart" "$P" cfg set thr0=4 thr1=16; has 'ctrl_dw_thr_0=4 ctrl_dw_thr_1=16'
+run 0 "0x0a06: pips_tag_of the whole setting" bash -c ". '$HERE/pips-lib.sh'
+    '$P' cfg set depth=8 time=106 cap=1 > '$T/c6.txt' && pips_tag_of '$T/c6.txt'"
+    has '^d8t106c1p1o1q256w4x16$'
+run 1 "0x0a06: quantum 4096 refused" "$P" cfg set quantum=4096
+run 0 "0x0a06: raw2/raw3 put everything back" "$P" cfg set raw2=0 raw3=0 cap=0 raw=1
+    has '^pb=0x00000000'; has '^thr=0x00000000'; has 'cfg=0x00000001'
+run 0 "0x0a06: hwtest regfile" "$P" hwtest regfile
+    has 'reg2 wrote 0x02aa0155 read 0x02aa0155'; has 'reg3 wrote 0x0a5a0100'; has 'status flags at +0x24'
+    has 'reserved registers 0x10-0x1c and 0x30-0x3c read 0 (0 do not'
+    has 'page batcher registers at +0x08/+0x0c'
+run 0 "0x0a06: status with no traffic" "$P" status; has '^status=ok'; has 'stuck=0'; has 'ovf_count_0=0'
+export PIPS_SIM_STAT="5,12,3,3000,40"
+run 0 "0x0a06: a recording, then the status reports it" bash -c "'$P' log-clear > /dev/null &&
+    '$P' log-start > /dev/null && '$P' log-stop > /dev/null && '$P' status"
+    has 'stat_flags=0x00000005 ovf0=1 ovf1=0 stuck=1'; has 'ovf_count_0=12 ovf_count_1=3'
+    has 'mrd_wait_max_us_0=12.00'; has 'STUCK'
+run 0 "0x0a06: that read cleared it" "$P" status; has 'stuck=0'; has 'ovf_count_0=0 ovf_count_1=0'
+unset PIPS_SIM_STAT
+export PIPS_SIM_DESIGN=0x0a05
+run 0 "0x0a05: status says none" "$P" status; has '^status=none'
+run 1 "0x0a05: pb refused" "$P" cfg set pb=1; has 'has no page batcher registers'
+run 0 "0x0a05: cfg lists pb=none" "$P" cfg; has '^pb=none page_batch_en=0'
+unset PIPS_SIM_DESIGN
+
 echo "-- analysis tools on both formats"
 # A v2 sweep run folder as the runners write it, and a v1 one from before.
 NEW="$T/logs/dualssd-pips-off-1-id0a04-d8t22c1/4k-j1-both-RUN-0"
@@ -695,7 +728,7 @@ for s in dualssd_sweep dualnic_flow_sweep; do
 name=""; dp=1
 while [ $# -gt 0 ]; do [ "$1" = -o ] && name="$2"; [ "$1" = --no-datapath ] && dp=0; shift; done
 c=$("$PIPS_TOOL" cfg)
-echo "$(basename "$0") $name ARGS=${DUALSSD_ARGS:-}${DUALNIC_ARGS:-} $(printf '%s\n' "$c" | grep -E '^(cfg|drain)=' | xargs) DP=$dp" >> "$RESULTS_DIR/calls.txt"
+echo "$(basename "$0") $name ARGS=${DUALSSD_ARGS:-}${DUALNIC_ARGS:-} $(printf '%s\n' "$c" | grep -E '^(cfg|drain|pb|thr)=' | xargs) DP=$dp" >> "$RESULTS_DIR/calls.txt"
 design=$(printf '%s\n' "$c" | sed -n 's/^design_id=//p')
 # The runners' sweep hooks (pips-lib.sh) for a datapath check and one point.
 . "$(dirname "$0")/../pips/pips-lib.sh"
@@ -793,6 +826,22 @@ run 0 "  calls" cat "$T/res/calls.txt"
 awk -F'\t' '!/^#/ && $4 == "point" { print $2, $3 }' "$T/res/dualssd-pips-off-dsweep1.manifest.tsv" | tr '\n' ' ' |
     grep -qx 'd1t0c1 4k-j1-both d8t106c1 4k-j1-both ' && ok "  manifest rows: setting, point" ||
     bad "  $(cat "$T/res/dualssd-pips-off-dsweep1.manifest.tsv")"
+
+export PIPS_SIM_DESIGN=0x0a06
+"$P" cfg set raw=0x00000005 cap=0 raw2=0 raw3=0 > /dev/null
+: > "$T/res/calls.txt"
+run 0 "0x0a06: --pbs \"0 1\" --set, every field written" \
+    sweep dualnic_pips_sweep.sh -o N6 --cfgs 8:106 --caps 1 --pbs "0 1" --set "thr=31 quantum=64"
+    has 'settings: d8t106c1q64w31 d8t106c1p1q64w31'
+run 0 "  calls: pb and thr as set" cat "$T/res/calls.txt"
+    has '^dualnic_flow_sweep.sh N6-id0a06-d8t106c1q64w31 .* pb=0x00400000 .* thr=0x001f001f'
+    has '^dualnic_flow_sweep.sh N6-id0a06-d8t106c1p1q64w31 .* pb=0x00400001 '
+run 0 "  original setting, pb and thr back" "$P" cfg; has 'cfg=0x00000005'; has '^pb=0x00000000'; has '^thr=0x00000000'
+run 0 "0x0a06: batch_mrd settings are skipped" sweep dualssd_pips_sweep.sh -o S6 --cfgs "8:22:1 4:22" --caps 0 --no-asy
+    has 'SKIPPED: batch_mrd has no effect'
+export PIPS_SIM_DESIGN=0x0a05
+run 1 "0x0a05: --pbs is refused" sweep dualnic_pips_sweep.sh -o N7 --pbs 1 --caps 0; has 'has no page batcher'
+unset PIPS_SIM_DESIGN
 
 echo "-- pips-timeout-pick.py: time thresholds for depths, from a sweep's results"
 cat > "$T/tp.jsonl" <<'EOF'

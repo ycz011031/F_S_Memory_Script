@@ -96,6 +96,15 @@ def one_run(reports, exp, j, nics):
         rx = read_kv(os.path.join(base, f'retx-nic{i}.rpt'))
         if 'Retx_percent' in rx:
             r[f'retx_nic{i}_pct'] = rx['Retx_percent']
+        # Pause, discard, buffer and error counter deltas over the window, both
+        # ends of NIC i's link (srv_ = this host, cli_ = the client): nicstats_report.
+        r.update({f'nic{i}_{k}': v for k, v in
+                  read_kv(os.path.join(base, f'nicstats-nic{i}.rpt')).items()})
+    # TCP retransmits on the client over the window, all flows (nstat).
+    rx = read_kv(os.path.join(base, 'retx.rpt'))
+    if 'Retx_percent' in rx:
+        r['retx_pct'] = rx['Retx_percent']
+        r['retx_segs'] = rx.get('Retx_segs')
     # The PIPS TLP log's numbers (--pips-log 1), pips_*: full or not, records,
     # drops, per-port TLPs, MWr Gbps and time in the batcher. Its text status
     # goes in 'pips_log'.
@@ -107,8 +116,14 @@ def dump(a):
     nics = [int(x) for x in a.nics.split(',') if x != '']
     runs = [one_run(a.reports, a.exp, j, nics) for j in range(a.runs)]
 
+    # nicstats files list only the counters that moved: a run without one had 0.
+    keys = list(dict.fromkeys(k for r in runs for k in r))
+    for r in runs:
+        for k in keys:
+            if k not in r and re.match(r'nic\d_(srv|cli)_', k):
+                r[k] = 0.0
     mean, sd = {}, {}
-    for k in runs[0]:
+    for k in keys:
         vals = [r.get(k) for r in runs]
         if any(v is None for v in vals):
             mean[k] = sd[k] = None
@@ -206,6 +221,53 @@ def pips_table(recs, key, tw):
     print('  batcher (logs of design 0x0a04 on; - before).')
 
 
+def flows_key(v):
+    """Sort key for flows_per_nic: 5, or '5x30' for an uneven co-run (NIC 0 x NIC 1)."""
+    parts = [int(x) for x in re.findall(r'\d+', str(v or 0))] or [0]
+    return (sum(parts) / len(parts), str(v))
+
+
+def nic_tput(m):
+    """'N0/N1' Gbps of a record's mean, '-' if neither NIC has one."""
+    v = [m.get(f'tput_nic{i}_gbps') for i in (0, 1)]
+    if v == [None, None]:
+        return '-'
+    return '/'.join('-' if x is None else f'{x:.1f}' for x in v)
+
+
+def status_table(recs, key, tw):
+    """The page batcher's status over each run (design 0x0a06 on): overflow spills,
+    the watchdog's stuck bit, the longest MRd wait. Means over runs."""
+    rs = [r for r in recs if r['mean'].get('pips_stat_valid')]
+    if not rs:
+        return
+    hdr = (f"{'IOMMU':<{tw}} {'RATE':<9} {'FLOWS':>5} {'MODE':<9} {'OVF0':>6} {'OVF1':>6} "
+           f"{'STUCK':>5} {'MRD_WAIT_us in0/in1':>20} {'RETX_%':>7} {'PAUSE srv/cli':>14}")
+    print()
+    print('PIPS page batcher status per configuration (design 0x0a06 on; means over runs)')
+    print(hdr)
+    print('-' * len(hdr))
+    for r in sorted(rs, key=key):
+        m = r['mean']
+        pause_s = sum(v or 0 for k, v in m.items() if k.startswith('nic') and '_srv_' in k and 'pause' in k)
+        pause_c = sum(v or 0 for k, v in m.items() if k.startswith('nic') and '_cli_' in k and 'pause' in k)
+        w = f"{fmt(m.get('pips_stat_mrd_wait_max_us_0'), None, '.2f')}/" \
+            f"{fmt(m.get('pips_stat_mrd_wait_max_us_1'), None, '.2f')}"
+        flag = '  <-- STUCK' if (m.get('pips_stat_stuck') or 0) > 0 else ''
+        print(f"{tag(r):<{tw}} {str(r.get('bandwidth_per_nic')):<9} "
+              f"{str(r.get('flows_per_nic')):>5} {str(r.get('mode')):<9} "
+              f"{fmt(m.get('pips_stat_ovf_count_0'), None, '.0f'):>6} "
+              f"{fmt(m.get('pips_stat_ovf_count_1'), None, '.0f'):>6} "
+              f"{fmt(m.get('pips_stat_stuck'), None, '.0f'):>5} {w:>20} "
+              f"{fmt(m.get('retx_pct'), None, '.3f'):>7} {f'{pause_s:.0f}/{pause_c:.0f}':>14}{flag}")
+    print()
+    print('  OVF0/1 = times input 0/1 spilled to its overflow (per-page mode: no free page')
+    print('  segment); STUCK = the watchdog forced a drain (should be 0); MRD_WAIT = the')
+    print('  longest time a read waited at the switch (crash safety: the device\'s completion')
+    print('  timeout is 50 us at the least). RETX_% = client TCP retransmits; PAUSE = pause')
+    print('  counter increments over the window, this host / the client, both NICs.')
+
+
 def summary(a):
     recs = []
     for path in a.files:
@@ -218,7 +280,7 @@ def summary(a):
         print()
 
     def key(r):
-        return (str(r.get('bandwidth_per_nic')), r.get('flows_per_nic') or 0,
+        return (str(r.get('bandwidth_per_nic')), flows_key(r.get('flows_per_nic')),
                 {'nic0only': 0, 'nic1only': 1, 'both': 2}.get(r.get('mode'), 3),
                 tag(r))
 
@@ -231,7 +293,7 @@ def summary(a):
             base.setdefault(g, []).append(r['mean'].get('misses_per_gbps'))
 
     tw = max([7] + [len(tag(r)) for r in recs])
-    hdr = f"{'IOMMU':<{tw}} {'RATE':<9} {'FLOWS':>5} {'MODE':<9} {'TPUT_Gbps':>16} " \
+    hdr = f"{'IOMMU':<{tw}} {'RATE':<9} {'FLOWS':>5} {'MODE':<9} {'TPUT_Gbps':>16} {'NIC0/NIC1':>11} " \
           f"{'PCIe_wr':>8} {'MISS_PER_GBPS':>20} {'CPU_%':>12} {'CONTENTION':>10}"
     print(hdr)
     print('-' * len(hdr))
@@ -250,6 +312,7 @@ def summary(a):
         print(f"{tag(r):<{tw}} {str(r.get('bandwidth_per_nic')):<9} "
               f"{str(r.get('flows_per_nic')):>5} {str(r.get('mode')):<9} "
               f"{fmt(m.get('tput_total_gbps'), s.get('tput_total_gbps'), '.2f'):>16} "
+              f"{nic_tput(m):>11} "
               f"{fmt(wr, None, '.1f'):>8} "
               f"{fmt(m.get('misses_per_gbps'), s.get('misses_per_gbps'), '.0f'):>20} "
               f"{fmt(m.get('cpu_util_pct'), s.get('cpu_util_pct'), '.1f'):>12} "
@@ -260,10 +323,15 @@ def summary(a):
     print('  the on/off comparison is TPUT and CPU_% at the same RATE/FLOWS.')
     print('  Ignore LINK BOUND rows for IOMMU conclusions: there the ~126 Gbps')
     print('  shared uplink, not the IOMMU, is the constraint.')
+    print('  FLOWS AxB = an uneven co-run: A flows on NIC 0, B on NIC 1. RATE hw<R> = the')
+    print('  client NIC paced each port to R in hardware (iperf3 uncapped).')
     if any(r.get('pips_batch') for r in recs):
-        print('  IOMMU <mode> d<D>t<T>[m1][c1][@<id>] = NICs behind PIPS with batcher depth D,')
-        print('  time T (m1: batch_mrd on; c1: drain depth cap on) on FPGA design 0x<id>.')
+        print('  IOMMU <mode> d<D>t<T>[m1][c1][p1][o1][q<N>][w<N>][@<id>] = NICs behind PIPS with')
+        print('  batcher depth D, time T (m1: batch_mrd on; c1: drain depth cap on; p1: per-page')
+        print('  batching; o1: ctrl_push off; q<N>: grant quantum N beats; w<N>: completion')
+        print('  threshold N DW) on FPGA design 0x<id>.')
     pips_table(recs, key, tw)
+    status_table(recs, key, tw)
 
 
 def main():

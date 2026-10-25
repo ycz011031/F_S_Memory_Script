@@ -52,6 +52,8 @@ run by hand when needed · **orphan** = no caller and superseded · **data** /
 | PIPS switch: same over JTAG | `source scripts/pips/pips-xsct.tcl` in XSCT | XSCT host |
 | PIPS switch stopped answering: save the state first | `bash scripts/pips/pips-hang-snapshot.sh` (read-only), then XSCT | PIPS host |
 | PIPS tools: test without hardware | `make -C scripts/pips check` | any Linux |
+| PIPS design 0x0A06 campaign: every sweep, the pending analysis, one tarball in ~ | `bash scripts/pips/pips-campaign.sh ssd\|nic --tmux` (`--dry-run`: plan, ETA, commands) | bigserver / icx |
+| PIPS page batcher status (0x0A06): spills, stuck, MRd wait | `sudo scripts/pips/pips status` (read clears); per sweep `python3 scripts/pips/pips-status-table.py ~/<sweep>.manifest.tsv` | PIPS host |
 | PIPS analysis, everything one testbed needs in one run (page order + model, then payload or control by length, both designs) | `bash scripts/pips/pips-analyze.sh ssd\|nic --tmux` | the host with the logs |
 | PIPS: page order of one sweep | `bash scripts/pips/pips-seq-grab.sh ssd\|nic` or `--manifest ~/<sweep>.manifest.tsv` | the host with the logs |
 | PIPS: one log's page order, arrival order and batcher model | `python3 scripts/pips/pips-page-seq.py LOG --model self,std,sweepc1 --show 200 --port out,arr` | any (needs the log) |
@@ -239,6 +241,21 @@ scripts/pips/pips-analyze.sh ssd|nic         one run per testbed, both designs, 
 scripts/pips/pips-timeout-pick.py            · pips-page-seq.py (batcher, parse_setting, fifo_limits)
 scripts/pips/pips-mwr-sizes.py, pips-addr-pattern.py   · pips-log-decode.py
 scripts/pips/pips-hang-snapshot.sh           read-only state capture when the switch stops answering
+scripts/pips/pips-status-table.py            manifests -> each run's pips-status.txt (0x0A06): spills, stuck, MRd wait
+```
+
+The 0x0A06 campaign wraps the sweeps and the analysis:
+
+```
+scripts/pips/pips-campaign.sh ssd|nic [--tmux] [--dry-run]   phases, ETA, heartbeat, hang handling
+ ─ (nic) nic-host-snapshot.sh here and on styx (ssh), before and after
+ ─ dualssd_pips_sweep.sh | dualnic_pips_sweep.sh --tag <stamp><phase> --pbs --set ...   per phase
+ │    (the runners read `pips status` per run: pips-lib.sh pips_status_collect)
+ ─ (switch gone) pips-hang-snapshot.sh, later switch phases skipped
+ ─ pips-status-table.py <every manifest>      status.txt/.tsv
+ ─ pips-analyze.sh <kind> --sweeps "" --manifest ...   the new sweeps (no model on 0x0a06)
+ ─ pips-analyze.sh <kind> [--no-lengths]      the pending 0x0A04/0x0A05 analysis
+ ─ tar: ~/pips-campaign-<kind>-<stamp>.tar.gz (results, manifests, runs' small files, analyses)
 ```
 
 Outputs come back to the analysis machine as tarballs and feed the report
@@ -350,9 +367,9 @@ falls back to default events and every column shifts.
 |---|---|
 | `pips-bringup.sh` | entry: enumeration, links, `pips hwtest`, smoke recording, optional soak |
 | `pips-fio-log.sh` | entry: one read-only fio run on the NVMe behind PIPS, with the TLP log |
-| `pips-lib.sh` | lib: tool build, device discovery below the switch, lspci summary, output folder, run lock, batcher setting names (`pips_tag`, `c1` for the drain cap), design ID tags (`design_of`, `pips_idtag`), the runner hooks, and the sweep identity (`pips_sweep_begin`: sweep ID and manifest; per run `sweep-id.txt`, a manifest row, `pips_sweep_id`). Also sourced by both runners and both PIPS sweeps |
-| `pips.c` | called/entry: the BAR0 tool (`pips`): registers, window, regfile (with the drain cap, design ID, log format), DMA, log, DDR dumps, `hwtest`, `soak` |
-| `pips_regs.h` | data: register map, verbatim from the FPGA repo's `sw_handoff/` (design 0x0a04) |
+| `pips-lib.sh` | lib: tool build, device discovery below the switch, lspci summary, output folder, run lock, batcher setting names (`pips_tag`, `c1` for the drain cap; from 0x0A06 `p1 o1 q<N> w<N>`, `pb_of`, `pips_tag_of <readout>`), design ID tags (`design_of`, `pips_idtag`), the runner hooks (from 0x0A06 `pips status` at each run's start and after its window, `pips_status_collect` → `pips-status.txt`, `pips_stat_*` in the `.rpt`), and the sweep identity (`pips_sweep_begin`: sweep ID and manifest; per run `sweep-id.txt`, a manifest row, `pips_sweep_id`). Also sourced by both runners and both PIPS sweeps |
+| `pips.c` | called/entry: the BAR0 tool (`pips`): registers, window, regfile (with the drain cap, design ID, log format; from 0x0A06 reg2/reg3 `pb= pushoff= quantum= thr=` and `status`), DMA, log, DDR dumps, `hwtest`, `soak` |
+| `pips_regs.h` | data: register map, from the FPGA repo's `sw_handoff/` (design 0x0a04) and `pips_batch_ctrl.v` (0x0A06 page batcher) |
 | `pips-log-decode.py` | called/entry: TLP log (`.bin` or `.gz`) → whole-or-cut status, per-port summary, CSV, JSON, `.rpt`. Record format v1 or v2 by design ID (`--design-id`, `-id<XXXX>` in the name, `pips-cfg.txt` beside it, else v1); `detect()`/`load()` serve the three tools below |
 | `pips-addr-pattern.py` | manual: TLP logs or sweep log folders → address width, page spread, IOVA reuse, out-stream runs and hold, LRU reuse distance and predicted IOTLB misses; one table line and one JSON line per log. Imports `pips-log-decode.py`'s loader |
 | `pips-page-seq.py` | manual: one TLP log → page access sequence run by run, per-drive interleaving, batching what-if (windows regrouped by drive / page / ideal, on the output and on the arrival order), optional set-associative IOTLB simulation, CSV of every TLP. v2 logs: the arrival order rebuilt from `pkt_wait` (stream `arr`), and `--model` runs the `axi4_mwr_batch.v` batcher on it (groups self, std, sweep, sweepc1, deep, each with an optional `fBEATS` FIFO size; or any `dDtT[m1][c1][fBEATS]`), counting what asked for each drain. Output timing: 1 cycle per beat, `--grant-gap` (3) per new drain, no faster than `--link` (gen3x8 drives, gen4x8 NICs); FIFO size from the design ID (`--fifo`). `--progress` prints stages to stderr. `--kind nic` (default for `dualnic` paths): 16 DW writes are the completions, a packet's visit ends at its short last TLP. Imports `pips-addr-pattern.py` (`tlp_events`) |
@@ -362,6 +379,8 @@ falls back to default events and every column shifts.
 | `pips-traffic.py` | manual: every TLP log under `utils/logs` (or the paths given, or `--list FILE`), either format, drives and NICs → per device: writes classed by address behaviour (ring entries, payload bursts, MSI), the size rule that splits them and how reliable it is, payload-length motifs per completion, time in the batcher per class (v2); a progress line per log, tables summed per kind / design / IOMMU / setting, CSV, JSONL. Labels sweeps named `-<N>` or by tag (`dsweep1`). Imports `pips-log-decode.py` |
 | `pips-xsct.tcl` | manual: config and drain registers, design ID, DMA and log over JTAG (XSCT) |
 | `pips-analyze.sh` | manual, on the host with the logs: everything the report needs from one testbed in one run: `pips-seq-grab.sh` on each sweep (default the 0x0A04 sweep and the 0x0A05 depth sweep by its manifest), then `pips-traffic.py --list` over all their logs (payload or control by length, per design), with liveness lines, into `~/pips-analyze-<kind>-<date>.tar.gz`. Calls both |
+| `pips-campaign.sh` | entry, on bigserver / icx: the design 0x0A06 campaign (§2.6): every phase as a PIPS sweep, hang handling, the new and the pending analysis, one tarball `~/pips-campaign-<kind>-<stamp>.tar.gz`. `--dry-run` prints the plan, ETA and commands |
+| `pips-status-table.py` | manual / called by `pips-campaign.sh`: sweep manifests → each run's page batcher status (`pips-status.txt`): overflow spills, stuck, longest MRd wait; flags, worst per setting, `--tsv` |
 | `pips-hang-snapshot.sh` | manual, when the switch stops answering, before reprogramming: read-only capture of the Xilinx/Mellanox functions and the bridges above them (`lspci -vvv`, AER counters), `pips cfg`, the kernel log, `devlink health`, the newest sweep log → `~/pips-hang-<host>-<time>.tar.gz` |
 | `pips_sim.c` | data: BAR0 model for `make check`, any design (`PIPS_SIM_DESIGN`); never on a testbed |
 | `test-sim.sh` | called: by `make check` |
@@ -423,6 +442,8 @@ falls back to default events and every column shifts.
 | `~/seq-<sweep>/` + `.tar.gz` | `pips-seq-grab.sh`: `seq-<setting>-<point>.txt` (report + listings), `seq.jsonl` (one line per log: interleave, what-ifs, `windows_arr`, `model[]`, `link` (`fitted`, `rate_given`), `fifo`, `grant_gap`, `arrival` (`lost`: share of the log's time missing from the logged output, `link_fit`, `held`)), `calibrate.txt` (the uplink fit per log, `segments lost fit clean`; the median of the clean ones is every log's `--link-rate`, also in `manifest.txt`), `manifest.txt` | no |
 | `~/pips-analyze-<kind>-<date>/` + `.tar.gz` | `pips-analyze.sh`: `seq-<sweep>/` per sweep, `logs.txt`, `traffic.txt/.jsonl`, `traffic-sizes.csv`, `analyze.log` | no |
 | `~/pips-hang-<host>-<time>/` + `.tar.gz` | `pips-hang-snapshot.sh` | no |
+| `~/pips-campaign-<kind>-<stamp>/` + `.tar.gz` | `pips-campaign.sh`: `campaign.log`, `plan.txt`, `notes.txt`, `README.txt`, `results/` (each sweep's `.txt`, `.manifest.tsv`, per-setting `.jsonl/.txt`), `sweeplogs/<name>/`, `runs/` (each run's `pips-cfg.txt`, `pips-status*.txt`, `pips-log-summary.*`, `.rpt`s), `status.txt/.tsv`, `analyze-new/`, `analyze-pending/`, `snapshots/`. Unpack in `dualssd/<MMDD>/` or `dualnic/<MMDD>/` | no |
+| per run (from 0x0A06): `utils/logs/<run>/pips-status-before.txt`, `pips-status.txt`; NIC runs also `nstat-client.txt`, `ethtool-{srv,cli}-nic<i>-{before,after}.txt`, `utils/reports/<run>/retx.rpt`, `nicstats-nic<i>.rpt` | the runners (`pips-lib.sh`, `run-dualnic-experiment.sh`) | no |
 | `~/traffic*.txt/.jsonl/.csv` | `pips-traffic.py` run by hand (10-16: `traffic-ssd.txt`, `traffic-nic.txt`) | no |
 
 Sweep names never repeat: `<prefix>-<iommu>-<N>` with the first unused `N`

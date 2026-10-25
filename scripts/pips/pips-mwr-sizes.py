@@ -91,7 +91,7 @@ GROUP_KEYS = ("iommu", "cfg", "bs", "design", "sweep", "all")
 # dualssd-pips-strict-1-d8t22 (before design IDs were recorded),
 # dualssd-pips-strict-1-id0a04-d8t22c1 (after).
 SWEEP_RE = re.compile(r"^dual(?:ssd|nic)-pips-(?P<iommu>.+)-\d+(?:-id(?P<design>[0-9a-fA-F]{4}))?"
-                      r"-(?P<cfg>d\d+t\d+(?:m1)?(?:c1)?)$")
+                      r"-(?P<cfg>d\d+t\d+(?:m1)?(?:c1)?(?:p1)?(?:o1)?(?:q\d+)?(?:w\d+(?:x\d+)?)?)$")
 CONFIG_RE = re.compile(r"^(?:datapath-)?(?P<bs>\d+[kmg]?)-j[\d+]+(?:-\w+?)?-RUN-\d+$", re.I)
 
 

@@ -36,6 +36,16 @@ every FPGA design update (`pips.tcl` `pips_design_id`).
 | `0x0a03` | `2c6c3f5` (10-14) | **drain config register**, regfile reg1 (`0xA4000004`) bit 0 `drain_depth_cap`: 0 = one drain sends every packet in the FIFO (reset value, and what older builds always did), 1 = at most `depth_threshold` packets (0 counts as 1), the rest in the next batch. Safe to change at any time. Older builds read 0 there and ignore writes |
 | `0x0a04` | `591d854` (10-15) | **log record format v2**: one record per TLP leaving the batcher, in output order; `port` = the input it came in on; new `pkt_wait` (u16 at 0x0C, cycles in the batcher); `pkt_tag` moved 0x0C → 0x0F; AT moved from byte 0x0D into `pkt_type[5:4]`. No more separate in0/in1/out records |
 | `0x0a05` | `64193c6` (10-17) | **batching FIFOs of 512 beats** (`FIFO_DEPTH`, was the RTL default 128), FIFO 2 too. An input stops taking beats at 493 and asks for a drain above 477 (109 / 93 before): up to 95 drive or 53 NIC TLPs per batch. Registers and log format as 0x0a04. The 10-17 depth sweep (`dsweep1`) ran on it |
+| `0x0a06` | `9673e37`, timing fix `d44fdd0` (10-23/24) | **page batcher** (`axi4_mwr_batch_pp`, `PAGE_BATCH 1`): regfile reg2 `0x08` (completion size per input) and reg3 `0x0C` (`page_batch_en`, `ctrl_push_off`, `grant_quantum`), status at `0x24`-`0x2C` (overflow spills, stuck, longest MRd wait; `0x24` read clears). `page_batch_en` 0 (power-on) = one in-order FIFO per input with 0x0a05's rules, 1536 rows instead of 512; `batch_mrd` tied off. One output register cycle more. Log format v2 as before. `pips cfg` prints `pb=`/`thr=` lines, `pips cfg set pb= pushoff= quantum= thr=`, `pips status`; PIO-MANUAL §6 |
+
+**Setting tags from 0x0a06.** After `d<D>t<T>[m1][c1]` a tag carries the page
+batcher's fields that are not at their power-on value: `p1` (`page_batch_en`),
+`o1` (`ctrl_push_off`), `q<N>` (`grant_quantum`, beats), `w<N>` or `w<a>x<b>`
+(completion thresholds, DW). `d64t255c1p1q256w31` = depth 64, time 255, cap on,
+per page, quantum 256, threshold 31 DW on both inputs. `pips_tag_of <readout>`
+(pips-lib.sh) builds it from a `pips cfg` readout; the log tools' setting
+patterns accept it. The batcher model (`pips-page-seq.py --model`) describes
+the in-order FIFO only: `pips-seq-grab.sh` runs none on 0x0a06 sweeps.
 
 The trailer is the same in both log formats, so **a log cannot tell its own
 format**: a v1 decoder reads a v2 log without an error but with wrong tags.
@@ -540,6 +550,60 @@ Results from other settings or builds never mix: `dualssd-results.py` and
 Runs whose drives or NICs are behind PIPS record the design ID and setting
 even without `--pips-log` (`pips-cfg.txt` per run, `pips_design_id` and
 `pips_batch` in the JSONL).
+
+**The page batcher's knobs (design 0x0a06 on).** `--pbs "0 1"` runs every
+setting with `page_batch_en` 0 and 1 (it multiplies the settings as `--caps`
+does; default `"0"` on 0x0a06); `--set "pushoff=1 quantum=256 thr=31"` gives
+every setting those page batcher fields (thr0=/thr1= per input). Fields not
+given are written 0, their power-on value, so a sweep never inherits the last
+one's. On 0x0a06 a `batch_mrd` setting (`:1`) is skipped (tied off); on an older
+build `--pbs`/`--set` are refused. The original reg2/reg3 are put back at the
+end with reg0 and reg1. With `--pips-log 1` every run also reads `pips status`
+at its start (opening the period) and after its window: `pips-status.txt` in
+the run folder, `pips_stat_*` in its `.rpt` and record, a status table at the
+end of `~/<NAME>.txt`, a loud warning on a stuck bit.
+`pips-status-table.py <manifest>...` tabulates it per run.
+
+NIC runs (`run-dualnic-experiment.sh`) take `--flows-nic1 N` for uneven
+co-runs and `--client-hw-rate 50g` for pacing in the client NIC's hardware
+(mlx5 `tx_maxrate` per TX queue, iperf3 uncapped). In `dualnic_flow_sweep.sh`
+(and so `dualnic_pips_sweep.sh`) a flow entry `5:30` is 5 flows on NIC 0 and 30
+on NIC 1 (named `f5x30`, mode both only), a rate entry `hw50` the hardware
+pacing (named `hw50g`). Every NIC run also records the client's TCP
+retransmits over the window (`retx.rpt`, nstat) and both ends' pause, discard
+and buffer counter deltas (`nicstats-nic<i>.rpt`, ethtool -S).
+
+## The 0x0A06 campaign: everything in one script
+
+```bash
+bash scripts/pips/pips-campaign.sh ssd --dry-run   # the plan, the ETA, every command
+bash scripts/pips/pips-campaign.sh ssd --tmux      # bigserver, ~18 h
+bash scripts/pips/pips-campaign.sh nic --tmux      # icx, ~16 h
+```
+
+Every phase is a `*_pips_sweep.sh` with `--tag <stamp><phase>` (stamp
+`c<MMDDhhmm>`) on design 0x0a06 only, the completion threshold at 31 DW
+(`w31`) unless the phase is about it. Drives: `main` (8 depths x
+`page_batch_en` 0/1, cap on; bs 4k-1m x 1, 2, 4, 8, 16 per drive plus 2/4/8+16,
+drive 0 light), `cap0`, `push` (`ctrl_push_off`), `quant` (grant quantum
+64/256/1024 beats), `thr` (4 DW), `drv0` (drive 0 alone, HANDOFF §8 Next items
+2 and 4). NICs: `mainlo`/`mainhi` (depths 1-16 and 24-64 x `page_batch_en`
+0/1; flows 5, 10, 15, 30, 5:30, 30:10 at uncapped and 50 Gbps per NIC: 100
+together, under the shared uplink), `cap0`, `push`, `quant`, `thr` (16 DW),
+`alone` (NIC0 alone vs both at uncapped/50/25 Gbps, the packet-splitting
+settings), `hw` (the same paced in styx's NIC), `wire` (NIC0's link at 50G at
+both ends, put back after). `mainhi` runs last of the switch phases: d24
+stopped 0x0A05's NIC sweep. Then `pips-analyze.sh` on the new sweeps (no model:
+recorded and arrival order, listings, IOTLB simulation, lengths) and on the
+pending 0x0A04/0x0A05 sweeps, then one tarball,
+`~/pips-campaign-<kind>-<stamp>.tar.gz`: results, manifests, sweep logs, each
+run's small files (cfg, status, log summary, .rpt), status tables, analyses,
+NIC snapshots of icx and styx. Raw TLP logs stay on the host.
+
+If the switch stops answering, the campaign takes `pips-hang-snapshot.sh` at
+once, skips the switch phases still to come, says so in large letters, and
+still analyses and packs. `--only`, `--skip`, `--no-wire`, `--no-hw`,
+`--no-analysis`, `--no-pending`: `--help`.
 
 ## Without the host path: XSCT
 

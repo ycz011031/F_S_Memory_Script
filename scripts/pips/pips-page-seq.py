@@ -133,7 +133,7 @@ DEEP_SETS = ("d1t0c1", "d2t22c1", "d4t50c1", "d8t106c1", "d16t218c1", "d24t255c1
 GROUPS = {"std": STD_SETS, "sweep": SWEEP_SETS, "sweepc1": SWEEPC1_SETS, "deep": DEEP_SETS}
 GROUP_RE = re.compile(r"^(std|sweep|sweepc1|deep)(f\d+)?$")
 SET_RE = re.compile(r"^d(\d+)t(\d+)(m1)?(c1)?(?:f(\d+))?$")
-SET_IN_PATH = re.compile(r"-(d\d+t\d+(?:m1)?(?:c1)?)(?=[/-]|$)")
+SET_IN_PATH = re.compile(r"-(d\d+t\d+(?:m1)?(?:c1)?(?:p1)?(?:o1)?(?:q\d+)?(?:w\d+(?:x\d+)?)?)(?=[/-]|$)")
 # axi4_mwr_batch.v at its build parameters: FIFO_DEPTH beats of 64 B per input,
 # MAX_PKT_BEATS 16, so prog_full stops the input at FIFO_DEPTH - 19 beats and
 # the full trigger fires once fewer than 16 beats of that are left. FIFO_DEPTH
@@ -141,7 +141,12 @@ SET_IN_PATH = re.compile(r"-(d\d+t\d+(?:m1)?(?:c1)?)(?=[/-]|$)")
 # with 512 (493 / 477; pips.tcl, FPGA commit 64193c6).
 MAX_PKT_BEATS = 16
 FIFO_DEFAULT = 128
-FIFO_BY_DESIGN = {"0x0a05": 512}
+# 0x0A06 (page batcher) run with page_batch_en 0 is one in-order FIFO per input
+# over the whole data array, 1536 rows; its full trigger differs (free rows
+# below the largest packet seen), so the model is an approximation there, and
+# per-page mode (p1) it cannot model at all: pips-seq-grab.sh runs no model
+# on 0x0A06 sweeps.
+FIFO_BY_DESIGN = {"0x0a05": 512, "0x0a06": 1536}
 
 
 def fifo_limits(fifo):

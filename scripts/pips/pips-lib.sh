@@ -134,11 +134,30 @@ link_partner() {
 # design 0x0a03 did).
 cfg_of() { sed -n 's/^cfg=\(0x[0-9a-f]*\).*/\1/p' "$1"; }
 cap_of() { local c; c=$(sed -n 's/.*drain_depth_cap=\([01]\).*/\1/p' "$1" | head -1); echo "${c:-0}"; }
-pips_tag() {
-    local v=$(( $1 )) c="${2:-0}"
-    printf 'd%dt%d%s%s\n' $(( v & 0xFF )) $(( (v >> 8) & 0xFF )) \
-        "$( (( (v >> 16) & 1 )) && echo m1)" "$( [ "$c" = 1 ] && echo c1)"
+# The page batcher fields (design 0x0a06 on; 0 0 0 0 0 before): pb_of <file> ->
+# "<page_batch_en> <ctrl_push_off> <grant_quantum> <ctrl_dw_thr_0> <ctrl_dw_thr_1>".
+pb_of() {
+    awk '{ for (i = 1; i <= NF; i++) { split($i, kv, "="); v[kv[1]] = kv[2] } }
+         END { printf "%d %d %d %d %d\n", v["page_batch_en"], v["ctrl_push_off"], v["grant_quantum"],
+               v["ctrl_dw_thr_0"], v["ctrl_dw_thr_1"] }' "$1"
 }
+# pips_tag <cfg> [cap] [pb pushoff quantum thr0 thr1]: d<depth>t<time>, then m1
+# (batch_mrd), c1 (drain cap), p1 (page_batch_en), o1 (ctrl_push_off), q<N>
+# (grant_quantum, beats), w<N> (both completion thresholds N DW; w<a>x<b> when
+# they differ; none when both are 0 = 16 DW). Fields at their power-on value add
+# nothing, so every tag of an older build reads as before.
+pips_tag() {
+    local v=$(( $1 )) c="${2:-0}" p="${3:-0}" o="${4:-0}" q="${5:-0}" t0="${6:-0}" t1="${7:-0}" w=""
+    if [ "$t0" != 0 ] || [ "$t1" != 0 ]; then
+        if [ "$t0" = "$t1" ]; then w="w$t0"; else w="w${t0}x${t1}"; fi
+    fi
+    printf 'd%dt%d%s%s%s%s%s%s\n' $(( v & 0xFF )) $(( (v >> 8) & 0xFF )) \
+        "$( (( (v >> 16) & 1 )) && echo m1)" "$( [ "$c" = 1 ] && echo c1)" \
+        "$( [ "$p" = 1 ] && echo p1)" "$( [ "$o" = 1 ] && echo o1)" \
+        "$( [ "$q" != 0 ] && echo "q$q")" "$w"
+}
+# The whole setting a `pips cfg` readout file describes.
+pips_tag_of() { pips_tag "$(cfg_of "$1")" "$(cap_of "$1")" $(pb_of "$1"); }
 
 # The FPGA build, from `pips cfg`: design_of <file> -> 0x0a04, or none (a build
 # from before the DESIGN_ID register). pips_idtag <design> -> id0a04, the tag
@@ -207,9 +226,11 @@ pips_outdir() {
 # pips_design, pips_idt (id0a04) and pips_region; PIPS_STATUS collects each
 # run's log status. The runner's pips calls run as root without a prompt.
 pipsc() { sudo -n "$PIPS" "$@"; }
-pips_here=0; pips_cfg=""; pips_cap=0; pips_design=""; pips_idt=""; pips_region=""; PIPS_STATUS=()
+pips_here=0; pips_cfg=""; pips_cap=0; pips_pb="0 0 0 0 0"; pips_design=""; pips_idt=""; pips_region=""; PIPS_STATUS=()
 pips_gzip="${PIPS_LOG_GZIP:-1}"
-pips_setting() { pips_tag "$pips_cfg" "$pips_cap"; }
+pips_setting() { pips_tag "$pips_cfg" "$pips_cap" $pips_pb; }
+# The page batcher's status registers exist (design 0x0a06 on).
+pips_has_status() { pips_design_ge "${pips_design:-}" 0x0a06; }
 
 # pips_identify <what> <bdf>...: in preflight. Reads the switch's build and
 # batcher setting when one of the devices (<what>: "drive", "NIC") is behind
@@ -229,6 +250,7 @@ $(printf '%s\n' "$out" | tail -2 | sed 's/^/      /')
     else
         pips_cfg=$(cfg_of <(printf '%s\n' "$out"))
         pips_cap=$(cap_of <(printf '%s\n' "$out"))
+        pips_pb=$(pb_of <(printf '%s\n' "$out"))
         pips_design=$(design_of <(printf '%s\n' "$out"))
         pips_idt=$(pips_idtag "$pips_design")
         pips_region=$(pipsc info 2>/dev/null | awk '$1 == "LOG_BYTES" {print $2}')
@@ -321,9 +343,14 @@ pips_run_cfg() {
     if [ -n "$pips_cfg" ]; then
         pipsc cfg > "$L/pips-cfg.txt" 2>&1
         now=$(cfg_of "$L/pips-cfg.txt")
-        [ -n "$now" ] && [ "$(pips_tag "$now" "$(cap_of "$L/pips-cfg.txt")")" != "$(pips_setting)" ] && \
+        [ -n "$now" ] && [ "$(pips_tag_of "$L/pips-cfg.txt")" != "$(pips_setting)" ] && \
             echo "WARNING: the PIPS batcher setting changed during the experiment:" \
-                 "$(pips_setting) at the start, $(pips_tag "$now" "$(cap_of "$L/pips-cfg.txt")") now" >&2
+                 "$(pips_setting) at the start, $(pips_tag_of "$L/pips-cfg.txt") now" >&2
+    fi
+    # The status registers clear on read: this read opens the run's period.
+    if [ "$pips_log" = 1 ] && pips_has_status; then
+        pipsc status > "$L/pips-status-before.txt" 2>&1 ||
+            echo "WARNING: PIPS status read failed: $(tail -1 "$L/pips-status-before.txt")" >&2
     fi
     if [ "$pips_log" = 1 ]; then
         pipsc log-clear > "$L/pips-log-clear.txt" 2>&1 || \
@@ -366,6 +393,7 @@ pips_collect() {
     fi
     [ -s "$rpt" ] || printf 'status: FAILED\ndesign_id: %s\n' "${pips_design:-none}" > "$rpt"
     [ -n "${PIPS_SWEEP_ID:-}" ] && printf 'sweep_id: %s\n' "$PIPS_SWEEP_ID" >> "$rpt"
+    pips_status_collect "$rpt"
     PIPS_STATUS+=( "$(awk '/^status:/{print $2; exit}' "$rpt")" )
     local got=""
     for got in "$bin.gz" "$bin"; do [ -s "$got" ] && break; got=""; done
@@ -373,6 +401,37 @@ pips_collect() {
     echo "   PIPS log: $(awk '/^status:/{print $2; exit}' "$rpt")," \
          "$(awk '/^pips_records:/{r=$2} /^pips_dropped:/{d=$2} END{printf "%s records, %s dropped", r, d}' "$rpt")" \
          "(logs: pips-log-*.txt)"
+}
+
+# pips_status_collect <rpt>: the page batcher's status over this run (design
+# 0x0a06 on), read once after the window: since pips_run_cfg's read, so the
+# whole run, setup included. Saved as pips-status.txt and added to the .rpt as
+# numbers (they reach the JSONL record as pips_stat_*): overflow flags and
+# counts per input, the watchdog's stuck bit, the longest MRd wait (cycles of
+# 4 ns, and us). A stuck bit is printed as a warning: it should never be set.
+pips_status_collect() {
+    local rpt="$1" f="$L/pips-status.txt"
+    pips_has_status || return 0
+    if ! pipsc status > "$f" 2>&1 || ! grep -q '^status=ok' "$f"; then
+        echo "WARNING: PIPS status read failed: $(tail -1 "$f")" >&2
+        echo "pips_stat_valid: 0" >> "$rpt"
+        return 0
+    fi
+    awk '{ for (i = 1; i <= NF; i++) { split($i, kv, "="); if (kv[2] != "") v[kv[1]] = kv[2] } }
+         END {
+             print "pips_stat_valid: 1"
+             print "pips_stat_ovf0: " v["ovf0"];  print "pips_stat_ovf1: " v["ovf1"]
+             print "pips_stat_stuck: " v["stuck"]
+             print "pips_stat_ovf_count_0: " v["ovf_count_0"]; print "pips_stat_ovf_count_1: " v["ovf_count_1"]
+             print "pips_stat_mrd_wait_max_0: " v["mrd_wait_max_0"]; print "pips_stat_mrd_wait_max_1: " v["mrd_wait_max_1"]
+             print "pips_stat_mrd_wait_max_us_0: " v["mrd_wait_max_us_0"]
+             print "pips_stat_mrd_wait_max_us_1: " v["mrd_wait_max_us_1"]
+         }' "$f" >> "$rpt"
+    if grep -q 'stuck=1' "$f"; then
+        echo "!!!!!!!! WARNING: PIPS page batcher STUCK bit set in this run: its watchdog found the" >&2
+        echo "!!!!!!!! output idle with data held and forced a drain ($f)" >&2
+    fi
+    echo "   PIPS status: $(grep -E '^(stat_flags|ovf_count|mrd_wait_max_us)' "$f" | xargs)"
 }
 
 # pips_meta: PIPS_META = the --meta arguments for the results dump.
@@ -384,6 +443,13 @@ pips_meta() {
     if [ -n "$pips_cfg" ]; then
         PIPS_META+=( --meta pips_batch="$(pips_setting)" --meta pips_cfg="$pips_cfg"
                      --meta pips_drain_cap="$pips_cap" --meta pips_design_id="${pips_design:-unknown}" )
+        if pips_has_status; then
+            local p o q t0 t1
+            read -r p o q t0 t1 <<< "$pips_pb"
+            PIPS_META+=( --meta pips_page_batch="$p" --meta pips_ctrl_push_off="$o"
+                         --meta pips_grant_quantum="$q" --meta pips_ctrl_dw_thr_0="$t0"
+                         --meta pips_ctrl_dw_thr_1="$t1" )
+        fi
     fi
     [ "$pips_log" = 1 ] && PIPS_META+=( --meta pips_log="$(IFS=,; echo "${PIPS_STATUS[*]}")" )
     [ -n "${PIPS_SWEEP_ID:-}" ] && PIPS_META+=( --meta pips_sweep_id="$PIPS_SWEEP_ID"

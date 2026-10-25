@@ -17,7 +17,12 @@
  *                              config register (design >= 0x0a03), decoded,
  *                              the build's DESIGN_ID and its log format
  *   cfg set K=V...             read-modify-write them: depth= time= mrd= log=
- *                              raw= (reg0) cap= (reg1, drain_depth_cap)
+ *                              raw= (reg0) cap= (reg1, drain_depth_cap); from
+ *                              design 0x0a06 also pb= pushoff= quantum= raw3=
+ *                              (reg3) thr= thr0= thr1= raw2= (reg2)
+ *   status                     page batcher status (design >= 0x0a06): overflow
+ *                              flags and counts, stuck, longest MRd wait, since
+ *                              the previous read (reading clears them)
  *   dma                        log DMA (S2MM) registers, decoded
  *   dma-reset                  soft-reset the log DMA
  *   log-clear                  zero the log region in DDR
@@ -408,6 +413,7 @@ static int design_id(void)
 }
 
 static int has_drain_cfg(int id) { return id >= (int)PIPS_DESIGN_ID_DRAIN_CFG; }
+static int has_page_batch(int id) { return id >= (int)PIPS_DESIGN_ID_PAGE_BATCH; }
 
 /* The TLP log record format a build writes (pips_regs.h, "Record format"). */
 static const char *log_format(int id) { return id >= (int)PIPS_DESIGN_ID_LOG_V2 ? "v2" : "v1"; }
@@ -433,26 +439,58 @@ static void drain_id_print(int id, int have, uint32_t drain)
     printf("log_format=%s\n", log_format(id));
 }
 
+/* Page batcher registers (design >= 0x0a06): reg2 thresholds, reg3 mode and arbitration. */
+static uint32_t pb_rd(uint32_t off)
+{
+    return axi_rd_ok(PIPS_AXI_REGFILE + off, "page batcher register read");
+}
+
+/* key=value lines for scripts; on older builds "none", so a parser always finds the keys. */
+static void pb_print(int have, uint32_t pb, uint32_t thr)
+{
+    if (!have) {
+        printf("pb=none page_batch_en=0 ctrl_push_off=0 grant_quantum=0\n"
+               "thr=none ctrl_dw_thr_0=0 ctrl_dw_thr_1=0\n"
+               "# no page batcher registers (design < 0x%04x)\n", PIPS_DESIGN_ID_PAGE_BATCH);
+        return;
+    }
+    printf("pb=0x%08x page_batch_en=%u ctrl_push_off=%u grant_quantum=%u\n", pb, !!(pb & PIPS_PB_EN),
+           !!(pb & PIPS_PB_CTRL_PUSH_OFF), (pb >> PIPS_PB_QUANTUM_SHIFT) & PIPS_PB_QUANTUM_MAX);
+    printf("thr=0x%08x ctrl_dw_thr_0=%u ctrl_dw_thr_1=%u\n", thr, (thr >> PIPS_PB_THR0_SHIFT) & PIPS_PB_THR_MAX,
+           (thr >> PIPS_PB_THR1_SHIFT) & PIPS_PB_THR_MAX);
+    if (!(thr & PIPS_PB_THR_MAX) || !((thr >> PIPS_PB_THR1_SHIFT) & PIPS_PB_THR_MAX))
+        printf("# ctrl_dw_thr 0 = %u DW (the power-on value)\n", PIPS_PB_THR_DEFAULT);
+}
+
 static int cmd_cfg(int argc, char **argv)
 {
-    uint32_t old, v, rb, dold = 0, d = 0, drb = 0;
-    int id, have, set_cap = 0;
+    uint32_t old, v, rb, dold = 0, d = 0, drb = 0, pbo = 0, pb = 0, pbr = 0, tho = 0, th = 0, thr = 0;
+    int id, have, havepb, set_cap = 0, set_pb = 0, set_thr = 0;
 
     win_start();
     old = cfg_rd();
     id = design_id();
     have = has_drain_cfg(id);
+    havepb = has_page_batch(id);
     if (have)
         dold = drain_rd();
+    if (havepb) {
+        pbo = pb_rd(PIPS_PB_CFG_OFF);
+        tho = pb_rd(PIPS_PB_THR_OFF);
+    }
     if (argc == 0) {
         cfg_print(old);
         drain_id_print(id, have, dold);
+        pb_print(havepb, pbo, tho);
         return 0;
     }
     if (strcmp(argv[0], "set") || argc < 2)
-        die("usage: pips cfg [set depth=N time=N mrd=0|1 log=0|1 raw=VAL cap=0|1 ...]");
+        die("usage: pips cfg [set depth=N time=N mrd=0|1 log=0|1 raw=VAL cap=0|1 "
+            "pb=0|1 pushoff=0|1 quantum=N thr=N thr0=N thr1=N raw2=VAL raw3=VAL ...]");
     v = old;
     d = dold;
+    pb = pbo;
+    th = tho;
     for (int i = 1; i < argc; i++) {
         char *eq = strchr(argv[i], '=');
         uint64_t n;
@@ -485,22 +523,66 @@ static int cmd_cfg(int argc, char **argv)
             }
             d = n ? d | PIPS_BATCH_DRAIN_DEPTH_CAP : d & ~PIPS_BATCH_DRAIN_DEPTH_CAP;
             set_cap = 1;
+        } else if (!strcmp(argv[i], "pb") || !strcmp(argv[i], "pushoff") || !strcmp(argv[i], "quantum") ||
+                   !strcmp(argv[i], "raw3") || !strcmp(argv[i], "thr") || !strcmp(argv[i], "thr0") ||
+                   !strcmp(argv[i], "thr1") || !strcmp(argv[i], "raw2")) {
+            if (!havepb)
+                die("%s: design 0x%04x has no page batcher registers (needs >= 0x%04x)", argv[i],
+                    id < 0 ? 0 : (unsigned)id, PIPS_DESIGN_ID_PAGE_BATCH);
+            if (!strcmp(argv[i], "pb") || !strcmp(argv[i], "pushoff")) {
+                uint32_t bit = argv[i][1] == 'b' ? PIPS_PB_EN : PIPS_PB_CTRL_PUSH_OFF;
+                if (n > 1) die("%s: 0 or 1", argv[i]);
+                pb = n ? pb | bit : pb & ~bit;
+                set_pb = 1;
+            } else if (!strcmp(argv[i], "quantum")) {
+                if (n > PIPS_PB_QUANTUM_MAX) die("quantum: 0..%u beats (0 = off)", PIPS_PB_QUANTUM_MAX);
+                pb = (pb & ~(PIPS_PB_QUANTUM_MAX << PIPS_PB_QUANTUM_SHIFT)) | (uint32_t)n << PIPS_PB_QUANTUM_SHIFT;
+                set_pb = 1;
+            } else if (!strcmp(argv[i], "raw3")) {
+                if (n > 0xFFFFFFFFu) die("raw3: 32 bits");
+                pb = (uint32_t)n;
+                set_pb = 1;
+            } else if (!strcmp(argv[i], "raw2")) {
+                if (n > 0xFFFFFFFFu) die("raw2: 32 bits");
+                th = (uint32_t)n;
+                set_thr = 1;
+            } else {                                    /* thr (both inputs), thr0, thr1 */
+                if (n > PIPS_PB_THR_MAX) die("%s: 0..%u DW (0 = %u)", argv[i], PIPS_PB_THR_MAX, PIPS_PB_THR_DEFAULT);
+                if (strcmp(argv[i], "thr1"))
+                    th = (th & ~(PIPS_PB_THR_MAX << PIPS_PB_THR0_SHIFT)) | (uint32_t)n << PIPS_PB_THR0_SHIFT;
+                if (strcmp(argv[i], "thr0"))
+                    th = (th & ~(PIPS_PB_THR_MAX << PIPS_PB_THR1_SHIFT)) | (uint32_t)n << PIPS_PB_THR1_SHIFT;
+                set_thr = 1;
+            }
         } else {
-            die("unknown field '%s' (depth time mrd log raw cap)", argv[i]);
+            die("unknown field '%s' (depth time mrd log raw cap pb pushoff quantum thr thr0 thr1 raw2 raw3)",
+                argv[i]);
         }
     }
+    /* Thresholds before the mode: a switch to per-page mode never sees the old threshold. */
+    if (set_thr)
+        axi_wr_ok(PIPS_AXI_REGFILE + PIPS_PB_THR_OFF, th, "page batcher threshold register write");
+    if (set_pb)
+        axi_wr_ok(PIPS_AXI_REGFILE + PIPS_PB_CFG_OFF, pb, "page batcher config register write");
     cfg_wr(v);
     rb = cfg_rd();
     if (set_cap)
         axi_wr_ok(PIPS_AXI_REGFILE + PIPS_BATCH_DRAIN_OFF, d, "drain config register write");
     if (have)
         drb = drain_rd();
+    if (havepb) {
+        pbr = pb_rd(PIPS_PB_CFG_OFF);
+        thr = pb_rd(PIPS_PB_THR_OFF);
+    }
     printf("# was 0x%08x", old);
     if (have)
         printf(", drain 0x%08x", dold);
+    if (havepb)
+        printf(", pb 0x%08x, thr 0x%08x", pbo, tho);
     putchar('\n');
     cfg_print(rb);
     drain_id_print(id, have, drb);
+    pb_print(havepb, pbr, thr);
     if (rb != v) {
         fprintf(stderr, "pips: wrote 0x%08x, read back 0x%08x\n", v, rb);
         return 1;
@@ -509,6 +591,42 @@ static int cmd_cfg(int argc, char **argv)
         fprintf(stderr, "pips: drain config: wrote 0x%08x, read back 0x%08x\n", d, drb);
         return 1;
     }
+    if ((set_pb && pbr != pb) || (set_thr && thr != th)) {
+        fprintf(stderr, "pips: page batcher: wrote pb 0x%08x thr 0x%08x, read back pb 0x%08x thr 0x%08x\n",
+                pb, th, pbr, thr);
+        return 1;
+    }
+    return 0;
+}
+
+/* Page batcher status (design >= 0x0a06). The 0x24 read returns the sticky flags
+ * and clears them and the batcher's status, and latches the counts at 0x28/0x2C:
+ * each call reports the period since the previous one (or since power-on). */
+static int cmd_status(void)
+{
+    uint32_t f, c, w;
+    int id;
+
+    win_start();
+    id = design_id();
+    if (!has_page_batch(id)) {
+        printf("status=none\n# design %s has no page batcher status (needs >= 0x%04x)\n",
+               id < 0 ? "none" : "older", PIPS_DESIGN_ID_PAGE_BATCH);
+        return 0;
+    }
+    f = axi_rd_ok(PIPS_AXI_REGFILE + PIPS_PB_STAT_FLAGS_OFF, "status flags read");
+    c = axi_rd_ok(PIPS_AXI_REGFILE + PIPS_PB_STAT_OVF_COUNT_OFF, "overflow count read");
+    w = axi_rd_ok(PIPS_AXI_REGFILE + PIPS_PB_STAT_MRD_WAIT_OFF, "MRd wait read");
+    printf("status=ok\n");
+    printf("stat_flags=0x%08x ovf0=%u ovf1=%u stuck=%u\n", f, !!(f & PIPS_PB_STAT_OVF0),
+           !!(f & PIPS_PB_STAT_OVF1), !!(f & PIPS_PB_STAT_STUCK));
+    printf("ovf_count_0=%u ovf_count_1=%u\n", c & 0xFFFFu, c >> 16);
+    printf("mrd_wait_max_0=%u mrd_wait_max_1=%u\n", w & 0xFFFFu, w >> 16);
+    printf("mrd_wait_max_us_0=%.2f mrd_wait_max_us_1=%.2f\n", (w & 0xFFFFu) / USER_CLK_HZ * 1e6,
+           (w >> 16) / USER_CLK_HZ * 1e6);
+    printf("# since the previous status read (this read cleared them); counts saturate at 65535\n");
+    if (f & PIPS_PB_STAT_STUCK)
+        printf("# STUCK: the batcher's watchdog found the output idle with data held and forced a drain\n");
     return 0;
 }
 
@@ -1037,7 +1155,7 @@ static void t_regfile(void)
 {
     const uint64_t a = PIPS_AXI_REGFILE + PIPS_BATCH_CFG_OFF;
     uint32_t lo, hi, orig, v, st, id, bad, pats[3];
-    int drain;
+    int drain, pb;
 
     win_start();
     bar_wr32(PIPS_REG_WIN_BASE_LO, (uint32_t)PIPS_AXI_REGFILE | 3u);
@@ -1083,8 +1201,11 @@ static void t_regfile(void)
     check(!st && !(id >> 16) && PIPS_DESIGN_ID(id) >= PIPS_DESIGN_ID_FIRST,
           "DESIGN_ID 0x%04x at 0x%08" PRIx64 " (pips.tcl pips_design_id; bits [31:16] 0x%04x)",
           PIPS_DESIGN_ID(id), a + PIPS_DESIGN_ID_OFF, id >> 16);
-    note("log format %s; drain config register %s", log_format((int)PIPS_DESIGN_ID(id)),
-         has_drain_cfg((int)PIPS_DESIGN_ID(id)) ? "at +0x04" : "absent (design < 0x0a03)");
+    note("log format %s; drain config register %s; page batcher registers %s",
+         log_format((int)PIPS_DESIGN_ID(id)),
+         has_drain_cfg((int)PIPS_DESIGN_ID(id)) ? "at +0x04" : "absent (design < 0x0a03)",
+         has_page_batch((int)PIPS_DESIGN_ID(id)) ? "at +0x08/+0x0c, status +0x24-+0x2c"
+                                                 : "absent (design < 0x0a06)");
     axi_wr(a + PIPS_DESIGN_ID_OFF, ~id);
     v = axi_rd(a + PIPS_DESIGN_ID_OFF);
     st = win_check(NULL);
@@ -1111,13 +1232,47 @@ static void t_regfile(void)
                   !!(v & PIPS_BATCH_DRAIN_DEPTH_CAP), i == 1 ? " (restored)" : "");
         }
     }
+    pb = has_page_batch((int)PIPS_DESIGN_ID(id));
+    if (pb) {
+        /* reg2/reg3 hold what is written; page_batch_en is left as it is (a mode change waits
+         * for an empty batcher), the other fields get a pattern, then everything is restored. */
+        for (uint32_t r = PIPS_PB_THR_OFF; r <= PIPS_PB_CFG_OFF; r += 4) {
+            uint32_t o = axi_rd(a + r), want;
+            st = win_check(NULL);
+            if (!check(!st, "reg%u (page batcher) at 0x%08" PRIx64 " answers: 0x%08x (WIN_STATUS %s)",
+                       r / 4, a + r, o, win_flags(st)))
+                return;
+            for (int i = 0; i < 2; i++) {
+                want = i ? o : r == PIPS_PB_THR_OFF ? 0x02AA0155u
+                                                    : (o & PIPS_PB_EN) | 0x0A5A0000u | (~o & PIPS_PB_CTRL_PUSH_OFF);
+                axi_wr(a + r, want);
+                v = axi_rd(a + r);
+                st = win_check(NULL);
+                check(v == want && !st, "reg%u wrote 0x%08x read 0x%08x%s", r / 4, want, v,
+                      i ? " (restored)" : "");
+            }
+        }
+        /* Status: reading 0x24 clears it (this test's read starts a new period). */
+        v = axi_rd(a + PIPS_PB_STAT_FLAGS_OFF);
+        st = win_check(NULL);
+        check(!st && !(v & ~0x7u), "status flags at +0x24: 0x%08x (ovf0 %u ovf1 %u stuck %u; bits [31:3] 0)",
+              v, !!(v & PIPS_PB_STAT_OVF0), !!(v & PIPS_PB_STAT_OVF1), !!(v & PIPS_PB_STAT_STUCK));
+        note("overflow counts 0x%08x, longest MRd wait 0x%08x (cycles, [15:0] in0, [31:16] in1)",
+             axi_rd(a + PIPS_PB_STAT_OVF_COUNT_OFF), axi_rd(a + PIPS_PB_STAT_MRD_WAIT_OFF));
+    }
     bad = 0;
     for (uint32_t off = 4; off < 0x40; off += 4)
-        if (off != PIPS_DESIGN_ID_OFF && !(drain && off == PIPS_BATCH_DRAIN_OFF))
+        if (off != PIPS_DESIGN_ID_OFF && !(drain && off == PIPS_BATCH_DRAIN_OFF) &&
+            !(pb && (off == PIPS_PB_THR_OFF || off == PIPS_PB_CFG_OFF ||
+                     (off >= PIPS_PB_STAT_FLAGS_OFF && off <= PIPS_PB_STAT_MRD_WAIT_OFF))))
             bad += axi_rd(a + off) != 0;
     st = win_check(NULL);
-    check(!bad && !st, "reserved registers 0x%02x-0x1c and 0x24-0x3c read 0 (%u do not, WIN_STATUS "
-          "%s)", drain ? 0x08 : 0x04, bad, win_flags(st));
+    if (pb)
+        check(!bad && !st, "reserved registers 0x10-0x1c and 0x30-0x3c read 0 (%u do not, WIN_STATUS %s)",
+              bad, win_flags(st));
+    else
+        check(!bad && !st, "reserved registers 0x%02x-0x1c and 0x24-0x3c read 0 (%u do not, WIN_STATUS "
+              "%s)", drain ? 0x08 : 0x04, bad, win_flags(st));
     v = axi_rd(a + 0x40);
     st = win_check(NULL);
     check(v == orig && !st, "0x%08" PRIx64 " repeats reg0: 0x%08x", a + 0x40, v);
@@ -1385,6 +1540,8 @@ static void usage(void)
     fputs("usage: pips [-s BDF] [-f] <command> [args]\n"
           "  info | rd OFF [N] | wr OFF VAL | axi-rd ADDR [N] | axi-wr ADDR VAL\n"
           "  cfg | cfg set depth=N time=N mrd=0|1 log=0|1 raw=VAL cap=0|1 ...\n"
+          "        (design >= 0x0a06 also: pb=0|1 pushoff=0|1 quantum=N thr=N thr0=N thr1=N raw2= raw3=)\n"
+          "  status            page batcher status since the last read (read clears; >= 0x0a06)\n"
           "  dma | dma-reset\n"
           "  log-clear | log-start | log-stop [MS] | log-wait [MS] | log-dump FILE [BYTES]\n"
           "  ddr-dump ADDR BYTES FILE\n"
@@ -1453,6 +1610,8 @@ int main(int argc, char **argv)
     }
     if (!strcmp(cmd, "cfg"))
         return cmd_cfg(argc, argv);
+    if (!strcmp(cmd, "status") && argc == 0)
+        return cmd_status();
     if (!strcmp(cmd, "dma") && argc == 0) {
         win_start();
         dma_print();

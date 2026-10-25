@@ -32,6 +32,16 @@
 #   reports/<name>-RUN-server-<j>/pips-log.rpt   status: FULL, CUT, +DROPS,
 #                               NO_TRAILER, BAD or FAILED; design_id, log_format
 # A log problem does not fail the run. PIPS_LOG_GZIP=0 keeps the .bin.
+#
+# --flows-nic1 N: NIC 1 runs N flows (both -S and -C) instead of -S/-C, for an
+# uneven co-run; the results record flows_per_nic as "<nic0>x<nic1>".
+# --client-hw-rate RATE (e.g. 50g): the client's NIC paces each active port to
+# RATE in hardware (mlx5 per-queue tx_maxrate, RATE / flows on every TX queue),
+# so frames leave evenly spaced; iperf3 itself runs uncapped (-b is ignored).
+# Put back to 0 (no limit) when the run ends. A port that refuses it stops the run.
+# Every run also records, over the measurement window, TCP retransmits on the
+# client (nstat: reports/<name>-RUN-server-<j>/retx.rpt) and the deltas of both
+# ends' pause, discard and buffer counters (ethtool -S: nicstats-nic<i>.rpt).
 set -u
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -54,6 +64,8 @@ num_runs=1
 sync_client=0
 results_file=""        # JSONL to append to; default ~/<exp>-<N>.jsonl, first unused N
 pips_log=0             # 1: record the PIPS switch's TLP log in every run
+flows1=""              # NIC 1's flow count when it differs from NIC 0's (--flows-nic1)
+hw_rate=""             # client-side hardware pacing per port (--client-hw-rate), e.g. 50g
 CLIENT_BRANCH="$(git -C "$HERE/.." rev-parse --abbrev-ref HEAD 2>/dev/null || echo icx-dualnic)"
 
 while [ $# -gt 0 ]; do
@@ -74,12 +86,18 @@ while [ $# -gt 0 ]; do
         --uncapped)      bandwidth="uncapped"; shift ;;
         --results)       results_file="$2"; shift 2 ;;
         --pips-log)      pips_log="$2"; shift 2 ;;
+        --flows-nic1)    flows1="$2"; shift 2 ;;
+        --client-hw-rate) hw_rate="$2"; shift 2 ;;
         -h|--help)
-            sed -n '2,34p' "$0"; exit 0 ;;
+            awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; exit 0 ;;
         *) echo "unknown option: $1"; exit 2 ;;
     esac
 done
 case "$pips_log" in 0|1) ;; *) echo "ERROR: --pips-log must be 0 or 1" >&2; exit 2 ;; esac
+case "$flows1" in ''|[1-9]|[1-9][0-9]) ;; *) echo "ERROR: --flows-nic1 takes 1-99" >&2; exit 2 ;; esac
+case "$hw_rate" in ''|[1-9]*[gG]) ;; *) echo "ERROR: --client-hw-rate takes e.g. 50g" >&2; exit 2 ;; esac
+# Flows of NIC i: -S, or --flows-nic1 for NIC 1.
+nflows() { if [ "$1" = 1 ] && [ -n "$flows1" ]; then echo "$flows1"; else echo "$num_servers"; fi; }
 
 # iperf3 -b is PER FLOW. To cap a NIC at an aggregate rate its flows have to
 # divide that rate between them, otherwise "-b 40g" with 8 flows asks for
@@ -347,6 +365,60 @@ cleanup() {
     sudo pkill -9 iperf3 >/dev/null 2>&1 || true
     rsh_try "sudo pkill -9 iperf3; screen -wipe" >/dev/null 2>&1 || true
     sudo bash -c 'echo 0 > /sys/kernel/debug/tracing/tracing_on' 2>/dev/null || true
+    if [ -n "$hw_rate" ]; then
+        local i
+        for i in "${ACTIVE[@]}"; do hw_rate_set "${CLIENT_INTFS[$i]}" 0 >/dev/null 2>&1; done
+    fi
+    return 0
+}
+
+# Hardware pacing on the client (--client-hw-rate): hw_rate_set <client port>
+# <Mbps per queue, 0 = off> on every TX queue of that port. Prints what the port
+# reads back; fails if it refuses (the driver or firmware lacks tx_maxrate).
+hw_rate_set() {
+    local c="$1" per="$2"
+    rsh_try "sudo bash -c 'n=0; for q in /sys/class/net/$c/queues/tx-*/tx_maxrate; do
+                 echo $per > \$q || exit 1; n=\$((n + 1)); done
+                 echo \"     $c: \$n TX queues, tx-0 reads \$(cat /sys/class/net/$c/queues/tx-0/tx_maxrate) Mbps\"'" ||
+        { echo "ERROR: $c on the client refused tx_maxrate=$per" >&2; return 1; }
+}
+# <aggregate, e.g. 50g> <flows> -> Mbps per TX queue (each flow gets its own queue)
+hw_per_queue() { awk -v r="${1%[gG]}" -v n="$2" 'BEGIN { printf "%d", (r * 1000 + n - 1) / n }'; }
+
+# Counters over the measurement window. ethtool -S of the server port (here)
+# and the client port (styx) before and after; the deltas of the pause,
+# discard, buffer and error counters go to reports/<run>/nicstats-nic<i>.rpt
+# as srv_<name> / cli_<name>. TCP retransmits on the client from nstat (all
+# its flows, both ports): reports/<run>/retx.rpt.
+NICSTAT_RE='pause|discard|out_of_buffer|buffer_passed|_err|crc|drop'
+nicstats_snap() {   # <tag before|after>
+    local i
+    for i in "${ACTIVE[@]}"; do
+        ethtool -S "${SERVER_INTFS[$i]}" > "$L/ethtool-srv-nic$i-$1.txt" 2>/dev/null
+        rsh_try "ethtool -S ${CLIENT_INTFS[$i]}" > "$L/ethtool-cli-nic$i-$1.txt" 2>/dev/null
+    done
+    if [ "$1" = before ]; then
+        rsh_try "nstat -n" >/dev/null 2>&1
+    else
+        rsh_try "nstat -z TcpOutSegs TcpRetransSegs" > "$L/nstat-client.txt" 2>/dev/null
+    fi
+}
+nicstats_report() {
+    local i r="$setup_dir/reports/$RUN"
+    for i in "${ACTIVE[@]}"; do
+        for side in srv cli; do
+            awk -v re="$NICSTAT_RE" -v side="$side" '
+                { gsub(/^[ \t]+/, ""); split($0, kv, /:[ \t]*/); k = kv[1]; v = kv[2] + 0 }
+                k !~ re { next }
+                FNR == NR { b[k] = v; next }
+                { d = v - b[k]; if (d != 0) printf "%s_%s: %d\n", side, k, d }
+            ' "$L/ethtool-$side-nic$i-before.txt" "$L/ethtool-$side-nic$i-after.txt" 2>/dev/null
+        done > "$r/nicstats-nic$i.rpt"
+    done
+    # nstat after nstat -n: the increments since the window opened (-z: zeros too)
+    awk '$1 == "TcpOutSegs" { o = $2 } $1 == "TcpRetransSegs" { x = $2 }
+         END { if (o == "") exit; printf "Out_segs: %d\nRetx_segs: %d\nRetx_percent: %.4f\n", o, x, o ? 100 * x / o : 0 }' \
+        "$L/nstat-client.txt" > "$r/retx.rpt" 2>/dev/null
 }
 
 # One experiment at a time. Every run kills iperf3 on BOTH hosts before it
@@ -374,7 +446,8 @@ trap 'exit 143' TERM
 echo "=============================================================="
 echo "  experiment : $exp"
 echo "  NICs       : $nics  (indices: ${ACTIVE[*]})"
-echo "  per NIC    : $num_servers flows, $( [ "$(per_flow_bw "$bandwidth" "$num_clients")" = 0 ] && echo "UNCAPPED (line rate)" || echo "$bandwidth aggregate ($(per_flow_bw "$bandwidth" "$num_clients") bps/flow)" ), cca=$cca"
+[ -n "$hw_rate" ] && bandwidth=uncapped           # the client's NIC paces, not iperf3
+echo "  per NIC    : $num_servers flows${flows1:+ (NIC 1: $flows1)}, $( [ "$(per_flow_bw "$bandwidth" "$num_clients")" = 0 ] && echo "UNCAPPED (line rate)" || echo "$bandwidth aggregate ($(per_flow_bw "$bandwidth" "$num_clients") bps/flow)" ), cca=$cca${hw_rate:+, client NIC paced to $hw_rate per port in hardware}"
 echo "  mtu $mtu  ring $ring_buffer  sockbuf ${buf}MB  dur ${dur}s"
 echo "  IOMMU      : $iommu_mode   (kernel $(uname -r))"
 echo "=============================================================="
@@ -453,16 +526,20 @@ for ((j = 0; j < num_runs; j++)); do
     sleep 1
     for i in "${ACTIVE[@]}"; do
         ( cd "$exp_dir" && sudo bash run-netapp-tput.sh -m server \
-              -S "$num_servers" -o "$RUN-nic$i" -p "${BASE_PORTS[$i]}" \
+              -S "$(nflows "$i")" -o "$RUN-nic$i" -p "${BASE_PORTS[$i]}" \
               -c "${SERVER_CORES[$i]}" --no_kill ) 9>&- &   # don't hold the lock
     done
     sleep 5
 
     # Confirm the receivers actually bound before driving traffic at them.
-    want=$(( num_servers * ${#ACTIVE[@]} ))
-    got=$(ss -ltn 2>/dev/null | awk -v n="$num_servers" '
+    want=0; ranges=""
+    for i in "${ACTIVE[@]}"; do
+        want=$(( want + $(nflows "$i") )); ranges="$ranges ${BASE_PORTS[$i]}:$(nflows "$i")"
+    done
+    got=$(ss -ltn 2>/dev/null | awk -v r="$ranges" '
+        BEGIN { n = split(r, rr, " "); for (k = 1; k <= n; k++) { split(rr[k], b, ":"); lo[k] = b[1]; cnt[k] = b[2] } }
         { split($4,a,":"); p=a[length(a)]+0
-          if ((p>=3000 && p<3000+n) || (p>=4000 && p<4000+n)) c++ }
+          for (k = 1; k <= n; k++) if (p >= lo[k] && p < lo[k] + cnt[k]) c++ }
         END{ print c+0 }')
     echo "   receivers listening: $got/$want"
     [ "$got" -eq 0 ] && { echo "ERROR: no iperf3 receivers bound." >&2; exit 1; }
@@ -472,14 +549,22 @@ for ((j = 0; j < num_runs; j++)); do
     sudo bash -c 'echo 1 > /sys/kernel/debug/tracing/tracing_on' 2>/dev/null
 
     # -------------------------------------------------------------- senders
-    flow_bw=$(per_flow_bw "$bandwidth" "$num_clients")
     # Same rule as the receivers: sweep once, then --no_kill for every group.
     rsh "sudo pkill -9 iperf3 >/dev/null 2>&1; screen -wipe >/dev/null 2>&1; true"
     sleep 1
+    if [ -n "$hw_rate" ]; then
+        for i in "${ACTIVE[@]}"; do
+            per=$(hw_per_queue "$hw_rate" "$(nflows "$i")")
+            echo "   client hardware pacing: ${CLIENT_INTFS[$i]} $hw_rate = $per Mbps per TX queue"
+            hw_rate_set "${CLIENT_INTFS[$i]}" "$per" || exit 1
+        done
+    fi
     for i in "${ACTIVE[@]}"; do
+        nf=$(nflows "$i")
+        flow_bw=$(per_flow_bw "$bandwidth" "$nf")
         rsh "screen -dmS client_nic$i bash -c \"cd $exp_dir && \
              sudo bash run-netapp-tput.sh -m client -a ${SERVER_NIC_IPS[$i]} \
-             -C $num_clients -S $num_servers -o $exp-RUN-client-$j-nic$i \
+             -C $nf -S $nf -o $exp-RUN-client-$j-nic$i \
              -p ${BASE_PORTS[$i]} -l ${CLIENT_CORES[$i]} -c ${CLIENT_CORES[$i]} \
              -b $flow_bw --cca $cca --no_kill\""
     done
@@ -507,10 +592,15 @@ for ((j = 0; j < num_runs; j++)); do
     # One pcm-iio collection: the counters are a stack-level sum regardless of
     # how many NICs are active, which is exactly the contention signal.
     echo "recording host metrics for ${dur}s (aggregate over active NICs)..."
+    nicstats_snap before
     ( cd "$setup_dir" && sudo bash record-host-metrics.sh -f 0 --iio 0 -t 1 \
         --intf "${SERVER_INTFS[${ACTIVE[0]}]}" -o "$RUN" --type 0 \
         --cpu-util 1 --pcie 1 --membw 1 --bw 0 --dur "$dur" \
         --cores "$active_cores" )
+    nicstats_snap after
+    nicstats_report
+    echo "   window counters: $(cat "$setup_dir/reports/$RUN/retx.rpt" 2>/dev/null | xargs);" \
+         "pause/discard deltas: $(cat "$setup_dir/reports/$RUN"/nicstats-nic*.rpt 2>/dev/null | grep -c .) nonzero"
 
     # The window is over: dump and decode the TLP log while iperf3 finishes.
     t_pips=$SECONDS
@@ -641,14 +731,18 @@ if [ -z "$results_file" ]; then
     results_file="$HOME/$exp-$k.jsonl"
 fi
 flow_bw=$(per_flow_bw "$bandwidth" "$num_clients")
+fl_meta="$num_servers"
+[ "$nics" -eq 2 ] && [ -n "$flows1" ] && [ "$flows1" != "$num_servers" ] && fl_meta="${num_servers}x$flows1"
 pips_meta       # the PIPS build, setting and log status, when the NICs are behind it
 python3 "$HERE/dualnic-results.py" dump \
     --reports "$setup_dir/reports" --exp "$exp" --runs "$num_runs" \
     --nics "$(IFS=,; echo "${ACTIVE[*]}")" --out "$results_file" \
     --meta mode="$( [ "$nics" -eq 2 ] && echo both || echo "nic${nic_index}only" )" \
     --meta iommu="$iommu_mode" \
-    --meta flows_per_nic="$num_servers" \
-    --meta bandwidth_per_nic="$( [ "$flow_bw" = 0 ] && echo uncapped || echo "$bandwidth" )" \
+    --meta flows_per_nic="$fl_meta" \
+    --meta flows_nic0="$(nflows 0)" --meta flows_nic1="$(nflows 1)" \
+    --meta bandwidth_per_nic="$( [ -n "$hw_rate" ] && echo "hw$hw_rate" || { [ "$flow_bw" = 0 ] && echo uncapped || echo "$bandwidth"; } )" \
+    --meta client_hw_rate="${hw_rate:-none}" \
     --meta per_flow_bps="$flow_bw" \
     --meta mtu="$mtu" --meta ring_buffer="$ring_buffer" --meta sockbuf_mb="$buf" \
     --meta dur_s="$dur" --meta cca="$cca" --meta cpu_util_cores="$active_cores" \

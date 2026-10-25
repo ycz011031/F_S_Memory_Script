@@ -224,12 +224,48 @@ returns DECERR.
 |---|---|---|
 | `0x00` | RW | **batcher/logger config** (reg0, below) |
 | `0x04` | RW | **batcher drain config** (reg1, below), from design `0x0A03`. Before: reserved, reads 0, ignores writes |
-| `0x08–0x1C` | RO | reserved, read 0. Can become read/write in a later build (`REG_RW_MASK`) |
+| `0x08` | RW | **page batcher thresholds** (reg2, below), from design `0x0A06`. Before: reserved, reads 0 |
+| `0x0C` | RW | **page batcher config** (reg3, below), from design `0x0A06`. Before: reserved, reads 0 |
+| `0x10–0x1C` | RO | reserved, read 0. Can become read/write in a later build (`REG_RW_MASK`) |
 | `0x20` | RO | **design ID**: `[15:0]` build identifier, `[31:16]` 0 |
-| `0x24–0x3C` | RO | reserved, read 0 |
+| `0x24` | RO, **read clears** | **page batcher status flags** (from `0x0A06`, below): `[0]` in0 overflowed, `[1]` in1 overflowed, `[2]` stuck |
+| `0x28` | RO | overflow spill counts, `[15:0]` in0, `[31:16]` in1, as of the last `0x24` read |
+| `0x2C` | RO | longest MRd wait in cycles (4 ns), `[15:0]` in0, `[31:16]` in1, as of the last `0x24` read |
+| `0x30–0x3C` | RO | reserved, read 0 |
 
 Writes to read-only registers are ignored with an OKAY response
 (`WIN_STATUS` stays 0).
+
+**The page batcher (design `0x0A06` on).** The batcher is `axi4_mwr_batch_pp`
+(FPGA repo `src/Utilities/`), its registers decoded by `pips_batch_ctrl_0`
+(`src/switch/pips_batch_ctrl.v`). Every field's 0 is its power-on value.
+
+| Register | Bits | Field | Meaning |
+|---|---|---|---|
+| reg2 `0x08` | `[10:0]` | `ctrl_dw_thr_0` | an MWr from in0 with Dword Count ≤ this is a **completion** (control lane, a fence: that device's older data leaves first). 0 = 16 DW |
+| | `[26:16]` | `ctrl_dw_thr_1` | the same for in1 |
+| reg3 `0x0C` | `[0]` | `page_batch_en` | 1 = batch **per page** (address >> 12) with per-device age order, a completion lane and an overflow; 0 = one in-order FIFO per input with the earlier builds' rules (the FIFO is the whole 1536-row array). A change takes effect once that input's batcher is empty |
+| | `[8]` | `ctrl_push_off` | 0 = a waiting completion makes every older batch eligible to drain; 1 = off |
+| | `[27:16]` | `grant_quantum` | beats one input may send in a turn while the other waits; 0 = no limit |
+
+Fixed in the build: weighted round robin by open pages (`wrr_en` 1),
+`seg_low_water` 0, 8 page segments of 128 rows per input plus 512 overflow
+rows and 512 completion rows. `batch_mrd` (reg0 `[16]`) is tied off: writable,
+no effect. A completion taken for data loses the fence; data taken for a
+completion only costs batching, so err high: the campaign uses 31 DW (`w31`).
+On the 0x0A04/0x0A05 logs drive completions are 4 DW and mlx5's 16 DW; NIC
+data starts at 32 DW, drive 1 writes some data of 4-32 DW (0.5%) and of 36 DW
+(14%). MSI writes are recognised by address whatever the threshold.
+
+**Status.** Reading `0x24` returns the sticky flags, clears them and the
+batcher's own status, and latches `0x28`/`0x2C`: one read closes a period.
+`pips status` does exactly that and prints the decoded values; the runners
+read it at the start of every run (opening the period) and after its
+measurement window (`pips-status.txt`, `pips_stat_*` in the results).
+`stuck` means the batcher's watchdog found the output idle for 4096 cycles
+with data held and forced a drain: it should never be set. The MRd wait is
+the longest any read waited at an input (a device's completion timeout is
+50 µs at the least). Over JTAG: `pips_status` in `pips-xsct.tcl`.
 
 **Design ID.**
 - Set in `pips.tcl` (`pips_design_id`), `0x0A02` first, +1 with every FPGA

@@ -9,6 +9,10 @@
 #
 # Arguments: flows per NIC, rates in Gbps per NIC (default "uncapped", i.e.
 # line rate), repeats, modes (default "both", the co-run).
+# A flow entry A:B is an uneven co-run, A flows on NIC 0 and B on NIC 1
+# (named f<A>x<B>; run in mode "both" only, other modes skip it). A rate entry
+# hw<N> paces each client port to N Gbps in the client NIC's hardware instead
+# of iperf3's -b (run-dualnic-experiment.sh --client-hw-rate; named hw<N>g).
 # -o NAME anywhere names the result files. -p PREFIX names the experiments
 # (run folders in utils/logs and utils/reports) <PREFIX>-<rate>-f<flows>-<mode>
 # instead of dnflows-<iommu>-...; dualnic_pips_sweep.sh gives each batcher
@@ -95,10 +99,18 @@ summarize() {
     } | tee "$TXT"
 }
 
-rate_args() {   # <rate> -> sets bwarg (for the runner) and tag (for names)
+rate_args() {   # <rate> -> sets bwarg, hwarg (for the runner) and tag (for names)
+    hwarg=()
     case "$1" in
         uncapped|unlimited|0) bwarg="uncapped"; tag="uncapped" ;;
+        hw[0-9]*)             bwarg="uncapped"; tag="${1}g"; hwarg=( --client-hw-rate "${1#hw}g" ) ;;
         *)                    bwarg="${1}g";    tag="${1}g" ;;
+    esac
+}
+flow_args() {  # <flows, N or A:B> -> sets fl (NIC 0's flows), flarg (runner) and ftag (names)
+    case "$1" in
+        *:*) fl=${1%%:*}; flarg=( --flows-nic1 "${1#*:}" ); ftag="${fl}x${1#*:}" ;;
+        *)   fl=$1; flarg=(); ftag=$1 ;;
     esac
 }
 
@@ -106,7 +118,7 @@ rate_args() {   # <rate> -> sets bwarg (for the runner) and tag (for names)
 # already aborts when it cannot ping or start iperf3; this also catches a path
 # that connects but carries nothing, which would otherwise surface at the end
 # as a summary full of zeros.
-low=$(printf '%s\n' $FLOWS | sort -n | head -1)
+low=$(printf '%s\n' $FLOWS | cut -d: -f1 | sort -n | head -1)
 rate_args "${RATES%% *}"
 e="$PREFIX-$tag-f$low-datapath"
 echo
@@ -115,7 +127,8 @@ if [ "$DATAPATH" = 0 ]; then
 else
     echo "######## datapath check: NIC0 alone, $low flows/NIC, $tag, 1 run"
     if ! ./run-dualnic-experiment.sh -E "$e" --nics 1 --nic-index 0 \
-            -S "$low" -C "$low" -b "$bwarg" --runs 1 --results "$JSONL" ${EXTRA[@]+"${EXTRA[@]}"}; then
+            -S "$low" -C "$low" -b "$bwarg" ${hwarg[@]+"${hwarg[@]}"} --runs 1 --results "$JSONL" \
+            ${EXTRA[@]+"${EXTRA[@]}"}; then
         echo "######## ABORTING: datapath check failed" >&2
         exit 1
     fi
@@ -132,6 +145,7 @@ fi
 for r in $RATES; do
     rate_args "$r"
     for f in $FLOWS; do
+        flow_args "$f"
         for mode in $MODES; do
             case "$mode" in
                 nic0only) args="--nics 1 --nic-index 0" ;;
@@ -139,12 +153,16 @@ for r in $RATES; do
                 both)     args="--nics 2" ;;
                 *) echo "unknown mode '$mode' (nic0only|nic1only|both)" >&2; exit 2 ;;
             esac
+            if [ ${#flarg[@]} -gt 0 ] && [ "$mode" != both ]; then
+                echo "######## $tag f$ftag $mode: skipped (an uneven entry runs in mode both only)"
+                continue
+            fi
             echo
-            echo "######## IOMMU $IOMMU  $tag/NIC  $f flows/NIC  $mode"
-            if ! ./run-dualnic-experiment.sh -E "$PREFIX-$tag-f$f-$mode" $args \
-                    -S "$f" -C "$f" -b "$bwarg" --runs "$RUNS" --results "$JSONL" \
-                    ${EXTRA[@]+"${EXTRA[@]}"}; then
-                echo "######## ABORTING at $tag/f$f/$mode" >&2
+            echo "######## IOMMU $IOMMU  $tag/NIC  $ftag flows/NIC  $mode"
+            if ! ./run-dualnic-experiment.sh -E "$PREFIX-$tag-f$ftag-$mode" $args \
+                    -S "$fl" -C "$fl" ${flarg[@]+"${flarg[@]}"} -b "$bwarg" ${hwarg[@]+"${hwarg[@]}"} \
+                    --runs "$RUNS" --results "$JSONL" ${EXTRA[@]+"${EXTRA[@]}"}; then
+                echo "######## ABORTING at $tag/f$ftag/$mode" >&2
                 summarize
                 exit 1
             fi

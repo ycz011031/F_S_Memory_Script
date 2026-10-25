@@ -22,6 +22,8 @@
  * leaving the batcher, port = its input, pkt_wait at 0x0c, tag at 0x0f, AT in
  * pkt_type[5:4]; before, v1: records for in0, in1 and out, tag at 0x0c, AT at
  * 0x0d). "none" is a build from before DESIGN_ID: 0x20 answers DECERR.
+ * From 0x0a06: reg2/reg3 hold what is written, and 0x24-0x2C report
+ * $PIPS_SIM_STAT for a period that had a recording in it (stat_read below).
  */
 #define _GNU_SOURCE
 #include <fcntl.h>
@@ -49,6 +51,10 @@ struct state {
     uint32_t nrec, ndrop;
     uint32_t tail;      /* bytes the logger holds that the DMA has not taken */
     uint8_t bram[PIPS_BRAM_SIZE];
+    /* design >= 0x0a06 (appended: an older state file reads these as 0, the power-on values) */
+    uint32_t pbthr, pbcfg;      /* reg2, reg3 */
+    uint32_t stat_pend;         /* a recording ran since the last 0x24 read */
+    uint32_t stat_cnt, stat_wait; /* 0x28 / 0x2C as latched by the last 0x24 read */
 };
 
 static struct state *S;
@@ -188,6 +194,7 @@ static void log_edge(uint32_t old, uint32_t now)
         uint8_t r[16];
 
         S->rec = 1;
+        S->stat_pend = 1;
         S->nrec = S->ndrop = 0;
         if (!S->xfer)
             return;                     /* DMA not running: nothing gets through */
@@ -213,14 +220,38 @@ static void log_edge(uint32_t old, uint32_t now)
     }
 }
 
+/* Page batcher status (design >= 0x0a06): $PIPS_SIM_STAT = "FLAGS,OVF0,OVF1,WAIT0,WAIT1"
+ * is what a period with a recording in it reports (default all 0); a period without
+ * one reports 0. Reading 0x24 returns the flags, latches 0x28/0x2C and clears. */
+static uint32_t stat_read(void)
+{
+    const char *e = getenv("PIPS_SIM_STAT");
+    unsigned f = 0, o0 = 0, o1 = 0, w0 = 0, w1 = 0;
+
+    if (S->stat_pend && e)
+        sscanf(e, "%u,%u,%u,%u,%u", &f, &o0, &o1, &w0, &w1);
+    if (!S->stat_pend)
+        f = o0 = o1 = w0 = w1 = 0;
+    S->stat_pend = 0;
+    S->stat_cnt = (o0 & 0xFFFFu) | (o1 & 0xFFFFu) << 16;
+    S->stat_wait = (w0 & 0xFFFFu) | (w1 & 0xFFFFu) << 16;
+    return f & 7u;
+}
+
 /* ------------------------------------------------------------ AXI targets */
 static uint32_t axi_read(uint64_t a, int *err)
 {
     if (a >= PIPS_AXI_REGFILE && a < PIPS_AXI_REGFILE + 0x10000) {
+        int pb = design() >= (int)PIPS_DESIGN_ID_PAGE_BATCH;
         switch (a & 0x3F) {             /* 16 registers, repeating every 0x40 */
         case PIPS_BATCH_CFG_OFF: return S->cfg;
         case PIPS_BATCH_DRAIN_OFF:
             return design() >= (int)PIPS_DESIGN_ID_DRAIN_CFG ? S->drain : 0;
+        case PIPS_PB_THR_OFF: return pb ? S->pbthr : 0;
+        case PIPS_PB_CFG_OFF: return pb ? S->pbcfg : 0;
+        case PIPS_PB_STAT_FLAGS_OFF: return pb ? stat_read() : 0;
+        case PIPS_PB_STAT_OVF_COUNT_OFF: return pb ? S->stat_cnt : 0;
+        case PIPS_PB_STAT_MRD_WAIT_OFF: return pb ? S->stat_wait : 0;
         case PIPS_DESIGN_ID_OFF:
             if (design() < 0)
                 break;                  /* before the register: DECERR */
@@ -250,6 +281,14 @@ static int axi_write(uint64_t a, uint32_t v)
         uint32_t old = S->cfg;
         if ((a & 0x3F) == PIPS_BATCH_DRAIN_OFF && design() >= (int)PIPS_DESIGN_ID_DRAIN_CFG) {
             S->drain = v & PIPS_BATCH_DRAIN_DEPTH_CAP;
+            return 0;
+        }
+        if (design() >= (int)PIPS_DESIGN_ID_PAGE_BATCH && (a & 0x3F) == PIPS_PB_THR_OFF) {
+            S->pbthr = v;
+            return 0;
+        }
+        if (design() >= (int)PIPS_DESIGN_ID_PAGE_BATCH && (a & 0x3F) == PIPS_PB_CFG_OFF) {
+            S->pbcfg = v;
             return 0;
         }
         if (a & 0x3F)

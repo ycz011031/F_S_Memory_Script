@@ -27,6 +27,16 @@
 #                     design 0x0a03); 1 = at most DEPTH packets per drain. Cap
 #                     1 needs design 0x0a03 or later; the sweep refuses to
 #                     start without it.
+#   --pbs "0 1"       page_batch_en values run with every --cfgs/--caps setting
+#                     (design 0x0a06 on; default "0" there): 1 = per-page
+#                     batching (tag p1), 0 = one in-order FIFO per input with
+#                     the earlier builds' rules. Refused on an older build.
+#   --set "K=V ..."   page batcher fields for every setting (design 0x0a06 on):
+#                     pushoff=0|1 (tag o1), quantum=BEATS (q<N>), thr=DW or
+#                     thr0= thr1= (w<N>, w<a>x<b>; 0 = 16 DW). Fields not given
+#                     are written 0, their power-on value, so every setting
+#                     starts from the same state. On 0x0a06 batch_mrd (the :1
+#                     of --cfgs) has no effect, and such settings are skipped.
 #   --no-asy          the even grid only
 #   --asy-low "2 4 8", --asy-high "16 32", --no-swap, --single, --single-ssd N
 #                     as dualssd_cross_sweep.sh (--single = drive 0 alone)
@@ -82,9 +92,12 @@ for a in "$@"; do if [ "$a" = --tmux ]; then IN_TMUX=1; else PASS+=( "$a" ); fi;
 set -- ${PASS[@]+"${PASS[@]}"}
 
 CFGS="1:0 8:22"; CAPS="0 1"; NAME=""; LABEL=""; ASY=1; SINGLE_SSD=""; DP_ONCE=0; OPTS=(); POS=()
+PBS=""; SETKV=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --cfgs)        CFGS="$2"; shift 2 ;;
+        --pbs)         PBS="$2"; shift 2 ;;
+        --set)         SETKV="$2"; shift 2 ;;
         --caps)        CAPS="$2"; shift 2 ;;
         --no-asy)      ASY=0; shift ;;
         --datapath-once) DP_ONCE=1; shift ;;
@@ -94,7 +107,7 @@ while [ $# -gt 0 ]; do
         --no-swap)     OPTS+=( "$1" ); shift ;;
         --single)      SINGLE_SSD="${SINGLE_SSD:-0}"; shift ;;
         --single-ssd)  SINGLE_SSD="$2"; shift 2 ;;
-        -h|--help)     sed -n '2,72p' "$SELF"; exit 0 ;;
+        -h|--help)     awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF"; exit 0 ;;
         -*)            echo "unknown option: $1" >&2; exit 2 ;;
         *)             POS+=( "$1" ); shift ;;
     esac
@@ -111,6 +124,24 @@ case "$LABEL" in d[0-9]*t[0-9]*|id[0-9a-f][0-9a-f][0-9a-f][0-9a-f]*)
 for c in $CAPS; do
     case "$c" in 0|1) ;; *) echo "--caps: '$c' is not 0 or 1" >&2; exit 2 ;; esac
 done
+for p in $PBS; do
+    case "$p" in 0|1) ;; *) echo "--pbs: '$p' is not 0 or 1" >&2; exit 2 ;; esac
+done
+# --set: the page batcher fields every setting gets (0 = power-on value).
+PO=0; PQ=0; PT0=0; PT1=0
+for kv in $SETKV; do
+    k=${kv%%=*}; v=${kv#*=}
+    case "$v" in ''|*[!0-9]*) echo "--set: '$kv' is not KEY=NUMBER" >&2; exit 2 ;; esac
+    case "$k" in
+        pushoff) [ "$v" -le 1 ] || { echo "--set: pushoff is 0 or 1" >&2; exit 2; }; PO=$v ;;
+        quantum) [ "$v" -le 4095 ] || { echo "--set: quantum is 0-4095 beats" >&2; exit 2; }; PQ=$v ;;
+        thr)     [ "$v" -le 2047 ] || { echo "--set: thr is 0-2047 DW" >&2; exit 2; }; PT0=$v; PT1=$v ;;
+        thr0)    [ "$v" -le 2047 ] || { echo "--set: thr0 is 0-2047 DW" >&2; exit 2; }; PT0=$v ;;
+        thr1)    [ "$v" -le 2047 ] || { echo "--set: thr1 is 0-2047 DW" >&2; exit 2; }; PT1=$v ;;
+        *) echo "--set: unknown field '$k' (pushoff quantum thr thr0 thr1)" >&2; exit 2 ;;
+    esac
+done
+WANT_PB=0; { [ -n "$PBS" ] || [ -n "$SETKV" ]; } && WANT_PB=1
 TAGS=(); VALS=(); WANT_CAP=0
 for c in $CFGS; do
     IFS=: read -r d t m extra <<< "$c"
@@ -120,9 +151,12 @@ for c in $CFGS; do
        { [ "$m" != 0 ] && [ "$m" != 1 ]; }; then
         echo "--cfgs: '$c' is not DEPTH:TIME[:MRD] (0-255, 0-255, 0 or 1)" >&2; exit 2
     fi
-    for cap in $CAPS; do
-        TAGS+=( "$(pips_tag $(( d | t << 8 | m << 16 )) "$cap")" ); VALS+=( "$d $t $m $cap" )
-        [ "$cap" = 1 ] && WANT_CAP=1
+    for pb in ${PBS:-0}; do
+        for cap in $CAPS; do
+            TAGS+=( "$(pips_tag $(( d | t << 8 | m << 16 )) "$cap" "$pb" "$PO" "$PQ" "$PT0" "$PT1")" )
+            VALS+=( "$d $t $m $cap $pb" )
+            [ "$cap" = 1 ] && WANT_CAP=1
+        done
     done
 done
 [ ${#TAGS[@]} -gt 0 ] || { echo "--cfgs/--caps: no settings" >&2; exit 2; }
@@ -152,6 +186,19 @@ DESIGN=$(design_of <(printf '%s\n' "$out")); IDT=$(pips_idtag "$DESIGN")
 HAVE_CAP=""; pips_design_ge "$DESIGN" 0x0a03 && HAVE_CAP=1
 [ "$WANT_CAP" = 1 ] && [ -z "$HAVE_CAP" ] &&
     die "--caps 1: design ${DESIGN:-?} has no drain depth cap (needs 0x0a03 or later); use --caps 0"
+# The page batcher's registers exist from design 0x0a06: there every setting
+# writes all of them (--pbs, --set, else their power-on 0), and the originals
+# are put back at the end.
+HAVE_PB=""; PB0=""; THR0=""
+if pips_design_ge "$DESIGN" 0x0a06; then
+    HAVE_PB=1
+    PB0=$(printf '%s\n' "$out" | sed -n 's/^pb=\(0x[0-9a-f]*\).*/\1/p')
+    THR0=$(printf '%s\n' "$out" | sed -n 's/^thr=\(0x[0-9a-f]*\).*/\1/p')
+    [ -n "$PB0" ] && [ -n "$THR0" ] || die "design $DESIGN: pips cfg shows no pb=/thr= lines (rebuild scripts/pips/pips)"
+elif [ "$WANT_PB" = 1 ]; then
+    die "--pbs/--set: design ${DESIGN:-?} has no page batcher (needs 0x0a06 or later)"
+fi
+PBSET="pushoff=$PO quantum=$PQ thr0=$PT0 thr1=$PT1"
 
 declare -p SSD_SERIALS >/dev/null 2>&1 || die "SSD_SERIALS is not set in utils/setup-server.sh"
 IOMMU=$(for s in "${SSD_SERIALS[@]}"; do
@@ -186,8 +233,9 @@ exec > >(trap '' INT TERM; exec tee -a "$LOGDIR/pips-sweep.log") 2>&1
 restore() {
     local v
     v=$(printf '0x%08x' $(( CFG0 & ~0x1000000 )))
-    if P cfg set raw="$v" ${HAVE_CAP:+cap="$CAP0"} > "$LOGDIR/cfg-restored.txt" 2>&1; then
-        echo "######## batcher setting restored: $(pips_tag "$v" "$CAP0") ($v)"
+    if P cfg set raw="$v" ${HAVE_CAP:+cap="$CAP0"} ${HAVE_PB:+raw2="$THR0" raw3="$PB0"} \
+            > "$LOGDIR/cfg-restored.txt" 2>&1; then
+        echo "######## batcher setting restored: $(pips_tag_of "$LOGDIR/cfg-restored.txt") ($v)"
     else
         echo "######## WARNING: could not restore the batcher setting $v:" \
              "$(tail -1 "$LOGDIR/cfg-restored.txt")" >&2
@@ -214,18 +262,28 @@ echo "######## logs: $LOGDIR/"
 # ----------------------------------------------------------------- sweep
 DONE=(); NOTES=(); DP_OK=0; t0=$SECONDS
 for k in "${!TAGS[@]}"; do
-    tag=${TAGS[$k]}; read -r d t m cap <<< "${VALS[$k]}"
+    tag=${TAGS[$k]}; read -r d t m cap pb <<< "${VALS[$k]}"
     sub="$NAME${IDT:+-$IDT}-$tag"
     echo
     echo "######## [$((k + 1))/${#TAGS[@]}] batcher $tag: depth $d, time $t, batch_mrd $m," \
          "drain cap $cap ($(( (SECONDS - t0) / 60 )) min in)"
+    if [ -n "$HAVE_PB" ] && [ "$m" = 1 ]; then
+        NOTES+=( "$tag: SKIPPED: batch_mrd has no effect on design $DESIGN (tied off in the page batcher)" )
+        echo "######## ${NOTES[-1]}" >&2
+        continue
+    fi
     if ! P cfg set depth="$d" time="$t" mrd="$m" log=0 ${HAVE_CAP:+cap="$cap"} \
-            > "$LOGDIR/cfg-$tag.txt" 2>&1; then
+            ${HAVE_PB:+pb="$pb" $PBSET} > "$LOGDIR/cfg-$tag.txt" 2>&1; then
         NOTES+=( "$tag: NOT RUN, setting it failed: $(tail -1 "$LOGDIR/cfg-$tag.txt")" )
         echo "######## ${NOTES[-1]}" >&2
         continue
     fi
-    echo "######## set: $(grep -E '^(cfg|drain|design_id)=' "$LOGDIR/cfg-$tag.txt" | xargs)"
+    echo "######## set: $(grep -E '^(cfg|drain|pb|thr|design_id)=' "$LOGDIR/cfg-$tag.txt" | xargs)"
+    if [ "$(pips_tag_of "$LOGDIR/cfg-$tag.txt")" != "$tag" ]; then
+        NOTES+=( "$tag: NOT RUN, the switch reads back $(pips_tag_of "$LOGDIR/cfg-$tag.txt")" )
+        echo "######## ${NOTES[-1]}" >&2
+        continue
+    fi
     DP=(); [ "$DP_ONCE" = 1 ] && [ "$DP_OK" = 1 ] && DP=( --no-datapath )
     export PIPS_SWEEP_SUB="$sub"
     DUALSSD_ARGS="${DUALSSD_ARGS:-} --pips-log 1" \
@@ -239,8 +297,8 @@ for k in "${!TAGS[@]}"; do
     pips_sweep_save "$DIR"
     P cfg > "$LOGDIR/cfg-$tag-after.txt" 2>/dev/null
     now=$(cfg_of "$LOGDIR/cfg-$tag-after.txt")
-    if [ -n "$now" ] && [ "$(pips_tag "$now" "$(cap_of "$LOGDIR/cfg-$tag-after.txt")")" != "$tag" ]; then
-        NOTES+=( "$tag: the batcher read $(pips_tag "$now" "$(cap_of "$LOGDIR/cfg-$tag-after.txt")") at the end: changed during the sweep" )
+    if [ -n "$now" ] && [ "$(pips_tag_of "$LOGDIR/cfg-$tag-after.txt")" != "$tag" ]; then
+        NOTES+=( "$tag: the batcher read $(pips_tag_of "$LOGDIR/cfg-$tag-after.txt") at the end: changed during the sweep" )
         echo "######## WARNING: ${NOTES[-1]}" >&2
     fi
     if [ "$STOP" = 1 ] || [ "$rc" = 130 ] || [ "$rc" = 143 ]; then

@@ -19,7 +19,10 @@
 #                    model default becomes "self,<every setting of the
 #                    sweep>,sweep,sweepc1" plus the cap-on sweep with the other
 #                    FIFO size (sweepc1f128 on a 0x0a05 sweep, else
-#                    sweepc1f512), and the output ~/seq-<sweep>
+#                    sweepc1f512), and the output ~/seq-<sweep>. On a sweep of
+#                    design 0x0a06 or later (the page batcher) no model runs
+#                    unless --model is given: the recorded order, arrival order
+#                    (rebuilt from pkt_wait), what-ifs and IOTLB simulation only
 #   --sweep NAME     sweep name before the setting (default
 #                    dualssd-pips-strict-1-id0a04 / dualnic-pips-strict-1-id0a04)
 #   --sets "S ..."   batcher settings (default: the eight 0x0A04 ones,
@@ -125,6 +128,11 @@ if [ -n "$MANIFEST" ]; then
     other_fifo=sweepc1f512
     [ "$(mhead design_id)" = 0x0a05 ] && other_fifo=sweepc1f128
     [ "$MODEL_GIVEN" = 1 ] || MODEL="self,$(echo $msets | tr ' ' ','),sweep,sweepc1,$other_fifo"
+    # The page batcher (0x0a06 on) reorders by page and has its own triggers:
+    # the in-order FIFO model does not describe it. Recorded order only.
+    case "$(mhead design_id)" in
+        0x0a0[6-9]|0x0a[1-9a-f]?) [ "$MODEL_GIVEN" = 1 ] || MODEL="" ;;
+    esac
 fi
 OUT=${OUT:-$HOME/seq-$SWEEP}
 OUT=${OUT%/}

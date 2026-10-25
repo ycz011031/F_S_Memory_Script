@@ -14,17 +14,25 @@ together, [LOCAL-SETUP.md](LOCAL-SETUP.md) for first-time provisioning.
   which sweep and design, which report generator reads what, the published
   pages). On the Windows analysis machine `claude.md` (git-ignored) adds its
   local paths, tools and editing gotchas.
-- **To run (2026-10-20):** `scripts/pips/pips-analyze.sh` again on both hosts
-  (§8 "Next" item 0): the 10-19 run's models were wrong (items 11-12); its
-  length verdicts stand. Until it is back, the page's Figures 4/6 come from
-  the listing-based recovery (item 12). Results come back as
-  `~/pips-analyze-<kind>-*.tar.gz`.
+- **To run (2026-10-25): the design 0x0A06 campaign**, one script per host
+  (§8 "0x0A06 campaign"): `bash scripts/pips/pips-campaign.sh ssd --tmux` on
+  bigserver (~18 h), `bash scripts/pips/pips-campaign.sh nic --tmux` on icx
+  (~16 h); `--dry-run` prints the plan, ETA and commands. It also runs the
+  pending `pips-analyze.sh` on the 0x0A04/0x0A05 sweeps (§8 "Next" item 0).
+  Each host leaves one `~/pips-campaign-<kind>-<stamp>.tar.gz` to copy back.
+- **Last updated:** 2026-10-25: FPGA design **0x0A06** (the page batcher,
+  `9673e37` + `d44fdd0`) supported by the tools (`pips cfg set pb= pushoff=
+  quantum= thr=`, `pips status`, tags `p1 o1 q<N> w<N>`); the sweeps take
+  `--pbs`/`--set`; NIC runs take uneven flows (`5:30`), hardware pacing
+  (`hw50`) and record retransmits and pause/discard counters; the campaign
+  script. Not yet run on hardware; `make check` not run (no Linux here; the C
+  was only syntax-checked).
 - **2026-10-20 (NIC splitting):** why one NIC alone splits its packets and
   two together don't is in §8 item 13: the gap between a NIC's packets on
   its wire decides it; styx's shared dual-port card is the suspect
   (untested; tests in §8 "Next" item 5). Dual-NIC runs never recorded
   retransmits.
-- **Last updated:** 2026-10-20 (later): page order **recovered from the
+- **Earlier, 2026-10-20 (later):** page order **recovered from the
   10-19 listings** without the raw logs (§8 item 12): each device's own order
   is exact from the order as sent; the batcher model runs on it with I/O
   bursts and an output rate fitted to each log's recorded wait; checks
@@ -1572,6 +1580,7 @@ Two changes since the 10-13 sweeps matter to the experiments:
 | `0x0A03` | `2c6c3f5`, 10-14 | **drain depth cap** (regfile reg1, `pips cfg set cap=1`): a drain sends at most `depth_threshold` packets instead of the whole FIFO. Off (0) is the reset value and what `0x0A02` did |
 | `0x0A04` | `591d854`, 10-15 | **TLP log format v2**: one record per TLP leaving the batcher, tagged with its input and its time in the batcher (`pkt_wait`); no separate input records. Same trailer, so only the design ID tells the formats apart |
 | `0x0A05` | `64193c6`, 10-17 | **batching FIFOs of 512 beats** (`FIFO_DEPTH`, was 128; FIFO 2 too): an input stops at 493 beats and asks for a drain above 477, so a batch reaches 95 drive or 53 NIC TLPs (18 / 10 before). Nothing else changed. The depth sweep ran on it |
+| `0x0A06` | `9673e37` + timing fix `d44fdd0`, 10-23/24 | **page batcher** (`axi4_mwr_batch_pp`): per device, packets batch **by page** (8 segments of 128 rows, a 512-row overflow, a completion lane that fences: a device's older data leaves before its completion), weighted round robin by open pages, a read flushes its own device first. reg2 = completion size per input (0 = 16 DW), reg3 = `page_batch_en` (power-on 0: one in-order FIFO per input with 0x0A05's rules, 1536 rows), `ctrl_push_off`, `grant_quantum`; status at `0x24`-`0x2C` (spills, stuck watchdog, longest MRd wait; `0x24` read clears). `batch_mrd` tied off. Depth/time/cap keep their meaning. PIO-MANUAL §6 |
 
 **Every artifact carries the design ID from now on**: raw logs in the name
 (`pips-log-id0a04.bin.gz`), sweeps in the name (`<NAME>-id0a04-d8t22c1`), text
@@ -1583,6 +1592,9 @@ log from before). So the 10-13 logs still decode as before. Details:
 
 Settings are named `d<depth>t<time>[m1][c1]`: `d8t22c1` = depth 8, time 0x16,
 drain cap on. A name without `c1` has the cap off, as every name from before.
+From 0x0A06 the page batcher's fields follow when not at power-on: `p1`
+per page, `o1` ctrl_push off, `q<N>` grant quantum, `w<N>` completion
+threshold (`d64t255c1p1q256w31`).
 
 ### Run
 
@@ -2070,6 +2082,52 @@ The cap and the v2 log work on hardware: all 804 logs FULL, no drops,
    scripts/pips/pips-hang-snapshot.sh` (read-only: lspci -vvv up the chain,
    AER counters, `pips cfg`, kernel log, devlink health, sweep log), then
    XSCT `pips_cfg`/`pips_dma` and the board temperature.
+
+### 0x0A06 campaign (set up 2026-10-25, not yet run)
+
+`scripts/pips/pips-campaign.sh ssd|nic` (`--dry-run` for the exact commands).
+Design 0x0A06 only; no reboot (IOMMU as booted, strict), no PCIe retrain.
+Decisions, with the user (10-25):
+
+- **Completion threshold 31 DW on both inputs (`w31`) in every phase but
+  `thr`.** Erring high is safe (data taken for a completion only costs
+  batching and adds a fence); a completion taken for data loses the fence.
+  0x0A04/0x0A05 logs (`*/1019/pips-analyze-*/traffic.txt`): drive completions
+  4 DW, mlx5 16 DW; NIC data from 32 DW (69 writes) and 48 DW; drive 1 writes
+  data of 4-32 DW (about 0.5% of its writes) and 36 DW (14%), so 31 keeps
+  the 36s as data. `thr` runs the exact entry size (4 drives, 16 NICs).
+- **Drives:** instances 1, 2, 4, 8, 16 (32 dropped: same as 16); uneven only
+  2/4/8 on drive 0 + 16 on drive 1 (the heavy side moved little). `main` = 8
+  depths x `page_batch_en` 0/1, cap on (640 runs); `cap0` d1/d8/d64 cap off;
+  `push` o1; `quant` 64/256/1024 beats; `thr` 4 DW; `drv0` drive 0 alone and
+  1+1, 16+16 at 4k-1m on d1t0 cap off/on (Next items 2, 4). Knob phases use a
+  smaller grid: 4k/16k/1m x 1/4/16 + 2+16.
+- **NICs:** flows 5, 10, 15, 30 and uneven 5:30, 30:10 (heavy side
+  alternating), uncapped and **capped at 50 Gbps per NIC**, 100 together:
+  under the weakest shared link (the switch's Gen4 x8 uplink, ~107 Gbps of
+  payload measured; styx's one Gen3 x16 card, 126 raw). `mainlo` depths 1-16,
+  `mainhi` 24-64 last of the switch phases (d24 stopped 0x0A05's sweep).
+- **Packet splitting (§8 item 13):** `alone` NIC0 alone vs both, 5 flows,
+  uncapped / 50 / 25 Gbps (iperf3 `-b`), at d1t0 (clean on 0x0A04), d16t64
+  (split, cap off) and d4t22c1 (split), `page_batch_en` 0/1. On 0x0A06 with
+  `page_batch_en` 0 the FIFO is 1536 rows, so a long hold no longer fills it:
+  whole packets there would mean **backpressure (posted credits withheld by
+  the FPGA's downstream port) causes the splitting**, not the wait itself.
+  `hw` paces in styx's NIC (mlx5 `tx_maxrate`, even frame spacing) instead of
+  iperf3's bursts. `wire` forces NIC0's link to 50G at both ends (Ethernet
+  only; restored after): frames 0.64 us apart, the co-run spacing, alone.
+  Every NIC run now records client retransmits and pause/discard deltas.
+- **Hardware the user may add later (not in this run):** an ingress rate
+  limiter on each of the three ports; per-input counts of cycles the
+  batcher refused input while data waited (turns "probably credits" into a
+  measurement); a register for the downstream link speed.
+- **If the switch hangs:** snapshot at once, later switch phases skipped,
+  loud warnings, analysis and packing go on.
+- **When the tarballs are back:** unpack in `dualssd/<MMDD>/`,
+  `dualnic/<MMDD>/`; `results/` has the summaries (`~/<sweep>.txt`, with the
+  status table), `status.txt` the stuck/spill/wait check, `analyze-new/` the
+  page order (recorded and arrival, listings), `analyze-pending/` the
+  0x0A04/0x0A05 model rerun (item 0's checks).
 
 ### Next
 
