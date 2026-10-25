@@ -2123,6 +2123,23 @@ Decisions, with the user (10-25):
   measurement); a register for the downstream link speed.
 - **If the switch hangs:** snapshot at once, later switch phases skipped,
   loud warnings, analysis and packing go on.
+- **2026-10-25, first run, bigserver: soft lockups.** About 1h40 in (stamp
+  `c10251207`), right after the 80 clean `d1t0c1` runs (`page_batch_en` 0 and
+  1), as `d2t22c1w31` (`page_batch_en` 0) began: CPUs 40 and 45 (fio cores,
+  the drives' interrupt CPUs) stuck 22-150 s in `nvme_irq` → `nvme_unmap_data`
+  → `iommu_dma_unmap_page` → `qi_flush_iotlb` → `qi_submit_sync` (strict
+  mode's synchronous IOTLB invalidation, dmar7); an `awk` waiting on them in
+  `smp_call_function_single`; `sar`, `pcm-iio` killed, fio outlived by the
+  window, the point FAILED. 6 more lockups after 13:48. The switch's status
+  over that run was clean (no stuck, no spill, MRd wait max 13.6/11.4 us), no
+  AER, no NVMe timeouts, no DMAR faults; no profiler running (`sep5`,
+  `socwatch2_16`, `vtsspp` loaded, 0 users). Open: why 0x0A04/0x0A05 ran the
+  same load clean and this setting doesn't. Test: one 4k 2+2 run at d1t0c1 vs
+  d2t22c1 (pb 0), counting lockups (HANDOFF Next).
+- **2026-10-25, icx:** `retx.rpt` permission denied: `record-host-metrics.sh`
+  (sudo, retransmits on by default) writes its own root-owned `retx.rpt`;
+  the client's nstat count is now `retx-client.rpt` (fixed; earlier runs of
+  this campaign have no client retransmits).
 - **When the tarballs are back:** unpack in `dualssd/<MMDD>/`,
   `dualnic/<MMDD>/`; `results/` has the summaries (`~/<sweep>.txt`, with the
   status table), `status.txt` the stuck/spill/wait check, `analyze-new/` the

@@ -570,7 +570,7 @@ co-runs and `--client-hw-rate 50g` for pacing in the client NIC's hardware
 (and so `dualnic_pips_sweep.sh`) a flow entry `5:30` is 5 flows on NIC 0 and 30
 on NIC 1 (named `f5x30`, mode both only), a rate entry `hw50` the hardware
 pacing (named `hw50g`). Every NIC run also records the client's TCP
-retransmits over the window (`retx.rpt`, nstat) and both ends' pause, discard
+retransmits over the window (`retx-client.rpt`, nstat) and both ends' pause, discard
 and buffer counter deltas (`nicstats-nic<i>.rpt`, ethtool -S).
 
 ## The 0x0A06 campaign: everything in one script

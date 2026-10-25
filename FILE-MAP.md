@@ -443,7 +443,7 @@ falls back to default events and every column shifts.
 | `~/pips-analyze-<kind>-<date>/` + `.tar.gz` | `pips-analyze.sh`: `seq-<sweep>/` per sweep, `logs.txt`, `traffic.txt/.jsonl`, `traffic-sizes.csv`, `analyze.log` | no |
 | `~/pips-hang-<host>-<time>/` + `.tar.gz` | `pips-hang-snapshot.sh` | no |
 | `~/pips-campaign-<kind>-<stamp>/` + `.tar.gz` | `pips-campaign.sh`: `campaign.log`, `plan.txt`, `notes.txt`, `README.txt`, `results/` (each sweep's `.txt`, `.manifest.tsv`, per-setting `.jsonl/.txt`), `sweeplogs/<name>/`, `runs/` (each run's `pips-cfg.txt`, `pips-status*.txt`, `pips-log-summary.*`, `.rpt`s), `status.txt/.tsv`, `analyze-new/`, `analyze-pending/`, `snapshots/`. Unpack in `dualssd/<MMDD>/` or `dualnic/<MMDD>/` | no |
-| per run (from 0x0A06): `utils/logs/<run>/pips-status-before.txt`, `pips-status.txt`; NIC runs also `nstat-client.txt`, `ethtool-{srv,cli}-nic<i>-{before,after}.txt`, `utils/reports/<run>/retx.rpt`, `nicstats-nic<i>.rpt` | the runners (`pips-lib.sh`, `run-dualnic-experiment.sh`) | no |
+| per run (from 0x0A06): `utils/logs/<run>/pips-status-before.txt`, `pips-status.txt`; NIC runs also `nstat-client.txt`, `ethtool-{srv,cli}-nic<i>-{before,after}.txt`, `utils/reports/<run>/retx-client.rpt`, `nicstats-nic<i>.rpt` | the runners (`pips-lib.sh`, `run-dualnic-experiment.sh`) | no |
 | `~/traffic*.txt/.jsonl/.csv` | `pips-traffic.py` run by hand (10-16: `traffic-ssd.txt`, `traffic-nic.txt`) | no |
 
 Sweep names never repeat: `<prefix>-<iommu>-<N>` with the first unused `N`

@@ -40,7 +40,7 @@
 # so frames leave evenly spaced; iperf3 itself runs uncapped (-b is ignored).
 # Put back to 0 (no limit) when the run ends. A port that refuses it stops the run.
 # Every run also records, over the measurement window, TCP retransmits on the
-# client (nstat: reports/<name>-RUN-server-<j>/retx.rpt) and the deltas of both
+# client (nstat: reports/<name>-RUN-server-<j>/retx-client.rpt) and the deltas of both
 # ends' pause, discard and buffer counters (ethtool -S: nicstats-nic<i>.rpt).
 set -u
 
@@ -389,7 +389,8 @@ hw_per_queue() { awk -v r="${1%[gG]}" -v n="$2" 'BEGIN { printf "%d", (r * 1000 
 # and the client port (styx) before and after; the deltas of the pause,
 # discard, buffer and error counters go to reports/<run>/nicstats-nic<i>.rpt
 # as srv_<name> / cli_<name>. TCP retransmits on the client from nstat (all
-# its flows, both ports): reports/<run>/retx.rpt.
+# its flows, both ports): reports/<run>/retx-client.rpt. (retx.rpt beside it is
+# record-host-metrics.sh's, written as root: this host's own retransmits.)
 NICSTAT_RE='pause|discard|out_of_buffer|buffer_passed|_err|crc|drop'
 nicstats_snap() {   # <tag before|after>
     local i
@@ -418,7 +419,7 @@ nicstats_report() {
     # nstat after nstat -n: the increments since the window opened (-z: zeros too)
     awk '$1 == "TcpOutSegs" { o = $2 } $1 == "TcpRetransSegs" { x = $2 }
          END { if (o == "") exit; printf "Out_segs: %d\nRetx_segs: %d\nRetx_percent: %.4f\n", o, x, o ? 100 * x / o : 0 }' \
-        "$L/nstat-client.txt" > "$r/retx.rpt" 2>/dev/null
+        "$L/nstat-client.txt" > "$r/retx-client.rpt" 2>/dev/null
 }
 
 # One experiment at a time. Every run kills iperf3 on BOTH hosts before it
@@ -599,7 +600,7 @@ for ((j = 0; j < num_runs; j++)); do
         --cores "$active_cores" )
     nicstats_snap after
     nicstats_report
-    echo "   window counters: $(cat "$setup_dir/reports/$RUN/retx.rpt" 2>/dev/null | xargs);" \
+    echo "   window counters: $(cat "$setup_dir/reports/$RUN/retx-client.rpt" 2>/dev/null | xargs);" \
          "pause/discard deltas: $(cat "$setup_dir/reports/$RUN"/nicstats-nic*.rpt 2>/dev/null | grep -c .) nonzero"
 
     # The window is over: dump and decode the TLP log while iperf3 finishes.

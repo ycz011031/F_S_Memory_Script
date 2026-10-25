@@ -100,8 +100,9 @@ def one_run(reports, exp, j, nics):
         # ends of NIC i's link (srv_ = this host, cli_ = the client): nicstats_report.
         r.update({f'nic{i}_{k}': v for k, v in
                   read_kv(os.path.join(base, f'nicstats-nic{i}.rpt')).items()})
-    # TCP retransmits on the client over the window, all flows (nstat).
-    rx = read_kv(os.path.join(base, 'retx.rpt'))
+    # TCP retransmits on the client over the window, all flows (nstat). Not
+    # retx.rpt: record-host-metrics.sh writes that one, for this host (receiver).
+    rx = read_kv(os.path.join(base, 'retx-client.rpt'))
     if 'Retx_percent' in rx:
         r['retx_pct'] = rx['Retx_percent']
         r['retx_segs'] = rx.get('Retx_segs')
