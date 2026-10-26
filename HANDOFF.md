@@ -1574,7 +1574,12 @@ points: [scripts/pips/README.md](scripts/pips/README.md).
   (https://claude.ai/artifact/L3U8deVtMb4nHmb91AscK3) is the 0x0A06
   campaign (results R1-R8 below, the splitting rule, next steps); it is
   hand-written (`dualssd/dualssd-pips-0a06-report.html`, numbers from
-  `c1026.py`'s output, no generator). Both generators are in the git-ignored `dualssd/report-gen/` (README
+  `c1026.py`'s output, no generator). "PIPS TLP Patterns"
+  (https://claude.ai/artifact/Ni2PkBjsera7xFxx6wJdF2) is 0x0A04 and 0x0A05,
+  drives and NICs: page switches and visits per I/O for every log (as sent,
+  as entered, on the uplink; data writes only) and a viewer of each log's
+  listing excerpt (`report-gen/tlpdump.py`, data from the campaign's
+  `analyze-pending/`). Both generators are in the git-ignored `dualssd/report-gen/` (README
   there: `py -3 build.py` for 0x0A02, `py -3 page4.py` for 0x0A04–0x0A05,
   from the local copies; Tables 6-7 come from `seq4.py` (first grab),
   Figures 3-6 from `seqarr.py` + `seqarr.js` reading the `pips-seq-grab.sh`
