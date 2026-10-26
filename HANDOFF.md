@@ -1582,7 +1582,10 @@ points: [scripts/pips/README.md](scripts/pips/README.md).
   drives and NICs: page switches and visits per I/O for every log (as sent,
   as entered, on the uplink; data writes only) and a viewer of each log's
   listing excerpt (`report-gen/tlpdump.py`, data from the campaign's
-  `analyze-pending/`). Both generators are in the git-ignored `dualssd/report-gen/` (README
+  `analyze-pending/`); since v3 (10-26) it is instead the averaged summary of
+  the page-order figures for 0x0A04, 0x0A05 and 0x0A06 (one chart per drive
+  block size and one for the NICs, `report-gen/sumpage.py`; the viewer stays
+  local as `dualssd/dualssd-pips-tlp-viewer.html`). Both generators are in the git-ignored `dualssd/report-gen/` (README
   there: `py -3 build.py` for 0x0A02, `py -3 page4.py` for 0x0A04–0x0A05,
   from the local copies; Tables 6-7 come from `seq4.py` (first grab),
   Figures 3-6 from `seqarr.py` + `seqarr.js` reading the `pips-seq-grab.sh`
