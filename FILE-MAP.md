@@ -492,6 +492,7 @@ stay on the hosts; only results, grabs and reports come back.
 | `report-gen/` | the page generators (below) | | |
 | `seqdata/<kind>/<point>.json` | per-point data for the 0x0A04–0x0A05 page's Figures 3-6 (`seqarr.export`), published beside the page as `seq/<kind>/` | | the page (fetch) |
 | `dualssd-pips-0a04-report.html` | "PIPS 0x0A04–0x0A05 Sweeps", https://claude.ai/artifact/MbNxzaJ5KgmuM59PPC4NcA | | |
+| `dualssd-pips-0a06-report.html` | "PIPS 0x0A06 Campaign", https://claude.ai/artifact/L3U8deVtMb4nHmb91AscK3: hand-written, numbers copied from `1026/c1026-ssd.txt` and `dualnic/1026/c1026-nic.txt` into its inline script; republish the file as is | `0x0A06`, 10-25/26 | `c1026.py` (tables only) |
 | `dualssd-pips-report.html` | "PIPS Batcher Sweeps" (0x0A02), https://claude.ai/artifact/XsrLugEhsaMzY6vwARSLGU | | |
 | `dualssd-xsweeps-report.html` | "Dual-SSD Cross Sweeps" (designs A-D), https://claude.ai/artifact/AcYH8Ff2Drt5kon44un3gX; its generator was not kept | | |
 
@@ -518,6 +519,6 @@ stay on the hosts; only results, grabs and reports come back.
 | `deep4.py` + `deep/` | Figure 7, Table 8: time limits per depth, from `pips-timeout-pick.py` output (`pick-*`, `eval-*`, `eval-*-f512` = 0x0A05 FIFO) |
 | `a05.py` | the 0x0A05 section: Figure 8 (each depth vs d1t0c1), Table 9 (waits, link split), Table 10 (NICs) |
 | `nicorder.py` | not a page part: why one NIC alone splits its packets and two together don't (HANDOFF §8 item 13). Per NIC: rate, wait p50/p99, own order over the whole log (`dualnic/1016` JSONL + the 10-19 grab's headers), and each packet's receive queue from its completion address (the listings); `py -3 nicorder.py > ../../dualnic/1019/nicorder.txt` |
-| `c1026.py` | not a page part (yet): the 0x0A06 campaign's tables from `dualssd/1026`, `dualnic/1026` (results JSONL + `analyze-new` seq.jsonl): noise from repeated points, page_batch_en 0 vs 1 per depth and size, knob phases vs main, drive 0 alone, NIC splitting (in0 TLPs per run, pauses, discards); `py -3 c1026.py [ssd|nic]` |
+| `c1026.py` | not a page part (yet): the 0x0A06 campaign's tables from `dualssd/1026`, `dualnic/1026` (results JSONL + `analyze-new` seq.jsonl): noise from repeated points, page_batch_en 0 vs 1 per depth and size, knob phases vs main, drive 0 alone, NIC splitting (in0 TLPs per run, pauses, discards); `py -3 c1026.py [ssd|nic]`. Its numbers are copied by hand into `dualssd-pips-0a06-report.html` |
 | `sizes.py` | the "Payload or control, by size" section: Table 11 and its `SZ*` slots, from the 10-19 analyses' `traffic.jsonl` (`FILES`; add the NICs' 0x0A05 one when it comes) |
 | `build.py`, `load.py`, `template.html`, `seqfigs.py`, `seqtabs.py`, `seqruns.json`, `seq14.json`, `seq/` | the 0x0A02 page ("PIPS Batcher Sweeps") from `dualssd/1013` (+1006, 1010); `seq/` holds three small 0x0A02 logs and a CSV it was built from |

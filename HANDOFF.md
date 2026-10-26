@@ -24,7 +24,9 @@ together, [LOCAL-SETUP.md](LOCAL-SETUP.md) for first-time provisioning.
   throughput don't move (strict mode: every visit misses anyway); it ends
   the NICs' pause frames; the NIC splitting is the NIC's receive backlog,
   decided by frame spacing on its wire (Ethernet forced to 50G: whole
-  packets alone at every setting).
+  packets alone at every setting). Report page "PIPS 0x0A06 Campaign"
+  (https://claude.ai/artifact/L3U8deVtMb4nHmb91AscK3, hand-written
+  `dualssd/dualssd-pips-0a06-report.html`), with the next steps (§8 "Next").
 - **2026-10-25:** the campaign script
   (`bash scripts/pips/pips-campaign.sh ssd|nic --tmux`, §8 "0x0A06
   campaign"); FPGA design **0x0A06** (the page batcher,
@@ -1568,7 +1570,11 @@ points: [scripts/pips/README.md](scripts/pips/README.md).
   0x0A04 Sweeps") is 0x0A04, drives and NICs, with what pcm logged on icx and
   the page order (Figures 3–6, Tables 6–7), the depth sweep's times (Figure
   7, Table 8) and 0x0A05's results (Figure 8, Tables 9–10, the NIC stop;
-  generator `a05.py`). Both generators are in the git-ignored `dualssd/report-gen/` (README
+  generator `a05.py`). "PIPS 0x0A06 Campaign"
+  (https://claude.ai/artifact/L3U8deVtMb4nHmb91AscK3) is the 0x0A06
+  campaign (results R1-R8 below, the splitting rule, next steps); it is
+  hand-written (`dualssd/dualssd-pips-0a06-report.html`, numbers from
+  `c1026.py`'s output, no generator). Both generators are in the git-ignored `dualssd/report-gen/` (README
   there: `py -3 build.py` for 0x0A02, `py -3 page4.py` for 0x0A04–0x0A05,
   from the local copies; Tables 6-7 come from `seq4.py` (first grab),
   Figures 3-6 from `seqarr.py` + `seqarr.js` reading the `pips-seq-grab.sh`
@@ -2239,6 +2245,15 @@ measurement.
    ingress rate limiter would slow the NIC's writes and so (predicted) cause
    splitting, not prevent it;** to match alone and together, slow the wire
    (`wire` phase: `ethtool -s ... speed 50000` both ends).
+   **The rule (page R6):** a NIC keeps its packets whole while it writes
+   each packet before the next frame arrives. At 100G a frame takes ~0.32
+   us on the wire; the packet plus completion takes ~0.27 us up Gen4 x8 at
+   the fitted 60.5 B/cycle: ~50 ns slack (estimate). NIC0 alone at 100G,
+   mean `pips_in0_wait_mean`: d1t0 31-47 ns whole (6.7-6.9 TLPs per run),
+   held settings with pb1 80-83 ns partly split (4.66, 3.30, no pauses),
+   pb0 147-239 ns fully split with pauses; frames ~0.6 us apart (both NICs
+   uncapped) stay whole at 200-345 ns. Splitting doesn't move misses
+   (0x0A04 item 8).
 7. **Drive 0 alone (`drv0`, Next items 2 and 4).** One drive at 1m: 55.3
    Gb/s at d1t0, 54.0 at d1t0c1 (-2.3% at j1 and j16): the per-drain cap's
    re-grant gap binds a drive slightly. Both drives at 1m: 53.4-53.7 total
@@ -2259,18 +2274,55 @@ match; drives: waits 3x low, link fit 35.5 B/cycle, open: result 8); item
 3 answered (no run under 10 samples after the placement fix); item 4
 answered (result 7: -2.3% at 1m); item 5's decisive question answered by
 the `wire` phase (result 6). New, in order of use:
-- **A non-strict run**, if a reboot is ever allowed: page batching can only
-  cut misses when entries survive between visits (result 1).
-- **Uneven load for the arbiter:** one NIC capped at 25G (Ethernet speed or
-  `-b`), the other uncapped, to give `grant_quantum` something to divide
-  (result 4).
-- **Hardware asks:** 32-bit overflow counters (`0x28` saturates, result 3);
-  more page segments, or a count of TLPs that went through the overflow;
-  the cycles-refused-while-waiting counter (would measure result 6's
-  backpressure directly). Before building an ingress rate limiter: result 6
-  predicts it splits packets.
+The question to settle first: can page order move IOTLB misses on these
+hosts at all? In strict mode no (result 1). Software and runs, in order:
+- **Count maps and unmaps (no reboot, ~5 min, §5 item 3, never run):**
+  `sudo perf stat -e iommu:map,iommu:unmap -a -- sleep 5` during a 5-flow
+  NIC run and a 4k drive run; unmaps per 4 KiB written. ~1 = compulsory
+  misses (strict invalidation); far fewer (mlx5 `page_pool` keeping pages
+  mapped) = capacity misses from a working set far beyond the IOTLB, where
+  the lever is the ring size (`ethtool -G ... rx`), not the switch.
+- **Lazy mode without a reboot (decisive for the page batcher):**
+  `echo DMA-FQ | sudo tee /sys/kernel/iommu_groups/<g>/type` per group.
+  Check first: that 5.15 (bigserver) / 6.8 (icx) accept it (may need the
+  driver unbound), that the devices behind PIPS have groups of their own
+  and no boot or RAID disk shares one. Back to strict needs the driver
+  unbound or a reboot. Then pb0 vs pb1 on a small set (drives d8/d64 at
+  4k, 16k, 1m; NICs 5 flows). Misses falling with pb1 = the page batcher
+  has its case; if not, order isn't the lever on these IOMMUs.
+- **Superpage probe:** fio 2 MiB blocks on hugepage buffers
+  (`--iomem=mmaphuge`) on one drive; misses per 4 KiB well below 1 means
+  2 MiB IOMMU mappings work (may be stopped by `max_hw_sectors_kb` or IOVA
+  alignment).
+- **Uneven load for the arbiter:** NIC0's link at 25G or 50G, NIC1 at 100G,
+  so `grant_quantum` has unequal inputs (result 4). Link speed, not pacing
+  (result 6).
+- **Latency in the summaries:** fio completion latency p50/p99, pb0 vs pb1,
+  to see result 5's read waits at the application.
 - **Drive model waits** (result 8): find the ~30% of each drive log's time
   the output timing lacks before trusting modelled drive waits.
+
+Hardware (PIPS), in order:
+- **Counters:** 32-bit overflow (`0x28` saturates, result 3); per-input
+  cycles refused while the device had data (measures result 6's
+  backpressure); per-input FIFO occupancy high-water; MRd wait mean or
+  histogram, not only the maximum.
+- **Hold only when another input is waiting:** a lone NIC at 100G has ~50 ns
+  slack per frame, so any hold costs it (result 2's single-NIC table) and
+  there is nothing to batch against; pass a lone input through as d1t0
+  does.
+- **A FIFO limit register** (rows per input, 128-1536): bigger FIFOs added
+  time in the switch (0x0A05) and read waits (0x0A06, result 5) without
+  uplink throughput; sweeping it gives read wait against throughput.
+- **The rate limiter:** fine on drive ports; on NIC ports predicted to split
+  packets and cause pause frames (result 6). Build it with the
+  refused-cycles counter. For alone-vs-together NIC comparisons use link
+  speed. As a test knob: step it 95G -> 50G on a 100G link at d1t0 to find
+  where splitting starts.
+- **More page segments,** only if lazy mode shows misses moving: a segment
+  holds one page, a NIC packet fills one, so 8 segments = 8 packets in
+  flight; 64-row segments (one 4 KiB page) would double the count in the
+  same memory.
 
 0. **Rerun the analysis on both hosts with the stall rebuild and the new
    grant gap** (items 11-12; the 10-19 run is in
