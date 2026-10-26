@@ -1574,7 +1574,10 @@ points: [scripts/pips/README.md](scripts/pips/README.md).
   (https://claude.ai/artifact/L3U8deVtMb4nHmb91AscK3) is the 0x0A06
   campaign (results R1-R8 below, the splitting rule, next steps); it is
   hand-written (`dualssd/dualssd-pips-0a06-report.html`, numbers from
-  `c1026.py`'s output, no generator). "PIPS TLP Patterns"
+  `c1026.py`'s output, no generator) except its page-order section
+  (v2, Figures 6-9: `report-gen/page6.py` splices `seq6-section.html`, the
+  `seqrec6.py` index and `seqarr6.js` between `<!--SEQ6-BEGIN/END-->`; data
+  `dualssd/seq6/<kind>/*.json` published as `seq/<kind>/`). "PIPS TLP Patterns"
   (https://claude.ai/artifact/Ni2PkBjsera7xFxx6wJdF2) is 0x0A04 and 0x0A05,
   drives and NICs: page switches and visits per I/O for every log (as sent,
   as entered, on the uplink; data writes only) and a viewer of each log's
@@ -1597,7 +1600,7 @@ Two changes since the 10-13 sweeps matter to the experiments:
 | `0x0A03` | `2c6c3f5`, 10-14 | **drain depth cap** (regfile reg1, `pips cfg set cap=1`): a drain sends at most `depth_threshold` packets instead of the whole FIFO. Off (0) is the reset value and what `0x0A02` did |
 | `0x0A04` | `591d854`, 10-15 | **TLP log format v2**: one record per TLP leaving the batcher, tagged with its input and its time in the batcher (`pkt_wait`); no separate input records. Same trailer, so only the design ID tells the formats apart |
 | `0x0A05` | `64193c6`, 10-17 | **batching FIFOs of 512 beats** (`FIFO_DEPTH`, was 128; FIFO 2 too): an input stops at 493 beats and asks for a drain above 477, so a batch reaches 95 drive or 53 NIC TLPs (18 / 10 before). Nothing else changed. The depth sweep ran on it |
-| `0x0A06` | `9673e37` + timing fix `d44fdd0`, 10-23/24 | **page batcher** (`axi4_mwr_batch_pp`): per device, packets batch **by page** (8 segments of 128 rows, a 512-row overflow, a completion lane that fences: a device's older data leaves before its completion), weighted round robin by open pages, a read flushes its own device first. reg2 = completion size per input (0 = 16 DW), reg3 = `page_batch_en` (power-on 0: one in-order FIFO per input with 0x0A05's rules, 1536 rows), `ctrl_push_off`, `grant_quantum`; status at `0x24`-`0x2C` (spills, stuck watchdog, longest MRd wait; `0x24` read clears). `batch_mrd` tied off. Depth/time/cap keep their meaning. PIO-MANUAL §6 |
+| `0x0A06` | `9673e37` + timing fix `d44fdd0`, 10-23/24 | **page batcher** (`axi4_mwr_batch_pp`): per device, packets batch **by page** (8 segments of 128 rows, a 512-row overflow, a completion lane that fences: a device's older data leaves before its completion), weighted round robin by open pages, a read flushes its own device first. reg2 = completion size per input (0 = 16 DW), reg3 = `page_batch_en` (power-on 0: one in-order FIFO per input, 1536 rows, 0x0A05's triggers; but the build ties `wrr_en` = 1 (`pips_batch_ctrl.v:121`), so the arbiter stays open-page weighted, completions-first and read-flush-first even at 0: not 0x0A05's plain round robin, see result 9), `ctrl_push_off`, `grant_quantum`; status at `0x24`-`0x2C` (spills, stuck watchdog, longest MRd wait; `0x24` read clears). `batch_mrd` tied off. Depth/time/cap keep their meaning. PIO-MANUAL §6 |
 
 **Every artifact carries the design ID from now on**: raw logs in the name
 (`pips-log-id0a04.bin.gz`), sweeps in the name (`<NAME>-id0a04-d8t22c1`), text
@@ -2271,6 +2274,25 @@ measurement.
    on 0x0A04, 1.17 vs 3.57 on 0x0A05) and the uplink calibration fits 35.5
    B/cycle, above Gen3 x8's raw 31.5 (expected 30-31): about 30% of each
    log's time is missing and the fit hides it in a too-fast link. Open.
+9. **Page order on 0x0A06 (page v2, Figures 6-9; `report-gen/seqrec6.py`,
+   `page6.py`).** The 0x0A04-0x0A05 page's Figures 3-6 for the main sweeps
+   (drives 40 points, NICs 12 two-NIC points, 8 depths, pb0 and pb1): the
+   batcher model (0x0A05's rules, FIFO 1536 or 512) on each device's own
+   order from the pb0 logs, floor, raw, recorded pb0/pb1 marks. NICs: the
+   model fits (own setting within +-7%, median per depth and rate); pb0
+   page switches per packet 9.0 (50G) / 8.0 (uncapped) at d1, 4.5 / 3.9 at
+   d16, back up to 5.6 / 5.0 at d64 (the pause/splitting depths); pb1 at
+   d64 2.9 / 2.5, below the by-page line (3.6 / 2.9), 1.8x the floor (1.6 /
+   1.4). Drives: **the model doesn't fit pb0 on a full link** (own setting
+   16-49% fewer page switches than recorded at 16k-1m; 4k within 12%, 8k
+   within 10% to d8 then 19-30% low), where it fit 0x0A04 within a few %:
+   likely `wrr_en` tied 1 (above), so pb0 is not 0x0A05's arbiter. pb0 at
+   d16-64 sends about the raw order (16k 10.3 vs raw 10.8; 64k 14.1-14.3 vs
+   18.2; 1m 10.1-10.4 vs 15.3); pb1 at d64 8.6 / 9.0 / 5.9 (16k/64k/1m),
+   -16/-36/-41%, still 3-4x the by-page line (2.7 / 2.2 / 1.7) and far
+   above the floor (1.2-1.4): consistent with the constant spills (result
+   3). To check the arbiter: rerun a few drive points with wrr off, if a
+   build allows it, or model the WRR in `pips-page-seq.py`'s batcher.
 
 ### Next
 
