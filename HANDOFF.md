@@ -14,19 +14,25 @@ together, [LOCAL-SETUP.md](LOCAL-SETUP.md) for first-time provisioning.
   which sweep and design, which report generator reads what, the published
   pages). On the Windows analysis machine `claude.md` (git-ignored) adds its
   local paths, tools and editing gotchas.
-- **To run (2026-10-25): the design 0x0A06 campaign**, one script per host
-  (§8 "0x0A06 campaign"): `bash scripts/pips/pips-campaign.sh ssd --tmux` on
-  bigserver (~18 h), `bash scripts/pips/pips-campaign.sh nic --tmux` on icx
-  (~16 h); `--dry-run` prints the plan, ETA and commands. It also runs the
-  pending `pips-analyze.sh` on the 0x0A04/0x0A05 sweeps (§8 "Next" item 0).
-  Each host leaves one `~/pips-campaign-<kind>-<stamp>.tar.gz` to copy back.
-- **Last updated:** 2026-10-25: FPGA design **0x0A06** (the page batcher,
+- **Last updated:** 2026-10-26: **the 0x0A06 campaign ran on both hosts**
+  (bigserver `c10251425`, 18h11, 828 points; icx `c10251157`, 22h27, 332
+  points; switch answered throughout, no soft lockups, no stuck). Results in
+  §8 "0x0A06 campaign results"; data in `dualssd/1026/`, `dualnic/1026/`
+  (local, git-ignored; FILE-MAP §7), tables from
+  `dualssd/report-gen/c1026.py`. Headlines: page batching groups pages
+  (runs per I/O -28% drives, -50% NICs at depth 64) but IOTLB misses and
+  throughput don't move (strict mode: every visit misses anyway); it ends
+  the NICs' pause frames; the NIC splitting is the NIC's receive backlog,
+  decided by frame spacing on its wire (Ethernet forced to 50G: whole
+  packets alone at every setting).
+- **2026-10-25:** the campaign script
+  (`bash scripts/pips/pips-campaign.sh ssd|nic --tmux`, §8 "0x0A06
+  campaign"); FPGA design **0x0A06** (the page batcher,
   `9673e37` + `d44fdd0`) supported by the tools (`pips cfg set pb= pushoff=
   quantum= thr=`, `pips status`, tags `p1 o1 q<N> w<N>`); the sweeps take
   `--pbs`/`--set`; NIC runs take uneven flows (`5:30`), hardware pacing
   (`hw50`) and record retransmits and pause/discard counters; the campaign
-  script. Not yet run on hardware; `make check` not run (no Linux here; the C
-  was only syntax-checked).
+  script. `make check` passed on bigserver (10-25, after `693c60a5f`).
 - **2026-10-20 (NIC splitting):** why one NIC alone splits its packets and
   two together don't is in §8 item 13: the gap between a NIC's packets on
   its wire decides it; styx's shared dual-port card is the suspect
@@ -2083,7 +2089,7 @@ The cap and the v2 log work on hardware: all 804 logs FULL, no drops,
    AER counters, `pips cfg`, kernel log, devlink health, sweep log), then
    XSCT `pips_cfg`/`pips_dma` and the board temperature.
 
-### 0x0A06 campaign (set up 2026-10-25, not yet run)
+### 0x0A06 campaign (set up 2026-10-25, ran 10-25/26; results below)
 
 `scripts/pips/pips-campaign.sh ssd|nic` (`--dry-run` for the exact commands).
 Design 0x0A06 only; no reboot (IOMMU as booted, strict), no PCIe retrain.
@@ -2161,7 +2167,110 @@ Decisions, with the user (10-25):
   page order (recorded and arrival, listings), `analyze-pending/` the
   0x0A04/0x0A05 model rerun (item 0's checks).
 
+### 0x0A06 campaign results (2026-10-26)
+
+Data: `dualssd/1026/pips-campaign-ssd-c10251425/` (bigserver, started 10-25
+14:25 on `693c60a5f`, 18h11), `dualnic/1026/pips-campaign-nic-c10251157/`
+(icx, started 10-25 11:57 on `9b36f3e6c`, 22h27). Tables:
+`py -3 dualssd/report-gen/c1026.py [ssd|nic]`, saved as
+`dualssd/1026/c1026-ssd.txt` and `dualnic/1026/c1026-nic.txt`. Every phase
+ran; the switch answered to the end; no stuck flag, no soft lockup (the
+placement fix held), no pcm-iio run under 10 samples; every page-order log
+analysed (828 + 318). Each point ran once. Noise, from the points two phases
+repeat (drv0 vs main, cap0 vs drv0, 14 pairs): Gb/s median 0.8% (max 3.5%),
+IOTLB misses per 4 KiB median 2.1% (max 5.9%). The NIC campaign started
+before the retransmit fix: its `retx_pct` is 0 for want of data, not a
+measurement.
+
+1. **Page batching regroups pages but changes neither misses nor
+   throughput, on both hosts.** Drives (`main`, 40 points per setting):
+   `page_batch_en` 1 cuts runs per I/O on the uplink by 2% at d1 up to 28%
+   at d64 (44% at 1m), TLPs per run 2.4 → 3.5; IOTLB misses per 4 KiB
+   (pcm-iio) change by -1.0 to +0.3% (noise), Gb/s by 0 to -1.1%. NICs (12
+   points per setting): runs per I/O 4.9 → 2.5 at d64, TLPs per run 2.8 →
+   5.5; misses per Gb 36.6k at every setting either way. The model's
+   strict-mode IOTLB (1x64) agrees: about -1%. Reason: in strict mode every
+   page visit is a miss (its entry was invalidated when the last I/O on it
+   completed), so the floor is one miss per page; measured 1.09 per 4 KiB at
+   1m, 1.25-1.4 at 4-16k. Regrouping removes only re-misses from thrashing,
+   which a 64-entry IOTLB rarely sees with these open-page counts. Batching
+   can only show in a non-strict (lazy) mode, which needs a reboot.
+2. **Page batching ends the NICs' pause frames.** With `page_batch_en` 0,
+   d1t0c1 and d16-d64 have NIC pause frames and receive discards (d1t0c1:
+   45k pauses, 321k discards per run on average; d36/d64: 35k, 290k) and
+   uncapped 5-flow both-NIC throughput drops to 104.7-106.4 Gbps; with 1,
+   zero pauses at every depth and 107.1 Gbps everywhere. One NIC alone,
+   uncapped: pb0 d16t64 93.8 Gbps, 58k pauses, 612k discards; pb1 95.3, none.
+   d4t22c1: pb0 90.3, 100k pauses, 1.38M discards; pb1 95.5, none.
+3. **Page batching runs out of page segments constantly.** Overflow
+   (`0x28`) on almost every pb1 run: drives a few hundred to thousands per
+   run at 4k, saturated (65535 per input) on many; NICs saturated on nearly
+   all. The 16-bit counter hides how often; batching works between spills.
+4. **Knobs (`cap0`, `push` o1, `quant` 64/256/1024, `thr` 4 DW / 16 DW):
+   no effect beyond noise** on Gb/s or misses, either host. Cap off at depth
+   1 regroups more (runs per I/O -38 to -65%) with the same misses. The
+   uneven flows (5:30, 30:10) still give each NIC the same rate (48/48,
+   42/42 Gbps): the arbiter (and the quantum) never had uneven load to
+   divide. 30 flows per NIC: 48 Gbps total at every setting, as without the
+   switch and with the IOMMU off on 10-01: a host limit.
+5. **Read waits (`0x2C`).** Drives: an MRd waited up to 262 us (pb0) /
+   219 us (pb1), median per run 104/63 us at 64k, 21-32 us at 4-8k, at every
+   depth including d1t0c1: reads queue behind the input's writes in the
+   1536-row FIFO when the Gen3 x8 uplink is full (bufferbloat, not the
+   hold). No AER or timeouts seen. NICs: at most 12.8 us (pb0), 8.7 (pb1).
+6. **NIC packet splitting (item 13) is the NIC's receive backlog; frame
+   spacing on its wire decides it.** NIC0's own order (in0 TLPs per run, 8
+   = whole 4000-byte packets, 1 = fully interleaved), pb0:
+   - Ethernet forced to 50G (`wire`, 0.64 us per frame): **whole packets
+     alone** at d16t64 (7.22) and d4t22c1 (7.24), where at 100G alone they
+     split (1.03, 1.03, with pauses and discards). Both NICs: whole (7.20,
+     7.24).
+   - Paced at 50G on a 100G wire: split anyway. iperf3 `-b` alone: d16t64
+     5.53, d4t22c1 2.06; styx's hardware shaper (`tx_maxrate`, `hw`) alone:
+     3.13, 2.66; both NICs at 50G each: 4.08, 2.85 (iperf3), 7.17, 1.27
+     (shaper). Pacing still sends line-rate bursts.
+   - Uncapped, both NICs: whole at every setting (7.2-7.3); one alone at
+     d1t0 (no hold): mostly whole (6.68, no pauses).
+   So a NIC splits when frames arrive at 100G faster than the switch takes
+   its writes at that setting (a hold, or two NICs' paced bursts at once):
+   its receive buffer backs up (pause frames, discards) and it writes
+   several packets at once. Styx's shared card matters only because, with
+   both ports busy, it spaces each port's frames ~0.6 us apart. **An FPGA
+   ingress rate limiter would slow the NIC's writes and so (predicted) cause
+   splitting, not prevent it;** to match alone and together, slow the wire
+   (`wire` phase: `ethtool -s ... speed 50000` both ends).
+7. **Drive 0 alone (`drv0`, Next items 2 and 4).** One drive at 1m: 55.3
+   Gb/s at d1t0, 54.0 at d1t0c1 (-2.3% at j1 and j16): the per-drain cap's
+   re-grant gap binds a drive slightly. Both drives at 1m: 53.4-53.7 total
+   (alternating inputs costs ~3% of the Gen3 x8 uplink). Smaller sizes: no
+   cap effect beyond noise.
+8. **Pending model rerun (item 0).** NICs: the model on the arrival order
+   matches the recorded order (runs per I/O ratio median 1.000 / 1.015,
+   waits 0.39/0.39 and 0.85/0.86 us; link fit 60.5 B/cycle, Gen4 x8). Drives:
+   runs match (1.04 / 1.01) but **waits come out 3x low** (0.40 vs 1.44 us
+   on 0x0A04, 1.17 vs 3.57 on 0x0A05) and the uplink calibration fits 35.5
+   B/cycle, above Gen3 x8's raw 31.5 (expected 30-31): about 30% of each
+   log's time is missing and the fit hides it in a too-fast link. Open.
+
 ### Next
+
+Status 10-26 (from the 0x0A06 campaign, results above): item 0 ran (NICs
+match; drives: waits 3x low, link fit 35.5 B/cycle, open: result 8); item
+3 answered (no run under 10 samples after the placement fix); item 4
+answered (result 7: -2.3% at 1m); item 5's decisive question answered by
+the `wire` phase (result 6). New, in order of use:
+- **A non-strict run**, if a reboot is ever allowed: page batching can only
+  cut misses when entries survive between visits (result 1).
+- **Uneven load for the arbiter:** one NIC capped at 25G (Ethernet speed or
+  `-b`), the other uncapped, to give `grant_quantum` something to divide
+  (result 4).
+- **Hardware asks:** 32-bit overflow counters (`0x28` saturates, result 3);
+  more page segments, or a count of TLPs that went through the overflow;
+  the cycles-refused-while-waiting counter (would measure result 6's
+  backpressure directly). Before building an ingress rate limiter: result 6
+  predicts it splits packets.
+- **Drive model waits** (result 8): find the ~30% of each drive log's time
+  the output timing lacks before trusting modelled drive waits.
 
 0. **Rerun the analysis on both hosts with the stall rebuild and the new
    grant gap** (items 11-12; the 10-19 run is in
