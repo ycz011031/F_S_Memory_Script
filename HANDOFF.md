@@ -1585,7 +1585,10 @@ points: [scripts/pips/README.md](scripts/pips/README.md).
   `analyze-pending/`); since v3 (10-26) it is instead the averaged summary of
   the page-order figures for 0x0A04, 0x0A05 and 0x0A06 (one chart per drive
   block size and one for the NICs, `report-gen/sumpage.py`; the viewer stays
-  local as `dualssd/dualssd-pips-tlp-viewer.html`). Both generators are in the git-ignored `dualssd/report-gen/` (README
+  local as `dualssd/dualssd-pips-tlp-viewer.html`). v4 (10-26): a second NIC
+  chart, capped at 50 Gbps per NIC (0x0A06 only, the earlier designs never ran
+  it), a pooled model FIFO ("all": every log at every FIFO, now the default)
+  and a table of the model checks (own setting vs log) per design and group. Both generators are in the git-ignored `dualssd/report-gen/` (README
   there: `py -3 build.py` for 0x0A02, `py -3 page4.py` for 0x0A04–0x0A05,
   from the local copies; Tables 6-7 come from `seq4.py` (first grab),
   Figures 3-6 from `seqarr.py` + `seqarr.js` reading the `pips-seq-grab.sh`
@@ -2296,6 +2299,15 @@ measurement.
    above the floor (1.2-1.4): consistent with the constant spills (result
    3). To check the arbiter: rerun a few drive points with wrr off, if a
    build allows it, or model the WRR in `pips-page-seq.py`'s batcher.
+   Checks per design on the summary's common points (median of model at the
+   log's own setting vs that log, d1-8 / d16-64): 0x0A04 cap off and on,
+   0x0A05 within +-3% at every block size and the NICs (0x0A05 8k/16k d1-8
+   +8%); 0x0A06 pb0 NICs (uncapped, 50G) -4..0%; 0x0A06 pb0 drives 4k
+   -1/-9%, 8k -10/-28%, 16k -44/-48%, 64k -28/-25%, 1m -41/-31%. So the
+   averaged summary's marks vs lines gaps are mostly not model error: cap-off
+   marks aren't on the cap-on lines, the lines pool every run's device order
+   and fitted link (0x0A06's split NIC packets lift the 1536 line), pb1 is
+   not modelled; only 0x0A06 pb0 drives on a full link are.
 
 ### Next
 
