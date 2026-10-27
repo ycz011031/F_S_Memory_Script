@@ -1585,7 +1585,9 @@ points: [scripts/pips/README.md](scripts/pips/README.md).
   `analyze-pending/`); since v3 (10-26) it is instead the averaged summary of
   the page-order figures for 0x0A04, 0x0A05 and 0x0A06 (one chart per drive
   block size and one for the NICs, `report-gen/sumpage.py`; the viewer stays
-  local as `dualssd/dualssd-pips-tlp-viewer.html`). v4 (10-26): a second NIC
+  local as `dualssd/dualssd-pips-tlp-viewer.html`). v5 (10-26): every line
+  from the measured arrival order (result 10 of the 0x0A06 campaign; v1-v4
+  used seqrec's synthetic arrivals). v4 (10-26): a second NIC
   chart, capped at 50 Gbps per NIC (0x0A06 only, the earlier designs never ran
   it), a pooled model FIFO ("all": every log at every FIFO, now the default)
   and a table of the model checks (own setting vs log) per design and group. Both generators are in the git-ignored `dualssd/report-gen/` (README
@@ -2289,7 +2291,9 @@ measurement.
    page switches per packet 9.0 (50G) / 8.0 (uncapped) at d1, 4.5 / 3.9 at
    d16, back up to 5.6 / 5.0 at d64 (the pause/splitting depths); pb1 at
    d64 2.9 / 2.5, below the by-page line (3.6 / 2.9), 1.8x the floor (1.6 /
-   1.4). Drives: **the model doesn't fit pb0 on a full link** (own setting
+   1.4). **Superseded by result 10** (the raw and model lines here are
+   seqrec's synthetic arrivals, not the measured order). Drives, as first
+   read: the model doesn't fit pb0 on a full link (own setting
    16-49% fewer page switches than recorded at 16k-1m; 4k within 12%, 8k
    within 10% to d8 then 19-30% low), where it fit 0x0A04 within a few %:
    likely `wrr_en` tied 1 (above), so pb0 is not 0x0A05's arbiter. pb0 at
@@ -2299,15 +2303,51 @@ measurement.
    above the floor (1.2-1.4): consistent with the constant spills (result
    3). To check the arbiter: rerun a few drive points with wrr off, if a
    build allows it, or model the WRR in `pips-page-seq.py`'s batcher.
-   Checks per design on the summary's common points (median of model at the
-   log's own setting vs that log, d1-8 / d16-64): 0x0A04 cap off and on,
-   0x0A05 within +-3% at every block size and the NICs (0x0A05 8k/16k d1-8
-   +8%); 0x0A06 pb0 NICs (uncapped, 50G) -4..0%; 0x0A06 pb0 drives 4k
-   -1/-9%, 8k -10/-28%, 16k -44/-48%, 64k -28/-25%, 1m -41/-31%. So the
-   averaged summary's marks vs lines gaps are mostly not model error: cap-off
-   marks aren't on the cap-on lines, the lines pool every run's device order
-   and fitted link (0x0A06's split NIC packets lift the 1536 line), pb1 is
-   not modelled; only 0x0A06 pb0 drives on a full link are.
+10. **Methodology correction: lines from the measured arrival order
+   (10-26, summary page v5).** The model, floor and raw lines on all three
+   page-order pages (0x0A04-0x0A05 v8-v10, 0x0A06 v2, summary v1-v4) come
+   from `seqrec.py`/`seqrec6.py`: each device's own order with **synthetic**
+   arrival times (I/O bursts at a fixed pace, link fitted to the recorded
+   wait), the 10-20 stopgap (§8 item 12: "the host rerun measures the
+   arrival order and settles it"). The rerun is in: every log of the
+   campaign's analysis has the measured arrival order (`interleave.arr`,
+   `windows_arr`: in_sop = out_sop - pkt_wait, stalls put back) and, for
+   0x0A04/0x0A05 (`analyze-pending/`), the batcher model run on it
+   (`model`: self, the sweep's settings, sweepc1 at both FIFOs);
+   `pips-seq-grab.sh` runs no model on 0x0A06 sweeps. Measured arrivals are
+   far less interleaved than the synthetic ones: raw (windows_arr w=1, on
+   the marks' scale, pb0 logs) 4k 5.4, 8k 6.5, 16k 7.6, 64k 13.3, 1m 9.5,
+   NICs 5.8, NICs 50G 7.1, against synthetic 6.2, 8.7, 10.5, 18.4, 15.6, 6.5,
+   8.1. The arrival order hardly depends on the design (16k: 0x0A05 7.0,
+   0x0A06 pb0 7.0; 0x0A04 8.4-9.1, its 128-row FIFO pushes back). The model
+   on the measured order at each log's own setting: 0x0A05 within 1.5%
+   (median, d16-64) at every block size and the NICs, 0x0A04 0-8% (cap off
+   and on), up to +15% at d1-8 (8-16k). So: **0x0A04/0x0A05 batch below
+   their arrival order as the model says** (0x0A05 d64 16k/64k/1m 4.7 /
+   10.9 / 6.7; arrival 7.0 / 13.5 / 10.0; model 5.1 / 11.0 / 6.5), and
+   **0x0A06 pb0 sends more page switches than arrived** (d64 10.3 / 14.1 /
+   10.1 against its own arrival 7.0 / 13.1 / 9.2; 8k 6.2 vs 5.75; NICs 6.0
+   vs 6.3, about arrival), twice the model at 16k, from the same arrival
+   order as 0x0A05. Result 9's "pb0 sends about the raw order" and "the
+   model doesn't fit pb0" were artifacts of the synthetic raw/model. The
+   difference lies between arrival and the uplink (0x0A06's drains and
+   input choice); known rule difference `wrr_en` tied 1 (open-page WRR per
+   beat instead of round robin), plus 1536 rows and its pipeline; not
+   confirmed. pb1: arrival not measurable (the rebuild holds each input to
+   its output order, which pb1 breaks: its `arr` reads 3.6 at 16k against
+   pb0's 6.3), so compare with pb0's: pb1 d64 16k 8.6 (above arrival 7.0),
+   64k 9.0, 1m 5.9 (below), NICs 2.5 (at the model's by-page 2.5). To do:
+   (a) rerun the 0x0A06 analysis on the hosts with `--model` (pips-seq-grab
+   `--manifest ... --model self,deep,sweepc1,sweepc1f512` on the main
+   sweeps, pb0 logs) for its own-setting check and 1536-row lines; (b) redo
+   the 0x0A04-0x0A05 page's Figures 3-6 and the 0x0A06 page's Figures 6-9
+   from `seq.jsonl` (model, windows_arr) instead of seqrec; (c) to test the
+   arbiter, a build with `wrr_en` in a register. Summary page v5
+   (`sumpage.py`) already uses the measured order: raw = windows_arr w=1
+   (pb0 logs of every design), model = host model cap on t255 at depths
+   1-64, FIFO 128/512 (0x0A04/0x0A05 logs), floor = seqrec's (each device's
+   own order; needs no cross-device timing), checks = host model at own
+   setting.
 
 ### Next
 
