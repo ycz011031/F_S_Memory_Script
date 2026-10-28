@@ -182,6 +182,34 @@ run 1 "0x0a05: pb refused" "$P" cfg set pb=1; has 'has no page batcher registers
 run 0 "0x0a05: cfg lists pb=none" "$P" cfg; has '^pb=none page_batch_en=0'
 unset PIPS_SIM_DESIGN
 
+echo "-- design 0x0a07: rate caps (reg4) and refused-cycle counters (0x30-0x3c)"
+export PIPS_SIM_DESIGN=0x0a07
+run 0 "0x0a07: cfg shows rcap" "$P" cfg; has '^rcap=0x00000000 rate_cap_0=0 rate_cap_1=0 rate_cap_out=0'
+run 0 "0x0a07: cfg set rcap (both inputs) and rcapout" "$P" cfg set rcap=100 rcapout=200
+    has '^rcap=0x00c86464 rate_cap_0=100 rate_cap_1=100 rate_cap_out=200'; has 'in0 50.0, in1 50.0, out 100.0'
+run 0 "0x0a07: rcap0 alone" "$P" cfg set rcap0=7; has 'rate_cap_0=7 rate_cap_1=100 rate_cap_out=200'
+run 0 "0x0a07: pips_tag_of with rate caps" bash -c ". '$HERE/pips-lib.sh'
+    '$P' cfg set depth=8 time=106 cap=1 pb=0 pushoff=0 quantum=0 thr=31 > '$T/c7.txt' && pips_tag_of '$T/c7.txt'"
+    has '^d8t106c1w31r7x100x200$'
+run 1 "0x0a07: rcap 256 refused" "$P" cfg set rcap=256
+run 0 "0x0a07: raw4 puts it back" "$P" cfg set raw4=0 raw2=0 raw3=0 cap=0 raw=1; has '^rcap=0x00000000'
+run 0 "0x0a07: hwtest regfile" "$P" hwtest regfile
+    has 'reg4 wrote 0x00a55ac3 read 0x00a55ac3'; has 'counters at +0x30-+0x3c answer'
+    has 'reserved registers 0x14-0x1c read 0 (0 do not'; has 'rate caps at +0x10'
+export PIPS_SIM_BP="1000,2000,0,5"
+run 0 "0x0a07: counters" "$P" counters; has '^counters=ok'; has 'bp_cycles_0=[0-9]* bp_cycles_1='
+run 0 "0x0a07: status shows the counters too" "$P" status; has '^status=ok'; has '^bp_cycles_0='
+run 0 "0x0a07: pips_bp_summary over wrapped samples" bash -c ". '$HERE/pips-lib.sh'
+    printf 'ms\tb0\tb1\th0\th1\n0\t4000000000\t0\t0\t0\n2000\t200000000\t1000000\t0\t0\n' > '$T/bp.tsv'
+    pips_bp_summary '$T/bp.tsv'"
+    has '^pips_stat_bp_valid: 1'; has '^pips_stat_bp_cycles_0: 494967296$'; has '^pips_stat_bp_frac_0: 0.9899'
+unset PIPS_SIM_BP
+export PIPS_SIM_DESIGN=0x0a06
+run 0 "0x0a06: counters says none" "$P" counters; has '^counters=none'
+run 1 "0x0a06: rcap refused" "$P" cfg set rcap=10; has 'has no rate caps'
+run 0 "0x0a06: cfg lists rcap=none" "$P" cfg; has '^rcap=none rate_cap_0=0'
+unset PIPS_SIM_DESIGN
+
 echo "-- analysis tools on both formats"
 # A v2 sweep run folder as the runners write it, and a v1 one from before.
 NEW="$T/logs/dualssd-pips-off-1-id0a04-d8t22c1/4k-j1-both-RUN-0"
@@ -735,7 +763,7 @@ for s in dualssd_sweep dualnic_flow_sweep; do
 name=""; dp=1
 while [ $# -gt 0 ]; do [ "$1" = -o ] && name="$2"; [ "$1" = --no-datapath ] && dp=0; shift; done
 c=$("$PIPS_TOOL" cfg)
-echo "$(basename "$0") $name ARGS=${DUALSSD_ARGS:-}${DUALNIC_ARGS:-} $(printf '%s\n' "$c" | grep -E '^(cfg|drain|pb|thr)=' | xargs) DP=$dp" >> "$RESULTS_DIR/calls.txt"
+echo "$(basename "$0") $name ARGS=${DUALSSD_ARGS:-}${DUALNIC_ARGS:-} $(printf '%s\n' "$c" | grep -E '^(cfg|drain|pb|thr|rcap)=' | xargs) DP=$dp" >> "$RESULTS_DIR/calls.txt"
 design=$(printf '%s\n' "$c" | sed -n 's/^design_id=//p')
 # The runners' sweep hooks (pips-lib.sh) for a datapath check and one point.
 . "$(dirname "$0")/../pips/pips-lib.sh"
@@ -846,6 +874,19 @@ run 0 "  calls: pb and thr as set" cat "$T/res/calls.txt"
 run 0 "  original setting, pb and thr back" "$P" cfg; has 'cfg=0x00000005'; has '^pb=0x00000000'; has '^thr=0x00000000'
 run 0 "0x0a06: batch_mrd settings are skipped" sweep dualssd_pips_sweep.sh -o S6 --cfgs "8:22:1 4:22" --caps 0 --no-asy
     has 'SKIPPED: batch_mrd has no effect'
+export PIPS_SIM_DESIGN=0x0a07
+"$P" cfg set raw=0x00000005 cap=0 raw2=0 raw3=0 raw4=0x00000303 > /dev/null
+: > "$T/res/calls.txt"
+run 0 "0x0a07: rate caps written 0 unless --set, tag only when set" \
+    sweep dualnic_pips_sweep.sh -o N8 --cfgs 8:106 --caps 1 --pbs 0 --set "thr=31"
+    has 'settings: d8t106c1w31$'
+run 0 "  calls: rcap 0" cat "$T/res/calls.txt"; has '^dualnic_flow_sweep.sh N8-id0a07-d8t106c1w31 .* rcap=0x00000000'
+run 0 "  original rate caps back" "$P" cfg; has '^rcap=0x00000303'
+run 0 "0x0a07: --set rcap" sweep dualnic_pips_sweep.sh -o N9 --cfgs 8:106 --caps 1 --set "rcap0=100"
+    has 'settings: d8t106c1r100x0x0$'
+export PIPS_SIM_DESIGN=0x0a06
+run 1 "0x0a06: --set rcap is refused" sweep dualnic_pips_sweep.sh -o N10 --cfgs 8:106 --caps 1 --set "rcap=10"
+    has 'has no rate caps'
 export PIPS_SIM_DESIGN=0x0a05
 run 1 "0x0a05: --pbs is refused" sweep dualnic_pips_sweep.sh -o N7 --pbs 1 --caps 0; has 'has no page batcher'
 unset PIPS_SIM_DESIGN

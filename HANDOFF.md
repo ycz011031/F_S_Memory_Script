@@ -14,7 +14,21 @@ together, [LOCAL-SETUP.md](LOCAL-SETUP.md) for first-time provisioning.
   which sweep and design, which report generator reads what, the published
   pages). On the Windows analysis machine `claude.md` (git-ignored) adds its
   local paths, tools and editing gotchas.
-- **Last updated:** 2026-10-26: **the 0x0A06 campaign ran on both hosts**
+- **Last updated:** 2026-10-28: **FPGA design 0x0A07 is built** (FPGA repo
+  `28ff5b6`): rate caps on both inputs and the output (regfile reg4), counters
+  of the cycles each input was refused (and the rate cap's part), and a
+  **changed read flush** (no longer preempts the other input's drain: on
+  0x0A06 it interleaved the two devices packet by packet, the likely cause of
+  0x0A06 result 10's excess page switches). Tools support it (`pips cfg set
+  rcap=`, `pips counters`, counters sampled every 2 s per run into
+  `pips-bp.tsv`, `pips_stat_bp_frac_*`; sweeps `--set rcap0=`, tag
+  `r<a>x<b>x<c>`; hwtest checks reg4). **To run: the minimal rerun of the
+  0x0A06 campaign on 0x0A07,** `pips-campaign.sh ssd|nic --minimal --tmux`
+  (§8 "0x0A07 minimal rerun": drives as the 0x0A06 main sweep at 4 depths;
+  NICs with the Ethernet and the FPGA rate cap at representative points);
+  `make check` not run yet (no Linux here). Open items: §8 "Next", status
+  10-28; items 0b and 1 canceled.
+- **2026-10-26: the 0x0A06 campaign ran on both hosts**
   (bigserver `c10251425`, 18h11, 828 points; icx `c10251157`, 22h27, 332
   points; switch answered throughout, no soft lockups, no stuck). Results in
   §8 "0x0A06 campaign results"; data in `dualssd/1026/`, `dualnic/1026/`
@@ -1609,6 +1623,7 @@ Two changes since the 10-13 sweeps matter to the experiments:
 | `0x0A04` | `591d854`, 10-15 | **TLP log format v2**: one record per TLP leaving the batcher, tagged with its input and its time in the batcher (`pkt_wait`); no separate input records. Same trailer, so only the design ID tells the formats apart |
 | `0x0A05` | `64193c6`, 10-17 | **batching FIFOs of 512 beats** (`FIFO_DEPTH`, was 128; FIFO 2 too): an input stops at 493 beats and asks for a drain above 477, so a batch reaches 95 drive or 53 NIC TLPs (18 / 10 before). Nothing else changed. The depth sweep ran on it |
 | `0x0A06` | `9673e37` + timing fix `d44fdd0`, 10-23/24 | **page batcher** (`axi4_mwr_batch_pp`): per device, packets batch **by page** (8 segments of 128 rows, a 512-row overflow, a completion lane that fences: a device's older data leaves before its completion), weighted round robin by open pages, a read flushes its own device first. reg2 = completion size per input (0 = 16 DW), reg3 = `page_batch_en` (power-on 0: one in-order FIFO per input, 1536 rows, 0x0A05's triggers; but the build ties `wrr_en` = 1 (`pips_batch_ctrl.v:121`), so the arbiter stays open-page weighted, completions-first and read-flush-first even at 0: not 0x0A05's plain round robin, see result 9), `ctrl_push_off`, `grant_quantum`; status at `0x24`-`0x2C` (spills, stuck watchdog, longest MRd wait; `0x24` read clears). `batch_mrd` tied off. Depth/time/cap keep their meaning. PIO-MANUAL §6 |
+| `0x0A07` | `28ff5b6`, 10-27 (AXI4-switch `aa823c9` + `1803d4a`) | As 0x0A06 plus: **rate caps** (reg4 `0x10`: in0, in1, out one byte each, n beats per 256 cycles = n x 0.5 Gb/s of 64-byte beats, 0 = uncapped = power-on; token bucket, held only between TLPs, reads and completions held too; input caps ahead of the `pkt_wait` stamp, the out cap inside it), **refused-cycle counters** (`0x30`/`0x34` in0/in1, any reason; `0x38`/`0x3C` the cap's part; free-running 32 bit, wrap after 17.2 s counted). **Read flush changed:** a read waiting at its barrier no longer preempts the other input's drain episode (0x0A06's did, and with reads waiting on both drives the two went out interleaved packet by packet); its input takes the next episode and drains to the barrier in one run, drain cap ignored. Worst-case read wait now includes the other input's episode (`axi4_page_batch_ch.v` header: ~30-77 us cap off, ~18-46 us cap on). `wrr_en` still tied 1. PIO-MANUAL §6 |
 
 **Every artifact carries the design ID from now on**: raw logs in the name
 (`pips-log-id0a04.bin.gz`), sweeps in the name (`<NAME>-id0a04-d8t22c1`), text
@@ -1622,7 +1637,8 @@ Settings are named `d<depth>t<time>[m1][c1]`: `d8t22c1` = depth 8, time 0x16,
 drain cap on. A name without `c1` has the cap off, as every name from before.
 From 0x0A06 the page batcher's fields follow when not at power-on: `p1`
 per page, `o1` ctrl_push off, `q<N>` grant quantum, `w<N>` completion
-threshold (`d64t255c1p1q256w31`).
+threshold (`d64t255c1p1q256w31`); from 0x0A07 `r<in0>x<in1>x<out>` when a
+rate cap is set (`d1t0c1r200x0x0`).
 
 ### Run
 
@@ -2349,7 +2365,87 @@ measurement.
    own order; needs no cross-device timing), checks = host model at own
    setting.
 
+### 0x0A07 minimal rerun (set up 2026-10-28, not run yet)
+
+Why rerun: 0x0A07 changes the read flush, which acts with `page_batch_en`
+0 too (`axi4_mwr_batch_pp`'s arbiter serves both modes). On 0x0A06 a read
+waiting at either input preempted the other input's drain episode; on the
+drives (reads waiting on both ports nearly always on a full link) the two
+devices left interleaved packet by packet. That is the likeliest cause of
+result 10's "0x0A06 pb0 sends more page switches than arrived" (twice the
+model at 16k, from the same arrival order as 0x0A05), ahead of `wrr_en`. So
+every 0x0A06 page-order number that involves both drives is suspect; the
+miss and throughput results (1, 2, 4) are unlikely to move (strict mode).
+
+`bash scripts/pips/pips-campaign.sh ssd --minimal --tmux` (bigserver) and
+`... nic --minimal --tmux` (icx); `--dry-run` shows the commands. The
+switch must report 0x0a07 (the campaign takes the design it finds at the
+start and refuses a change). Phases:
+- drives `mini`: depths 1, 4, 16, 64 (d1t0, d4t50, d16t218, d64t255) x
+  `page_batch_en` 0/1, cap on, w31; 4k/16k/64k/1m x 1/4/16 per drive +
+  2+16: 129 runs, ~2h15, then ~35 min analysis.
+- NICs (user, 10-28: the Ethernet cap and/or the FPGA rate cap instead of
+  iperf3 pacing, a few representative points, not the full sweep); 59 runs,
+  ~2h35, then ~20 min analysis:
+  - `rcap`, links at 100G: the FPGA rate cap on both inputs (`--set
+    rcap=N`), NIC0 alone and both, 5 flows uncapped. At d1t0 (no hold) rcap
+    0 / 214 / 169 / 113 (~off / 95 / 75 / 50 Gb/s of NIC writes: a 512-byte
+    write is 9 beats, so rcap ≈ 2.25 x Gb/s); at d16t218c1 pb 0/1 rcap 113.
+    Tests result 6's prediction that a rate limiter on a NIC port causes
+    splitting (it holds the NIC's writes, so its receive buffer backs up);
+    `pips_stat_cap_hold_frac_*` shows where the cap binds.
+  - `uneven`: NIC0's link forced to 50G at both ends, NIC1 at 100G: both
+    NICs, 5 and 5:30 flows, d1t0c1 and d16t218c1, pb 0/1. The uneven load
+    the arbiter never had on 0x0A06 (result 4).
+  - `wire50`: both links at 50G (the matched alone-vs-together condition of
+    result 6, 100 Gb/s together under the uplink's ~107): NIC0 alone and
+    both, 5 and 30 flows, d1t0c1, d4t50c1, d16t218c1, d64t255c1 x pb 0/1
+    (d64 last). The NIC counterpart of the drives' `mini`.
+  - The links are put back as found after the phases (also on exit);
+    `--no-wire` leaves out `uneven` and `wire50`.
+- Rate caps are written by every sweep setting (0 unless `--set rcap`; the
+  original goes back at the end). No knob phases (no effect on 0x0A06,
+  result 4), no pending 0x0A04/0x0A05 analysis (`--pending`).
+- New in every run: `pips-bp.tsv` (the counters every 2 s; a sample is
+  skipped when `pips log-wait` holds the BAR0 lock, gaps stay well under the
+  17 s wrap) and in the `.rpt`/JSONL `pips_stat_bp_frac_0/1` (refused share of
+  the run's cycles, setup included), `pips_stat_cap_hold_frac_*`,
+  `pips_stat_bp_valid`, `pips_stat_bp_max_gap_s`. `pips-status-table.py` and
+  the summaries' status tables print REFUSED_% per input.
+- Analysis runs the batcher model on the new logs (`PIPS_PB_MODEL`, default
+  `self,sweepc1,sweepc1f512`): on pb0 logs `self` is the log's setting without
+  `w31` (`pips-page-seq.py` now strips the page batcher fields; on 0x0A06 logs
+  `--model self` used to fail to parse), so `seq.jsonl` has the own-setting
+  check that result 10 (a) asked for. pb1 logs get the sweep lines only
+  (meaningless there: arrival not measurable).
+
+Before it: program 0x0A07 on both boards, `sudo bash
+scripts/pips/pips-bringup.sh` (hwtest now checks reg4 and the counters), and
+`make -C scripts/pips check` on one host (the 0x0A07 tests in `test-sim.sh`
+are new and have not run). Check after: `status.txt` (stuck, spills, MRd
+wait: the new flush lets a read wait for the other input's episode too, and
+0x0A06 already reached 262 us on the drives), then compare pb0 page switches
+per packet with the arrival order and the model (result 10's numbers: d64
+16k/64k/1m 0x0A06 pb0 10.3/14.1/10.1, arrival 7.0/13.1/9.2, 0x0A05 model
+5.1/11.0/6.5); on the NICs, TLPs per run of NIC0 (whole packets ≈ 7-8)
+against the rcap level, REFUSED_% and the cap's share, and pause frames.
+
 ### Next
+
+Status 10-28 (0x0A07 built): first the minimal rerun above. From the
+hardware list below, 0x0A07 delivered the per-input refused-cycle counter
+and the rate limiter; still not built: a 32-bit overflow count (`0x28`
+still saturates at 65535), FIFO occupancy high-water, MRd wait mean or
+histogram, hold only when the other input waits, the FIFO limit register,
+`wrr_en` in a register (result 10 (c)). The rate cap is now usable as the
+test knob below: NIC writes of 512 bytes take 9 beats, so `rcap0` ≈ 2.25 x
+the NIC's payload Gb/s (50G ≈ 113, 95G ≈ 214; calibrate on d1t0 first, the
+counters' cap share shows when it binds). Result 10 (a) is in the rerun's
+analysis for 0x0A07; for the 0x0A06 logs it needs `PIPS_PB_MODEL="self,sweepc1,sweepc1f512"
+bash scripts/pips/pips-analyze.sh <kind> --sweeps "" --manifest <each main
+sweep's manifest>` on the hosts. (b), redrawing the 0x0A04-0x0A05 page's
+Figures 3-6 and the 0x0A06 page's Figures 6-9 from `seq.jsonl`, is still
+open; the 0x0A06 drive figures may be superseded by 0x0A07's.
 
 Status 10-26 (from the 0x0A06 campaign, results above): item 0 ran (NICs
 match; drives: waits 3x low, link fit 35.5 B/cycle, open: result 8); item
@@ -2427,16 +2523,10 @@ Hardware (PIPS), in order:
    lines; the whole-log grab has `model[]` and `windows_arr` per log),
    rebuild, publish; add the NICs' 0x0A05 `traffic.jsonl` to
    `sizes.FILES`.
-0b. **Finish the NIC depth sweep** after reprogramming 0x0A05: first
-   `--cfgs "24:255" --caps 1 --tag d24repro "10 15"` to see if the stop
-   repeats (snapshot if it does), then `--cfgs "24:255 36:255 64:255" --caps
-   1 --datapath-once --tag dsweep1b`.
-   (The 10-16 regrab this replaces is in `*/1016/seq-*-0a04-arr/`; its
-   model ran without the uplink limit and the grant gap: items 9-10.)
-1. **IOMMU off on `0x0A04`** (or `0x0A05`), drives and NICs, cap off and on. Completes the
-   comparison with 0x0A02, and tells whether drive 0's single-instance drop
-   needs the IOMMU. Check first that both NICs are behind the same DMAR unit
-   (§5 item 1).
+0b. **CANCELED, closed 10-28 (user):** finish the NIC depth sweep on 0x0A05
+   (d24 repro, `dsweep1b`). Superseded: 0x0A06 ran d24-d64 on the NICs
+   without a stop, and 0x0A07 is the build now.
+1. **CANCELED, closed 10-28 (user):** IOMMU off on `0x0A04`/`0x0A05`.
 2. **Build or boot for drive 0:** drive 0 alone and 1+1 at 4–16k, 1 instance,
    on the 0x0A04 and 0x0A02 bitstreams within one boot, then after a reboot.
 3. **`pcm-iio` samples:** read `pcm-iio.out` and `pcie.csv` (every stack,

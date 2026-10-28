@@ -226,15 +226,41 @@ returns DECERR.
 | `0x04` | RW | **batcher drain config** (reg1, below), from design `0x0A03`. Before: reserved, reads 0, ignores writes |
 | `0x08` | RW | **page batcher thresholds** (reg2, below), from design `0x0A06`. Before: reserved, reads 0 |
 | `0x0C` | RW | **page batcher config** (reg3, below), from design `0x0A06`. Before: reserved, reads 0 |
-| `0x10–0x1C` | RO | reserved, read 0. Can become read/write in a later build (`REG_RW_MASK`) |
+| `0x10` | RW | **batcher rate caps** (reg4, below), from design `0x0A07`. Before: reserved, reads 0 |
+| `0x14–0x1C` | RO | reserved, read 0. Can become read/write in a later build (`REG_RW_MASK`) |
 | `0x20` | RO | **design ID**: `[15:0]` build identifier, `[31:16]` 0 |
 | `0x24` | RO, **read clears** | **page batcher status flags** (from `0x0A06`, below): `[0]` in0 overflowed, `[1]` in1 overflowed, `[2]` stuck |
 | `0x28` | RO | overflow spill counts, `[15:0]` in0, `[31:16]` in1, as of the last `0x24` read |
 | `0x2C` | RO | longest MRd wait in cycles (4 ns), `[15:0]` in0, `[31:16]` in1, as of the last `0x24` read |
-| `0x30–0x3C` | RO | reserved, read 0 |
+| `0x30`, `0x34` | RO | **refused cycles** in0, in1 (from `0x0A07`): cycles the input had a beat waiting and was not taken, any reason. Free-running 32 bit, wrap, no read side effect. Before: reserved, read 0 |
+| `0x38`, `0x3C` | RO | **rate-cap held cycles** in0, in1 (from `0x0A07`): the part of `0x30`/`0x34` where that input's rate cap was closed |
 
 Writes to read-only registers are ignored with an OKAY response
 (`WIN_STATUS` stays 0).
+
+**Rate caps and counters (design `0x0A07` on).** reg4 `0x10`: `[7:0]`
+`rate_cap_0` (in0 = `s_axis_0`, downstream path one), `[15:8]` `rate_cap_1`
+(in1, path zero), `[23:16]` `rate_cap_out` (the USP RQ output), `[31:24]`
+reserved. Each is n beats per 256-cycle window = n x 62.5 MB/s (n x 0.5 Gb/s
+of 64-byte beats; a header beat or a partial last beat costs a whole one); 0 =
+uncapped, the power-on value. A loose token bucket (`axis_rate_cap.v`): a port
+is held only between TLPs, never mid-packet; leftover tokens are dropped at
+each refill and debt is carried, so a burst is at most one window's worth; MRd
+and completions are held like data. The input caps sit ahead of the ingress
+stamp, so a log's `pkt_wait` excludes their hold; the out cap sits after the
+output tap, so its hold is part of `pkt_wait`, and a low out cap slows a full
+array's drain and lengthens MRd waits. `pips cfg` prints `rcap=` and
+`rate_cap_*=`; `pips cfg set rcap=N` (both inputs) `rcap0= rcap1= rcapout=
+raw4=`; sweeps `--set "rcap0=100"` (tag `r<in0>x<in1>x<out>`). The counters
+wrap after 2^32 counted cycles (17.2 s), and a drive on a full uplink can be
+refused most of a run, so the runners sample them with `pips counters` every 2
+s (`pips-bp.tsv` in the run folder; `pips_stat_bp_frac_0/1` = refused share of
+the run's cycles in the results). 0x0A07 also changed the read flush: a
+channel with a read waiting at its barrier no longer preempts the other
+channel's drain episode (on 0x0A06 it did, and with reads waiting on both
+ports the two devices went out interleaved packet by packet); it takes the
+next episode and drains its whole backlog to the barrier in one run, drain cap
+ignored.
 
 **The page batcher (design `0x0A06` on).** The batcher is `axi4_mwr_batch_pp`
 (FPGA repo `src/Utilities/`), its registers decoded by `pips_batch_ctrl_0`
@@ -282,6 +308,9 @@ the longest any read waited at an input (a device's completion timeout is
 | `0x0A02` | `e389cca`, 10-11 | DESIGN_ID; log v1. The 10-13 dual-SSD PIPS sweeps ran on it |
 | `0x0A03` | `2c6c3f5`, 10-14 | reg1 `drain_depth_cap`; log v1 |
 | `0x0A04` | `591d854`, 10-15 | log record format v2 (§8.3) |
+| `0x0A05` | `64193c6`, 10-17 | batching FIFO 512 rows (was 128) |
+| `0x0A06` | `9673e37` + `d44fdd0`, 10-23/24 | page batcher: reg2/reg3, status `0x24`-`0x2C` |
+| `0x0A07` | `28ff5b6`, 10-27 | rate caps (reg4 `0x10`), refused / held cycle counters `0x30`-`0x3C`, read flush no longer preempts |
 
 Every artifact the tools write carries the design ID: in the name for raw logs
 (`pips-log-id0a04.bin.gz`) and sweeps (`<NAME>-id0a04-<setting>`), inside for
@@ -795,7 +824,7 @@ widen the DMA back to 2 GB and keep the constants.
 
 | Tool | Use |
 |---|---|
-| `pips` (C, `make`) | `info`, `rd`/`wr`, `axi-rd`/`axi-wr`, `cfg [set depth= time= mrd= log= raw= cap=]` (prints `drain=`, `design_id=`, `log_format=`), `dma`, `dma-reset`, `log-clear`, `log-start`, `log-wait`/`log-stop`, `log-dump`, `ddr-dump`, `hwtest [steps]`, `soak` |
+| `pips` (C, `make`) | `info`, `rd`/`wr`, `axi-rd`/`axi-wr`, `cfg [set depth= time= mrd= log= raw= cap=]` (prints `drain=`, `design_id=`, `log_format=`; 0x0A06 on also `pb= pushoff= quantum= thr= raw2= raw3=`, 0x0A07 on `rcap= rcap0= rcap1= rcapout= raw4=`), `status` (0x0A06 on), `counters` (0x0A07 on), `dma`, `dma-reset`, `log-clear`, `log-start`, `log-wait`/`log-stop`, `log-dump`, `ddr-dump`, `hwtest [steps]`, `soak` |
 | `pips-bringup.sh` | enumeration, links, kernel log, `hwtest`, an empty recording (`log-smoke-id<XXXX>.bin`); logs in `utils/logs/pips-bringup-*` |
 | `pips-fio-log.sh` | one read-only fio run with a recording (`log-id<XXXX>.bin`), before/after readouts |
 | `dualssd_pips_sweep.sh`, `dualnic_pips_sweep.sh` | the dual-SSD cross sweep with uneven co-runs / the dual-NIC flow sweep, once per batcher setting with the drain cap off and on, a recording per run checked FULL/CUT; names carry the design ID |

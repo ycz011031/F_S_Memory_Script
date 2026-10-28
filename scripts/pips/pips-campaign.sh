@@ -1,5 +1,5 @@
 #!/bin/bash
-# The design 0x0A06 campaign on one testbed, start to finish: every sweep
+# The design 0x0A06/0x0A07 campaign on one testbed, start to finish: every sweep
 # (page_batch_en across the depth sweep, cap off, ctrl_push off, grant quantum,
 # the completion threshold, and on the NICs the alone/paced/wire-speed tests of
 # the packet splitting), then the analysis of those sweeps and the analysis
@@ -11,6 +11,7 @@
 #   bash scripts/pips/pips-campaign.sh ssd --tmux       # bigserver: the drives
 #   bash scripts/pips/pips-campaign.sh nic --tmux       # icx: the NICs
 #   bash scripts/pips/pips-campaign.sh nic --dry-run    # the plan, ETA and commands only
+#   bash scripts/pips/pips-campaign.sh ssd --minimal --tmux   # the 0x0A07 rerun (below)
 #
 # Options:
 #   --tmux            run in a new tmux session (asks for the sudo password
@@ -18,9 +19,23 @@
 #   --dry-run         print the plan, the ETA and every sweep command; run nothing
 #   --only "P ..."    run only these phases (names: --dry-run lists them)
 #   --skip "P ..."    leave these phases out
+#   --minimal         the short rerun on a new build (0x0A07, 10-28), a few
+#                     representative points, no knob phases, no pending
+#                     analysis (--pending to add it back). Drives: the main
+#                     comparison at 4 depths (1, 4, 16, 64) x page_batch_en
+#                     0/1, cap on, w31, bs 4k/16k/64k/1m x 1/4/16 + 2+16.
+#                     NICs, with the Ethernet or the FPGA rate cap instead of
+#                     iperf3 pacing: rcap (NIC0 alone and both, 5 flows, at
+#                     100G: the FPGA rate cap on both inputs at 0/95/75/50G of
+#                     NIC writes at d1t0, and 50G at d16t218c1 pb 0/1), uneven
+#                     (NIC0's link at 50G, NIC1 at 100G: 5 and 5:30 flows at
+#                     d1t0c1 and d16t218c1, pb 0/1), wire50 (both links at
+#                     50G: NIC0 alone and both, 5 and 30 flows, depths 1, 4,
+#                     16, 64 x pb 0/1); the links are put back at the end
+#   --pending         with --minimal: the pending 0x0A04/0x0A05 analysis too
 #   --no-analysis     sweeps only, then pack (no page order, lengths, pending)
 #   --no-pending      leave out the pending 0x0A04/0x0A05 analysis
-#   --no-wire         NIC: leave out the 50G wire-speed phase
+#   --no-wire         NIC: leave out the phases that change link speeds (wire, uneven, wire50)
 #   --no-hw           NIC: leave out the hardware-paced phase
 #   -j N              logs at a time in the analysis (default: half the CPUs, at most 16)
 #   --stamp S         the label prefix of this campaign's sweeps (default c<MMDDhhmm>)
@@ -30,9 +45,13 @@
 #                     folders in utils/logs and utils/reports, TLP logs included).
 #                     Nothing is deleted; rm -rf ~/pips-retired/S when sure
 # Environment: HEARTBEAT=seconds between liveness lines (default 300),
-# RESULTS_DIR (default ~), DUALSSD_ARGS (default "--membw 0").
+# RESULTS_DIR (default ~), DUALSSD_ARGS (default "--membw 0"), PIPS_PB_MODEL
+# (the batcher model on the new sweeps' logs, pips-seq-grab.sh; default
+# "self,sweepc1,sweepc1f512": the page_batch_en 0 logs' own setting, HANDOFF
+# §8 0x0A06 result 10; "" for none).
 #
-# Every sweep: design 0x0a06 only (refused otherwise), IOMMU as booted (no
+# Every sweep: design 0x0a06 or 0x0a07, the one the switch had at the start
+# (refused otherwise), rate caps 0 (uncapped) on 0x0a07, IOMMU as booted (no
 # reboot), drain cap on unless the phase says, the completion threshold at
 # 31 DW on both inputs (w31: conservative, data taken for a completion only
 # costs batching; 0x0A04/0x0A05 logs: drive completions 4 DW, mlx5 16 DW,
@@ -40,7 +59,7 @@
 # NIC data from 32 DW), the status registers read in every run (0x24 before
 # the run, 0x24/0x28/0x2C after the window: pips_stat_* in the results).
 #
-# If the switch stops answering (design ID not 0x0a06, or reads 0xFFFFFFFF):
+# If the switch stops answering (design ID not the one at the start, or reads 0xFFFFFFFF):
 # a read-only snapshot (pips-hang-snapshot.sh) is taken at once, every switch
 # phase still to come is skipped with a warning, and the campaign goes on with
 # the analysis and the packing. Warnings are repeated at the end.
@@ -50,7 +69,7 @@
 #   plan.txt          phases, points, estimates; notes.txt: warnings, skips
 #   results/          each sweep's ~/<name>.txt, .manifest.tsv, per-setting .jsonl/.txt
 #   sweeplogs/<name>/ the sweep folder (pips-sweep.log, cfg-*.txt, manifest)
-#   runs/             per run the small files: pips-cfg.txt, pips-status*.txt,
+#   runs/             per run the small files: pips-cfg.txt, pips-status*.txt, pips-bp.tsv,
 #                     pips-log-summary.*, sweep-id.txt, nstat, and its reports/ (.rpt)
 #   status.txt/.tsv   pips-status-table.py over every sweep: spills, stuck, MRd wait
 #   analyze-new/      pips-analyze.sh on this campaign's sweeps (recorded and
@@ -76,7 +95,7 @@ case "$KIND" in
 esac
 PASS=("$KIND"); IN_TMUX=0
 for a in "$@"; do if [ "$a" = --tmux ]; then IN_TMUX=1; else PASS+=("$a"); fi; done
-DRY=0; ONLY=""; SKIP=""; ANALYSIS=1; PENDING=1; WIRE=1; HW=1; JOBS=""; STAMP=""; RETIRE=""
+DRY=0; ONLY=""; SKIP=""; ANALYSIS=1; PENDING=""; WIRE=1; HW=1; JOBS=""; STAMP=""; RETIRE=""; MINIMAL=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --tmux) shift ;;
@@ -86,6 +105,8 @@ while [ $# -gt 0 ]; do
         --skip) SKIP="$2"; shift 2 ;;
         --no-analysis) ANALYSIS=0; shift ;;
         --no-pending) PENDING=0; shift ;;
+        --pending) PENDING=1; shift ;;
+        --minimal) MINIMAL=1; shift ;;
         --no-wire) WIRE=0; shift ;;
         --no-hw) HW=0; shift ;;
         -j) JOBS="$2"; shift 2 ;;
@@ -118,6 +139,9 @@ if [ -n "$RETIRE" ]; then
     exit 0
 fi
 STAMP=${STAMP:-c$(date +%m%d%H%M)}
+# --minimal leaves the pending 0x0A04/0x0A05 analysis out unless --pending.
+[ -n "$PENDING" ] || { if [ "$MINIMAL" = 1 ]; then PENDING=0; else PENDING=1; fi; }
+export PIPS_PB_MODEL="${PIPS_PB_MODEL-self,sweepc1,sweepc1f512}"
 case "$STAMP" in [A-Za-z]*) ;; *) echo "--stamp: must start with a letter" >&2; exit 2 ;; esac
 case "$STAMP" in *[!A-Za-z0-9]*) echo "--stamp: letters and digits only" >&2; exit 2 ;; esac
 if [ "$IN_TMUX" = 1 ] && [ "$DRY" = 0 ]; then
@@ -155,8 +179,21 @@ NIC_KNOB=( "5 30 5:30" "uncapped 50" 1 )                                        
 NIC_ALONE=( --modes "nic0only both" "5" "uncapped 50 25" 1 )                              # 6
 NIC_HW=( --modes "nic0only both" "5" "hw50 hw25" 1 )                                      # 4
 NIC_WIRE=( --modes "nic0only both" "5" "uncapped" 1 )                                     # 2
+# --minimal (0x0A07): 4 depths, the knob grids (drives with 64k added: the
+# size result 10 compares), the splitting test without 25G.
+MINI_LO="1:0 4:50 16:218"; MINI_HI="64:255"
+SSD_MINI=( --asy-low 2 --asy-high 16 --no-swap "4k 16k 64k 1m" "1 4 16" 1 )               # 12 + 4
+# NICs: the FPGA rate cap on both inputs, in beats per 256 cycles. A 512-byte
+# NIC write takes 9 beats, so rcap ~ 2.25 x the NIC's Gb/s of writes: 214 ~ 95G,
+# 169 ~ 75G, 113 ~ 50G (pips_stat_cap_hold_frac shows whether it binds).
+NIC_RCAPS="0 214 169 113"; NIC_RCAP_HELD=113
+NIC_PAIR=( --modes "nic0only both" "5" "uncapped" 1 )                                     # 2
+NIC_UNEVEN=( "5 5:30" "uncapped" 1 )                                                      # 2, both NICs
+NIC_W50=( --modes "nic0only both" "5 30" "uncapped" 1 )                                   # 4
 
-if [ "$KIND" = ssd ]; then
+if [ "$MINIMAL" = 1 ]; then
+    if [ "$KIND" = ssd ]; then PHASES=(mini); else PHASES=(rcap uneven wire50); fi
+elif [ "$KIND" = ssd ]; then
     PHASES=(main cap0 push quant thr drv0)
 else
     PHASES=(mainlo cap0 push quant thr alone hw mainhi wire)
@@ -170,6 +207,10 @@ est_points() {
         ssd:quant)  echo $(( 3 * (12 + 1) )) ;;
         ssd:thr)    echo $(( 2 * 12 + 1 )) ;;
         ssd:drv0)   echo $(( 2 * 16 + 1 )) ;;
+        ssd:mini)   echo $(( 8 * 16 + 1 )) ;;
+        nic:rcap)   echo $(( 4 * (2 + 1) + 2 * 2 + 1 )) ;;
+        nic:uneven) echo $(( 4 * 2 + 1 )) ;;
+        nic:wire50) echo $(( 8 * 4 + 1 )) ;;
         nic:mainlo) echo $(( 10 * 12 + 1 )) ;;
         nic:mainhi) echo $(( 6 * 12 + 1 )) ;;
         nic:cap0)   echo $(( 6 * 6 + 1 )) ;;
@@ -190,6 +231,10 @@ describe() {
         ssd:quant)  echo "grant quantum 64/256/1024 beats, per page, d64t255; knob grid" ;;
         ssd:thr)    echo "completion threshold 4 DW (the NVMe entry exactly), per page, d8/d64; knob grid" ;;
         ssd:drv0)   echo "items 2/4: drive 0 alone and 1+1/16+16 at 4k-1m, d1t0 cap off and on" ;;
+        ssd:mini)   echo "page_batch_en 0/1 x depths 1/4/16/64, cap on, w31; bs 4k/16k/64k/1m x 1/4/16 + 2+16" ;;
+        nic:rcap)   echo "FPGA rate cap on both inputs (rcap $NIC_RCAPS: ~off/95/75/50G) at d1t0, and rcap $NIC_RCAP_HELD at d16t218c1 pb 0/1; NIC0 alone and both, 5 flows, 100G links" ;;
+        nic:uneven) echo "NIC0's link at 50G, NIC1's at 100G (uneven load for the arbiter): both NICs, 5 and 5:30 flows, d1t0c1 and d16t218c1, pb 0/1" ;;
+        nic:wire50) echo "both NICs' links at 50G: NIC0 alone and both, 5 and 30 flows, depths 1/4/16/64 x pb 0/1, cap on, w31; links put back after" ;;
         nic:mainlo) echo "page_batch_en 0/1 x depths 1-16, cap on, w31; flows 5/10/15/30, 5:30, 30:10; uncapped and 50G" ;;
         nic:mainhi) echo "the same at depths 24/36/64 (last switch phase: d24 stopped 0x0A05's NIC sweep)" ;;
         nic:cap0)   echo "cap off at d1/d8/d16, page_batch_en 0/1; flows 5/30/5:30, uncapped and 50G" ;;
@@ -205,7 +250,7 @@ want_phase() {
     local p=$1
     [ -n "$ONLY" ] && ! [[ " $ONLY " == *" $p "* ]] && return 1
     [[ " $SKIP " == *" $p "* ]] && return 1
-    [ "$p" = wire ] && [ "$WIRE" = 0 ] && return 1
+    case "$p" in wire|uneven|wire50) [ "$WIRE" = 0 ] && return 1 ;; esac
     [ "$p" = hw ] && [ "$HW" = 0 ] && return 1
     return 0
 }
@@ -219,7 +264,9 @@ RUN_PHASES=(); for p in "${PHASES[@]}"; do want_phase "$p" && RUN_PHASES+=("$p")
 est_analysis() {
     local pts=0 p
     for p in "${RUN_PHASES[@]}"; do pts=$(( pts + $(est_points "$p") )); done
-    local new=$(( pts * 35 / 60 / JOBS + 10 )) pend=0
+    local per=35
+    [ -n "$PIPS_PB_MODEL" ] && per=95                  # + the model, ~1 min a log
+    local new=$(( pts * per / 60 / JOBS + 10 )) pend=0
     if [ "$PENDING" = 1 ]; then
         if [ "$KIND" = ssd ]; then pend=$(( 180 * 16 / (JOBS < 16 ? JOBS : 16) )); else pend=$(( 50 * 8 / (JOBS < 8 ? JOBS : 8) )); fi
     fi
@@ -231,7 +278,7 @@ clock_in() { date -d "+$1 min" '+%a %H:%M' 2>/dev/null || echo "+$(fmt_min "$1")
 
 plan() {
     local p n m tot=0
-    echo "pips-campaign $KIND, stamp $STAMP, $(hostname), $(date '+%F %T'), repo $(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)"
+    echo "pips-campaign $KIND$( [ "$MINIMAL" = 1 ] && echo " (minimal)"), stamp $STAMP, $(hostname), $(date '+%F %T'), repo $(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)"
     echo "sweeps named dual$KIND-pips-<iommu>-$STAMP<phase>; ${MIN_PER_PT} min per run (estimate)"
     printf '  %-7s %5s %8s  %s\n' phase runs time what
     for p in "${RUN_PHASES[@]}"; do
@@ -241,7 +288,7 @@ plan() {
     done
     read -r an ap <<< "$(est_analysis)"
     echo "  sweeps: $(fmt_min "$tot")"
-    echo "  analysis: new sweeps $(fmt_min "$an"), pending 0x0A04/0x0A05 $(fmt_min "$ap") (-j $JOBS)"
+    echo "  analysis: new sweeps $(fmt_min "$an") (model: ${PIPS_PB_MODEL:-none}), pending 0x0A04/0x0A05 $(fmt_min "$ap") (-j $JOBS)"
     echo "  ETA, everything packed: $(fmt_min $(( tot + an + ap + 10 ))) from now, ~$(clock_in $(( tot + an + ap + 10 )))"
     for p in "${PHASES[@]}"; do want_phase "$p" || echo "  (phase $p left out)"; done
 }
@@ -256,12 +303,16 @@ banner() {
     for l in "$@"; do echo "!!!!  $l"; done
     echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"; echo
 }
-# The switch answers with the expected build. 20 s at most.
+# The switch answers with the expected build: 0x0a06 or 0x0a07, and after
+# the preflight the one it had then (CAMPAIGN_DESIGN). 20 s at most.
+CAMPAIGN_DESIGN=""
 switch_ok() {
-    local out
+    local out d
     out=$(timeout 20 sudo -n "$PIPS" cfg 2>&1) || { LAST_SWITCH="$out"; return 1; }
     LAST_SWITCH="$out"
-    [ "$(design_of <(printf '%s\n' "$out"))" = 0x0a06 ]
+    d=$(design_of <(printf '%s\n' "$out"))
+    case "$d" in 0x0a06|0x0a07) ;; *) return 1 ;; esac
+    [ -z "$CAMPAIGN_DESIGN" ] || [ "$d" = "$CAMPAIGN_DESIGN" ]
 }
 switch_dead() {   # <where>
     [ "$SWITCH_DEAD" = 1 ] && return 0
@@ -342,16 +393,60 @@ if [ "$KIND" = nic ]; then
     S0=${SERVER_INTFS[0]}; C0=${CLIENT_INTFS[0]}
     link_of() { awk '/Speed:/ { s = $2 } /Auto-negotiation:/ { a = $2 } /Link detected:/ { l = $3 }
                      END { print s, a, l }'; }
-    # wire_wait <speed Mb/s>: both ends of NIC0's link up at that speed (90 s)
-    wire_wait() {
-        local k s c
+    # Ethernet link speed of NIC i at both ends (icx and styx); the PCIe links
+    # are not touched. The first change records the link as found
+    # (LINK_FOUND_S/C: "speed autoneg link"); link_restore_all puts back every
+    # link changed, and the campaign calls it after the phases however they end.
+    LINK_FOUND_S=(); LINK_FOUND_C=()
+    # link_wait <i> <Mb/s>: both ends of NIC i's link up at that speed (90 s)
+    link_wait() {
+        local i=$1 k s c
         for k in $(seq 1 18); do
             sleep 5
-            s=$(ethtool "$S0" 2>/dev/null | link_of); c=$(rsh_try "ethtool $C0" 2>/dev/null | link_of)
-            echo "    wire: $S0 $s | $C0 $c"
-            [[ "$s" == "${1}Mb/s "*" yes" ]] && [[ "$c" == "${1}Mb/s "*" yes" ]] && return 0
+            s=$(ethtool "${SERVER_INTFS[$i]}" 2>/dev/null | link_of); c=$(rsh_try "ethtool ${CLIENT_INTFS[$i]}" 2>/dev/null | link_of)
+            echo "    link NIC$i: ${SERVER_INTFS[$i]} $s | ${CLIENT_INTFS[$i]} $c"
+            [[ "$s" == "${2}Mb/s "*" yes" ]] && [[ "$c" == "${2}Mb/s "*" yes" ]] && return 0
         done
         return 1
+    }
+    # link_set <i> <Mb/s | found>: force NIC i's link to that speed at both ends
+    # (nothing if it is there already), or put it back as found. 1 if it did not
+    # come up so within 90 s.
+    link_set() {
+        local i=$1 want=$2 si=${SERVER_INTFS[$1]} ci=${CLIENT_INTFS[$1]} s c ss sa cs ca
+        if [ -z "${LINK_FOUND_S[$i]:-}" ]; then
+            [ "$want" = found ] && return 0
+            LINK_FOUND_S[$i]=$(ethtool "$si" 2>/dev/null | link_of)
+            LINK_FOUND_C[$i]=$(rsh_try "ethtool $ci" 2>/dev/null | link_of)
+            say "link NIC$i as found: $si ${LINK_FOUND_S[$i]} | $ci ${LINK_FOUND_C[$i]}"
+        fi
+        read -r ss sa _ <<< "${LINK_FOUND_S[$i]}"; read -r cs ca _ <<< "${LINK_FOUND_C[$i]}"
+        if [ "$want" = found ]; then
+            want=${ss%Mb/s}
+            say "link NIC$i: back to ${ss} (autoneg ${sa} / ${ca})"
+            if [ "$sa" = on ]; then sudo -n ethtool -s "$si" autoneg on; else sudo -n ethtool -s "$si" speed "$want" autoneg off; fi
+            if [ "$ca" = on ]; then rsh_try "sudo -n ethtool -s $ci autoneg on"; else rsh_try "sudo -n ethtool -s $ci speed ${cs%Mb/s} autoneg off"; fi
+        else
+            s=$(ethtool "$si" 2>/dev/null | link_of); c=$(rsh_try "ethtool $ci" 2>/dev/null | link_of)
+            [[ "$s" == "${want}Mb/s "*" yes" ]] && [[ "$c" == "${want}Mb/s "*" yes" ]] && return 0
+            say "link NIC$i: forcing ${want} Mb/s at both ends"
+            sudo -n ethtool -s "$si" speed "$want" autoneg off || return 1
+            rsh_try "sudo -n ethtool -s $ci speed $want autoneg off" || return 1
+        fi
+        link_wait "$i" "$want"
+    }
+    link_restore_all() {
+        local i ss sa cs ca
+        for i in "${!LINK_FOUND_S[@]}"; do
+            if ! link_set "$i" found; then
+                read -r ss sa _ <<< "${LINK_FOUND_S[$i]}"; read -r cs ca _ <<< "${LINK_FOUND_C[$i]}"
+                banner "NIC$i's LINK DID NOT COME BACK AT ${ss}." "Put it back by hand:" \
+                       "  sudo ethtool -s ${SERVER_INTFS[$i]} $( [ "$sa" = on ] && echo "autoneg on" || echo "speed ${ss%Mb/s} autoneg off")" \
+                       "  ssh $CLIENT_USERNAME@$CLIENT_SSH_IP sudo ethtool -s ${CLIENT_INTFS[$i]} $( [ "$ca" = on ] && echo "autoneg on" || echo "speed ${cs%Mb/s} autoneg off")"
+                note "NIC$i's link did not come back at $ss: fix by hand (campaign.log)"
+            fi
+        done
+        LINK_FOUND_S=(); LINK_FOUND_C=()
     }
     snapshot_nics() {   # <tag before|after>
         say "NIC snapshots ($1): icx here, styx over ssh (read-only)"
@@ -383,6 +478,13 @@ phase_run() {
         ssd:drv0)  sweep_run drv0 --cfgs "1:0" --caps "0 1" --pbs 0 --set "$THR" "${SSD_DRV0[@]}" ;;
         nic:mainlo) sweep_run mainlo --cfgs "$DEPTH_LO" --caps 1 --pbs "0 1" --set "$THR" "${NIC_MAIN[@]}" ;;
         nic:mainhi) sweep_run mainhi --cfgs "$DEPTH_HI" --caps 1 --pbs "0 1" --set "$THR" "${NIC_MAIN[@]}" ;;
+        ssd:mini)   sweep_run mini --cfgs "$MINI_LO $MINI_HI" --caps 1 --pbs "0 1" --set "$THR" "${SSD_MINI[@]}" ;;
+        nic:rcap)  for q in $NIC_RCAPS; do
+                       sweep_run "rc$q" --cfgs "1:0" --caps 0 --pbs 0 --set "$THR rcap=$q" "${NIC_PAIR[@]}"
+                   done
+                   sweep_run "rc${NIC_RCAP_HELD}h" --cfgs "16:218" --caps 1 --pbs "0 1" --set "$THR rcap=$NIC_RCAP_HELD" "${NIC_PAIR[@]}" ;;
+        nic:uneven) phase_links uneven "50000 found" --cfgs "1:0 16:218" --caps 1 --pbs "0 1" --set "$THR" "${NIC_UNEVEN[@]}" ;;
+        nic:wire50) phase_links wire50 "50000 50000" --cfgs "$MINI_LO $MINI_HI" --caps 1 --pbs "0 1" --set "$THR" "${NIC_W50[@]}" ;;
         nic:cap0)  sweep_run cap0 --cfgs "1:0 8:106 16:218" --caps 0 --pbs "0 1" --set "$THR" "${NIC_KNOB[@]}" ;;
         nic:push)  sweep_run push --cfgs "8:106 16:218" --caps 1 --pbs 1 --set "$THR pushoff=1" "${NIC_KNOB[@]}" ;;
         nic:quant) for q in 64 256 1024; do
@@ -404,35 +506,39 @@ phase_run() {
 # it was. Ethernet only: the PCIe links are not touched.
 phase_wire() {
     if [ "$DRY" = 1 ]; then
-        echo "    sudo ethtool -s $S0 speed 50000 autoneg off; styx: sudo ethtool -s $C0 speed 50000 autoneg off"
+        echo "    NIC0's link at 50000 Mb/s at both ends (ethtool -s ... speed 50000 autoneg off)"
         sweep_run wirea --cfgs "16:64" --caps 0 --pbs 0 --set "$THR" "${NIC_WIRE[@]}"
         sweep_run wireb --cfgs "4:22" --caps 1 --pbs 0 --set "$THR" "${NIC_WIRE[@]}"
-        echo "    then both ends back to their speed and autonegotiation as found"
+        echo "    then back to its speed and autonegotiation as found"
         return 0
     fi
     [ "$SWITCH_DEAD" = 1 ] && { note "phase wire SKIPPED: the switch is not answering"; return 0; }
-    local s0 c0 ss sa cs ca ok=1
-    s0=$(ethtool "$S0" 2>/dev/null | link_of); c0=$(rsh_try "ethtool $C0" 2>/dev/null | link_of)
-    read -r ss sa _ <<< "$s0"; read -r cs ca _ <<< "$c0"
-    say "wire: NIC0 link as found: $S0 $s0 | $C0 $c0; forcing 50G at both ends"
-    sudo -n ethtool -s "$S0" speed 50000 autoneg off || ok=0
-    rsh_try "sudo -n ethtool -s $C0 speed 50000 autoneg off" || ok=0
-    if [ "$ok" = 1 ] && wire_wait 50000; then
+    if link_set 0 50000; then
         sweep_run wirea --cfgs "16:64" --caps 0 --pbs 0 --set "$THR" "${NIC_WIRE[@]}"
         sweep_run wireb --cfgs "4:22" --caps 1 --pbs 0 --set "$THR" "${NIC_WIRE[@]}"
     else
         note "phase wire: NIC0's link did not come up at 50G (the cable or the card may not do it); nothing run"
     fi
-    say "wire: putting NIC0's link back"
-    if [ "$sa" = on ]; then sudo -n ethtool -s "$S0" autoneg on; else sudo -n ethtool -s "$S0" speed "${ss%Mb/s}" autoneg off; fi
-    if [ "$ca" = on ]; then rsh_try "sudo -n ethtool -s $C0 autoneg on"; else rsh_try "sudo -n ethtool -s $C0 speed ${cs%Mb/s} autoneg off"; fi
-    if ! wire_wait "${ss%Mb/s}"; then
-        banner "NIC0's LINK DID NOT COME BACK AT ${ss} after the wire-speed test." \
-               "Put it back by hand:" \
-               "  sudo ethtool -s $S0 $( [ "$sa" = on ] && echo "autoneg on" || echo "speed ${ss%Mb/s} autoneg off")" \
-               "  ssh $CLIENT_USERNAME@$CLIENT_SSH_IP sudo ethtool -s $C0 $( [ "$ca" = on ] && echo "autoneg on" || echo "speed ${cs%Mb/s} autoneg off")"
-        note "NIC0's link did not come back at $ss after the wire test: fix by hand (campaign.log)"
+    link_restore_all
+}
+
+# phase_links <label> "<NIC0 speed> <NIC1 speed>" <sweep args...>: the links at
+# those speeds (Mb/s, or "found" = as at the start), then one sweep. The links
+# stay so for the next phase (fewer flaps); link_restore_all after the phases.
+phase_links() {
+    local label=$1 speeds=$2 i=0 sp ok=1; shift 2
+    if [ "$DRY" = 1 ]; then
+        for sp in $speeds; do echo "    NIC$i's link: $sp$( [ "$sp" = found ] || echo " Mb/s") at both ends"; i=$((i + 1)); done
+        sweep_run "$label" "$@"
+        return 0
     fi
+    [ "$SWITCH_DEAD" = 1 ] && { note "phase $label SKIPPED: the switch is not answering"; return 0; }
+    for sp in $speeds; do
+        link_set "$i" "$sp" || { ok=0; note "phase $label: NIC$i's link did not come up at $sp; nothing run"; break; }
+        i=$((i + 1))
+    done
+    [ "$ok" = 1 ] && sweep_run "$label" "$@"
+    return 0
 }
 
 # ------------------------------------------------------------------ dry run
@@ -455,8 +561,15 @@ sudo -n true 2>/dev/null || { echo "ERROR: sudo needs a password: run with --tmu
 plan | tee "$OUT/plan.txt"
 echo
 pips_build || { echo "ERROR: cannot build $PIPS" >&2; exit 1; }
-switch_ok || { echo "ERROR: the switch does not answer as design 0x0a06:" >&2; printf '%s\n' "$LAST_SWITCH" | tail -5 >&2; exit 1; }
-say "switch: $(printf '%s\n' "$LAST_SWITCH" | grep -E '^(cfg|drain|pb|thr|design_id)=' | xargs)"
+switch_ok || { echo "ERROR: the switch does not answer as design 0x0a06 or 0x0a07:" >&2; printf '%s\n' "$LAST_SWITCH" | tail -5 >&2; exit 1; }
+CAMPAIGN_DESIGN=$(design_of <(printf '%s\n' "$LAST_SWITCH"))
+say "switch: $(printf '%s\n' "$LAST_SWITCH" | grep -E '^(cfg|drain|pb|thr|rcap|design_id)=' | xargs)"
+[ "$MINIMAL" = 1 ] && [ "$CAMPAIGN_DESIGN" != 0x0a07 ] &&
+    note "--minimal is the 0x0A07 rerun, but the switch is $CAMPAIGN_DESIGN"
+if [ "$CAMPAIGN_DESIGN" = 0x0a07 ]; then
+    sudo -n "$PIPS" counters > "$OUT/counters-at-start.txt" 2>&1 &&
+        say "refused-cycle counters answer: $(grep -E '^bp_cycles' "$OUT/counters-at-start.txt")"
+fi
 sudo -n "$PIPS" status > "$OUT/status-at-start.txt" 2>&1 && say "status registers at start: $(grep -E '^(stat_flags|ovf_count|mrd_wait_max_us)' "$OUT/status-at-start.txt" | xargs)"
 free=$(df -Pk "$HOME" | awk 'NR == 2 { printf "%d", $4 / 1048576 }')
 [ "${free:-0}" -lt 20 ] && note "only ${free} GB free in $HOME: the TLP logs take ~1-2 MB per run"
@@ -504,7 +617,11 @@ heartbeat() {
     done
 }
 heartbeat & HB=$!
-on_exit() { kill "$HB" "$SUDO_KEEP" 2>/dev/null; }
+on_exit() {
+    kill "$HB" "$SUDO_KEEP" 2>/dev/null
+    # a link left forced by a phase that never got to put it back
+    [ "$KIND" = nic ] && [ ${#LINK_FOUND_S[@]} -gt 0 ] && link_restore_all
+}
 trap on_exit EXIT
 trap 'STOPPED=1; note "campaign interrupted by hand"' INT TERM
 
@@ -521,6 +638,7 @@ for i in "${!RUN_PHASES[@]}"; do
     [ "$STOPPED" = 1 ] && { note "phase $p not run: stopped by hand"; continue; }
     phase_run "$p"
 done
+[ "$KIND" = nic ] && link_restore_all
 echo
 say "sweeps done: ${#NAMES[@]} sweep(s): ${NAMES[*]:-none}"
 sudo -n "$PIPS" status > "$OUT/status-at-end.txt" 2>&1
@@ -561,7 +679,7 @@ for m in ${MANIFESTS[@]+"${MANIFESTS[@]}"}; do
         [ -n "$ld" ] || continue
         ( cd "$REPO" && find "$ld" -maxdepth 1 -type f \( -name 'pips-cfg.txt' -o -name 'pips-status*.txt' \
               -o -name 'pips-log-summary.*' -o -name 'sweep-id.txt' -o -name 'nstat-client.txt' \
-              -o -name 'pips-log-record.txt' -o -name 'windows.txt' \) -print0 2>/dev/null |
+              -o -name 'pips-log-record.txt' -o -name 'windows.txt' -o -name 'pips-bp.tsv' \) -print0 2>/dev/null |
           xargs -0 -r cp --parents -t "$OUT/runs/" )
         ( cd "$REPO" && [ -d "$rd" ] && find "$rd"* -maxdepth 1 -type f -name '*.rpt' -size -1M -print0 2>/dev/null |
           xargs -0 -r cp --parents -t "$OUT/runs/" )

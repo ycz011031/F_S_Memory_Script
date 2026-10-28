@@ -37,15 +37,21 @@ every FPGA design update (`pips.tcl` `pips_design_id`).
 | `0x0a04` | `591d854` (10-15) | **log record format v2**: one record per TLP leaving the batcher, in output order; `port` = the input it came in on; new `pkt_wait` (u16 at 0x0C, cycles in the batcher); `pkt_tag` moved 0x0C → 0x0F; AT moved from byte 0x0D into `pkt_type[5:4]`. No more separate in0/in1/out records |
 | `0x0a05` | `64193c6` (10-17) | **batching FIFOs of 512 beats** (`FIFO_DEPTH`, was the RTL default 128), FIFO 2 too. An input stops taking beats at 493 and asks for a drain above 477 (109 / 93 before): up to 95 drive or 53 NIC TLPs per batch. Registers and log format as 0x0a04. The 10-17 depth sweep (`dsweep1`) ran on it |
 | `0x0a06` | `9673e37`, timing fix `d44fdd0` (10-23/24) | **page batcher** (`axi4_mwr_batch_pp`, `PAGE_BATCH 1`): regfile reg2 `0x08` (completion size per input) and reg3 `0x0C` (`page_batch_en`, `ctrl_push_off`, `grant_quantum`), status at `0x24`-`0x2C` (overflow spills, stuck, longest MRd wait; `0x24` read clears). `page_batch_en` 0 (power-on) = one in-order FIFO per input with 0x0a05's rules, 1536 rows instead of 512; `batch_mrd` tied off. One output register cycle more. Log format v2 as before. `pips cfg` prints `pb=`/`thr=` lines, `pips cfg set pb= pushoff= quantum= thr=`, `pips status`; PIO-MANUAL §6 |
+| `0x0a07` | `28ff5b6` (10-27; AXI4-switch `aa823c9` + `1803d4a`) | **rate caps and refused-cycle counters**: regfile reg4 `0x10` (`rate_cap_0`/`_1`/`_out`, one byte each, n beats per 256 cycles = n x 0.5 Gb/s, 0 = uncapped = power-on; a token bucket held only between TLPs, `axis_rate_cap.v`), `0x30`/`0x34` refused cycles per input (any reason), `0x38`/`0x3C` the rate cap's part, free-running 32 bit, wrap after 17.2 s counted. **Read flush changed:** a channel with a read waiting no longer preempts the other channel's drain episode (0x0A06's did: with reads waiting on both drives the two went out interleaved packet by packet); it takes the next episode and drains its backlog to the barrier in one run, drain cap ignored. Otherwise as 0x0a06 (page batcher, 1536 rows, log v2). `pips cfg` prints `rcap=`, `pips cfg set rcap= rcap0= rcap1= rcapout= raw4=`, `pips counters`; the runners sample the counters every 2 s (`pips-bp.tsv`, `pips_stat_bp_frac_*`); PIO-MANUAL §6 |
 
 **Setting tags from 0x0a06.** After `d<D>t<T>[m1][c1]` a tag carries the page
 batcher's fields that are not at their power-on value: `p1` (`page_batch_en`),
 `o1` (`ctrl_push_off`), `q<N>` (`grant_quantum`, beats), `w<N>` or `w<a>x<b>`
-(completion thresholds, DW). `d64t255c1p1q256w31` = depth 64, time 255, cap on,
+(completion thresholds, DW), and from 0x0a07 `r<in0>x<in1>x<out>` (rate caps,
+beats per 256 cycles; none when all 0). `d64t255c1p1q256w31` = depth 64, time 255, cap on,
 per page, quantum 256, threshold 31 DW on both inputs. `pips_tag_of <readout>`
 (pips-lib.sh) builds it from a `pips cfg` readout; the log tools' setting
 patterns accept it. The batcher model (`pips-page-seq.py --model`) describes
-the in-order FIFO only: `pips-seq-grab.sh` runs none on 0x0a06 sweeps.
+the in-order FIFO only: `pips-seq-grab.sh` runs none on 0x0a06/0x0a07 sweeps
+unless `--model` or `PIPS_PB_MODEL` names some (the campaign sets
+`self,sweepc1,sweepc1f512`). On such a log `--model self` is the log's setting
+without the page batcher fields (`d8t106c1w31` -> `d8t106c1`), and is left out
+on a `p1` log.
 
 The trailer is the same in both log formats, so **a log cannot tell its own
 format**: a v1 decoder reads a v2 log without an error but with wrong tags.
@@ -579,10 +585,24 @@ and buffer counter deltas (`nicstats-nic<i>.rpt`, ethtool -S).
 bash scripts/pips/pips-campaign.sh ssd --dry-run   # the plan, the ETA, every command
 bash scripts/pips/pips-campaign.sh ssd --tmux      # bigserver, ~18 h
 bash scripts/pips/pips-campaign.sh nic --tmux      # icx, ~16 h
+bash scripts/pips/pips-campaign.sh ssd --minimal --tmux   # 0x0A07 rerun, bigserver ~3 h
+bash scripts/pips/pips-campaign.sh nic --minimal --tmux   # 0x0A07 rerun, icx ~4 h
 ```
 
+`--minimal` (the 0x0A07 rerun, 10-28): drives `mini` = depths 1, 4, 16, 64 x
+`page_batch_en` 0/1, cap on, w31, bs 4k/16k/64k/1m x 1/4/16 + 2+16 (129 runs).
+NICs, at representative points, capped by the Ethernet link or the FPGA rate
+cap instead of iperf3 pacing (59 runs): `rcap` (links at 100G; rcap 0/214/169/113
+≈ off/95/75/50 Gb/s at d1t0 and 113 at d16t218c1 pb 0/1; NIC0 alone and both, 5
+flows), `uneven` (NIC0's link at 50G, NIC1's at 100G; 5 and 5:30 flows, d1t0c1
+and d16t218c1, pb 0/1), `wire50` (both links at 50G; NIC0 alone and both, 5 and
+30 flows, depths 1/4/16/64 x pb 0/1). Links go back as found after the phases
+(`link_set`/`link_restore_all`); `--no-wire` leaves out every phase that
+changes a link. No knob phases, no pending analysis (`--pending` adds it). The design is the one the switch has at the
+start (0x0a06 or 0x0a07) and must stay so.
+
 Every phase is a `*_pips_sweep.sh` with `--tag <stamp><phase>` (stamp
-`c<MMDDhhmm>`) on design 0x0a06 only, the completion threshold at 31 DW
+`c<MMDDhhmm>`) on design 0x0a06 or 0x0a07 (rate caps 0), the completion threshold at 31 DW
 (`w31`) unless the phase is about it. Drives: `main` (8 depths x
 `page_batch_en` 0/1, cap on; bs 4k-1m x 1, 2, 4, 8, 16 per drive plus 2/4/8+16,
 drive 0 light), `cap0`, `push` (`ctrl_push_off`), `quant` (grant quantum
@@ -593,8 +613,9 @@ together, under the shared uplink), `cap0`, `push`, `quant`, `thr` (16 DW),
 `alone` (NIC0 alone vs both at uncapped/50/25 Gbps, the packet-splitting
 settings), `hw` (the same paced in styx's NIC), `wire` (NIC0's link at 50G at
 both ends, put back after). `mainhi` runs last of the switch phases: d24
-stopped 0x0A05's NIC sweep. Then `pips-analyze.sh` on the new sweeps (no model:
-recorded and arrival order, listings, IOTLB simulation, lengths) and on the
+stopped 0x0A05's NIC sweep. Then `pips-analyze.sh` on the new sweeps (recorded
+and arrival order, listings, IOTLB simulation, lengths, and the model named by
+`PIPS_PB_MODEL`, default `self,sweepc1,sweepc1f512`) and on the
 pending 0x0A04/0x0A05 sweeps, then one tarball,
 `~/pips-campaign-<kind>-<stamp>.tar.gz`: results, manifests, sweep logs, each
 run's small files (cfg, status, log summary, .rpt), status tables, analyses,

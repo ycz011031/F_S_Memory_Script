@@ -12,7 +12,8 @@
 #   xsct% pips_cfg_set depth 8 time 0x16      ;# read-modify-write: depth time mrd log raw
 #   xsct% pips_cfg_set cap 1                  ;# reg1 drain_depth_cap (design 0x0a03 on)
 #   xsct% pips_status                         ;# page batcher status at +0x24-0x2C (0x0a06 on;
-#                                             ;#   reading clears it): spills, stuck, MRd wait
+#                                             ;#   reading clears it): spills, stuck, MRd wait;
+#                                             ;#   0x0a07 on also the refused-cycle counters
 #   xsct% pips_dma                            ;# S2MM registers at 0xA4010000, decoded
 #   xsct% pips_log_start                      ;# arm the DMA on the log region, log_enable 0 -> 1
 #   xsct% pips_log_stop                       ;# log_enable 1 -> 0, wait for the DMA, print the trailer
@@ -74,6 +75,11 @@ proc pips_cfg {} {
             [expr {$p & 1}] [expr {($p >> 8) & 1}] [expr {($p >> 16) & 0xFFF}]]
         puts [format "thr=0x%08x ctrl_dw_thr_0=%d ctrl_dw_thr_1=%d" $t [expr {$t & 0x7FF}] [expr {($t >> 16) & 0x7FF}]]
     }
+    if {$id ne "none" && $id >= 0x0a07} {
+        set r [pips_rd [expr {$::pips_regfile + 0x10}]]
+        puts [format "rcap=0x%08x rate_cap_0=%d rate_cap_1=%d rate_cap_out=%d" $r \
+            [expr {$r & 0xFF}] [expr {($r >> 8) & 0xFF}] [expr {($r >> 16) & 0xFF}]]
+    }
     puts "design_id=$id"
     puts "log_format=[expr {$id ne "none" && $id >= 0x0a04 ? "v2" : "v1"}]"
     return $v
@@ -93,6 +99,13 @@ proc pips_status {} {
     puts [format "ovf_count_0=%d ovf_count_1=%d" [expr {$c & 0xFFFF}] [expr {$c >> 16}]]
     puts [format "mrd_wait_max_us_0=%.2f mrd_wait_max_us_1=%.2f (cycles %d %d)" \
         [expr {($w & 0xFFFF) * 0.004}] [expr {($w >> 16) * 0.004}] [expr {$w & 0xFFFF}] [expr {$w >> 16}]]
+    if {$id >= 0x0a07} {
+        # Free-running 32-bit counters (0x0a07 on), no read side effect: two reads
+        # some seconds apart give the share of cycles each input was refused.
+        set c {}
+        foreach o {0x30 0x34 0x38 0x3C} { lappend c [pips_rd [expr {$::pips_regfile + $o}]] }
+        puts [format "bp_cycles_0=%u bp_cycles_1=%u cap_hold_cycles_0=%u cap_hold_cycles_1=%u" {*}$c]
+    }
 }
 
 proc pips_cfg_set {args} {

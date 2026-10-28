@@ -146,16 +146,37 @@
 #define PIPS_PB_STAT_OVF_COUNT_OFF  0x28u                     /* [15:0] in0, [31:16] in1 */
 #define PIPS_PB_STAT_MRD_WAIT_OFF   0x2Cu                     /* [15:0] in0, [31:16] in1 */
 
+/* reg4 at PIPS_AXI_REGFILE + 0x10 (design >= 0x0A07): batcher rate caps, one byte per port,
+ * n beats per 256-cycle window = n x 62.5 MB/s (n x 0.5 Gb/s of beats; header beats and partial
+ * last beats count whole), 0 = uncapped (the power-on value). A loose token bucket
+ * (axis_rate_cap.v): a port is held only between TLPs, never mid-packet, and MRd and completions
+ * are held like data. The input caps sit ahead of the ingress stamp, so a log's pkt_wait
+ * excludes their hold; the out cap sits after the output tap, so its hold is part of pkt_wait. */
+#define PIPS_DESIGN_ID_RATE_CAP     0x0A07u   /* first build with reg4 and the counters below */
+#define PIPS_RCAP_OFF               0x10u
+#define PIPS_RCAP_IN0_SHIFT         0         /* rate_cap_0, in0 = s_axis_0 = downstream path one */
+#define PIPS_RCAP_IN1_SHIFT         8         /* rate_cap_1, in1 = s_axis_1 = downstream path zero */
+#define PIPS_RCAP_OUT_SHIFT         16        /* rate_cap_out, out = USP RQ */
+#define PIPS_RCAP_MAX               0xFFu
+#define PIPS_RCAP_WIN_CYCLES        256u      /* CAP_WIN_LOG2 8 */
+/* Counters (design >= 0x0A07), read-only, free-running 32-bit, wrap (17.2 s of counted cycles
+ * at 250 MHz), no read side effect: take differences, often enough not to miss a wrap. */
+#define PIPS_BP_CYCLES_0_OFF        0x30u     /* in0 had a beat waiting and was refused, any reason */
+#define PIPS_BP_CYCLES_1_OFF        0x34u
+#define PIPS_CAP_HOLD_0_OFF         0x38u     /* the part of bp_cycles_0 where in0's rate cap was closed */
+#define PIPS_CAP_HOLD_1_OFF         0x3Cu
+
 /* axil4_regfile_0 layout (pips.tcl, comment above axil4_regfile_0):
  *   0x00        batcher config, RW (above)
  *   0x04        batcher drain config, RW (above)
  *   0x08        page batcher thresholds, RW (design >= 0x0A06; before, reserved, read 0)
  *   0x0C        page batcher config, RW (design >= 0x0A06; before, reserved, read 0)
- *   0x10 - 0x1C reserved, read 0
+ *   0x10        batcher rate caps, RW (design >= 0x0A07; before, reserved, read 0)
+ *   0x14 - 0x1C reserved, read 0
  *   0x20 - 0x3F read-only range; writes are ignored (OKAY, WIN_STATUS stays 0)
  *     0x20      DESIGN_ID: [15:0] build identifier (pips.tcl pips_design_id), [31:16] 0
  *     0x24-0x2C page batcher status (design >= 0x0A06, above; before, reserved, read 0)
- *     0x30-0x3C reserved, read 0
+ *     0x30-0x3C refused / rate-cap-held cycle counters (design >= 0x0A07; before, reserved, read 0)
  * The design ID goes up by one with every FPGA design update: compare it with the build you expect. */
 #define PIPS_REGFILE_RO_OFF     0x20u
 #define PIPS_DESIGN_ID_OFF      0x20u

@@ -19,10 +19,16 @@
  *   cfg set K=V...             read-modify-write them: depth= time= mrd= log=
  *                              raw= (reg0) cap= (reg1, drain_depth_cap); from
  *                              design 0x0a06 also pb= pushoff= quantum= raw3=
- *                              (reg3) thr= thr0= thr1= raw2= (reg2)
+ *                              (reg3) thr= thr0= thr1= raw2= (reg2); from
+ *                              design 0x0a07 also rcap0= rcap1= rcapout= rcap=
+ *                              (both inputs) raw4= (reg4, rate caps)
  *   status                     page batcher status (design >= 0x0a06): overflow
  *                              flags and counts, stuck, longest MRd wait, since
- *                              the previous read (reading clears them)
+ *                              the previous read (reading clears them); from
+ *                              0x0a07 also the counters below
+ *   counters                   refused and rate-cap-held cycles per input
+ *                              (design >= 0x0a07): free-running 32-bit, wrap,
+ *                              no read side effect (take differences)
  *   dma                        log DMA (S2MM) registers, decoded
  *   dma-reset                  soft-reset the log DMA
  *   log-clear                  zero the log region in DDR
@@ -414,6 +420,7 @@ static int design_id(void)
 
 static int has_drain_cfg(int id) { return id >= (int)PIPS_DESIGN_ID_DRAIN_CFG; }
 static int has_page_batch(int id) { return id >= (int)PIPS_DESIGN_ID_PAGE_BATCH; }
+static int has_rate_cap(int id) { return id >= (int)PIPS_DESIGN_ID_RATE_CAP; }
 
 /* The TLP log record format a build writes (pips_regs.h, "Record format"). */
 static const char *log_format(int id) { return id >= (int)PIPS_DESIGN_ID_LOG_V2 ? "v2" : "v1"; }
@@ -462,35 +469,59 @@ static void pb_print(int have, uint32_t pb, uint32_t thr)
         printf("# ctrl_dw_thr 0 = %u DW (the power-on value)\n", PIPS_PB_THR_DEFAULT);
 }
 
+/* Rate caps (design >= 0x0a07), the same way: "none" and zeros on older builds. */
+static void rcap_print(int have, uint32_t rc)
+{
+    unsigned c0 = (rc >> PIPS_RCAP_IN0_SHIFT) & PIPS_RCAP_MAX, c1 = (rc >> PIPS_RCAP_IN1_SHIFT) & PIPS_RCAP_MAX,
+             co = (rc >> PIPS_RCAP_OUT_SHIFT) & PIPS_RCAP_MAX;
+
+    if (!have) {
+        printf("rcap=none rate_cap_0=0 rate_cap_1=0 rate_cap_out=0\n"
+               "# no rate caps (design < 0x%04x)\n", PIPS_DESIGN_ID_RATE_CAP);
+        return;
+    }
+    printf("rcap=0x%08x rate_cap_0=%u rate_cap_1=%u rate_cap_out=%u\n", rc, c0, c1, co);
+    if (c0 || c1 || co)
+        printf("# rate caps in Gb/s of 64-byte beats (0 = uncapped): in0 %.1f, in1 %.1f, out %.1f\n",
+               c0 * 0.5, c1 * 0.5, co * 0.5);
+}
+
 static int cmd_cfg(int argc, char **argv)
 {
     uint32_t old, v, rb, dold = 0, d = 0, drb = 0, pbo = 0, pb = 0, pbr = 0, tho = 0, th = 0, thr = 0;
-    int id, have, havepb, set_cap = 0, set_pb = 0, set_thr = 0;
+    uint32_t rco = 0, rc = 0, rcr = 0;
+    int id, have, havepb, haverc, set_cap = 0, set_pb = 0, set_thr = 0, set_rc = 0;
 
     win_start();
     old = cfg_rd();
     id = design_id();
     have = has_drain_cfg(id);
     havepb = has_page_batch(id);
+    haverc = has_rate_cap(id);
     if (have)
         dold = drain_rd();
     if (havepb) {
         pbo = pb_rd(PIPS_PB_CFG_OFF);
         tho = pb_rd(PIPS_PB_THR_OFF);
     }
+    if (haverc)
+        rco = pb_rd(PIPS_RCAP_OFF);
     if (argc == 0) {
         cfg_print(old);
         drain_id_print(id, have, dold);
         pb_print(havepb, pbo, tho);
+        rcap_print(haverc, rco);
         return 0;
     }
     if (strcmp(argv[0], "set") || argc < 2)
         die("usage: pips cfg [set depth=N time=N mrd=0|1 log=0|1 raw=VAL cap=0|1 "
-            "pb=0|1 pushoff=0|1 quantum=N thr=N thr0=N thr1=N raw2=VAL raw3=VAL ...]");
+            "pb=0|1 pushoff=0|1 quantum=N thr=N thr0=N thr1=N raw2=VAL raw3=VAL "
+            "rcap=N rcap0=N rcap1=N rcapout=N raw4=VAL ...]");
     v = old;
     d = dold;
     pb = pbo;
     th = tho;
+    rc = rco;
     for (int i = 1; i < argc; i++) {
         char *eq = strchr(argv[i], '=');
         uint64_t n;
@@ -554,11 +585,39 @@ static int cmd_cfg(int argc, char **argv)
                     th = (th & ~(PIPS_PB_THR_MAX << PIPS_PB_THR1_SHIFT)) | (uint32_t)n << PIPS_PB_THR1_SHIFT;
                 set_thr = 1;
             }
+        } else if (!strcmp(argv[i], "rcap") || !strcmp(argv[i], "rcap0") || !strcmp(argv[i], "rcap1") ||
+                   !strcmp(argv[i], "rcapout") || !strcmp(argv[i], "raw4")) {
+            if (!haverc)
+                die("%s: design 0x%04x has no rate caps (needs >= 0x%04x)", argv[i],
+                    id < 0 ? 0 : (unsigned)id, PIPS_DESIGN_ID_RATE_CAP);
+            if (!strcmp(argv[i], "raw4")) {
+                if (n > 0xFFFFFFFFu) die("raw4: 32 bits");
+                rc = (uint32_t)n;
+            } else {
+                int sh[2] = { -1, -1 };
+                if (n > PIPS_RCAP_MAX) die("%s: 0..%u beats per %u cycles (0 = uncapped)", argv[i],
+                                           PIPS_RCAP_MAX, PIPS_RCAP_WIN_CYCLES);
+                if (!strcmp(argv[i], "rcapout"))
+                    sh[0] = PIPS_RCAP_OUT_SHIFT;
+                else if (!strcmp(argv[i], "rcap0"))
+                    sh[0] = PIPS_RCAP_IN0_SHIFT;
+                else if (!strcmp(argv[i], "rcap1"))
+                    sh[0] = PIPS_RCAP_IN1_SHIFT;
+                else {                                  /* rcap: both inputs */
+                    sh[0] = PIPS_RCAP_IN0_SHIFT;
+                    sh[1] = PIPS_RCAP_IN1_SHIFT;
+                }
+                for (int k = 0; k < 2 && sh[k] >= 0; k++)
+                    rc = (rc & ~(PIPS_RCAP_MAX << sh[k])) | (uint32_t)n << sh[k];
+            }
+            set_rc = 1;
         } else {
-            die("unknown field '%s' (depth time mrd log raw cap pb pushoff quantum thr thr0 thr1 raw2 raw3)",
-                argv[i]);
+            die("unknown field '%s' (depth time mrd log raw cap pb pushoff quantum thr thr0 thr1 raw2 raw3 "
+                "rcap rcap0 rcap1 rcapout raw4)", argv[i]);
         }
     }
+    if (set_rc)
+        axi_wr_ok(PIPS_AXI_REGFILE + PIPS_RCAP_OFF, rc, "rate cap register write");
     /* Thresholds before the mode: a switch to per-page mode never sees the old threshold. */
     if (set_thr)
         axi_wr_ok(PIPS_AXI_REGFILE + PIPS_PB_THR_OFF, th, "page batcher threshold register write");
@@ -574,15 +633,20 @@ static int cmd_cfg(int argc, char **argv)
         pbr = pb_rd(PIPS_PB_CFG_OFF);
         thr = pb_rd(PIPS_PB_THR_OFF);
     }
+    if (haverc)
+        rcr = pb_rd(PIPS_RCAP_OFF);
     printf("# was 0x%08x", old);
     if (have)
         printf(", drain 0x%08x", dold);
     if (havepb)
         printf(", pb 0x%08x, thr 0x%08x", pbo, tho);
+    if (haverc)
+        printf(", rcap 0x%08x", rco);
     putchar('\n');
     cfg_print(rb);
     drain_id_print(id, have, drb);
     pb_print(havepb, pbr, thr);
+    rcap_print(haverc, rcr);
     if (rb != v) {
         fprintf(stderr, "pips: wrote 0x%08x, read back 0x%08x\n", v, rb);
         return 1;
@@ -596,6 +660,39 @@ static int cmd_cfg(int argc, char **argv)
                 pb, th, pbr, thr);
         return 1;
     }
+    if (set_rc && rcr != rc) {
+        fprintf(stderr, "pips: rate caps: wrote 0x%08x, read back 0x%08x\n", rc, rcr);
+        return 1;
+    }
+    return 0;
+}
+
+/* Refused and rate-cap-held cycles per input (design >= 0x0a07): one key=value line.
+ * Free-running 32-bit counters that wrap; reading has no side effect. */
+static void counters_print(void)
+{
+    uint32_t b0 = axi_rd_ok(PIPS_AXI_REGFILE + PIPS_BP_CYCLES_0_OFF, "bp_cycles_0 read"),
+             b1 = axi_rd_ok(PIPS_AXI_REGFILE + PIPS_BP_CYCLES_1_OFF, "bp_cycles_1 read"),
+             h0 = axi_rd_ok(PIPS_AXI_REGFILE + PIPS_CAP_HOLD_0_OFF, "cap_hold_cycles_0 read"),
+             h1 = axi_rd_ok(PIPS_AXI_REGFILE + PIPS_CAP_HOLD_1_OFF, "cap_hold_cycles_1 read");
+
+    printf("bp_cycles_0=%u bp_cycles_1=%u cap_hold_cycles_0=%u cap_hold_cycles_1=%u\n", b0, b1, h0, h1);
+}
+
+static int cmd_counters(void)
+{
+    int id;
+
+    win_start();
+    id = design_id();
+    if (!has_rate_cap(id)) {
+        printf("counters=none\n# design %s has no refused-cycle counters (needs >= 0x%04x)\n",
+               id < 0 ? "none" : "older", PIPS_DESIGN_ID_RATE_CAP);
+        return 0;
+    }
+    printf("counters=ok\n");
+    counters_print();
+    printf("# free-running 32-bit cycle counts (4 ns), wrap after 17.2 s counted: take differences\n");
     return 0;
 }
 
@@ -625,6 +722,10 @@ static int cmd_status(void)
     printf("mrd_wait_max_us_0=%.2f mrd_wait_max_us_1=%.2f\n", (w & 0xFFFFu) / USER_CLK_HZ * 1e6,
            (w >> 16) / USER_CLK_HZ * 1e6);
     printf("# since the previous status read (this read cleared them); counts saturate at 65535\n");
+    if (has_rate_cap(id)) {
+        counters_print();
+        printf("# bp_cycles/cap_hold_cycles: free-running, wrap, not cleared by this read\n");
+    }
     if (f & PIPS_PB_STAT_STUCK)
         printf("# STUCK: the batcher's watchdog found the output idle with data held and forced a drain\n");
     return 0;
@@ -1155,7 +1256,7 @@ static void t_regfile(void)
 {
     const uint64_t a = PIPS_AXI_REGFILE + PIPS_BATCH_CFG_OFF;
     uint32_t lo, hi, orig, v, st, id, bad, pats[3];
-    int drain, pb;
+    int drain, pb, rc;
 
     win_start();
     bar_wr32(PIPS_REG_WIN_BASE_LO, (uint32_t)PIPS_AXI_REGFILE | 3u);
@@ -1201,11 +1302,13 @@ static void t_regfile(void)
     check(!st && !(id >> 16) && PIPS_DESIGN_ID(id) >= PIPS_DESIGN_ID_FIRST,
           "DESIGN_ID 0x%04x at 0x%08" PRIx64 " (pips.tcl pips_design_id; bits [31:16] 0x%04x)",
           PIPS_DESIGN_ID(id), a + PIPS_DESIGN_ID_OFF, id >> 16);
-    note("log format %s; drain config register %s; page batcher registers %s",
+    note("log format %s; drain config register %s; page batcher registers %s; rate caps %s",
          log_format((int)PIPS_DESIGN_ID(id)),
          has_drain_cfg((int)PIPS_DESIGN_ID(id)) ? "at +0x04" : "absent (design < 0x0a03)",
          has_page_batch((int)PIPS_DESIGN_ID(id)) ? "at +0x08/+0x0c, status +0x24-+0x2c"
-                                                 : "absent (design < 0x0a06)");
+                                                 : "absent (design < 0x0a06)",
+         has_rate_cap((int)PIPS_DESIGN_ID(id)) ? "at +0x10, counters +0x30-+0x3c"
+                                               : "absent (design < 0x0a07)");
     axi_wr(a + PIPS_DESIGN_ID_OFF, ~id);
     v = axi_rd(a + PIPS_DESIGN_ID_OFF);
     st = win_check(NULL);
@@ -1260,14 +1363,44 @@ static void t_regfile(void)
         note("overflow counts 0x%08x, longest MRd wait 0x%08x (cycles, [15:0] in0, [31:16] in1)",
              axi_rd(a + PIPS_PB_STAT_OVF_COUNT_OFF), axi_rd(a + PIPS_PB_STAT_MRD_WAIT_OFF));
     }
+    rc = has_rate_cap((int)PIPS_DESIGN_ID(id));
+    if (rc) {
+        /* reg4 holds what is written: a pattern in the three caps (reserved byte 0), then the
+         * original. A cap set for a few microseconds only slows traffic, it never stops it. */
+        uint32_t o = axi_rd(a + PIPS_RCAP_OFF), want, c[4];
+
+        st = win_check(NULL);
+        if (!check(!st, "reg4 (rate caps) at 0x%08" PRIx64 " answers: 0x%08x (WIN_STATUS %s)",
+                   a + PIPS_RCAP_OFF, o, win_flags(st)))
+            return;
+        for (int i = 0; i < 2; i++) {
+            want = i ? o : 0x00A55AC3u;
+            axi_wr(a + PIPS_RCAP_OFF, want);
+            v = axi_rd(a + PIPS_RCAP_OFF);
+            st = win_check(NULL);
+            check(v == want && !st, "reg4 wrote 0x%08x read 0x%08x%s", want, v, i ? " (restored)" : "");
+        }
+        /* Counters: read-only, free-running; a write is ignored. */
+        for (int i = 0; i < 4; i++)
+            c[i] = axi_rd(a + PIPS_BP_CYCLES_0_OFF + 4u * (uint32_t)i);
+        axi_wr(a + PIPS_BP_CYCLES_0_OFF, 0);
+        st = win_check(NULL);
+        check(!st, "counters at +0x30-+0x3c answer, a write is ignored (WIN_STATUS %s)", win_flags(st));
+        note("refused cycles in0 %u in1 %u, rate-cap held in0 %u in1 %u (free-running, wrap)",
+             c[0], c[1], c[2], c[3]);
+    }
     bad = 0;
     for (uint32_t off = 4; off < 0x40; off += 4)
         if (off != PIPS_DESIGN_ID_OFF && !(drain && off == PIPS_BATCH_DRAIN_OFF) &&
             !(pb && (off == PIPS_PB_THR_OFF || off == PIPS_PB_CFG_OFF ||
-                     (off >= PIPS_PB_STAT_FLAGS_OFF && off <= PIPS_PB_STAT_MRD_WAIT_OFF))))
+                     (off >= PIPS_PB_STAT_FLAGS_OFF && off <= PIPS_PB_STAT_MRD_WAIT_OFF))) &&
+            !(rc && (off == PIPS_RCAP_OFF || off >= PIPS_BP_CYCLES_0_OFF)))
             bad += axi_rd(a + off) != 0;
     st = win_check(NULL);
-    if (pb)
+    if (rc)
+        check(!bad && !st, "reserved registers 0x14-0x1c read 0 (%u do not, WIN_STATUS %s)",
+              bad, win_flags(st));
+    else if (pb)
         check(!bad && !st, "reserved registers 0x10-0x1c and 0x30-0x3c read 0 (%u do not, WIN_STATUS %s)",
               bad, win_flags(st));
     else
@@ -1541,7 +1674,9 @@ static void usage(void)
           "  info | rd OFF [N] | wr OFF VAL | axi-rd ADDR [N] | axi-wr ADDR VAL\n"
           "  cfg | cfg set depth=N time=N mrd=0|1 log=0|1 raw=VAL cap=0|1 ...\n"
           "        (design >= 0x0a06 also: pb=0|1 pushoff=0|1 quantum=N thr=N thr0=N thr1=N raw2= raw3=)\n"
+          "        (design >= 0x0a07 also: rcap=N rcap0=N rcap1=N rcapout=N raw4=; N beats per 256 cycles)\n"
           "  status            page batcher status since the last read (read clears; >= 0x0a06)\n"
+          "  counters          refused / rate-cap-held cycles per input (free-running; >= 0x0a07)\n"
           "  dma | dma-reset\n"
           "  log-clear | log-start | log-stop [MS] | log-wait [MS] | log-dump FILE [BYTES]\n"
           "  ddr-dump ADDR BYTES FILE\n"
@@ -1612,6 +1747,8 @@ int main(int argc, char **argv)
         return cmd_cfg(argc, argv);
     if (!strcmp(cmd, "status") && argc == 0)
         return cmd_status();
+    if (!strcmp(cmd, "counters") && argc == 0)
+        return cmd_counters();
     if (!strcmp(cmd, "dma") && argc == 0) {
         win_start();
         dma_print();

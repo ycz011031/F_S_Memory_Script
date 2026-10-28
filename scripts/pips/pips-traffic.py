@@ -100,7 +100,7 @@ WAIT_CLASSES = ("payload", "ring", "unclear", "msi", "mrd")
 SRC = ("in0", "in1")
 LOG_NAME = re.compile(r"^(?:pips-)?log(?:-id[0-9a-fA-F]{4})?\.bin(?:\.gz)?$")
 SWEEP_RE = re.compile(r"(?P<sweep>dual(?P<kind>ssd|nic)-pips-(?P<iommu>[^/]+?)-(?:\d+|[A-Za-z][A-Za-z0-9]*?)"
-                      r"(?:-id(?P<design>[0-9a-fA-F]{4}))?-(?P<cfg>d\d+t\d+(?:m1)?(?:c1)?(?:p1)?(?:o1)?(?:q\d+)?(?:w\d+(?:x\d+)?)?))(?=[-/]|$)")
+                      r"(?:-id(?P<design>[0-9a-fA-F]{4}))?-(?P<cfg>d\d+t\d+(?:m1)?(?:c1)?(?:p1)?(?:o1)?(?:q\d+)?(?:w\d+(?:x\d+)?)?(?:r\d+x\d+x\d+)?))(?=[-/]|$)")
 SSD_RUN_RE = re.compile(r"^(?P<dp>datapath-)?(?P<bs>\d+[kmgKMG]?)-j(?P<j>[\d+]+)(?:-(?P<mode>[a-z0-9]+))?"
                         r"-RUN-\d+$")
 NIC_RUN_RE = re.compile(r"-(?P<rate>uncapped|\d+g|hw\d+g)-f(?P<flows>\d+(?:x\d+)?)-(?P<mode>nic0only|nic1only|both|datapath)"

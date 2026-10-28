@@ -37,6 +37,10 @@
 #                     are written 0, their power-on value, so every setting
 #                     starts from the same state. On 0x0a06 batch_mrd (the :1
 #                     of --cfgs) has no effect, and such settings are skipped.
+#                     From design 0x0a07 also the rate caps, in beats per 256
+#                     cycles (0.5 Gb/s each, 0 = uncapped, written 0 when not
+#                     given): rcap=N (both inputs), rcap0= rcap1= rcapout=
+#                     (tag r<in0>x<in1>x<out>).
 #   --no-asy          the even grid only
 #   --asy-low "2 4 8", --asy-high "16 32", --no-swap, --single, --single-ssd N
 #                     as dualssd_cross_sweep.sh (--single = drive 0 alone)
@@ -128,7 +132,7 @@ for p in $PBS; do
     case "$p" in 0|1) ;; *) echo "--pbs: '$p' is not 0 or 1" >&2; exit 2 ;; esac
 done
 # --set: the page batcher fields every setting gets (0 = power-on value).
-PO=0; PQ=0; PT0=0; PT1=0
+PO=0; PQ=0; PT0=0; PT1=0; RC0=0; RC1=0; RCO=0
 for kv in $SETKV; do
     k=${kv%%=*}; v=${kv#*=}
     case "$v" in ''|*[!0-9]*) echo "--set: '$kv' is not KEY=NUMBER" >&2; exit 2 ;; esac
@@ -138,7 +142,10 @@ for kv in $SETKV; do
         thr)     [ "$v" -le 2047 ] || { echo "--set: thr is 0-2047 DW" >&2; exit 2; }; PT0=$v; PT1=$v ;;
         thr0)    [ "$v" -le 2047 ] || { echo "--set: thr0 is 0-2047 DW" >&2; exit 2; }; PT0=$v ;;
         thr1)    [ "$v" -le 2047 ] || { echo "--set: thr1 is 0-2047 DW" >&2; exit 2; }; PT1=$v ;;
-        *) echo "--set: unknown field '$k' (pushoff quantum thr thr0 thr1)" >&2; exit 2 ;;
+        rcap|rcap0|rcap1|rcapout)
+                 [ "$v" -le 255 ] || { echo "--set: $k is 0-255 beats per 256 cycles" >&2; exit 2; }
+                 case "$k" in rcap) RC0=$v; RC1=$v ;; rcap0) RC0=$v ;; rcap1) RC1=$v ;; rcapout) RCO=$v ;; esac ;;
+        *) echo "--set: unknown field '$k' (pushoff quantum thr thr0 thr1 rcap rcap0 rcap1 rcapout)" >&2; exit 2 ;;
     esac
 done
 WANT_PB=0; { [ -n "$PBS" ] || [ -n "$SETKV" ]; } && WANT_PB=1
@@ -153,7 +160,7 @@ for c in $CFGS; do
     fi
     for pb in ${PBS:-0}; do
         for cap in $CAPS; do
-            TAGS+=( "$(pips_tag $(( d | t << 8 | m << 16 )) "$cap" "$pb" "$PO" "$PQ" "$PT0" "$PT1")" )
+            TAGS+=( "$(pips_tag $(( d | t << 8 | m << 16 )) "$cap" "$pb" "$PO" "$PQ" "$PT0" "$PT1" "$RC0" "$RC1" "$RCO")" )
             VALS+=( "$d $t $m $cap $pb" )
             [ "$cap" = 1 ] && WANT_CAP=1
         done
@@ -199,6 +206,17 @@ elif [ "$WANT_PB" = 1 ]; then
     die "--pbs/--set: design ${DESIGN:-?} has no page batcher (needs 0x0a06 or later)"
 fi
 PBSET="pushoff=$PO quantum=$PQ thr0=$PT0 thr1=$PT1"
+# The rate caps exist from design 0x0a07: every setting writes them (--set,
+# else 0 = uncapped) and the original goes back at the end.
+HAVE_RC=""; RCAP0=""
+if pips_design_ge "$DESIGN" 0x0a07; then
+    HAVE_RC=1
+    RCAP0=$(printf '%s\n' "$out" | sed -n 's/^rcap=\(0x[0-9a-f]*\).*/\1/p')
+    [ -n "$RCAP0" ] || die "design $DESIGN: pips cfg shows no rcap= line (rebuild scripts/pips/pips)"
+    PBSET="$PBSET rcap0=$RC0 rcap1=$RC1 rcapout=$RCO"
+elif [ $(( RC0 + RC1 + RCO )) -gt 0 ]; then
+    die "--set rcap*: design ${DESIGN:-?} has no rate caps (needs 0x0a07 or later)"
+fi
 
 declare -p SSD_SERIALS >/dev/null 2>&1 || die "SSD_SERIALS is not set in utils/setup-server.sh"
 IOMMU=$(for s in "${SSD_SERIALS[@]}"; do
@@ -234,7 +252,7 @@ restore() {
     local v
     v=$(printf '0x%08x' $(( CFG0 & ~0x1000000 )))
     if P cfg set raw="$v" ${HAVE_CAP:+cap="$CAP0"} ${HAVE_PB:+raw2="$THR0" raw3="$PB0"} \
-            > "$LOGDIR/cfg-restored.txt" 2>&1; then
+            ${HAVE_RC:+raw4="$RCAP0"} > "$LOGDIR/cfg-restored.txt" 2>&1; then
         echo "######## batcher setting restored: $(pips_tag_of "$LOGDIR/cfg-restored.txt") ($v)"
     else
         echo "######## WARNING: could not restore the batcher setting $v:" \
@@ -278,7 +296,7 @@ for k in "${!TAGS[@]}"; do
         echo "######## ${NOTES[-1]}" >&2
         continue
     fi
-    echo "######## set: $(grep -E '^(cfg|drain|pb|thr|design_id)=' "$LOGDIR/cfg-$tag.txt" | xargs)"
+    echo "######## set: $(grep -E '^(cfg|drain|pb|thr|rcap|design_id)=' "$LOGDIR/cfg-$tag.txt" | xargs)"
     if [ "$(pips_tag_of "$LOGDIR/cfg-$tag.txt")" != "$tag" ]; then
         NOTES+=( "$tag: NOT RUN, the switch reads back $(pips_tag_of "$LOGDIR/cfg-$tag.txt")" )
         echo "######## ${NOTES[-1]}" >&2

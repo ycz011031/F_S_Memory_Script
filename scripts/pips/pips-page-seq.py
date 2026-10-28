@@ -133,7 +133,8 @@ DEEP_SETS = ("d1t0c1", "d2t22c1", "d4t50c1", "d8t106c1", "d16t218c1", "d24t255c1
 GROUPS = {"std": STD_SETS, "sweep": SWEEP_SETS, "sweepc1": SWEEPC1_SETS, "deep": DEEP_SETS}
 GROUP_RE = re.compile(r"^(std|sweep|sweepc1|deep)(f\d+)?$")
 SET_RE = re.compile(r"^d(\d+)t(\d+)(m1)?(c1)?(?:f(\d+))?$")
-SET_IN_PATH = re.compile(r"-(d\d+t\d+(?:m1)?(?:c1)?(?:p1)?(?:o1)?(?:q\d+)?(?:w\d+(?:x\d+)?)?)(?=[/-]|$)")
+PB_FIELDS = re.compile(r"(?:p1)?(?:o1)?(?:q\d+)?(?:w\d+(?:x\d+)?)?(?:r\d+x\d+x\d+)?$")
+SET_IN_PATH = re.compile(r"-(d\d+t\d+(?:m1)?(?:c1)?(?:p1)?(?:o1)?(?:q\d+)?(?:w\d+(?:x\d+)?)?(?:r\d+x\d+x\d+)?)(?=[/-]|$)")
 # axi4_mwr_batch.v at its build parameters: FIFO_DEPTH beats of 64 B per input,
 # MAX_PKT_BEATS 16, so prog_full stops the input at FIFO_DEPTH - 19 beats and
 # the full trigger fires once fewer than 16 beats of that are left. FIFO_DEPTH
@@ -146,7 +147,7 @@ FIFO_DEFAULT = 128
 # below the largest packet seen), so the model is an approximation there, and
 # per-page mode (p1) it cannot model at all: pips-seq-grab.sh runs no model
 # on 0x0A06 sweeps.
-FIFO_BY_DESIGN = {"0x0a05": 512, "0x0a06": 1536}
+FIFO_BY_DESIGN = {"0x0a05": 512, "0x0a06": 1536, "0x0a07": 1536}
 
 
 def fifo_limits(fifo):
@@ -843,13 +844,23 @@ def main(argv=None):
     if own is None:
         m = SET_IN_PATH.search(os.path.abspath(a.log).replace("\\", "/"))
         own = m.group(1) if m else None
+    # "self" on a page batcher log (0x0A06 on): with page_batch_en 0 the model's
+    # setting is the log's without the page batcher's fields (o1 q<N> w<N> r...),
+    # which the in-order model has no notion of; with p1 there is none.
+    own_model = own
+    if own is not None and PB_FIELDS.search(own):
+        own_model = None if "p1" in own else PB_FIELDS.sub("", own)
     names = []
     for x in (a.model.split(",") if a.model else []):
         g = GROUP_RE.match(x)
-        add = (tuple(s + (g.group(2) or "") for s in GROUPS[g.group(1)]) if g
-               else (own,) if x == "self" else (x,))
         if x == "self" and own is None:
             ap.error("--model self: no setting in the log's path; give --setting")
+        if x == "self" and own_model is None:
+            print(f"pips-page-seq: --model self left out: {own} is per-page batching (p1), "
+                  "which the model does not describe", file=sys.stderr)
+            continue
+        add = (tuple(s + (g.group(2) or "") for s in GROUPS[g.group(1)]) if g
+               else (own_model,) if x == "self" else (x,))
         for nm in add:
             try:
                 parse_setting(nm)

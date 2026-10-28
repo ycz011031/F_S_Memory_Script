@@ -236,6 +236,15 @@ def nic_tput(m):
     return '/'.join('-' if x is None else f'{x:.1f}' for x in v)
 
 
+def refused(m, bp):
+    """' in0/in1' refused shares in %, for the status table (design 0x0a07 on)."""
+    if not bp:
+        return ''
+    v = [m.get('pips_stat_bp_frac_0'), m.get('pips_stat_bp_frac_1')]
+    s = '/'.join('-' if x is None else f'{100 * x:.1f}' for x in v)
+    return f" {s:>18}"
+
+
 def status_table(recs, key, tw):
     """The page batcher's status over each run (design 0x0a06 on): overflow spills,
     the watchdog's stuck bit, the longest MRd wait. Means over runs."""
@@ -244,6 +253,9 @@ def status_table(recs, key, tw):
         return
     hdr = (f"{'IOMMU':<{tw}} {'RATE':<9} {'FLOWS':>5} {'MODE':<9} {'OVF0':>6} {'OVF1':>6} "
            f"{'STUCK':>5} {'MRD_WAIT_us in0/in1':>20} {'RETX_%':>7} {'PAUSE srv/cli':>14}")
+    bp = any(r['mean'].get('pips_stat_bp_frac_0') is not None for r in rs)
+    if bp:
+        hdr += f" {'REFUSED_% in0/in1':>18}"
     print()
     print('PIPS page batcher status per configuration (design 0x0a06 on; means over runs)')
     print(hdr)
@@ -260,8 +272,12 @@ def status_table(recs, key, tw):
               f"{fmt(m.get('pips_stat_ovf_count_0'), None, '.0f'):>6} "
               f"{fmt(m.get('pips_stat_ovf_count_1'), None, '.0f'):>6} "
               f"{fmt(m.get('pips_stat_stuck'), None, '.0f'):>5} {w:>20} "
-              f"{fmt(m.get('retx_pct'), None, '.3f'):>7} {f'{pause_s:.0f}/{pause_c:.0f}':>14}{flag}")
+              f"{fmt(m.get('retx_pct'), None, '.3f'):>7} {f'{pause_s:.0f}/{pause_c:.0f}':>14}"
+              f"{refused(m, bp)}{flag}")
     print()
+    if bp:
+        print('  REFUSED_% = share of the run\'s cycles input 0/1 had a beat waiting and was not')
+        print('  taken (FIFO full, lock, barrier or rate cap; design 0x0a07 on, pips-bp.tsv).')
     print('  OVF0/1 = times input 0/1 spilled to its overflow (per-page mode: no free page')
     print('  segment); STUCK = the watchdog forced a drain (should be 0); MRD_WAIT = the')
     print('  longest time a read waited at the switch (crash safety: the device\'s completion')

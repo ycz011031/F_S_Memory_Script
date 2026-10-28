@@ -134,27 +134,33 @@ link_partner() {
 # design 0x0a03 did).
 cfg_of() { sed -n 's/^cfg=\(0x[0-9a-f]*\).*/\1/p' "$1"; }
 cap_of() { local c; c=$(sed -n 's/.*drain_depth_cap=\([01]\).*/\1/p' "$1" | head -1); echo "${c:-0}"; }
-# The page batcher fields (design 0x0a06 on; 0 0 0 0 0 before): pb_of <file> ->
-# "<page_batch_en> <ctrl_push_off> <grant_quantum> <ctrl_dw_thr_0> <ctrl_dw_thr_1>".
+# The page batcher fields (design 0x0a06 on; 0 0 0 0 0 before) and the rate
+# caps (design 0x0a07 on; 0 0 0 before): pb_of <file> -> "<page_batch_en>
+# <ctrl_push_off> <grant_quantum> <ctrl_dw_thr_0> <ctrl_dw_thr_1> <rate_cap_0>
+# <rate_cap_1> <rate_cap_out>".
 pb_of() {
     awk '{ for (i = 1; i <= NF; i++) { split($i, kv, "="); v[kv[1]] = kv[2] } }
-         END { printf "%d %d %d %d %d\n", v["page_batch_en"], v["ctrl_push_off"], v["grant_quantum"],
-               v["ctrl_dw_thr_0"], v["ctrl_dw_thr_1"] }' "$1"
+         END { printf "%d %d %d %d %d %d %d %d\n", v["page_batch_en"], v["ctrl_push_off"], v["grant_quantum"],
+               v["ctrl_dw_thr_0"], v["ctrl_dw_thr_1"], v["rate_cap_0"], v["rate_cap_1"], v["rate_cap_out"] }' "$1"
 }
-# pips_tag <cfg> [cap] [pb pushoff quantum thr0 thr1]: d<depth>t<time>, then m1
-# (batch_mrd), c1 (drain cap), p1 (page_batch_en), o1 (ctrl_push_off), q<N>
-# (grant_quantum, beats), w<N> (both completion thresholds N DW; w<a>x<b> when
-# they differ; none when both are 0 = 16 DW). Fields at their power-on value add
-# nothing, so every tag of an older build reads as before.
+# pips_tag <cfg> [cap] [pb pushoff quantum thr0 thr1 [rcap0 rcap1 rcapout]]:
+# d<depth>t<time>, then m1 (batch_mrd), c1 (drain cap), p1 (page_batch_en), o1
+# (ctrl_push_off), q<N> (grant_quantum, beats), w<N> (both completion
+# thresholds N DW; w<a>x<b> when they differ; none when both are 0 = 16 DW),
+# r<in0>x<in1>x<out> (rate caps, beats per 256 cycles = 0.5 Gb/s each; none
+# when all 0 = uncapped). Fields at their power-on value add nothing, so every
+# tag of an older build reads as before.
 pips_tag() {
-    local v=$(( $1 )) c="${2:-0}" p="${3:-0}" o="${4:-0}" q="${5:-0}" t0="${6:-0}" t1="${7:-0}" w=""
+    local v=$(( $1 )) c="${2:-0}" p="${3:-0}" o="${4:-0}" q="${5:-0}" t0="${6:-0}" t1="${7:-0}" w="" r=""
+    local r0="${8:-0}" r1="${9:-0}" ro="${10:-0}"
     if [ "$t0" != 0 ] || [ "$t1" != 0 ]; then
         if [ "$t0" = "$t1" ]; then w="w$t0"; else w="w${t0}x${t1}"; fi
     fi
-    printf 'd%dt%d%s%s%s%s%s%s\n' $(( v & 0xFF )) $(( (v >> 8) & 0xFF )) \
+    if [ "$r0" != 0 ] || [ "$r1" != 0 ] || [ "$ro" != 0 ]; then r="r${r0}x${r1}x${ro}"; fi
+    printf 'd%dt%d%s%s%s%s%s%s%s\n' $(( v & 0xFF )) $(( (v >> 8) & 0xFF )) \
         "$( (( (v >> 16) & 1 )) && echo m1)" "$( [ "$c" = 1 ] && echo c1)" \
         "$( [ "$p" = 1 ] && echo p1)" "$( [ "$o" = 1 ] && echo o1)" \
-        "$( [ "$q" != 0 ] && echo "q$q")" "$w"
+        "$( [ "$q" != 0 ] && echo "q$q")" "$w" "$r"
 }
 # The whole setting a `pips cfg` readout file describes.
 pips_tag_of() { pips_tag "$(cfg_of "$1")" "$(cap_of "$1")" $(pb_of "$1"); }
@@ -226,11 +232,13 @@ pips_outdir() {
 # pips_design, pips_idt (id0a04) and pips_region; PIPS_STATUS collects each
 # run's log status. The runner's pips calls run as root without a prompt.
 pipsc() { sudo -n "$PIPS" "$@"; }
-pips_here=0; pips_cfg=""; pips_cap=0; pips_pb="0 0 0 0 0"; pips_design=""; pips_idt=""; pips_region=""; PIPS_STATUS=()
+pips_here=0; pips_cfg=""; pips_cap=0; pips_pb="0 0 0 0 0 0 0 0"; pips_design=""; pips_idt=""; pips_region=""; PIPS_STATUS=()
 pips_gzip="${PIPS_LOG_GZIP:-1}"
 pips_setting() { pips_tag "$pips_cfg" "$pips_cap" $pips_pb; }
 # The page batcher's status registers exist (design 0x0a06 on).
 pips_has_status() { pips_design_ge "${pips_design:-}" 0x0a06; }
+# The rate caps and the refused-cycle counters exist (design 0x0a07 on).
+pips_has_counters() { pips_design_ge "${pips_design:-}" 0x0a07; }
 
 # pips_identify <what> <bdf>...: in preflight. Reads the switch's build and
 # batcher setting when one of the devices (<what>: "drive", "NIC") is behind
@@ -353,6 +361,7 @@ pips_run_cfg() {
         pipsc status > "$L/pips-status-before.txt" 2>&1 ||
             echo "WARNING: PIPS status read failed: $(tail -1 "$L/pips-status-before.txt")" >&2
     fi
+    [ "$pips_log" = 1 ] && pips_has_counters && pips_bp_start
     if [ "$pips_log" = 1 ]; then
         pipsc log-clear > "$L/pips-log-clear.txt" 2>&1 || \
             echo "WARNING: PIPS log-clear failed: $(tail -1 "$L/pips-log-clear.txt")" >&2
@@ -405,6 +414,68 @@ pips_collect() {
          "(logs: pips-log-*.txt)"
 }
 
+# pips_bp_start: the refused-cycle counters (design 0x0a07 on) are
+# free-running 32-bit cycle counts that wrap after 17.2 s counted, and a drive
+# on a full uplink can be refused most of a run, so one difference over a run
+# can miss a wrap. A background loop samples them every PIPS_BP_EVERY seconds
+# (default 2) into pips-bp.tsv (ms since the epoch, then bp0 bp1 hold0 hold1)
+# from pips_run_cfg until pips_bp_stop; each `pips counters` takes the BAR0
+# lock for a few ms (a sample that finds it busy for 5 s is skipped). The loop
+# also ends with its runner or after 3 hours.
+PIPS_BP_PID=""
+pips_bp_sample() {
+    local out
+    out=$(pipsc counters 2>/dev/null) || return 1
+    printf '%s\n' "$out" | awk -v ms="$(date +%s%3N)" '
+        { for (i = 1; i <= NF; i++) { split($i, kv, "="); v[kv[1]] = kv[2] } }
+        END { if (v["bp_cycles_0"] != "") printf "%s\t%s\t%s\t%s\t%s\n", ms, v["bp_cycles_0"],
+                  v["bp_cycles_1"], v["cap_hold_cycles_0"], v["cap_hold_cycles_1"] }'
+}
+pips_bp_start() {
+    local f="$L/pips-bp.tsv" parent=$$ every="${PIPS_BP_EVERY:-2}"
+    pips_bp_stop
+    printf 'ms\tbp_cycles_0\tbp_cycles_1\tcap_hold_cycles_0\tcap_hold_cycles_1\n' > "$f"
+    pips_bp_sample >> "$f"
+    (
+        trap 'exit 0' TERM INT
+        end=$(( $(date +%s) + 10800 ))
+        while kill -0 "$parent" 2>/dev/null && [ "$(date +%s)" -lt "$end" ]; do
+            sleep "$every"
+            pips_bp_sample >> "$f"
+        done
+    ) &
+    PIPS_BP_PID=$!
+}
+pips_bp_stop() {
+    [ -n "$PIPS_BP_PID" ] || return 0
+    kill "$PIPS_BP_PID" 2>/dev/null
+    wait "$PIPS_BP_PID" 2>/dev/null
+    PIPS_BP_PID=""
+    [ -s "$L/pips-bp.tsv" ] && pips_bp_sample >> "$L/pips-bp.tsv"
+    return 0
+}
+# pips_bp_summary <tsv>: .rpt lines from the samples: refused (bp) and
+# rate-cap-held cycles per input summed over the wrapped differences, the span
+# they cover, the fraction of that span's cycles, the samples and the longest
+# gap between two (over 17 s: a wrap may be missing, pips_stat_bp_valid 0).
+pips_bp_summary() {
+    awk -F'\t' 'NR == 1 { next }
+        { n++; if (n > 1) { g = ($1 - t) / 1000; if (g > gap) gap = g
+                            for (k = 2; k <= 5; k++) { d = $k - p[k]; if (d < 0) d += 4294967296; s[k] += d } }
+          t = $1; if (n == 1) t0 = $1; for (k = 2; k <= 5; k++) p[k] = $k }
+        END {
+            span = (t - t0) / 1000; cyc = span * 250e6
+            print "pips_stat_bp_valid: " (n >= 2 && gap < 17 ? 1 : 0)
+            print "pips_stat_bp_samples: " n + 0
+            printf "pips_stat_bp_span_s: %.1f\n", span
+            printf "pips_stat_bp_max_gap_s: %.1f\n", gap
+            printf "pips_stat_bp_cycles_0: %.0f\npips_stat_bp_cycles_1: %.0f\n", s[2], s[3]
+            printf "pips_stat_cap_hold_cycles_0: %.0f\npips_stat_cap_hold_cycles_1: %.0f\n", s[4], s[5]
+            if (cyc > 0 && n >= 2 && gap < 17) printf "pips_stat_bp_frac_0: %.4f\npips_stat_bp_frac_1: %.4f\npips_stat_cap_hold_frac_0: %.4f\npips_stat_cap_hold_frac_1: %.4f\n",
+                                s[2] / cyc, s[3] / cyc, s[4] / cyc, s[5] / cyc
+        }' "$1"
+}
+
 # pips_status_collect <rpt>: the page batcher's status over this run (design
 # 0x0a06 on), read once after the window: since pips_run_cfg's read, so the
 # whole run, setup included. Saved as pips-status.txt and added to the .rpt as
@@ -414,6 +485,14 @@ pips_collect() {
 pips_status_collect() {
     local rpt="$1" f="$L/pips-status.txt"
     pips_has_status || return 0
+    if pips_has_counters; then
+        pips_bp_stop
+        if [ -s "$L/pips-bp.tsv" ]; then
+            pips_bp_summary "$L/pips-bp.tsv" >> "$rpt"
+            echo "   PIPS refused cycles: $(grep -E '^pips_stat_(bp_frac|cap_hold_frac|bp_valid|bp_max_gap)' "$rpt" |
+                                          sed 's/^pips_stat_//; s/: /=/' | xargs)"
+        fi
+    fi
     if ! pipsc status > "$f" 2>&1 || ! grep -q '^status=ok' "$f"; then
         echo "WARNING: PIPS status read failed: $(tail -1 "$f")" >&2
         echo "pips_stat_valid: 0" >> "$rpt"
@@ -462,10 +541,13 @@ pips_meta() {
                      --meta pips_drain_cap="$pips_cap" --meta pips_design_id="${pips_design:-unknown}" )
         if pips_has_status; then
             local p o q t0 t1
-            read -r p o q t0 t1 <<< "$pips_pb"
+            local r0 r1 ro
+            read -r p o q t0 t1 r0 r1 ro <<< "$pips_pb"
             PIPS_META+=( --meta pips_page_batch="$p" --meta pips_ctrl_push_off="$o"
                          --meta pips_grant_quantum="$q" --meta pips_ctrl_dw_thr_0="$t0"
                          --meta pips_ctrl_dw_thr_1="$t1" )
+            pips_has_counters && PIPS_META+=( --meta pips_rate_cap_0="$r0" --meta pips_rate_cap_1="$r1"
+                                              --meta pips_rate_cap_out="$ro" )
         fi
     fi
     [ "$pips_log" = 1 ] && PIPS_META+=( --meta pips_log="$(IFS=,; echo "${PIPS_STATUS[*]}")" )

@@ -24,6 +24,9 @@
  * 0x0d). "none" is a build from before DESIGN_ID: 0x20 answers DECERR.
  * From 0x0a06: reg2/reg3 hold what is written, and 0x24-0x2C report
  * $PIPS_SIM_STAT for a period that had a recording in it (stat_read below).
+ * From 0x0a07: reg4 (rate caps) holds what is written, and each read of
+ * bp_cycles_0 (0x30) advances the four counters 0x30-0x3C by
+ * $PIPS_SIM_BP = "BP0,BP1,HOLD0,HOLD1" (default 0), wrapping at 32 bits.
  */
 #define _GNU_SOURCE
 #include <fcntl.h>
@@ -55,6 +58,9 @@ struct state {
     uint32_t pbthr, pbcfg;      /* reg2, reg3 */
     uint32_t stat_pend;         /* a recording ran since the last 0x24 read */
     uint32_t stat_cnt, stat_wait; /* 0x28 / 0x2C as latched by the last 0x24 read */
+    /* design >= 0x0a07 (appended likewise) */
+    uint32_t rcap;              /* reg4 */
+    uint32_t bp[4];             /* 0x30-0x3C */
 };
 
 static struct state *S;
@@ -238,11 +244,25 @@ static uint32_t stat_read(void)
     return f & 7u;
 }
 
+/* Counters (design >= 0x0a07): a read of 0x30 advances all four by $PIPS_SIM_BP. */
+static uint32_t bp_read(unsigned i)
+{
+    const char *e = getenv("PIPS_SIM_BP");
+    unsigned d[4] = { 0, 0, 0, 0 };
+
+    if (i == 0 && e) {
+        sscanf(e, "%u,%u,%u,%u", &d[0], &d[1], &d[2], &d[3]);
+        for (int k = 0; k < 4; k++)
+            S->bp[k] += d[k];
+    }
+    return S->bp[i];
+}
+
 /* ------------------------------------------------------------ AXI targets */
 static uint32_t axi_read(uint64_t a, int *err)
 {
     if (a >= PIPS_AXI_REGFILE && a < PIPS_AXI_REGFILE + 0x10000) {
-        int pb = design() >= (int)PIPS_DESIGN_ID_PAGE_BATCH;
+        int pb = design() >= (int)PIPS_DESIGN_ID_PAGE_BATCH, rc = design() >= (int)PIPS_DESIGN_ID_RATE_CAP;
         switch (a & 0x3F) {             /* 16 registers, repeating every 0x40 */
         case PIPS_BATCH_CFG_OFF: return S->cfg;
         case PIPS_BATCH_DRAIN_OFF:
@@ -252,6 +272,10 @@ static uint32_t axi_read(uint64_t a, int *err)
         case PIPS_PB_STAT_FLAGS_OFF: return pb ? stat_read() : 0;
         case PIPS_PB_STAT_OVF_COUNT_OFF: return pb ? S->stat_cnt : 0;
         case PIPS_PB_STAT_MRD_WAIT_OFF: return pb ? S->stat_wait : 0;
+        case PIPS_RCAP_OFF: return rc ? S->rcap : 0;
+        case PIPS_BP_CYCLES_0_OFF: case PIPS_BP_CYCLES_1_OFF:
+        case PIPS_CAP_HOLD_0_OFF: case PIPS_CAP_HOLD_1_OFF:
+            return rc ? bp_read(((a & 0x3F) - PIPS_BP_CYCLES_0_OFF) / 4) : 0;
         case PIPS_DESIGN_ID_OFF:
             if (design() < 0)
                 break;                  /* before the register: DECERR */
@@ -289,6 +313,10 @@ static int axi_write(uint64_t a, uint32_t v)
         }
         if (design() >= (int)PIPS_DESIGN_ID_PAGE_BATCH && (a & 0x3F) == PIPS_PB_CFG_OFF) {
             S->pbcfg = v;
+            return 0;
+        }
+        if (design() >= (int)PIPS_DESIGN_ID_RATE_CAP && (a & 0x3F) == PIPS_RCAP_OFF) {
+            S->rcap = v;
             return 0;
         }
         if (a & 0x3F)
