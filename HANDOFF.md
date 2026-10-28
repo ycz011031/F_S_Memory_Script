@@ -14,7 +14,16 @@ together, [LOCAL-SETUP.md](LOCAL-SETUP.md) for first-time provisioning.
   which sweep and design, which report generator reads what, the published
   pages). On the Windows analysis machine `claude.md` (git-ignored) adds its
   local paths, tools and editing gotchas.
-- **Last updated:** 2026-10-28: **FPGA design 0x0A07 is built** (FPGA repo
+- **Last updated:** 2026-10-28 (evening): **the 0x0A07 drive rerun is in and
+  result 10 is solved** (§8 "0x0A07 drive results"): with page batching off
+  the drives' page switches are back to 0x0A05's level (sent / measured
+  arrival median 0.85, 0x0A05 0.81, 0x0A06 1.19; d64 16k 5.2 against 0x0A06's
+  9.9) and the model at the log's own setting fits within 2% at d16-64; with
+  page batching on, d64 16k / 64k / 1m fall from 8.3 / 9.1 / 5.9 to 2.6 / 3.4
+  / 3.5. Throughput and IOTLB misses unchanged (+0.8%, -1.8% median; strict
+  mode). Data `dualssd/1028/`, tables `report-gen/c1028.py`. The NIC rerun is
+  not back yet.
+- **Earlier 2026-10-28:** **FPGA design 0x0A07 is built** (FPGA repo
   `28ff5b6`): rate caps on both inputs and the output (regfile reg4), counters
   of the cycles each input was refused (and the rate cap's part), and a
   **changed read flush** (no longer preempts the other input's drain: on
@@ -2365,7 +2374,7 @@ measurement.
    own order; needs no cross-device timing), checks = host model at own
    setting.
 
-### 0x0A07 minimal rerun (set up 2026-10-28, not run yet)
+### 0x0A07 minimal rerun (set up 2026-10-28; drives ran 10-28, results below; NICs pending)
 
 Why rerun: 0x0A07 changes the read flush, which acts with `page_batch_en`
 0 too (`axi4_mwr_batch_pp`'s arbiter serves both modes). On 0x0A06 a read
@@ -2430,9 +2439,53 @@ per packet with the arrival order and the model (result 10's numbers: d64
 5.1/11.0/6.5); on the NICs, TLPs per run of NIC0 (whole packets ≈ 7-8)
 against the rcap level, REFUSED_% and the cap's share, and pause frames.
 
+### 0x0A07 drive results (2026-10-28, strict, cap on)
+
+`bigserver` `c10281318`, 129 runs in 2h24 (repo `58e001439`), switch
+answered to the end, stuck 0. Data `dualssd/1028/pips-campaign-ssd-c10281318/`
+(`results/`, `status.txt`, `analyze-new/seq-*/seq.jsonl` with the model);
+tables `py -3 dualssd/report-gen/c1028.py` (saved `dualssd/1028/c1028-ssd.txt`),
+against 0x0A05 (`1026/.../analyze-pending`, dsweep1) and 0x0A06 (`1026/...
+main`) at the common points: depths 1/4/16/64, 4k/16k/64k/1m, 1/4/16 per drive
+and 2+16, both drives. Page switches per 4 KiB page, marks scale.
+
+1. **Result 10 is solved: the read flush was the cause.** pb0 sends below its
+   measured arrival order again, as 0x0A05 does: sent / arrival median 0.85
+   [0.69, 1.31] over the 16 depth x size cells (0x0A05 0.81 [0.63, 1.18],
+   0x0A06 1.19 [0.78, 2.27]). d64 16k / 64k / 1m: 0x0A07 5.2 / 10.9 / 7.1,
+   0x0A05 4.5 / 10.9 / 6.7, 0x0A06 9.9 / 14.1 / 10.1. The arrival order is the
+   same on all three (16k 6.2-7.6). `wrr_en` (still tied 1) is not needed to
+   explain it.
+2. **The model fits 0x0A07 pb0 as it fits 0x0A05** (own setting vs log,
+   median per cell): within 2% at d16-64 at every size; at d1-4 it
+   overcounts as on 0x0A05 (16k d1 +58% vs 0x0A05 +52%; 64k/1m d1-4 +8 to
+   +19%, 0x0A05 +2 to +11%). Result 10 (a) for the drives is answered by
+   0x0A07; the 0x0A06 logs need no model rerun.
+3. **Page batching (pb1) now groups pages much better**: d64 16k / 64k / 1m
+   2.6 / 3.4 / 3.5 (0x0A06 8.3 / 9.1 / 5.9, -68 / -62 / -41%); d16 2.7 / 4.1
+   / 3.7. 16k d64 is at the old by-page line (2.7, result 9) and under pb0's
+   5.2 by half. 4k hardly changes (3.3 vs pb0 3.7). At d1 pb1 ≈ pb0.
+4. **Throughput and IOTLB misses don't move** (128 points, 0x0A07 / 0x0A06):
+   Gb/s median 1.008 [0.964, 1.148], misses per 4 KiB 0.982 [0.875, 1.206]
+   (16k and 64k -2 to -7%, 1m 0). Strict mode: every page visit misses
+   anyway (result 1), so the better grouping doesn't show in the counters.
+5. **Status:** stuck 0 everywhere. pb1 spills as on 0x0A06 (64k/1m saturate
+   the 16-bit count at 65535; result 3). MRd wait > 25 us at 25 of 128
+   points (0x0A06 60 of the same 134 setting-point rows), max 136 us (d4t50c1
+   64k 4 per drive, pb0; 0x0A06 262 us), median 21 us (0x0A06 24): the new
+   flush did not lengthen read waits. Refused cycles (new counters): 0.2-3%
+   at 4k, 30% at 16k with 1 job per drive, 50-70% per input from 16k with
+   more load and at 64k/1m, i.e. the Gen3 x8 uplink is full (53 Gb/s at
+   1m); cap share 0 (no rate cap set).
+
+So for the drives 0x0A07 replaces 0x0A06: the 0x0A06 page's drive page-order
+figures (6-9) and the summary page's 0x0A06 lines are superseded by these.
+
 ### Next
 
-Status 10-28 (0x0A07 built): first the minimal rerun above. From the
+Status 10-28 evening: the drive rerun is in (above, result 10 solved); the
+NIC rerun (`nic --minimal`) not back yet. Status 10-28 (0x0A07 built): first
+the minimal rerun above. From the
 hardware list below, 0x0A07 delivered the per-input refused-cycle counter
 and the rate limiter; still not built: a 32-bit overflow count (`0x28`
 still saturates at 65535), FIFO occupancy high-water, MRd wait mean or
