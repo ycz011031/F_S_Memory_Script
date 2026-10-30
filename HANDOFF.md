@@ -14,7 +14,18 @@ together, [LOCAL-SETUP.md](LOCAL-SETUP.md) for first-time provisioning.
   which sweep and design, which report generator reads what, the published
   pages). On the Windows analysis machine `claude.md` (git-ignored) adds its
   local paths, tools and editing gotchas.
-- **Last updated:** 2026-10-28 (evening): **the 0x0A07 drive rerun is in and
+- **Last updated:** 2026-10-30: **the 0x0A07 NIC rerun is in; verdict: the
+  switch study is done** (§8 "0x0A07 NIC results" and "Verdict"; report page
+  "PIPS 0x0A07 Campaign" https://claude.ai/artifact/91VNbNGeJVyfuLLH8acGvY,
+  hand-written `dualssd/dualssd-pips-0a07-report.html`). Measure: page
+  switches as the writes leave the switch (user, 10-30: misses and bandwidth
+  don't matter, the testbed's IOMMU is clean, unlike production). NICs at
+  the **legal floor** (completions leave at once: 2.29 per packet vs 2.28,
+  one NIC alone 2.24); drives 4k/16k within 20-40% of it; the only gap left
+  is drives at 64k/1m (2.3-2.8x, spills saturate: 8 page segments too few).
+  The FPGA rate cap splits a NIC's packets (R6's prediction confirmed). One
+  optional build (more segments) only if large drive I/Os matter.
+- **2026-10-28 (evening):** **the 0x0A07 drive rerun is in and
   result 10 is solved** (§8 "0x0A07 drive results"): with page batching off
   the drives' page switches are back to 0x0A05's level (sent / measured
   arrival median 0.85, 0x0A05 0.81, 0x0A06 1.19; d64 16k 5.2 against 0x0A06's
@@ -2374,7 +2385,7 @@ measurement.
    own order; needs no cross-device timing), checks = host model at own
    setting.
 
-### 0x0A07 minimal rerun (set up 2026-10-28; drives ran 10-28, results below; NICs pending)
+### 0x0A07 minimal rerun (set up and ran 2026-10-28; results below)
 
 Why rerun: 0x0A07 changes the read flush, which acts with `page_batch_en`
 0 too (`axi4_mwr_batch_pp`'s arbiter serves both modes). On 0x0A06 a read
@@ -2481,10 +2492,90 @@ and 2+16, both drives. Page switches per 4 KiB page, marks scale.
 So for the drives 0x0A07 replaces 0x0A06: the 0x0A06 page's drive page-order
 figures (6-9) and the summary page's 0x0A06 lines are superseded by these.
 
+6. **Legal floor (10-30, `report-gen/floor7.py` → `floor7.json`).** The
+   floor (seqrec.floor_runs: hold a device's next D TLPs, free to reorder)
+   ignores the switch's completion rule: a completion leaves as soon as its
+   older data has and seals every older open batch (`axi4_page_batch_ch.v`
+   header, "urgent"; `ctrl_push` only decides whether it also pulls the
+   batches ahead of it). The legal floor cuts each device's order at its
+   completions and groups only the data between them. From the 0x0A07 pb0
+   listings, d64: 4k 2.74 (floor 1.11), 16k 1.86 (1.22), 64k 1.49 (1.32), 1m
+   1.25 (1.22). pb1 d64 against it: 4k 3.29 (x1.20), 16k 2.61 (x1.40), 64k
+   3.43 (x2.30), 1m 3.46 (x2.77). Every pb1 64k/1m run saturates the spill
+   count (65535 per input), 4k/16k spill hundreds to thousands: the 64k/1m
+   gap is page-segment capacity (8 per device; a spilled drive goes to
+   arrival order until its overflow is granted).
+
+### 0x0A07 NIC results (2026-10-30, strict)
+
+`icx` `c10281317`, 59 runs, 4h01 (sweeps 3h50, an hour over the estimate),
+switch answered, stuck 0, links put back to 100G (NIC1's read "Unknown" once,
+then 100G). Data `dualnic/1028/pips-campaign-nic-c10281317/`; tables `py -3
+dualssd/report-gen/c1028.py nic` (saved `dualnic/1028/c1028-nic.txt`, with
+0x0A06 reference rows). Page switches per packet, marks scale.
+
+1. **The FPGA rate cap splits NIC0's packets, as 0x0A06 result 6
+   predicted.** NIC0 alone, 100G link, d1t0: uncapped 95.1 Gb/s, 6.42 TLPs
+   per run (84% of packets in one run), no pauses; rcap 214 / 169 / 113
+   (~95 / 75 / 50G): 88.2 / 69.3 / 46.9 Gb/s (93% of the intended level, so
+   rcap ≈ 2.25 x Gb/s holds), 1.10 / 1.07 / 1.14 TLPs per run, cap held
+   12.7 / 27.3 / 46.3% of cycles, ~91-97k pause frames, 1.3-1.4M discards,
+   retransmits 0.46-0.80%. d16t218c1 rcap 113: the same (pb1 2.51 TLPs per
+   run, still split). Both NICs: rcap 214/169 whole (7.2, 7.1; cap 0.4/4.3%,
+   each NIC's 53.5 is below the cap), rcap 113 split (1.11, 164k pauses,
+   2.4M discards). The rate cap cannot stand in for a slower NIC; the wire
+   speed can.
+2. **Uneven links (NIC0 50G, NIC1 100G):** the arbiter gives NIC1 what NIC0
+   leaves (48.8 / 55.9-58.3 Gb/s), not an even split. d1t0c1 (write-by-write
+   alternation) holds the 100G NIC: NIC1 split (1.04 pb0, 1.01 pb1), 50-64k
+   pauses, 0.6-1.1M discards, 8.5-8.8 page switches per packet. d16t218c1
+   pb0: NIC1 partly split (4.95), no pauses, 2.90; pb1 both whole (7.16 /
+   7.11), 2.46. 5:30 flows: uplink not full (95 Gb/s), nothing splits.
+3. **Both links at 50G (`wire50`): no splitting anywhere** (7.1-7.7 TLPs per
+   run, 88-97% one-run, zero pauses and discards, alone and both, every
+   depth, pb0 and pb1). Page switches per packet, both NICs, 5 flows, d1 / 4
+   / 16 / 64: pb0 7.91 / 3.53 / 2.66 / 2.37, pb1 6.83 / 2.94 / 2.29 / 2.29;
+   one NIC alone 2.23-2.27; arrival 5.6; floor 2.30 / 2.27 / 1.69 / 1.32;
+   **legal floor 2.28 from d4**. 30 flows: pb0 4.98 / 3.14 / 2.68 / 2.51, pb1
+   4.50 / 2.76 / 2.47 / 2.46, alone 2.37-2.40, legal 2.07. 0x0A06 at the same
+   50 Gb/s by iperf3 pacing on 100G links: pb0 3.57-4.87, pb1 3.02-3.08 at
+   d16-64 (split packets). **From d16 two NICs send what one alone does, and
+   pb1 sits on the legal floor.** Each packet is 8 writes to its own page
+   then a 16 DW completion to a completion-queue page (listing), so 2 per
+   packet is the minimum while completions leave at once.
+4. **Model** (own setting vs recorded, pb0): wire50 within 0.5-0.8% at
+   d16-64, 2% at d4, 6-9% at d1; rate-cap runs within 1%; uneven d16 <1%, d1
+   +6-8%.
+5. **Status:** stuck 0; MRd wait max 14 us; refused 0.2-10.5% at 50G, the
+   cap's share dominating on capped runs; pb1 spills ≤ 2k per run at 50G
+   (0x0A06 by pacing: saturated), 65535 at uneven d1t0c1p1. Counter sampler
+   valid in all runs (max gap 3.4 s). Sizes: completions 16 DW, RELIABLE.
+
+### Verdict (2026-10-30): the switch study is done
+
+The question the user asked ("is the study over, or do we keep adding to the
+FPGA?"), judged on page order only:
+- The 0x0A06 defect is fixed and nothing new broke (drives result 1, 5).
+- NICs are at the legal floor; drives 4k/16k within 20-40% of it.
+- The model reproduces pb0 within 2% at d16-64 on both hosts.
+- NIC splitting is the NIC's receive backlog, not a switch feature to add.
+- Left: drives at 64k/1m, 2.3-2.8x the legal floor, from page-segment
+  spills. **Optional, one build:** more segments per device (or a spill
+  that evicts the oldest segment instead of arrival-order overflow mode),
+  plus a 32-bit spill counter; test drives 64k/1m, d16/d64, pb1 (~20 runs,
+  30 min); bound 3.43 → 1.49, 3.46 → 1.25. Only if large drive I/Os matter.
+- **Not worth building here:** completion coalescing (hold completions so
+  several share a page), the only way below the legal floor (NICs 2.28 →
+  ~1.3): it delays when the host learns an I/O finished, a trade this clean
+  testbed can't judge; a separate study.
+
 ### Next
 
-Status 10-28 evening: the drive rerun is in (above, result 10 solved); the
-NIC rerun (`nic --minimal`) not back yet. Status 10-28 (0x0A07 built): first
+Status 10-30: both reruns are in; **verdict: the study is done** (above).
+The items below are kept for reference; none is needed. The only one still
+worth a build is more page segments (drives 64k/1m), and only if large drive
+I/Os matter. Status 10-28 evening: the drive rerun is in (above, result 10
+solved). Status 10-28 (0x0A07 built): first
 the minimal rerun above. From the
 hardware list below, 0x0A07 delivered the per-input refused-cycle counter
 and the rate limiter; still not built: a 32-bit overflow count (`0x28`
