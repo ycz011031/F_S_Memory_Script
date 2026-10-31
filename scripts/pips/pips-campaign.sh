@@ -12,6 +12,7 @@
 #   bash scripts/pips/pips-campaign.sh nic --tmux       # icx: the NICs
 #   bash scripts/pips/pips-campaign.sh nic --dry-run    # the plan, ETA and commands only
 #   bash scripts/pips/pips-campaign.sh ssd --minimal --tmux   # the 0x0A07 rerun (below)
+#   bash scripts/pips/pips-campaign.sh ssd --paper --tmux     # the 0x0A07 paper list (below)
 #
 # Options:
 #   --tmux            run in a new tmux session (asks for the sudo password
@@ -32,7 +33,34 @@
 #                     d1t0c1 and d16t218c1, pb 0/1), wire50 (both links at
 #                     50G: NIC0 alone and both, 5 and 30 flows, depths 1, 4,
 #                     16, 64 x pb 0/1); the links are put back at the end
-#   --pending         with --minimal: the pending 0x0A04/0x0A05 analysis too
+#   --paper           the experiment list for the paper on 0x0A07 (10-31,
+#                     HANDOFF §8 "0x0A07 paper campaign"), no reboot: the
+#                     IOMMU mode is changed at runtime (pips-iommu.sh) and put
+#                     back as found at the end. Phases, drives / NICs:
+#                     pcie   (E6) lspci of the PIPS path: MPS, MRRS, RO, IDO,
+#                            completion timeout, ACS, IOMMU groups
+#                     head   drives (E1, E10): d1t0c1 (batching off) vs
+#                            d16t218c1 and d64t255c1 pb 0/1, 4k/16k/64k/1m x
+#                            4/16 per drive, 3 runs each; throughput, CPU,
+#                            misses (by walk level), fio p99, pkt_wait (E5)
+#                     g100   NICs (E1, E9, E10): the same settings, both NICs,
+#                            5 and 30 flows, uncapped, 100G links, 3 runs
+#                     e8     NICs (E8): NIC0 alone, 5/10/15/30 flows, d1t0c1, 3 runs
+#                     rcap0  NICs (E11): both, 5 flows, d1t0, FPGA rate cap on
+#                            NIC0's input only: rcap0 113/90/68 (~47/37/28G)
+#                     ops    (E7) a small sweep with the runner's --iommu-ops 1:
+#                            map/unmap calls and VT-d invalidations per I/O
+#                     lazy   (E2) the devices to lazy (DMA-FQ), then head's
+#                            settings (drives 2 runs) or g100's and e8's (NICs,
+#                            1 run), and ops
+#                     pt     (E2 control, E8) the devices to passthrough, the
+#                            same (drives 1 run; NICs e8 3 runs), and ops
+#                     A mode the kernel refuses (bigserver's 5.15 changes only
+#                     one-device groups) skips its phase with a note; run it
+#                     after a reboot with the GRUB setting (yours) as
+#                     --paper --only lazy (or pt): the devices are then
+#                     already so. No pending analysis (--pending adds it)
+#   --pending         with --minimal or --paper: the pending 0x0A04/0x0A05 analysis too
 #   --no-analysis     sweeps only, then pack (no page order, lengths, pending)
 #   --no-pending      leave out the pending 0x0A04/0x0A05 analysis
 #   --no-wire         NIC: leave out the phases that change link speeds (wire, uneven, wire50)
@@ -52,7 +80,8 @@
 #
 # Every sweep: design 0x0a06 or 0x0a07, the one the switch had at the start
 # (refused otherwise), rate caps 0 (uncapped) on 0x0a07, IOMMU as booted (no
-# reboot), drain cap on unless the phase says, the completion threshold at
+# reboot; --paper's lazy and pt phases change it at runtime and put it back),
+# drain cap on unless the phase says, the completion threshold at
 # 31 DW on both inputs (w31: conservative, data taken for a completion only
 # costs batching; 0x0A04/0x0A05 logs: drive completions 4 DW, mlx5 16 DW,
 # drive 1's smallest data 4-32 DW at 0.5% of its writes and its 36 DW at 14%,
@@ -77,6 +106,9 @@
 #   analyze-pending/  pips-analyze.sh on the 0x0A04/0x0A05 sweeps (item 0)
 #   snapshots/        NIC: nic-host-snapshot.sh of icx and styx, before and
 #                     after; the hang snapshot if one was taken
+#   pcie/             --paper: pips-pcie-caps.sh (caps.txt, lspci per function)
+#   iommu-*.txt       --paper: the groups and mode at the start and end, the
+#                     checks, every change (iommu-switch.log)
 # Liveness: the sweeps print every run; the campaign prints a phase banner
 # with the ETA, and a heartbeat line every HEARTBEAT seconds.
 set -u
@@ -95,7 +127,7 @@ case "$KIND" in
 esac
 PASS=("$KIND"); IN_TMUX=0
 for a in "$@"; do if [ "$a" = --tmux ]; then IN_TMUX=1; else PASS+=("$a"); fi; done
-DRY=0; ONLY=""; SKIP=""; ANALYSIS=1; PENDING=""; WIRE=1; HW=1; JOBS=""; STAMP=""; RETIRE=""; MINIMAL=0
+DRY=0; ONLY=""; SKIP=""; ANALYSIS=1; PENDING=""; WIRE=1; HW=1; JOBS=""; STAMP=""; RETIRE=""; MINIMAL=0; PAPER=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --tmux) shift ;;
@@ -107,6 +139,7 @@ while [ $# -gt 0 ]; do
         --no-pending) PENDING=0; shift ;;
         --pending) PENDING=1; shift ;;
         --minimal) MINIMAL=1; shift ;;
+        --paper) PAPER=1; shift ;;
         --no-wire) WIRE=0; shift ;;
         --no-hw) HW=0; shift ;;
         -j) JOBS="$2"; shift 2 ;;
@@ -139,8 +172,9 @@ if [ -n "$RETIRE" ]; then
     exit 0
 fi
 STAMP=${STAMP:-c$(date +%m%d%H%M)}
-# --minimal leaves the pending 0x0A04/0x0A05 analysis out unless --pending.
-[ -n "$PENDING" ] || { if [ "$MINIMAL" = 1 ]; then PENDING=0; else PENDING=1; fi; }
+[ "$MINIMAL" = 1 ] && [ "$PAPER" = 1 ] && { echo "pips-campaign: --minimal or --paper, not both" >&2; exit 2; }
+# --minimal and --paper leave the pending 0x0A04/0x0A05 analysis out unless --pending.
+[ -n "$PENDING" ] || { if [ "$MINIMAL" = 1 ] || [ "$PAPER" = 1 ]; then PENDING=0; else PENDING=1; fi; }
 export PIPS_PB_MODEL="${PIPS_PB_MODEL-self,sweepc1,sweepc1f512}"
 case "$STAMP" in [A-Za-z]*) ;; *) echo "--stamp: must start with a letter" >&2; exit 2 ;; esac
 case "$STAMP" in *[!A-Za-z0-9]*) echo "--stamp: letters and digits only" >&2; exit 2 ;; esac
@@ -190,9 +224,25 @@ NIC_RCAPS="0 214 169 113"; NIC_RCAP_HELD=113
 NIC_PAIR=( --modes "nic0only both" "5" "uncapped" 1 )                                     # 2
 NIC_UNEVEN=( "5 5:30" "uncapped" 1 )                                                      # 2, both NICs
 NIC_W50=( --modes "nic0only both" "5 30" "uncapped" 1 )                                   # 4
+# --paper (0x0A07, 10-31): batching off = d1t0c1 pb0 (its own sweep), on =
+# PAPER_ON x pb 0/1. The repeat count is the grids' last argument.
+PAPER_ON="16:218 64:255"
+SSD_HEAD=( --no-asy "4k 16k 64k 1m" "4 16" 3 )                                            # 8 points
+SSD_LZ=( --no-asy "4k 16k 64k 1m" "4 16" 2 )
+SSD_PT=( --no-asy "4k 16k 64k 1m" "4 16" 1 )
+SSD_OPS=( --no-asy "4k 16k 1m" "16" 1 )                                                   # 3
+NIC_G=( "5 30" "uncapped" 3 ); NIC_G1=( "5 30" "uncapped" 1 )                             # 2 points, both NICs
+NIC_E8=( --modes nic0only "5 10 15 30" "uncapped" 3 ); NIC_E8_1=( --modes nic0only "5 10 15 30" "uncapped" 1 )
+# E11: NIC0 is input 0 (rc113 nic0only, 10-28: cap held on input 0 only).
+# 113 held NIC0 at 46.9 Gb/s (0.415 Gb/s per unit): 90 ~ 37G, 68 ~ 28G.
+NIC_RCAP0="113 90 68"; NIC_E11=( "5" "uncapped" 1 )
+NIC_OPS=( "5 30" "uncapped" 1 )
+RUNNER_EXTRA=""        # runner options for the next sweep (ops: --iommu-ops 1)
 
 if [ "$MINIMAL" = 1 ]; then
     if [ "$KIND" = ssd ]; then PHASES=(mini); else PHASES=(rcap uneven wire50); fi
+elif [ "$PAPER" = 1 ]; then
+    if [ "$KIND" = ssd ]; then PHASES=(pcie head ops lazy pt); else PHASES=(pcie g100 e8 rcap0 ops lazy pt); fi
 elif [ "$KIND" = ssd ]; then
     PHASES=(main cap0 push quant thr drv0)
 else
@@ -208,6 +258,17 @@ est_points() {
         ssd:thr)    echo $(( 2 * 12 + 1 )) ;;
         ssd:drv0)   echo $(( 2 * 16 + 1 )) ;;
         ssd:mini)   echo $(( 8 * 16 + 1 )) ;;
+        ssd:pcie|nic:pcie) echo 0 ;;
+        ssd:head)   echo $(( (8 * 3 + 1) + (4 * 8 * 3 + 1) )) ;;
+        ssd:ops)    echo $(( 3 + 1 )) ;;
+        ssd:lazy)   echo $(( (8 * 2 + 1) + (4 * 8 * 2 + 1) + 4 )) ;;
+        ssd:pt)     echo $(( (8 + 1) + (4 * 8 + 1) + 4 )) ;;
+        nic:g100)   echo $(( (2 * 3 + 1) + (4 * 2 * 3 + 1) )) ;;
+        nic:e8)     echo $(( 4 * 3 + 1 )) ;;
+        nic:rcap0)  echo $(( 3 * (1 + 1) )) ;;
+        nic:ops)    echo $(( 2 + 1 )) ;;
+        nic:lazy)   echo $(( (2 + 1) + (4 * 2 + 1) + (4 + 1) + 3 )) ;;
+        nic:pt)     echo $(( (2 + 1) + (4 * 2 + 1) + (4 * 3 + 1) + 3 )) ;;
         nic:rcap)   echo $(( 4 * (2 + 1) + 2 * 2 + 1 )) ;;
         nic:uneven) echo $(( 4 * 2 + 1 )) ;;
         nic:wire50) echo $(( 8 * 4 + 1 )) ;;
@@ -232,6 +293,17 @@ describe() {
         ssd:thr)    echo "completion threshold 4 DW (the NVMe entry exactly), per page, d8/d64; knob grid" ;;
         ssd:drv0)   echo "items 2/4: drive 0 alone and 1+1/16+16 at 4k-1m, d1t0 cap off and on" ;;
         ssd:mini)   echo "page_batch_en 0/1 x depths 1/4/16/64, cap on, w31; bs 4k/16k/64k/1m x 1/4/16 + 2+16" ;;
+        ssd:pcie|nic:pcie) echo "E6: lspci of the PIPS path (MPS, MRRS, RO, IDO, completion timeout, ACS, IOMMU groups); no runs" ;;
+        ssd:head)   echo "E1/E10/E5/E13: d1t0c1 (batching off) vs d16t218c1, d64t255c1 pb 0/1; 4k/16k/64k/1m x 4/16 per drive, 3 runs" ;;
+        ssd:ops)    echo "E7: map/unmap and VT-d invalidations per I/O (--iommu-ops 1), d1t0c1, 4k/16k/1m x 16" ;;
+        ssd:lazy)   echo "E2: devices to lazy (DMA-FQ) at runtime; head's settings, 2 runs; then ops" ;;
+        ssd:pt)     echo "E2 control: devices to passthrough at runtime; head's settings, 1 run; then ops" ;;
+        nic:g100)   echo "E1/E9/E10/E5: d1t0c1 (batching off) vs d16t218c1, d64t255c1 pb 0/1; both NICs, 5 and 30 flows, uncapped, 100G, 3 runs" ;;
+        nic:e8)     echo "E8: NIC0 alone, 5/10/15/30 flows, d1t0c1, 3 runs (strict here; pt in phase pt)" ;;
+        nic:rcap0)  echo "E11: both NICs, 5 flows, d1t0, rate cap on NIC0's input only: rcap0 $NIC_RCAP0 (~47/37/28G)" ;;
+        nic:ops)    echo "E7: map/unmap and VT-d invalidations per packet (--iommu-ops 1), d1t0c1, both NICs, 5 and 30 flows" ;;
+        nic:lazy)   echo "E2: devices to lazy (DMA-FQ) at runtime; g100's settings 1 run, e8 1 run; then ops" ;;
+        nic:pt)     echo "E2 control, E8: devices to passthrough at runtime; g100's settings 1 run, e8 3 runs; then ops" ;;
         nic:rcap)   echo "FPGA rate cap on both inputs (rcap $NIC_RCAPS: ~off/95/75/50G) at d1t0, and rcap $NIC_RCAP_HELD at d16t218c1 pb 0/1; NIC0 alone and both, 5 flows, 100G links" ;;
         nic:uneven) echo "NIC0's link at 50G, NIC1's at 100G (uneven load for the arbiter): both NICs, 5 and 5:30 flows, d1t0c1 and d16t218c1, pb 0/1" ;;
         nic:wire50) echo "both NICs' links at 50G: NIC0 alone and both, 5 and 30 flows, depths 1/4/16/64 x pb 0/1, cap on, w31; links put back after" ;;
@@ -278,7 +350,7 @@ clock_in() { date -d "+$1 min" '+%a %H:%M' 2>/dev/null || echo "+$(fmt_min "$1")
 
 plan() {
     local p n m tot=0
-    echo "pips-campaign $KIND$( [ "$MINIMAL" = 1 ] && echo " (minimal)"), stamp $STAMP, $(hostname), $(date '+%F %T'), repo $(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)"
+    echo "pips-campaign $KIND$( [ "$MINIMAL" = 1 ] && echo " (minimal)")$( [ "$PAPER" = 1 ] && echo " (paper)"), stamp $STAMP, $(hostname), $(date '+%F %T'), repo $(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)"
     echo "sweeps named dual$KIND-pips-<iommu>-$STAMP<phase>; ${MIN_PER_PT} min per run (estimate)"
     printf '  %-7s %5s %8s  %s\n' phase runs time what
     for p in "${RUN_PHASES[@]}"; do
@@ -297,6 +369,7 @@ plan() {
 T0=$SECONDS
 say() { echo "======== $(date '+%F %T') +$(fmt_min $(( (SECONDS - T0) / 60 )))  $*"; }
 NOTES=(); MANIFESTS=(); NAMES=(); SWITCH_DEAD=0; STOPPED=0
+IOMMU_FOUND=""; IOMMU_CHANGED=0; IOMMU_LOST=0; OPS_OK=1
 note() { NOTES+=("$*"); echo "$*" >> "$OUT/notes.txt" 2>/dev/null; say "NOTE: $*"; }
 banner() {
     echo; echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
@@ -332,8 +405,12 @@ sweep_run() {
     local label="$STAMP$1" rc m; shift
     if [ "$STOPPED" = 1 ]; then note "sweep $label not run: campaign stopped by hand"; return 1; fi
     if [ "$SWITCH_DEAD" = 1 ]; then note "sweep $label SKIPPED: the switch is not answering"; return 1; fi
+    if [ "$IOMMU_LOST" = 1 ]; then note "sweep $label SKIPPED: a device behind the switch was lost"; return 1; fi
+    local sargs="${DUALSSD_ARGS:---membw 0}${RUNNER_EXTRA:+ $RUNNER_EXTRA}" nargs="${DUALNIC_ARGS:-}${RUNNER_EXTRA:+ $RUNNER_EXTRA}"
+    nargs=${nargs# }
     if [ "$DRY" = 1 ]; then
-        printf '    %s%s --tag %s --datapath-once' "$( [ "$KIND" = ssd ] && echo "DUALSSD_ARGS=\"${DUALSSD_ARGS:---membw 0}\" ")" \
+        printf '    %s%s --tag %s --datapath-once' \
+            "$(if [ "$KIND" = ssd ]; then echo "DUALSSD_ARGS=\"$sargs\" "; elif [ -n "$nargs" ]; then echo "DUALNIC_ARGS=\"$nargs\" "; fi)" \
             "bash ${DRV#"$REPO"/}" "$label"
         printf ' %q' "$@"; echo
         return 0
@@ -342,9 +419,9 @@ sweep_run() {
     CUR_LABEL=$label; echo "$CUR_PHASE $label" > "$OUT/.state"
     say "sweep $label ($CUR_PHASE): $(describe "$CUR_PHASE")"
     if [ "$KIND" = ssd ]; then
-        DUALSSD_ARGS="${DUALSSD_ARGS:---membw 0}" bash "$DRV" --tag "$label" --datapath-once "$@"
+        DUALSSD_ARGS="$sargs" bash "$DRV" --tag "$label" --datapath-once "$@"
     else
-        bash "$DRV" --tag "$label" --datapath-once "$@"
+        DUALNIC_ARGS="$nargs" bash "$DRV" --tag "$label" --datapath-once "$@"
     fi
     rc=$?
     m=$(ls "$RESULTS"/dual"$KIND"-pips-*-"$label".manifest.tsv 2>/dev/null | head -1)
@@ -499,7 +576,109 @@ phase_run() {
                    sweep_run hwa --cfgs "16:64" --caps 0 --pbs 0 --set "$THR" "${NIC_HW[@]}"
                    sweep_run hwb --cfgs "4:22" --caps 1 --pbs 0 --set "$THR" "${NIC_HW[@]}" ;;
         nic:wire)  phase_wire ;;
+        ssd:pcie|nic:pcie) phase_pcie ;;
+        ssd:head)  sweep_run head1 --cfgs "1:0" --caps 1 --pbs 0 --set "$THR" "${SSD_HEAD[@]}"
+                   sweep_run head --cfgs "$PAPER_ON" --caps 1 --pbs "0 1" --set "$THR" "${SSD_HEAD[@]}" ;;
+        ssd:ops|nic:ops) ops_run ops ;;
+        ssd:lazy)  phase_mode lazy && {
+                       sweep_run lz1 --cfgs "1:0" --caps 1 --pbs 0 --set "$THR" "${SSD_LZ[@]}"
+                       sweep_run lz --cfgs "$PAPER_ON" --caps 1 --pbs "0 1" --set "$THR" "${SSD_LZ[@]}"
+                       ops_run lzops; } ;;
+        ssd:pt)    phase_mode pt && {
+                       sweep_run pt1 --cfgs "1:0" --caps 1 --pbs 0 --set "$THR" "${SSD_PT[@]}"
+                       sweep_run pt --cfgs "$PAPER_ON" --caps 1 --pbs "0 1" --set "$THR" "${SSD_PT[@]}"
+                       ops_run ptops; } ;;
+        nic:g100)  sweep_run g1 --cfgs "1:0" --caps 1 --pbs 0 --set "$THR" "${NIC_G[@]}"
+                   sweep_run g --cfgs "$PAPER_ON" --caps 1 --pbs "0 1" --set "$THR" "${NIC_G[@]}" ;;
+        nic:e8)    sweep_run e8 --cfgs "1:0" --caps 1 --pbs 0 --set "$THR" "${NIC_E8[@]}" ;;
+        nic:rcap0) for q in $NIC_RCAP0; do
+                       sweep_run "r0c$q" --cfgs "1:0" --caps 0 --pbs 0 --set "$THR rcap0=$q rcap1=0" "${NIC_E11[@]}"
+                   done ;;
+        nic:lazy)  phase_mode lazy && {
+                       sweep_run lzg1 --cfgs "1:0" --caps 1 --pbs 0 --set "$THR" "${NIC_G1[@]}"
+                       sweep_run lzg --cfgs "$PAPER_ON" --caps 1 --pbs "0 1" --set "$THR" "${NIC_G1[@]}"
+                       sweep_run lze8 --cfgs "1:0" --caps 1 --pbs 0 --set "$THR" "${NIC_E8_1[@]}"
+                       ops_run lzops; } ;;
+        nic:pt)    phase_mode pt && {
+                       sweep_run ptg1 --cfgs "1:0" --caps 1 --pbs 0 --set "$THR" "${NIC_G1[@]}"
+                       sweep_run ptg --cfgs "$PAPER_ON" --caps 1 --pbs "0 1" --set "$THR" "${NIC_G1[@]}"
+                       sweep_run pte8 --cfgs "1:0" --caps 1 --pbs 0 --set "$THR" "${NIC_E8[@]}"
+                       ops_run ptops; } ;;
     esac
+}
+
+# ------------------------------------------------------------------ --paper
+# E6: the PCIe settings along the switch's path (read-only).
+phase_pcie() {
+    if [ "$DRY" = 1 ]; then echo "    bash scripts/pips/pips-pcie-caps.sh -o <campaign>/pcie"; return 0; fi
+    say "pcie: lspci of the PIPS path into pcie/ (read-only)"
+    bash "$HERE/pips-pcie-caps.sh" -o "$OUT/pcie" 2>&1 | tail -40 || note "pips-pcie-caps.sh failed (pcie/)"
+}
+# E7: one small sweep with the runner's --iommu-ops 1 (perf tracepoint
+# counting costs CPU per map, so these runs are for the counts only).
+ops_run() {   # <label>
+    if [ "$OPS_OK" != 1 ]; then note "sweep $STAMP$1 SKIPPED: perf does not run (apt install linux-tools-\$(uname -r))"; return 0; fi
+    RUNNER_EXTRA="--iommu-ops 1"
+    if [ "$KIND" = ssd ]; then
+        sweep_run "$1" --cfgs "1:0" --caps 1 --pbs 0 --set "$THR" "${SSD_OPS[@]}"
+    else
+        sweep_run "$1" --cfgs "1:0" --caps 1 --pbs 0 --set "$THR" "${NIC_OPS[@]}"
+    fi
+    RUNNER_EXTRA=""
+}
+# E2/E8: the IOMMU mode of the devices behind the switch, at runtime
+# (pips-iommu.sh: sysfs group type, drivers unbound and bound back when the
+# kernel needs it). styx's ssh address must stay reachable on the NIC host.
+iommu_keep() { [ "$KIND" = nic ] && [ -n "${CLIENT_SSH_IP:-}" ] && echo "--keep $CLIENT_SSH_IP"; }
+iommu_mode_now() { bash "$HERE/pips-iommu.sh" mode 2>/dev/null; }
+iommu_to() {   # <mode>: 0 when the devices are in that mode
+    local rc
+    if [ "$DRY" = 1 ]; then echo "    bash scripts/pips/pips-iommu.sh set $1 $(iommu_keep)"; return 0; fi
+    [ "$(iommu_mode_now)" = "$1" ] && { say "IOMMU: the devices are $1 already"; return 0; }
+    say "IOMMU: the devices behind the switch to $1 (pips-iommu.sh, log iommu-switch.log)"
+    IOMMU_CHANGED=1
+    bash "$HERE/pips-iommu.sh" set "$1" $(iommu_keep) 2>&1 | tee -a "$OUT/iommu-switch.log"
+    rc=${PIPESTATUS[0]}
+    case "$rc" in
+        0) say "IOMMU: now $(iommu_mode_now)"; return 0 ;;
+        4) IOMMU_LOST=1
+           banner "A DEVICE BEHIND THE SWITCH DID NOT COME BACK after the IOMMU change to $1." \
+                  "Every sweep still to come is SKIPPED. Look: bash scripts/pips/pips-iommu.sh show; dmesg." \
+                  "A reboot (yours) puts it right: the boot's mode is in the kernel command line."
+           note "IOMMU change to $1: a device did not come back (iommu-switch.log); later sweeps skipped"
+           return 1 ;;
+        *) note "IOMMU change to $1 refused (pips-iommu.sh exit $rc, iommu-switch.log): its phase skipped; after a reboot with the GRUB setting run --paper --only $1"
+           return 1 ;;
+    esac
+}
+iommu_restore() {
+    [ "$IOMMU_CHANGED" = 1 ] || return 0
+    IOMMU_CHANGED=0
+    case "$IOMMU_FOUND" in
+        strict|lazy|pt) ;;
+        *) note "IOMMU: found as '$IOMMU_FOUND', not put back automatically (now $(iommu_mode_now))"; return 0 ;;
+    esac
+    say "IOMMU: putting the devices back as found ($IOMMU_FOUND)"
+    iommu_to "$IOMMU_FOUND"; local rc=$?
+    IOMMU_CHANGED=0   # once only (on_exit calls this too)
+    bash "$HERE/pips-iommu.sh" show > "$OUT/iommu-at-end.txt" 2>&1
+    if [ "$rc" != 0 ]; then
+        banner "THE IOMMU MODE WAS NOT PUT BACK TO $IOMMU_FOUND (now $(iommu_mode_now))." \
+               "bash scripts/pips/pips-iommu.sh set $IOMMU_FOUND $(iommu_keep), or a reboot (yours)."
+        note "IOMMU not put back to $IOMMU_FOUND: fix by hand or reboot"
+    fi
+}
+phase_mode() {   # <mode>: the devices to <mode> before the phase's sweeps; 1 = skip them
+    [ "$SWITCH_DEAD" = 1 ] && { note "phase $1 SKIPPED: the switch is not answering"; return 1; }
+    [ "$IOMMU_LOST" = 1 ] && { note "phase $1 SKIPPED: a device behind the switch was lost"; return 1; }
+    [ "$STOPPED" = 1 ] && return 1
+    iommu_to "$1" || return 1
+    if [ "$KIND" = ssd ] && [ "$DRY" = 0 ]; then
+        # A rebind reallocates the drives' interrupts: the 10-25 livelock check again.
+        bash "$REPO/scripts/ssd-irq-placement.sh" --check > "$OUT/irq-placement-$1.txt" 2>&1 ||
+            { note "phase $1 SKIPPED: after the rebind the drives' interrupt layout is unsafe for SSD_CORES (irq-placement-$1.txt)"; return 1; }
+    fi
+    return 0
 }
 
 # NIC0's link forced to 50G at both ends for two small sweeps, then put back as
@@ -566,6 +745,29 @@ CAMPAIGN_DESIGN=$(design_of <(printf '%s\n' "$LAST_SWITCH"))
 say "switch: $(printf '%s\n' "$LAST_SWITCH" | grep -E '^(cfg|drain|pb|thr|rcap|design_id)=' | xargs)"
 [ "$MINIMAL" = 1 ] && [ "$CAMPAIGN_DESIGN" != 0x0a07 ] &&
     note "--minimal is the 0x0A07 rerun, but the switch is $CAMPAIGN_DESIGN"
+if [ "$PAPER" = 1 ]; then
+    [ "$CAMPAIGN_DESIGN" = 0x0a07 ] || { echo "ERROR: --paper needs design 0x0a07 (rate caps, counters); the switch is $CAMPAIGN_DESIGN" >&2; exit 1; }
+    # The IOMMU mode as found: put back at the end (and on exit).
+    bash "$HERE/pips-iommu.sh" show > "$OUT/iommu-at-start.txt" 2>&1
+    IOMMU_FOUND=$(iommu_mode_now)
+    say "IOMMU: the devices behind the switch are ${IOMMU_FOUND:-unknown} (iommu-at-start.txt)"
+    sed 's/^/    /' "$OUT/iommu-at-start.txt"
+    for m in lazy pt; do
+        want_phase "$m" || continue
+        if bash "$HERE/pips-iommu.sh" check "$m" $(iommu_keep) >> "$OUT/iommu-check.txt" 2>&1; then
+            say "IOMMU: the change to $m looks possible (iommu-check.txt)"
+        else
+            note "IOMMU: the change to $m is refused now (iommu-check.txt); phase $m will be skipped unless the devices are $m already"
+        fi
+    done
+    if want_phase ops || want_phase lazy || want_phase pt; then
+        if sudo -n perf stat -a -e cpu-clock -o /dev/null -- sleep 0.1 >/dev/null 2>&1; then
+            say "perf runs: the ops sweeps count map/unmap and invalidations"
+        else
+            OPS_OK=0; note "perf does not run here: the ops sweeps are SKIPPED (sudo apt install linux-tools-\$(uname -r))"
+        fi
+    fi
+fi
 if [ "$CAMPAIGN_DESIGN" = 0x0a07 ]; then
     sudo -n "$PIPS" counters > "$OUT/counters-at-start.txt" 2>&1 &&
         say "refused-cycle counters answer: $(grep -E '^bp_cycles' "$OUT/counters-at-start.txt")"
@@ -618,9 +820,11 @@ heartbeat() {
 }
 heartbeat & HB=$!
 on_exit() {
-    kill "$HB" "$SUDO_KEEP" 2>/dev/null
-    # a link left forced by a phase that never got to put it back
+    kill "$HB" 2>/dev/null
+    # a link left forced, or an IOMMU mode left changed, by a phase that never got to put it back
     [ "$KIND" = nic ] && [ ${#LINK_FOUND_S[@]} -gt 0 ] && link_restore_all
+    iommu_restore
+    kill "$SUDO_KEEP" 2>/dev/null
 }
 trap on_exit EXIT
 trap 'STOPPED=1; note "campaign interrupted by hand"' INT TERM
@@ -639,6 +843,7 @@ for i in "${!RUN_PHASES[@]}"; do
     phase_run "$p"
 done
 [ "$KIND" = nic ] && link_restore_all
+iommu_restore
 echo
 say "sweeps done: ${#NAMES[@]} sweep(s): ${NAMES[*]:-none}"
 sudo -n "$PIPS" status > "$OUT/status-at-end.txt" 2>&1
@@ -679,7 +884,8 @@ for m in ${MANIFESTS[@]+"${MANIFESTS[@]}"}; do
         [ -n "$ld" ] || continue
         ( cd "$REPO" && find "$ld" -maxdepth 1 -type f \( -name 'pips-cfg.txt' -o -name 'pips-status*.txt' \
               -o -name 'pips-log-summary.*' -o -name 'sweep-id.txt' -o -name 'nstat-client.txt' \
-              -o -name 'pips-log-record.txt' -o -name 'windows.txt' -o -name 'pips-bp.tsv' \) -print0 2>/dev/null |
+              -o -name 'pips-log-record.txt' -o -name 'windows.txt' -o -name 'pips-bp.tsv' \
+              -o -name 'iommu-ops.txt' \) -print0 2>/dev/null |
           xargs -0 -r cp --parents -t "$OUT/runs/" )
         ( cd "$REPO" && [ -d "$rd" ] && find "$rd"* -maxdepth 1 -type f -name '*.rpt' -size -1M -print0 2>/dev/null |
           xargs -0 -r cp --parents -t "$OUT/runs/" )
@@ -691,6 +897,7 @@ say "packed the small files of $nruns runs"
     echo "pips-campaign $KIND $STAMP on $(hostname), $(date '+%F %T'), +$(fmt_min $(( (SECONDS - T0) / 60 )))"
     echo "sweeps: ${NAMES[*]:-none}"
     echo "switch: $( [ "$SWITCH_DEAD" = 1 ] && echo "STOPPED ANSWERING (snapshots/hang)" || echo "answered to the end")"
+    [ "$PAPER" = 1 ] && echo "IOMMU: found ${IOMMU_FOUND:-?}, at the end $(iommu_mode_now)"
     for x in ${NOTES[@]+"${NOTES[@]}"}; do echo "NOTE: $x"; done
 } > "$OUT/README.txt"
 TAR="$OUT.tar.gz"

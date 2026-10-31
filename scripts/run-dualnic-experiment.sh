@@ -42,6 +42,10 @@
 # Every run also records, over the measurement window, TCP retransmits on the
 # client (nstat: reports/<name>-RUN-server-<j>/retx-client.rpt) and the deltas of both
 # ends' pause, discard and buffer counters (ethtool -S: nicstats-nic<i>.rpt).
+# --iommu-ops 1: also count IOMMU map/unmap calls and VT-d invalidation
+# descriptors beside the pcm-iio window, with this host's rx packets of the
+# same seconds (perf tracepoints, utils/iommu-ops.sh: iommu-ops.txt/.rpt,
+# iommu_ops_* in the results). Counting costs CPU per map: for counting runs.
 set -u
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -66,6 +70,7 @@ results_file=""        # JSONL to append to; default ~/<exp>-<N>.jsonl, first un
 pips_log=0             # 1: record the PIPS switch's TLP log in every run
 flows1=""              # NIC 1's flow count when it differs from NIC 0's (--flows-nic1)
 hw_rate=""             # client-side hardware pacing per port (--client-hw-rate), e.g. 50g
+iommu_ops=0            # 1: count IOMMU map/unmap and VT-d invalidations (utils/iommu-ops.sh)
 CLIENT_BRANCH="$(git -C "$HERE/.." rev-parse --abbrev-ref HEAD 2>/dev/null || echo icx-dualnic)"
 
 while [ $# -gt 0 ]; do
@@ -88,12 +93,14 @@ while [ $# -gt 0 ]; do
         --pips-log)      pips_log="$2"; shift 2 ;;
         --flows-nic1)    flows1="$2"; shift 2 ;;
         --client-hw-rate) hw_rate="$2"; shift 2 ;;
+        --iommu-ops)     iommu_ops="$2"; shift 2 ;;
         -h|--help)
             awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; exit 0 ;;
         *) echo "unknown option: $1"; exit 2 ;;
     esac
 done
 case "$pips_log" in 0|1) ;; *) echo "ERROR: --pips-log must be 0 or 1" >&2; exit 2 ;; esac
+case "$iommu_ops" in 0|1) ;; *) echo "ERROR: --iommu-ops must be 0 or 1" >&2; exit 2 ;; esac
 case "$flows1" in ''|[1-9]|[1-9][0-9]) ;; *) echo "ERROR: --flows-nic1 takes 1-99" >&2; exit 2 ;; esac
 case "$hw_rate" in ''|[1-9]*[gG]) ;; *) echo "ERROR: --client-hw-rate takes e.g. 50g" >&2; exit 2 ;; esac
 # Flows of NIC i: -S, or --flows-nic1 for NIC 1.
@@ -597,7 +604,7 @@ for ((j = 0; j < num_runs; j++)); do
     ( cd "$setup_dir" && sudo bash record-host-metrics.sh -f 0 --iio 0 -t 1 \
         --intf "${SERVER_INTFS[${ACTIVE[0]}]}" -o "$RUN" --type 0 \
         --cpu-util 1 --pcie 1 --membw 1 --bw 0 --dur "$dur" \
-        --cores "$active_cores" )
+        --iommu-ops "$iommu_ops" --cores "$active_cores" )
     nicstats_snap after
     nicstats_report
     echo "   window counters: $(cat "$setup_dir/reports/$RUN/retx-client.rpt" 2>/dev/null | xargs);" \

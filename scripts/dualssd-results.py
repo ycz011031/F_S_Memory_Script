@@ -282,6 +282,8 @@ def one_run(reports, exp, j, ssds):
     # The PIPS TLP log's numbers (--pips-log 1), pips_*: full or not, records,
     # drops, per-port TLPs and MWr Gbps. Its text status goes in 'pips_log'.
     r.update(read_kv(os.path.join(base, 'pips-log.rpt')))
+    # IOMMU map/unmap and VT-d invalidation counts (--iommu-ops 1), iommu_ops_*.
+    r.update(read_kv(os.path.join(base, 'iommu-ops.rpt')))
     return r
 
 

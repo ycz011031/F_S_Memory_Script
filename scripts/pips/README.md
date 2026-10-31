@@ -587,6 +587,10 @@ bash scripts/pips/pips-campaign.sh ssd --tmux      # bigserver, ~18 h
 bash scripts/pips/pips-campaign.sh nic --tmux      # icx, ~16 h
 bash scripts/pips/pips-campaign.sh ssd --minimal --tmux   # 0x0A07 rerun, bigserver ~3 h
 bash scripts/pips/pips-campaign.sh nic --minimal --tmux   # 0x0A07 rerun, icx ~4 h
+bash scripts/pips/pips-campaign.sh ssd --paper --tmux     # 0x0A07 paper list, bigserver ~6 h
+bash scripts/pips/pips-campaign.sh nic --paper --tmux     # 0x0A07 paper list, icx ~5 h
+bash scripts/pips/pips-iommu.sh show                      # IOMMU groups and mode behind the switch
+bash scripts/pips/pips-pcie-caps.sh                       # PCIe settings along the switch's path
 ```
 
 `--minimal` (the 0x0A07 rerun, 10-28): drives `mini` = depths 1, 4, 16, 64 x
@@ -600,6 +604,19 @@ and d16t218c1, pb 0/1), `wire50` (both links at 50G; NIC0 alone and both, 5 and
 (`link_set`/`link_restore_all`); `--no-wire` leaves out every phase that
 changes a link. No knob phases, no pending analysis (`--pending` adds it). The design is the one the switch has at the
 start (0x0a06 or 0x0a07) and must stay so.
+
+`--paper` (the 0x0A07 paper list, 10-31; HANDOFF §8 "0x0A07 paper
+campaign"): `pcie` (E6, `pips-pcie-caps.sh`), drives `head` / NICs `g100`
+(E1, E10, E5, E9: d1t0c1 vs d16t218c1/d64t255c1 pb 0/1, 3 runs), NICs `e8`
+(NIC0 alone, 5-30 flows) and `rcap0` (rate cap on NIC0's input only), `ops`
+(E7: the runner's `--iommu-ops 1`, `utils/iommu-ops.sh`), then `lazy` and
+`pt` (E2): the devices behind the switch changed to DMA-FQ or identity at
+runtime by `pips-iommu.sh` (no reboot; drivers unbound and bound back where
+the kernel needs it), the same settings again, and back as found at the
+end. Needs design 0x0a07 and `perf` (`linux-tools-$(uname -r)`; without it
+the ops sweeps are skipped). A mode the kernel refuses (5.15: one-device
+groups only) skips its phase; after a reboot with the GRUB setting,
+`--paper --only lazy` runs it alone.
 
 Every phase is a `*_pips_sweep.sh` with `--tag <stamp><phase>` (stamp
 `c<MMDDhhmm>`) on design 0x0a06 or 0x0a07 (rate caps 0), the completion threshold at 31 DW

@@ -110,6 +110,8 @@ def one_run(reports, exp, j, nics):
     # drops, per-port TLPs, MWr Gbps and time in the batcher. Its text status
     # goes in 'pips_log'.
     r.update(read_kv(os.path.join(base, 'pips-log.rpt')))
+    # IOMMU map/unmap and VT-d invalidation counts (--iommu-ops 1), iommu_ops_*.
+    r.update(read_kv(os.path.join(base, 'iommu-ops.rpt')))
     return r
 
 

@@ -18,6 +18,9 @@ PCIE_REPORTING=1
 MEMBW_REPORTING=1
 IIO_REPORTING=0
 PFC_REPORTING=0
+# 1: count IOMMU map/unmap and VT-d invalidations (iommu-ops.sh, perf
+# tracepoints) beside the pcm-iio window: iommu-ops.txt / iommu-ops.rpt
+IOMMU_OPS_REPORTING=0
 # INTF=enp8s0
 PCIE_PATTERN="Socket1,IIO Stack 0 - PCIe0,Part0"
 
@@ -49,13 +52,14 @@ help()
                [ --pfc (=0/1, disable/enable recording PFC pause triggers) ] 
                [ --intf (interface name, over which to record PFC triggers) ] 
                [ -t | --type (=0/1, experiment type -- 0 for TCP, 1 for RDMA) ]
-	       [ --pattern ] 
+	       [ --pattern ]
+               [ --iommu-ops (=0/1, count IOMMU map/unmap and VT-d invalidations beside the PCIe window: iommu-ops.sh) ]
                [ -h | --help  ]"
     exit 2
 }
 
 SHORT=o:,c:,f:,t:,h
-LONG=dep:,outdir:,dur:,cpu-util:,cores:,retx:,tcplog:,bw:,flame:,pcie:,membw:,iio:,pfc:,intf:,type:,pattern:,help
+LONG=dep:,outdir:,dur:,cpu-util:,cores:,retx:,tcplog:,bw:,flame:,pcie:,membw:,iio:,pfc:,intf:,type:,pattern:,iommu-ops:,help
 OPTS=$(getopt -a -n $SCRIPT_NAME --options $SHORT --longoptions $LONG -- "$@")
 
 VALID_ARGUMENTS=$# # Returns the count of arguments that are in short or long options
@@ -82,6 +86,7 @@ while :; do
     --pfc) PFC_REPORTING="$2"; shift 2 ;;
     --intf) INTF="$2"; shift 2 ;;
     --pattern) PCIE_PATTERN="$2"; shift 2 ;;
+    --iommu-ops) IOMMU_OPS_REPORTING="$2"; shift 2 ;;
     -t | --type) TYPE="$2"; shift 2 ;;
     -h | --help) help ;;
     --) shift; break ;;
@@ -370,9 +375,15 @@ fi
 if [ "$PCIE_REPORTING" -eq 1 ]; then
   echo "Collecting PCIe bandwidth..."
   dump_pciebw
+  OPS_PID=""
+  if [ "$IOMMU_OPS_REPORTING" -eq 1 ]; then
+    bash iommu-ops.sh --dur "$DURATION_S" -o logs/$OUT_DIR/iommu-ops.txt -r reports/$OUT_DIR/iommu-ops.rpt &
+    OPS_PID=$!
+  fi
   mark pcie_start
   sleep $DURATION_S
   mark pcie_end
+  [ -n "$OPS_PID" ] && wait "$OPS_PID"
   sudo pkill -9 pcm
   if [ "$CPU_MODEL" = "85" ]; then parse_pciebw_skx; else parse_pciebw; fi
 fi

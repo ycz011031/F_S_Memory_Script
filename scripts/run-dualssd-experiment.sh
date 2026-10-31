@@ -61,6 +61,11 @@
 # A log problem does not fail the run; it shows in the status. PIPS_LOG_GZIP=0
 # keeps pips-log.bin uncompressed.
 #
+# --iommu-ops 1: also count IOMMU map/unmap calls and VT-d invalidation
+# descriptors beside the pcm-iio window (perf tracepoints, utils/iommu-ops.sh:
+# logs/<name>-RUN-<j>/iommu-ops.txt, reports/<name>-RUN-<j>/iommu-ops.rpt,
+# iommu_ops_* in the results). Counting costs CPU per map: for counting runs.
+#
 # Exit status 3: this configuration could not be measured (fio instances died,
 # stalled or missed the window, or pcm-iio logged nothing with the IOMMU on;
 # with it off or pt such a run is kept); sweeps log it and go on.
@@ -90,6 +95,7 @@ membw=1                # pcm-memory; adds 30 s + dur per run, --membw 0 skips it
 num_runs=1
 results_file=""        # JSONL to append to; default ~/<exp>-<N>.jsonl, first unused N
 pips_log=0             # 1: record the PIPS switch's TLP log in every run
+iommu_ops=0            # 1: count IOMMU map/unmap and VT-d invalidations (utils/iommu-ops.sh)
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -107,8 +113,9 @@ while [ $# -gt 0 ]; do
         --runs)         num_runs="$2"; shift 2 ;;
         --results)      results_file="$2"; shift 2 ;;
         --pips-log)     pips_log="$2"; shift 2 ;;
+        --iommu-ops)    iommu_ops="$2"; shift 2 ;;
         -h|--help)
-            sed -n '2,66p' "$SELF"; exit 0 ;;
+            sed -n '2,71p' "$SELF"; exit 0 ;;
         *) echo "unknown option: $1"; exit 2 ;;
     esac
 done
@@ -119,6 +126,7 @@ case "$rw" in
 esac
 case "$ssds" in 1|2) ;; *) echo "ERROR: --ssds must be 1 or 2" >&2; exit 2 ;; esac
 case "$pips_log" in 0|1) ;; *) echo "ERROR: --pips-log must be 0 or 1" >&2; exit 2 ;; esac
+case "$iommu_ops" in 0|1) ;; *) echo "ERROR: --iommu-ops must be 0 or 1" >&2; exit 2 ;; esac
 case "$ssd_index" in 0|1) ;; *) echo "ERROR: --ssd-index must be 0 or 1" >&2; exit 2 ;; esac
 # JOBS[i]: instances on drive i. -J n0,n1 sets them separately (co-run only).
 IFS=',' read -r -a JOBS <<< "$jobs"
@@ -469,6 +477,7 @@ for ((j = 0; j < num_runs; j++)); do
     echo "recording host metrics: CPU ${dur}s, then pcm-iio ${dur}s..."
     ( cd "$setup_dir" && sudo bash record-host-metrics.sh -f 0 --iio 0 --type 0 \
         --cpu-util 1 --retx 0 --bw 0 --pcie 1 --membw "$membw" --dur "$dur" \
+        --iommu-ops "$iommu_ops" \
         --cores "$active_cores" --pattern "$SSD_PCIE_PATTERN" -o "$RUN" ) 9>&-
 
     got=$(fio_count)
