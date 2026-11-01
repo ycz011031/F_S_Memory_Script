@@ -2,7 +2,9 @@
 # The IOMMU mode of the devices behind the PIPS switch, changed at runtime
 # through sysfs: no reboot, no GRUB change. For the 0x0A07 paper campaign's
 # E2 (lazy vs strict, passthrough as the control) and E8 (strict vs
-# passthrough); HANDOFF §8 "0x0A07 paper campaign".
+# passthrough); HANDOFF §8 "0x0A07 paper campaign". The campaign only
+# reads (mode, show): its legs are run one per boot (user, 10-31); set is
+# for use by hand.
 #
 #   bash scripts/pips/pips-iommu.sh show            # groups, members, drivers, mode
 #   bash scripts/pips/pips-iommu.sh mode            # the mode of them all: strict, lazy, pt

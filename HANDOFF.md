@@ -16,11 +16,12 @@ together, [LOCAL-SETUP.md](LOCAL-SETUP.md) for first-time provisioning.
   local paths, tools and editing gotchas.
 - **Last updated:** 2026-10-31: **the 0x0A07 paper campaign is set up, not
   run** (§8 "0x0A07 paper campaign"): `pips-campaign.sh ssd|nic --paper
-  --tmux`, the user's experiment list E1, E2, E5-E13 (E2b, E3, E4, E15 out of
-  scope) in one run per host, no reboot: lazy and passthrough by changing the
-  IOMMU group type at runtime (`scripts/pips/pips-iommu.sh`), put back as
-  found at the end. New: `pips-pcie-caps.sh` (E6), `utils/iommu-ops.sh` +
-  the runners' `--iommu-ops 1` (E7). Untested on the hosts.
+  --leg <mode> --tmux`, the user's experiment list E1, E2, E5-E13 (E2b, E3,
+  E4, E15 out of scope), one IOMMU leg per launch: the campaign runs the leg
+  of the mode the host booted with (strict, lazy, pt, off) and never changes
+  it; the user reboots between legs (~2h50 per leg per host). New:
+  `pips-pcie-caps.sh` (E6), `utils/iommu-ops.sh` + the runners'
+  `--iommu-ops 1` (E7). Untested on the hosts.
 - **2026-10-30:** **the 0x0A07 NIC rerun is in; verdict: the
   switch study is done** (§8 "0x0A07 NIC results" and "Verdict"; report page
   "PIPS 0x0A07 Campaign" https://claude.ai/artifact/91VNbNGeJVyfuLLH8acGvY,
@@ -2578,68 +2579,78 @@ FPGA?"), judged on page order only:
 
 ### 0x0A07 paper campaign (set up 2026-10-31, not run yet)
 
-The user's experiment list for the paper (10-31), on 0x0A07, one campaign
-per host, **no reboot and no GRUB change inside a campaign** (user rule:
-reboots and kernel command-line changes are the user's). In scope: E1, E2,
-E5-E14 minus the ones below; out of scope (user, 10-31): E2b (F&S kernel),
-E3 (commodity switch), E4 (data integrity), E15 (more page segments).
+The user's experiment list for the paper (10-31), on 0x0A07. **No reboot and
+no GRUB change inside a campaign** (user rule: reboots and kernel
+command-line changes are the user's). In scope: E1, E2, E5-E14 minus the
+ones below; out of scope (user, 10-31): E2b (F&S kernel), E3 (commodity
+switch), E4 (data integrity), E15 (more page segments).
+
+**One IOMMU leg per launch** (user, 10-31, second version: no runtime IOMMU
+change at all). `--paper` reads the mode the host booted with from the
+devices behind the switch (`pips-iommu.sh mode`: strict = `DMA`, lazy =
+`DMA-FQ`, pt = `identity`, off = no IOMMU group) and runs that leg; the
+sweeps name themselves by it (`dual<kind>-pips-<mode>-<stamp>...`). The user
+reboots between legs. `--leg M` refuses to start unless the devices are M
+(catches a missed reboot); with `--dry-run` it plans leg M on any machine.
+`--runs N` sets the runs per point of head, g100 and e8 (default 3).
+
+| Leg | Kernel command line (iommu tokens in `GRUB_CMDLINE_LINUX_DEFAULT`) | Group type |
+|---|---|---|
+| strict (the hosts' boot now) | `intel_iommu=on iommu.strict=1` | `DMA` |
+| lazy | `intel_iommu=on iommu.strict=0` | `DMA-FQ` |
+| pt | `intel_iommu=on iommu=pt` (no `iommu.strict`) | `identity` |
+| off (optional) | `intel_iommu=off` | no group |
 
 ```bash
-bash scripts/pips/pips-campaign.sh ssd --paper --dry-run   # plan, ETA, commands
-bash scripts/pips/pips-campaign.sh ssd --paper --tmux      # bigserver, ~4h30 sweeps, ~5h40 packed
-bash scripts/pips/pips-campaign.sh nic --paper --tmux      # icx, ~4h25 sweeps, ~5h05 packed
+bash scripts/pips/pips-campaign.sh ssd --paper --leg strict --dry-run   # plan, ETA, commands
+bash scripts/pips/pips-campaign.sh ssd --paper --leg strict --tmux      # bigserver
+bash scripts/pips/pips-campaign.sh nic --paper --leg strict --tmux      # icx
+# reboot with the lazy line, then --leg lazy; reboot with the pt line, then --leg pt;
+# reboot back to the strict line at the end
 ```
-Before: on each host `git pull`; `sudo apt install linux-tools-$(uname -r)`
-if `perf` does not run (else the ops sweeps are skipped with a note); the
-switch must report design 0x0a07 (refused otherwise).
 
-| Phase | Experiment | What runs |
-|---|---|---|
-| `pcie` | E6 | `pips-pcie-caps.sh`: lspci of root port, switch ports, devices: MPS, MRRS, RO, NoSnoop, tags, IDO, completion timeout ranges and value, ACS, IOMMU group/mode → `pcie/caps.txt` |
-| `head` (drives) | E1, E10, E5, E13 | strict: d1t0c1 pb0 (batching off) vs d16t218c1 and d64t255c1 pb 0/1; 4k/16k/64k/1m x 4/16 per drive; 3 runs per point (122 runs). Results carry Gb/s, CPU, misses by walk level (L1/L2/L3), fio p99, pkt_wait p50/p99 |
-| `g100` (NICs) | E1, E9, E10, E5 | the same settings, both NICs, 5 and 30 flows, uncapped, 100G links, 3 runs (32 runs). E9's d16/d64 uncapped page switches come from its logs |
-| `e8` (NICs) | E8 | NIC0 alone, 5/10/15/30 flows, d1t0c1, 3 runs |
-| `rcap0` (NICs) | E11 | both NICs, 5 flows, d1t0, rate cap on input 0 (NIC0) only: `rcap0` 113/90/68 (~47/37/28 Gb/s: 113 held NIC0 at 46.9 on 10-28). Expect NIC0's pauses and discards (0x0A07 NIC result 1) |
-| `ops` | E7 | a small sweep with the runner's `--iommu-ops 1`: `perf stat` of `iommu:map`, `iommu:unmap`, `intel_iommu:qi_submit` beside the pcm-iio window, with the drives' reads or the NICs' rx packets of the same seconds → `iommu_ops_*_per_io`, `_unmap_per_4k`, `_qi_per_unmap` in the results. Software counts: neither CPU has a VT-d invalidation PMU |
-| `lazy` | E2 | devices to lazy (DMA-FQ) at runtime, then head's settings (drives, 2 runs) or g100's and e8's (NICs, 1 run), then ops |
-| `pt` | E2 control, E8 | devices to passthrough (identity), the same (drives 1 run; NICs e8 3 runs = E8's strict-vs-pt), then ops |
+| Phase | Experiment | What runs (per leg) | Runs |
+|---|---|---|---|
+| `pcie` | E6 | `pips-pcie-caps.sh`: lspci of root port, switch ports, devices: MPS, MRRS, RO, NoSnoop, tags, IDO, completion timeout ranges and value, ACS, IOMMU group/mode → `pcie/caps.txt`; `cmdline.txt` | 0 |
+| `head` (drives) | E1, E2, E5, E10, E13 | d1t0c1 pb0 (batching off) vs d16t218c1 and d64t255c1 pb 0/1; 4k/16k/64k/1m x 4/16 per drive. Results carry Gb/s, CPU, misses by walk level (L1/L2/L3), fio p99, pkt_wait p50/p99 | 122 |
+| `g100` (NICs) | E1, E2, E5, E9, E10 | the same settings, both NICs, 5 and 30 flows, uncapped, 100G links. E9's d16/d64 page switches come from its logs | 32 |
+| `e8` (NICs) | E8 | NIC0 alone, 5/10/15/30 flows, d1t0c1 (strict leg vs pt leg = E8) | 13 |
+| `rcap0` (NICs, strict leg only) | E11 | both NICs, 5 flows, d1t0, rate cap on input 0 (NIC0) only: `rcap0` 113/90/68 (~47/37/28 Gb/s: 113 held NIC0 at 46.9 on 10-28) | 6 |
+| `ops` | E7 | the runner's `--iommu-ops 1`: `perf stat` of `iommu:map`, `iommu:unmap`, `intel_iommu:qi_submit` beside the pcm-iio window, with the drives' reads or the NICs' rx packets of the same seconds → `iommu_ops_*_per_io`, `_unmap_per_4k`, `_qi_per_unmap`. Software counts (no VT-d invalidation PMU on either CPU); pt and off should read ~0 | 4 / 3 |
+
+ETA per leg (estimates: 1.05 min per drive run, 2.6 per NIC run, analysis at
+-j 16): drives every leg ~2h12 sweeps, ~2h50 packed; NICs strict ~2h21
+sweeps, ~2h40 packed; NICs lazy/pt/off ~2h05, ~2h25. `--dry-run` prints the
+clock times.
 
 E12 (write sizes) comes from the analysis (`analyze-new`, lengths) of the
 same sweeps; E14 (bubble remover) is model code, not a run, not written.
 
-**The runtime IOMMU change** (`scripts/pips/pips-iommu.sh show|mode|check|set
-strict|lazy|pt`): writes `/sys/kernel/iommu_groups/<g>/type` for the group of
-every endpoint below the PIPS upstream port. strict -> lazy is live (drivers
-bound); every other change unbinds the group's endpoint drivers (nvme,
-mlx5_core), writes, binds back and waits for the drives (by serial) and
-interfaces (by name). The sweeps name themselves by the mode they find
-(`dual<kind>-pips-lazy-...`, `-pt-`), and the drives' interrupt check runs
-again after a rebind. Refuses an interface that carries the default route,
-an ssh connection or styx's ssh address, a mounted or held drive, a group
-member outside the switch with a driver, running fio/iperf3. **Kernel rule:**
-before 6.4 (bigserver's 5.15) a group changes only if it holds one device,
-bridges included; if PIPS's downstream ports have no ACS both drives share
-a group and the drives' lazy/pt phases are skipped with a note. Then, after
-a reboot with the GRUB setting (yours: `iommu.strict=0` for lazy, `iommu=pt`
-for pt), `pips-campaign.sh ssd --paper --only lazy --tmux` runs that phase
-alone (the devices are already so). The campaign's preflight
-(`iommu-check.txt`) says which way it will go. icx's 6.8 has no such rule.
-Exit 4 from the tool (a device did not come back) skips every later sweep;
-a reboot (yours) puts the boot mode back. At the end, and on exit, the
-campaign puts the devices back as found.
+Before each leg: `git pull`; `perf` must run (`sudo apt install
+linux-tools-$(uname -r)`, per kernel; else the ops sweeps are skipped with a
+note); the switch must report design 0x0a07 (refused otherwise). After a
+reboot also §3 "Check after a reboot" (icx) and, on bigserver, `bash
+scripts/ssd-irq-placement.sh` (the interrupt layout is per boot: the strict
+leg refuses an unsafe one; other legs note it and go on, since the 10-25
+livelock needs strict's synchronous invalidations).
 
-Check after: `iommu-switch.log`, `iommu-at-end.txt` (back to strict),
-`notes.txt`; per sweep the mode in its name; ops runs' `iommu-ops.rpt`
-(`iommu_ops_map/_unmap/_qi`, -1 = tracepoint missing). Analysis to write
-when the tarballs are back (local, like `c1028.py`): E1/E10 mean and spread
-per point, E2 misses per I/O strict/lazy/pt x pb0/pb1, E5 pkt_wait
-percentiles, E7 per-I/O counts per mode, E8 NIC0 alone strict vs pt, E9 page
-switches at 100G against the floors, E11 NIC0/NIC1 Gb/s per rcap0, E13 walk-level
-misses pb0 vs pb1.
+`scripts/pips/pips-iommu.sh` (`show|mode|check|set`) can still change a
+group's type at runtime by hand; the campaign only reads (`mode`, `show`).
+Kernel rule if ever used: before 6.4 (bigserver's 5.15) a group changes only
+if it holds one device, bridges included.
+
+Check after each leg: `README.txt` (the leg and command line), `notes.txt`,
+`iommu-at-start.txt` / `iommu-at-end.txt` (same mode), the mode in every
+sweep's name; ops runs' `iommu-ops.rpt` (`iommu_ops_map/_unmap/_qi`, -1 =
+tracepoint missing). Analysis to write when the tarballs are back (local,
+like `c1028.py`): E1/E10 mean and spread per point, E2 misses per I/O
+strict/lazy/pt x pb0/pb1, E5 pkt_wait percentiles, E7 per-I/O counts per
+mode, E8 NIC0 alone strict vs pt, E9 page switches at 100G against the
+floors, E11 NIC0/NIC1 Gb/s per rcap0, E13 walk-level misses pb0 vs pb1.
 
 ### Next
 
-Status 10-31: the paper campaign above is set up (not run).
+Status 10-31: the paper campaign above is set up (not run): one IOMMU leg per boot, the user reboots between legs.
 Status 10-30: both reruns are in; **verdict: the study is done** (above).
 The items below are kept for reference; none is needed. The only one still
 worth a build is more page segments (drives 64k/1m), and only if large drive

@@ -587,8 +587,8 @@ bash scripts/pips/pips-campaign.sh ssd --tmux      # bigserver, ~18 h
 bash scripts/pips/pips-campaign.sh nic --tmux      # icx, ~16 h
 bash scripts/pips/pips-campaign.sh ssd --minimal --tmux   # 0x0A07 rerun, bigserver ~3 h
 bash scripts/pips/pips-campaign.sh nic --minimal --tmux   # 0x0A07 rerun, icx ~4 h
-bash scripts/pips/pips-campaign.sh ssd --paper --tmux     # 0x0A07 paper list, bigserver ~6 h
-bash scripts/pips/pips-campaign.sh nic --paper --tmux     # 0x0A07 paper list, icx ~5 h
+bash scripts/pips/pips-campaign.sh ssd --paper --leg strict --tmux   # 0x0A07 paper list, one IOMMU leg per boot, bigserver ~2h50
+bash scripts/pips/pips-campaign.sh nic --paper --leg strict --tmux   # the same on icx, ~2h40 (other legs ~2h25)
 bash scripts/pips/pips-iommu.sh show                      # IOMMU groups and mode behind the switch
 bash scripts/pips/pips-pcie-caps.sh                       # PCIe settings along the switch's path
 ```
@@ -606,17 +606,22 @@ changes a link. No knob phases, no pending analysis (`--pending` adds it). The d
 start (0x0a06 or 0x0a07) and must stay so.
 
 `--paper` (the 0x0A07 paper list, 10-31; HANDOFF §8 "0x0A07 paper
-campaign"): `pcie` (E6, `pips-pcie-caps.sh`), drives `head` / NICs `g100`
-(E1, E10, E5, E9: d1t0c1 vs d16t218c1/d64t255c1 pb 0/1, 3 runs), NICs `e8`
-(NIC0 alone, 5-30 flows) and `rcap0` (rate cap on NIC0's input only), `ops`
-(E7: the runner's `--iommu-ops 1`, `utils/iommu-ops.sh`), then `lazy` and
-`pt` (E2): the devices behind the switch changed to DMA-FQ or identity at
-runtime by `pips-iommu.sh` (no reboot; drivers unbound and bound back where
-the kernel needs it), the same settings again, and back as found at the
-end. Needs design 0x0a07 and `perf` (`linux-tools-$(uname -r)`; without it
-the ops sweeps are skipped). A mode the kernel refuses (5.15: one-device
-groups only) skips its phase; after a reboot with the GRUB setting,
-`--paper --only lazy` runs it alone.
+campaign"): one IOMMU leg per launch. The leg is the mode the host booted
+with, read from the devices behind the switch (`pips-iommu.sh mode`:
+strict, lazy, pt, or off when they have no IOMMU group); the campaign never
+changes it (the user reboots between legs). `--leg M` refuses to start
+unless the devices are M (a missed reboot), and with `--dry-run` plans leg M
+anywhere. Phases: `pcie` (E6, `pips-pcie-caps.sh`, plus the command line),
+drives `head` / NICs `g100` (E1, E2, E5, E9, E10, E13: d1t0c1 vs
+d16t218c1/d64t255c1 pb 0/1), NICs `e8` (NIC0 alone, 5-30 flows), NICs
+`rcap0` (strict leg only: rate cap on NIC0's input), `ops` (E7: the
+runner's `--iommu-ops 1`, `utils/iommu-ops.sh`). `--runs N` (default 3) per
+point of head, g100, e8. Needs design 0x0a07 and `perf`
+(`linux-tools-$(uname -r)`; without it the ops sweeps are skipped). Drives:
+the interrupt-layout check refuses only the strict leg (the livelock needs
+strict's synchronous invalidations); other legs note it and go on.
+`pips-iommu.sh set` (runtime change) stays as a tool; the campaign does not
+call it.
 
 Every phase is a `*_pips_sweep.sh` with `--tag <stamp><phase>` (stamp
 `c<MMDDhhmm>`) on design 0x0a06 or 0x0a07 (rate caps 0), the completion threshold at 31 DW
