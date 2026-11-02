@@ -14,8 +14,11 @@ together, [LOCAL-SETUP.md](LOCAL-SETUP.md) for first-time provisioning.
   which sweep and design, which report generator reads what, the published
   pages). On the Windows analysis machine `claude.md` (git-ignored) adds its
   local paths, tools and editing gotchas.
-- **Last updated:** 2026-10-31: **the 0x0A07 paper campaign is set up, not
-  run** (§8 "0x0A07 paper campaign"): `pips-campaign.sh ssd|nic --paper
+- **Last updated:** 2026-11-02: **the 0x0A07 paper campaign is in and
+  analysed** (§8 "0x0A07 paper campaign results"; page "PIPS 0x0A07
+  Campaign" v2): drives lazy/pt/off + the 10-28 rerun as strict, NICs all
+  four modes; E7 has no data (no perf). 2026-10-31: set up
+  (§8 "0x0A07 paper campaign"): `pips-campaign.sh ssd|nic --paper
   --leg <mode> --tmux`, the user's experiment list E1, E2, E5-E13 (E2b, E3,
   E4, E15 out of scope), one IOMMU leg per launch: the campaign runs the leg
   of the mode the host booted with (strict, lazy, pt, off) and never changes
@@ -2577,7 +2580,7 @@ FPGA?"), judged on page order only:
   ~1.3): it delays when the host learns an I/O finished, a trade this clean
   testbed can't judge; a separate study.
 
-### 0x0A07 paper campaign (set up 2026-10-31, not run yet)
+### 0x0A07 paper campaign (set up 2026-10-31, ran 11-01; results below)
 
 The user's experiment list for the paper (10-31), on 0x0A07. **No reboot and
 no GRUB change inside a campaign** (user rule: reboots and kernel
@@ -2593,6 +2596,14 @@ sweeps name themselves by it (`dual<kind>-pips-<mode>-<stamp>...`). The user
 reboots between legs. `--leg M` refuses to start unless the devices are M
 (catches a missed reboot); with `--dry-run` it plans leg M on any machine.
 `--runs N` sets the runs per point of head, g100 and e8 (default 3).
+
+**Trap (icx, 11-01):** a command line with `intel_iommu_on` (underscore, a
+typo) is ignored: the kernel boots with the IOMMU off and `--leg lazy` is
+refused ("the devices ... are off"). It must be `intel_iommu=on`. icx was
+booted `6.12.43-vanilla` (since at least 10-26; the 6.8 in §1-6 is older): every leg must
+run on the same kernel (compare `cmdline.txt` in the tarballs), and a
+vanilla kernel has no `linux-tools-$(uname -r)` package (`perf` from its
+source tree, `make -C tools/perf`, or the ops sweeps are skipped).
 
 | Leg | Kernel command line (iommu tokens in `GRUB_CMDLINE_LINUX_DEFAULT`) | Group type |
 |---|---|---|
@@ -2648,8 +2659,71 @@ strict/lazy/pt x pb0/pb1, E5 pkt_wait percentiles, E7 per-I/O counts per
 mode, E8 NIC0 alone strict vs pt, E9 page switches at 100G against the
 floors, E11 NIC0/NIC1 Gb/s per rcap0, E13 walk-level misses pb0 vs pb1.
 
+### 0x0A07 paper campaign results (2026-11-02)
+
+Tarballs in `dualssd/1101/1101/`, `dualnic/1101/1101/` (unpacked beside
+them; FILE-MAP §7). Tables `py -3 dualssd/report-gen/c1101.py [ssd|nic]`,
+aggregates `agg1101.py`, floors `floor11.py`. Page: "PIPS 0x0A07 Campaign" v2
+https://claude.ai/artifact/91VNbNGeJVyfuLLH8acGvY (results per experiment and
+an experiment status table with the unavailable ones marked); the summary
+"PIPS TLP Patterns" v6 adds 0x0A07.
+
+What ran: drives lazy `c11011320`, pt `c11011925`, off `c11020003` (head,
+122 runs each, 3 per point); NICs strict `c11010108` (g100, e8, rcap0), lazy
+`c11011329`, pt `c11011926`, off `c11020003` (g100, e8). **Drives strict
+`c11010137` refused at start** (that boot put drive 0's interrupts on fio
+cores 37, 42); per the user (11-02) the **10-28 rerun stands in** for it
+(same kernel, cores, build, grid; 1 run per point). Checked: at 64k/1m it
+agrees with the three new legs within 1% (Gb/s), 2% (page switches), 5%
+(wait). **ops (E7) skipped in all 8 legs: `perf` runs on neither kernel**
+(bigserver 5.15.0-177-generic, icx 6.12.43-vanilla; icx has been on 6.12
+since at least 10-26, the "6.8" in §1-6 is older). Switch fine, stuck 0, no
+soft lockups.
+
+Results (page has the tables):
+1. **Batching costs the hosts nothing measurable (E1, E5).** d64 + page
+   batching vs d1t0c1, median over 8 drive points: Gb/s -0.8..-2.1%, CPU
+   +-0.2 points, fio p99 within 1.2%, every mode. Switch wait p99 4-26 us,
+   under 3% of the lowest fio mean latency (155 us, 4k).
+2. **Page order is the switch's, not the IOMMU's (E2, E9).** From 16k up page
+   switches per page agree within +-3% across the 4 modes at every setting;
+   d64 + page batching 1.3-1.5x legal floor at 4k/16k, 2.4-2.8x at 64k/1m
+   (segments run out, spill counter saturated) in every mode.
+3. **Page order doesn't move IOTLB misses (E2, E13).** pb1/pb0 drive misses
+   x1.000 strict, x0.995 lazy; NIC misses per Gb/s within ~2%. Misses ~1 per
+   4 KiB page in strict and lazy (compulsory). Walk-level misses unchanged.
+4. **Strict is the host cost, only at 4k (E2).** Drives 4k j4: strict 16.2,
+   lazy 46.2, pt 54.0, off 53.9 Gb/s. Strict: L1/L2 walk misses ~0.7 per 4 KiB
+   (lazy 0.002). 16k strict -7%; 64k/1m equal. Lazy cuts misses 22% at 4k
+   only.
+5. **NICs: IOMMU mode doesn't matter (E1, E8).** Both NICs within 0.3% across
+   modes. NIC0 alone (d1t0c1 splits its packets in every mode, ~80 Gb/s):
+   strict -1.7% at 30 flows, +1..+7 CPU points. NIC lazy misses = strict's
+   (mlx5 page pool keeps pages mapped).
+6. **100G (E9):** 5 flows, d64 + page batching 2.31 per packet vs legal floor
+   2.28; d1 and d64 without page batching split every packet (8.9-9.0, ~140k
+   pause frames, 2.2M discards per run). 30 flows host-limited at ~48.6 Gb/s
+   (as on 0x0A06).
+7. **E11:** rcap0 113/90/68 -> NIC0 40.6/33.7/26.8 Gb/s (86-96% of intent),
+   NIC1 takes the rest (total 105-106), NIC0 splits with pauses.
+8. **E12:** drive completions 4 DW, data 64 DW (drive 1 also 36 DW, 18-19%);
+   NIC completions 16 DW, data 128 DW 87% / 112 DW 12%; rules hold
+   99.04-100% / 99.999-100%, every mode. **E6:** identical PCIe settings in
+   every boot (MPS 256 bigserver / 512 icx, RO and NoSnoop on below the root
+   port, PIPS ports without ACS but each device in its own group with its
+   downstream port).
+9. **Confounded cell:** drives 4k j16 are CPU-bound and depend on each boot's
+   interrupt placement: pt (drive 0 completing on its own fio cores) 53.9 vs
+   off 46.4 Gb/s. Compare modes at 4k on j4. A fair j16 comparison needs a
+   rerun with `SSD_CORES` that avoid the interrupt CPUs in every boot.
+
+**Not available (write around it):** E2b, E3, E4, E15 (out of scope), E7
+(no perf), E14 (not written), NIC latency for E1 (iperf3 has none). Partly:
+E10 (drive strict 1 run; E11 1 run per cap).
+
 ### Next
 
+Status 11-02: the paper campaign is in and analysed (results above); the only open run is optional (item 9: drives 4k j16 per mode with interrupt-safe cores).
 Status 10-31: the paper campaign above is set up (not run): one IOMMU leg per boot, the user reboots between legs.
 Status 10-30: both reruns are in; **verdict: the study is done** (above).
 The items below are kept for reference; none is needed. The only one still
