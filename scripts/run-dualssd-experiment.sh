@@ -66,6 +66,22 @@
 # logs/<name>-RUN-<j>/iommu-ops.txt, reports/<name>-RUN-<j>/iommu-ops.rpt,
 # iommu_ops_* in the results). Counting costs CPU per map: for counting runs.
 #
+# --gen alias: the in-house generator instead of fio (scripts/pips/alias/,
+# README.md there). The drives are bound to vfio-pci for the runner's runs
+# (alias-vfio.sh; put back on nvme when it exits, and at its next start if a
+# run died) and alias-nvme reads them with polled queues: -J queues per drive,
+# --iodepth reads in flight per queue, --bs per read, every 4 KiB landing on
+# the next page of a fixed aliasing pattern mapped ONCE at a fixed IOVA, so
+# the misses come from the pattern, not from map/unmap:
+#   --ws N --stride N   pages first + i*stride, i < ws (default 64, 1)
+#   --first N --order cyclic|shuffle|random --page-list PATH --backing-pages N
+#   --lba rand|seq      where on the namespace (default rand)
+# Read-only as fio: the generator builds no command but Identify, queue
+# setup and Read. Its per-queue output is fio's (fio-ssd<i>-<k>.json and
+# _iops.1.log), so fio-sum and the results are the same; the results add
+# gen=alias and alias_* (pattern). The IOMMU must be on (VFIO needs a group;
+# pt is fine and translates: VFIO's domain is its own).
+#
 # Exit status 3: this configuration could not be measured (fio instances died,
 # stalled or missed the window, or pcm-iio logged nothing with the IOMMU on;
 # with it off or pt such a run is kept); sweeps log it and go on.
@@ -96,6 +112,8 @@ num_runs=1
 results_file=""        # JSONL to append to; default ~/<exp>-<N>.jsonl, first unused N
 pips_log=0             # 1: record the PIPS switch's TLP log in every run
 iommu_ops=0            # 1: count IOMMU map/unmap and VT-d invalidations (utils/iommu-ops.sh)
+gen=fio                # fio, or alias: scripts/pips/alias/alias-nvme through VFIO
+a_ws=64; a_stride=1; a_first=0; a_order=cyclic; a_list=""; a_backing=0; a_lba=rand
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -114,8 +132,16 @@ while [ $# -gt 0 ]; do
         --results)      results_file="$2"; shift 2 ;;
         --pips-log)     pips_log="$2"; shift 2 ;;
         --iommu-ops)    iommu_ops="$2"; shift 2 ;;
+        --gen)          gen="$2"; shift 2 ;;
+        --ws)           a_ws="$2"; shift 2 ;;
+        --stride)       a_stride="$2"; shift 2 ;;
+        --first)        a_first="$2"; shift 2 ;;
+        --order)        a_order="$2"; shift 2 ;;
+        --page-list)    a_list="$2"; shift 2 ;;
+        --backing-pages) a_backing="$2"; shift 2 ;;
+        --lba)          a_lba="$2"; shift 2 ;;
         -h|--help)
-            sed -n '2,71p' "$SELF"; exit 0 ;;
+            sed -n '2,85p' "$SELF"; exit 0 ;;
         *) echo "unknown option: $1"; exit 2 ;;
     esac
 done
@@ -128,6 +154,13 @@ case "$ssds" in 1|2) ;; *) echo "ERROR: --ssds must be 1 or 2" >&2; exit 2 ;; es
 case "$pips_log" in 0|1) ;; *) echo "ERROR: --pips-log must be 0 or 1" >&2; exit 2 ;; esac
 case "$iommu_ops" in 0|1) ;; *) echo "ERROR: --iommu-ops must be 0 or 1" >&2; exit 2 ;; esac
 case "$ssd_index" in 0|1) ;; *) echo "ERROR: --ssd-index must be 0 or 1" >&2; exit 2 ;; esac
+case "$gen" in fio|alias) ;; *) echo "ERROR: --gen must be fio or alias" >&2; exit 2 ;; esac
+case "$a_order" in cyclic|shuffle|random) ;; *) echo "ERROR: --order cyclic, shuffle or random" >&2; exit 2 ;; esac
+case "$a_lba" in rand|seq) ;; *) echo "ERROR: --lba rand or seq" >&2; exit 2 ;; esac
+for v in "$a_ws" "$a_stride" "$a_first" "$a_backing"; do
+    case "$v" in ''|*[!0-9]*) echo "ERROR: --ws/--stride/--first/--backing-pages take integers" >&2; exit 2 ;; esac
+done
+[ -z "$a_list" ] || [ -f "$a_list" ] || { echo "ERROR: --page-list $a_list: no such file" >&2; exit 2; }
 # JOBS[i]: instances on drive i. -J n0,n1 sets them separately (co-run only).
 IFS=',' read -r -a JOBS <<< "$jobs"
 case "${#JOBS[@]}" in
@@ -158,11 +191,36 @@ CPU_MODEL=$(awk -F: '/^model[[:space:]]*:/{gsub(/ /,"",$2); print $2; exit}' /pr
 # Which drive indices participate in this run.
 if [ "$ssds" -eq 1 ]; then ACTIVE=( "$ssd_index" ); else ACTIVE=( 0 1 ); fi
 
+ALIAS_DIR="$HERE/pips/alias"
+if [ "$gen" = alias ] && ls /run/alias-vfio/* >/dev/null 2>&1; then
+    echo "-- drives left on vfio-pci by an earlier alias run: putting them back on nvme"
+    sudo -n bash "$ALIAS_DIR/alias-vfio.sh" restore || echo "WARNING: alias-vfio.sh restore failed (status: bash $ALIAS_DIR/alias-vfio.sh status)" >&2
+fi
+
 DEVS=(); BDFS=()
 for i in "${ACTIVE[@]}"; do
     ssd_resolve "${SSD_SERIALS[$i]}" || exit 1
     DEVS[$i]=$SSD_DEV; BDFS[$i]=$SSD_BDF
 done
+# --gen alias binds these to vfio-pci: the active drives, and the other drive
+# too when it shares their IOMMU group (no ACS on the switch's ports: VFIO
+# then needs every endpoint of the group on vfio-pci, even for one drive alone).
+ALIAS_BIND=()
+if [ "$gen" = alias ]; then
+    for i in "${ACTIVE[@]}"; do ALIAS_BIND+=( "${BDFS[$i]}" ); done
+    for i in 0 1; do
+        [[ " ${ACTIVE[*]} " == *" $i "* ]] && continue
+        [ -n "${SSD_SERIALS[$i]:-}" ] || continue
+        ssd_resolve "${SSD_SERIALS[$i]}" >/dev/null 2>&1 || continue
+        og=$(basename "$(readlink "/sys/bus/pci/devices/$SSD_BDF/iommu_group" 2>/dev/null)" 2>/dev/null)
+        for b in "${ALIAS_BIND[@]}"; do
+            if [ -n "$og" ] && [ "$og" = "$(basename "$(readlink "/sys/bus/pci/devices/$b/iommu_group" 2>/dev/null)" 2>/dev/null)" ]; then
+                echo "-- SSD $i ($SSD_BDF) shares IOMMU group $og with an active drive: it goes to vfio-pci too (idle)"
+                ALIAS_BIND+=( "$SSD_BDF" ); break
+            fi
+        done
+    done
+fi
 
 # CORES[i]: the cores drive i's instances run on, round-robin. Normally
 # SSD_CORES[i]. A co-run with different counts splits both lists' cores in
@@ -214,6 +272,9 @@ translating() {   # true unless every active drive's IOMMU is off or passthrough
 # the pkill/pgrep command line itself, and the anchored fio from matching the
 # sudo wrapper.
 FIO_MATCH='^(/[^ ]*/)?fio .*--name=dualssd[_]'
+# --gen alias: the generator, by its binary path at the start of the command
+# line (sudo's own line starts with sudo). It also writes its JSON on SIGINT.
+[ "$gen" = alias ] && FIO_MATCH='^(/[^ ]*/)?alias-nvm[e] --dev '
 fio_count() { local n; n=$(pgrep -c -f "$FIO_MATCH" 2>/dev/null); echo "${n:-0}"; }
 stop_fio() {    # SIGINT makes fio stop and still write its JSON
     sudo -n pkill -INT -f "$FIO_MATCH" >/dev/null 2>&1 || true
@@ -248,8 +309,21 @@ preflight() {
     fi
 
     miss=""
-    for t in fio python3 sar lspci; do command -v "$t" >/dev/null || miss="$miss $t"; done
+    for t in $( [ "$gen" = fio ] && echo fio) python3 sar lspci; do command -v "$t" >/dev/null || miss="$miss $t"; done
     [ -n "$miss" ] && PROBLEMS+=("missing tools:$miss")
+    if [ "$gen" = alias ]; then
+        if ALIAS_NVME=$(bash "$ALIAS_DIR/alias-run.sh" --build alias-nvme 2>&1 | tail -1) && [ -x "$ALIAS_NVME" ]; then
+            echo "   alias-nvme: $ALIAS_NVME"
+        else
+            PROBLEMS+=("alias-nvme does not build here: $ALIAS_NVME
+    make -C $ALIAS_DIR nvme")
+        fi
+        modinfo vfio-pci >/dev/null 2>&1 || PROBLEMS+=("no vfio-pci module (modinfo vfio-pci)")
+        for i in "${ACTIVE[@]}"; do
+            [ -e "/sys/bus/pci/devices/${BDFS[$i]}/iommu_group" ] ||
+                PROBLEMS+=("SSD $i (${BDFS[$i]}) has no IOMMU group: --gen alias needs the IOMMU on (VFIO; pt is fine)")
+        done
+    fi
 
     if [ -x "$PCM_BIN/pcm-iio" ]; then
         echo "   pcm-iio: $PCM_BIN/pcm-iio"
@@ -339,8 +413,13 @@ $(printf '%s\n' "$busy" | sed 's/^/      /')")
 }
 
 aborted=0
+ALIAS_BOUND=0
 cleanup() {
     stop_fio
+    if [ "$ALIAS_BOUND" = 1 ]; then
+        sudo -n bash "$ALIAS_DIR/alias-vfio.sh" restore "${ALIAS_BIND[@]}" ||
+            echo "ERROR: drives not back on nvme: sudo bash $ALIAS_DIR/alias-vfio.sh restore" >&2
+    fi
     if [ "$aborted" = 1 ]; then
         # Interrupted mid-window: record-host-metrics.sh never got to stop its
         # samplers. Preflight made sure none of these belonged to anyone else.
@@ -394,13 +473,25 @@ echo "=============================================================="
 echo "  experiment : $exp   ($(date '+%F %T'))"
 echo "  SSDs       : $ssds  (indices: ${ACTIVE[*]})"
 for i in "${ACTIVE[@]}"; do echo "               $i: ${DEVS[$i]}  ${JOBS[$i]} instance(s) on cores ${CORES[$i]}"; done
+if [ "$gen" = alias ]; then
+echo "  generator  : alias-nvme (VFIO, polled), per queue: iodepth $iodepth, bs=$bs, lba $a_lba, read-only"
+echo "  pattern    : $( [ -n "$a_list" ] && echo "page list $a_list" || echo "ws $a_ws stride $a_stride first $a_first") order $a_order, backing ${a_backing:-0} (0 = default)"
+else
 echo "  per instance: iodepth $iodepth, $rw bs=$bs, $ioengine, O_DIRECT, read-only"
+fi
 echo "  windows    : ramp ${warm}s, CPU ${dur}s, PCIe ${dur}s$( [ "$membw" = 1 ] && echo ", memory $((30 + dur))s" )"
 echo "  IOMMU      : $iommu_mode on $iommu_units   (kernel $(uname -r))"
 echo "=============================================================="
 
 preflight
 uplink_gbps=$(shared_link_gbps $(for i in "${ACTIVE[@]}"; do echo "${BDFS[$i]}"; done))
+if [ "$gen" = alias ]; then
+    # The drives leave the nvme driver for this runner's runs; cleanup puts them back.
+    ALIAS_BOUND=1
+    sudo -n bash "$ALIAS_DIR/alias-vfio.sh" bind "${ALIAS_BIND[@]}" || {
+        echo "ERROR: could not bind the drives to vfio-pci (above)" >&2; exit 1; }
+    bash "$ALIAS_DIR/alias-vfio.sh" status "${ALIAS_BIND[@]}" | sed 's/^/   /'
+fi
 echo "   narrowest shared PCIe link: ~${uplink_gbps} Gbps"
 
 for ((j = 0; j < num_runs; j++)); do
@@ -429,7 +520,36 @@ for ((j = 0; j < num_runs; j++)); do
 
     # ---------------------------------------------------------------- load
     want=0; fio_pids=()
-    for i in "${ACTIVE[@]}"; do
+    if [ "$gen" = alias ]; then
+        # One generator for every active drive: one VFIO process per group.
+        aargs=(); acpus=(); aq=(); aser=()
+        for i in "${ACTIVE[@]}"; do
+            aargs+=( --dev "${BDFS[$i]}=$L/fio-ssd$i" ); acpus+=( "${CORES[$i]}" ); aq+=( "${JOBS[$i]}" )
+            aser+=( "${SSD_SERIALS[$i]}" )
+        done
+        [ -n "$a_list" ] && aargs+=( --page-list "$a_list" )
+        rm -f "$L/alias-ready"
+        sudo "$ALIAS_NVME" "${aargs[@]}" --serial "$(IFS=,; echo "${aser[*]}")" \
+            --queues "$(IFS=,; echo "${aq[*]}")" --cpus "$(IFS=/; echo "${acpus[*]}")" \
+            --qd "$iodepth" --bs "$bs" --lba "$a_lba" \
+            --ws "$a_ws" --stride "$a_stride" --first "$a_first" --order "$a_order" \
+            $( [ "$a_backing" -gt 0 ] && echo "--backing-pages $a_backing") \
+            --warm "$warm" --seconds "$fio_runtime" --heartbeat 10 \
+            --ready-file "$L/alias-ready" > "$L/alias-nvme.out" 2>&1 9>&- &
+        fio_pids+=( $! ); want=1
+        for _ in $(seq 300); do
+            [ -e "$L/alias-ready" ] && break
+            kill -0 "${fio_pids[0]}" 2>/dev/null || break
+            sleep 0.2
+        done
+        if [ ! -e "$L/alias-ready" ]; then
+            echo "ERROR: alias-nvme did not load the drives. Its output:" >&2
+            tail -15 "$L/alias-nvme.out" | sed 's/^/    /' >&2
+            exit 3
+        fi
+        grep -E '^alias-nvme: (0000|[0-9a-f]{4}:)|region|pattern' "$L/alias-nvme.out" | sed 's/^/   /'
+    fi
+    for i in $( [ "$gen" = fio ] && echo "${ACTIVE[@]}"); do
         IFS=',' read -r -a cores <<< "${CORES[$i]}"
         [ "${JOBS[$i]}" -gt "${#cores[@]}" ] && [ "$j" -eq 0 ] && \
             echo "   NOTE: SSD $i: ${JOBS[$i]} instances on ${#cores[@]} cores; some cores run more than one"
@@ -464,10 +584,10 @@ for ((j = 0; j < num_runs; j++)); do
     # An instance that died on startup leaves its drive under-loaded, and the
     # run would otherwise measure that without a word.
     got=$(fio_count)
-    echo "   fio instances running: $got/$want"
+    echo "   $( [ "$gen" = alias ] && echo "alias-nvme processes" || echo "fio instances") running: $got/$want"
     if [ "$got" -lt "$want" ]; then
-        echo "ERROR: only $got of $want fio instances are running. First errors:" >&2
-        cat "$L"/fio-ssd*.err 2>/dev/null | grep -v '^$' | head -10 | sed 's/^/    /' >&2
+        echo "ERROR: only $got of $want $gen processes are running. First errors:" >&2
+        cat "$L"/fio-ssd*.err "$L"/alias-nvme.out 2>/dev/null | grep -v '^$' | grep -iE 'error|fatal|warn' | head -10 | sed 's/^/    /' >&2
         exit 3
     fi
 
@@ -654,7 +774,10 @@ python3 "$HERE/dualssd-results.py" dump \
     --meta mode="$( [ "$ssds" -eq 2 ] && echo both || echo "ssd${ssd_index}only" )" \
     --meta iommu="$iommu_mode" --meta iommu_units="$iommu_units" \
     --meta instances_per_ssd="$inst" "${per_drive[@]}" --meta bs="$bs" --meta iodepth="$iodepth" \
-    --meta rw="$rw" --meta ioengine="$ioengine" \
+    --meta rw="$rw" --meta ioengine="$( [ "$gen" = alias ] && echo vfio-alias || echo "$ioengine")" \
+    --meta gen="$gen" \
+    $( [ "$gen" = alias ] && printf -- '--meta %s ' alias_ws="$a_ws" alias_stride="$a_stride" alias_first="$a_first" \
+        alias_order="$a_order" alias_backing="$a_backing" alias_lba="$a_lba" alias_list="${a_list:-none}") \
     --meta devices="$(for i in "${ACTIVE[@]}"; do printf '%s ' "${DEVS[$i]}"; done | xargs | tr ' ' ',')" \
     --meta serials="$(for i in "${ACTIVE[@]}"; do printf '%s ' "${SSD_SERIALS[$i]}"; done | xargs | tr ' ' ',')" \
     --meta dur_s="$dur" --meta warm_s="$warm" --meta cpu_util_cores="$active_cores" \

@@ -46,6 +46,24 @@
 # descriptors beside the pcm-iio window, with this host's rx packets of the
 # same seconds (perf tracepoints, utils/iommu-ops.sh: iommu-ops.txt/.rpt,
 # iommu_ops_* in the results). Counting costs CPU per map: for counting runs.
+#
+# --gen alias: the in-house generator instead of iperf3 (scripts/pips/alias/,
+# README.md there). This host posts one-sided RDMA READs to an alias-rdma
+# server on the client (styx), one per NIC, and its NIC writes the responses
+# into a local MR registered ONCE, one 4 KiB page per scatter entry, in a
+# fixed aliasing pattern: the same direction as iperf3 (the NIC behind the
+# switch writes into this host's memory), without map/unmap per packet.
+#   -S N                QPs per NIC (--flows-nic1 for NIC 1), one thread each NIC
+#   --depth N           READs in flight per QP (default 16)
+#   --rdma-bs BYTES     bytes per READ (default 4096: one page)
+#   --ws N --stride N   pages first + i*stride, i < ws (default 64, 1)
+#   --first N --order cyclic|shuffle|random --page-list PATH --backing-pages N
+# Line rate only (-b uncapped, no --client-hw-rate). Per NIC the generator
+# writes fio's files (logs/<run>/fio-nic<i>.json, _iops.1.log); the Gb/s over
+# the measurement windows goes to reports/<run>-nic<i>/iperf.bw.rpt as
+# Avg_iperf_tput, so sweeps and dualnic-results.py read it as before; the
+# results add gen=alias and alias_* (pattern). Strict or lazy mode: with pt or
+# off the MR is not translated and there is no IOTLB to alias.
 set -u
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -71,6 +89,8 @@ pips_log=0             # 1: record the PIPS switch's TLP log in every run
 flows1=""              # NIC 1's flow count when it differs from NIC 0's (--flows-nic1)
 hw_rate=""             # client-side hardware pacing per port (--client-hw-rate), e.g. 50g
 iommu_ops=0            # 1: count IOMMU map/unmap and VT-d invalidations (utils/iommu-ops.sh)
+gen=iperf              # iperf, or alias: scripts/pips/alias/alias-rdma (RDMA READ)
+a_ws=64; a_stride=1; a_first=0; a_order=cyclic; a_list=""; a_backing=0; a_depth=16; a_bs=4096
 CLIENT_BRANCH="$(git -C "$HERE/.." rev-parse --abbrev-ref HEAD 2>/dev/null || echo icx-dualnic)"
 
 while [ $# -gt 0 ]; do
@@ -94,6 +114,15 @@ while [ $# -gt 0 ]; do
         --flows-nic1)    flows1="$2"; shift 2 ;;
         --client-hw-rate) hw_rate="$2"; shift 2 ;;
         --iommu-ops)     iommu_ops="$2"; shift 2 ;;
+        --gen)           gen="$2"; shift 2 ;;
+        --ws)            a_ws="$2"; shift 2 ;;
+        --stride)        a_stride="$2"; shift 2 ;;
+        --first)         a_first="$2"; shift 2 ;;
+        --order)         a_order="$2"; shift 2 ;;
+        --page-list)     a_list="$2"; shift 2 ;;
+        --backing-pages) a_backing="$2"; shift 2 ;;
+        --depth)         a_depth="$2"; shift 2 ;;
+        --rdma-bs)       a_bs="$2"; shift 2 ;;
         -h|--help)
             awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; exit 0 ;;
         *) echo "unknown option: $1"; exit 2 ;;
@@ -103,6 +132,19 @@ case "$pips_log" in 0|1) ;; *) echo "ERROR: --pips-log must be 0 or 1" >&2; exit
 case "$iommu_ops" in 0|1) ;; *) echo "ERROR: --iommu-ops must be 0 or 1" >&2; exit 2 ;; esac
 case "$flows1" in ''|[1-9]|[1-9][0-9]) ;; *) echo "ERROR: --flows-nic1 takes 1-99" >&2; exit 2 ;; esac
 case "$hw_rate" in ''|[1-9]*[gG]) ;; *) echo "ERROR: --client-hw-rate takes e.g. 50g" >&2; exit 2 ;; esac
+case "$gen" in iperf|alias) ;; *) echo "ERROR: --gen must be iperf or alias" >&2; exit 2 ;; esac
+case "$a_order" in cyclic|shuffle|random) ;; *) echo "ERROR: --order cyclic, shuffle or random" >&2; exit 2 ;; esac
+for v in "$a_ws" "$a_stride" "$a_first" "$a_backing" "$a_depth" "$a_bs"; do
+    case "$v" in ''|*[!0-9]*) echo "ERROR: --ws/--stride/--first/--backing-pages/--depth/--rdma-bs take integers" >&2; exit 2 ;; esac
+done
+if [ "$gen" = alias ]; then
+    [ -z "$hw_rate" ] || { echo "ERROR: --gen alias runs at line rate: no --client-hw-rate" >&2; exit 2; }
+    case "$bandwidth" in 0|uncapped|unlimited|none|line|linerate) ;;
+        *) echo "ERROR: --gen alias runs at line rate: pass -b uncapped (got $bandwidth)" >&2; exit 2 ;; esac
+    [ -z "$a_list" ] || [ -f "$a_list" ] || { echo "ERROR: --page-list $a_list: no such file" >&2; exit 2; }
+fi
+ALIAS_DIR="$HERE/pips/alias"
+ALIAS_PORT_OFF=700     # alias-rdma servers listen on BASE_PORTS[i] + this
 # Flows of NIC i: -S, or --flows-nic1 for NIC 1.
 nflows() { if [ "$1" = 1 ] && [ -n "$flows1" ]; then echo "$flows1"; else echo "$num_servers"; fi; }
 
@@ -206,9 +248,21 @@ preflight() {
     }
     echo "   remote repo: OK ($REPO)"
 
+    if [ "$gen" = alias ]; then
+        # Build on both hosts as the user (the runs use sudo); the binaries live
+        # in build/<host>/ of each host's copy of the repo.
+        ALIAS_RDMA=$(bash "$ALIAS_DIR/alias-run.sh" --build alias-rdma 2>&1 | tail -1)
+        [ -x "$ALIAS_RDMA" ] || { echo "ERROR: alias-rdma does not build here: $ALIAS_RDMA" >&2; exit 1; }
+        R_ALIAS_RDMA=$(rsh_try "bash '$ALIAS_DIR/alias-run.sh' --build alias-rdma" 2>&1 | tail -1)
+        rsh_try "test -x '$R_ALIAS_RDMA'" || {
+            echo "ERROR: alias-rdma does not build on the client: $R_ALIAS_RDMA" >&2
+            echo "  (is $ALIAS_DIR in its copy of the repo? --sync-client; libibverbs-dev?)" >&2; exit 1; }
+        echo "   alias-rdma: $ALIAS_RDMA here, $R_ALIAS_RDMA on the client"
+    else
     rsh_try "command -v iperf3 >/dev/null" || {
         echo "ERROR: iperf3 not installed on the client." >&2; exit 1; }
     echo "   remote iperf3: OK"
+    fi
 
     # setup-server.sh is git-ignored, so it never arrives via git clone. The
     # client's setup-envir.sh sources it for DEP_DIR, which it needs to find
@@ -368,9 +422,16 @@ iommu_mode=$(for i in "${ACTIVE[@]}"; do
 # "sudo pkill -9 -f iperf3" command line itself, so pkill kills its own sudo
 # wrapper -- that is where the stream of "Killed" messages came from, and it
 # can stop the kill part-way through.
+# The alias generators by their binary path at the start of the command line.
+ALIAS_MATCH='^(/[^ ]*/)?alias-rdm[a] --role'
+alias_count() { local n; n=$(pgrep -c -f "$ALIAS_MATCH client" 2>/dev/null); echo "${n:-0}"; }
 cleanup() {
     sudo pkill -9 iperf3 >/dev/null 2>&1 || true
     rsh_try "sudo pkill -9 iperf3; screen -wipe" >/dev/null 2>&1 || true
+    if [ "$gen" = alias ]; then
+        sudo pkill -INT -f "$ALIAS_MATCH" >/dev/null 2>&1 || true
+        rsh_try "sudo pkill -INT -f '$ALIAS_MATCH'; screen -wipe" >/dev/null 2>&1 || true
+    fi
     sudo bash -c 'echo 0 > /sys/kernel/debug/tracing/tracing_on' 2>/dev/null || true
     if [ -n "$hw_rate" ]; then
         local i
@@ -457,6 +518,7 @@ echo "  NICs       : $nics  (indices: ${ACTIVE[*]})"
 [ -n "$hw_rate" ] && bandwidth=uncapped           # the client's NIC paces, not iperf3
 echo "  per NIC    : $num_servers flows${flows1:+ (NIC 1: $flows1)}, $( [ "$(per_flow_bw "$bandwidth" "$num_clients")" = 0 ] && echo "UNCAPPED (line rate)" || echo "$bandwidth aggregate ($(per_flow_bw "$bandwidth" "$num_clients") bps/flow)" ), cca=$cca${hw_rate:+, client NIC paced to $hw_rate per port in hardware}"
 echo "  mtu $mtu  ring $ring_buffer  sockbuf ${buf}MB  dur ${dur}s"
+[ "$gen" = alias ] && echo "  generator  : alias-rdma READs, -S = QPs per NIC, depth $a_depth, bs $a_bs; pattern $( [ -n "$a_list" ] && echo "page list $a_list" || echo "ws $a_ws stride $a_stride first $a_first") order $a_order"
 echo "  IOMMU      : $iommu_mode   (kernel $(uname -r))"
 echo "=============================================================="
 
@@ -525,6 +587,48 @@ for ((j = 0; j < num_runs; j++)); do
     done
     echo "   data-plane links: OK"
 
+    if [ "$gen" = alias ]; then
+    # ------------------------------------------------- alias: servers, clients
+    rsh "sudo pkill -INT -f '$ALIAS_MATCH' >/dev/null 2>&1; screen -wipe >/dev/null 2>&1; true"
+    for i in "${ACTIVE[@]}"; do
+        rsh "screen -dmS alias_srv_nic$i bash -c \"sudo $R_ALIAS_RDMA --role server --netdev ${CLIENT_INTFS[$i]} \
+             --port $(( BASE_PORTS[i] + ALIAS_PORT_OFF )) --heartbeat 30 > /tmp/alias-srv-nic$i.log 2>&1\""
+    done
+    sleep 2
+    a_secs=$(( 2 * dur + 30 + dur + 120 ))      # a backstop: stopped with SIGINT after the window
+    for i in "${ACTIVE[@]}"; do
+        rm -f "$L/alias-ready-nic$i"
+        sudo "$ALIAS_RDMA" --role client --netdev "${SERVER_INTFS[$i]}" --server-ip "${CLIENT_NIC_IPS[$i]}" \
+            --port $(( BASE_PORTS[i] + ALIAS_PORT_OFF )) --qps "$(nflows "$i")" --depth "$a_depth" --bs "$a_bs" \
+            --ws "$a_ws" --stride "$a_stride" --first "$a_first" --order "$a_order" \
+            $( [ -n "$a_list" ] && echo "--page-list $a_list") $( [ "$a_backing" -gt 0 ] && echo "--backing-pages $a_backing") \
+            --warm 10 --seconds "$a_secs" --heartbeat 10 --cpu "${SERVER_CORES[$i]%%,*}" \
+            --name "alias_nic$i" --out "$L/fio-nic$i" --ready-file "$L/alias-ready-nic$i" \
+            > "$L/alias-rdma-nic$i.log" 2>&1 9>&- &
+    done
+    for _ in $(seq 150); do
+        n=0; for i in "${ACTIVE[@]}"; do [ -e "$L/alias-ready-nic$i" ] && n=$((n + 1)); done
+        [ "$n" -eq "${#ACTIVE[@]}" ] && break
+        sleep 0.2
+    done
+    for i in "${ACTIVE[@]}"; do
+        if [ ! -e "$L/alias-ready-nic$i" ]; then
+            echo "ERROR: alias-rdma for NIC $i did not start. Its output, and the server's:" >&2
+            tail -12 "$L/alias-rdma-nic$i.log" | sed 's/^/    /' >&2
+            rsh_try "tail -5 /tmp/alias-srv-nic$i.log" 2>/dev/null | sed 's/^/    server: /' >&2
+            exit 1
+        fi
+        grep -E 'pattern|MR |connected' "$L/alias-rdma-nic$i.log" | sed "s/^/   NIC $i: /"
+    done
+    echo "warming up..."; sleep 12
+    running=$(alias_count)
+    echo "   alias-rdma clients running: $running/${#ACTIVE[@]}"
+    if [ "$running" -lt "${#ACTIVE[@]}" ]; then
+        echo "ERROR: an alias-rdma client stopped during the warm-up:" >&2
+        tail -5 "$L"/alias-rdma-nic*.log | sed 's/^/    /' >&2
+        exit 1
+    fi
+    else
     # ------------------------------------------------------------ receivers
     # Every invocation gets --no_kill and the stale-process sweep happens ONCE,
     # here. The invocations are backgrounded, so loop order is not execution
@@ -591,6 +695,7 @@ for ((j = 0; j < num_runs; j++)); do
         echo "                    -p ${BASE_PORTS[${ACTIVE[0]}]} -c 0 -b 1g --no_kill" >&2
         exit 1
     fi
+    fi   # gen
 
     # The TLP log, in steady state and before the window: BAR0 accesses
     # briefly hold up the switch's host-to-device requests.
@@ -614,6 +719,24 @@ for ((j = 0; j < num_runs; j++)); do
     t_pips=$SECONDS
     [ "$pips_log" = 1 ] && pips_collect
 
+    if [ "$gen" = alias ]; then
+        # Stop the clients (they write their JSON on SIGINT; the servers exit
+        # when their client closes), then Gb/s over exactly the windows.
+        alive=$(alias_count)
+        sudo pkill -INT -f "$ALIAS_MATCH client" >/dev/null 2>&1
+        for _ in $(seq 30); do [ "$(alias_count)" -eq 0 ] && break; sleep 0.5; done
+        [ "$alive" -lt "${#ACTIVE[@]}" ] && echo "WARNING: only $alive of ${#ACTIVE[@]} alias-rdma clients ran to the end of the window" >&2
+        for i in "${ACTIVE[@]}"; do
+            r="$setup_dir/reports/$RUN-nic$i"; mkdir -p "$r"
+            python3 "$HERE/dualssd-results.py" fio-sum --out "$r/fio.rpt" \
+                --windows "$L/windows.txt" "$L/fio-nic$i.json" ||
+                echo "WARNING: NIC $i: alias-rdma did not cover the measurement window (above)" >&2
+            g=$(awk '/^read_Gbps:/ { print $2 }' "$r/fio.rpt" 2>/dev/null)
+            echo "Avg_iperf_tput: ${g:-0}" > "$r/iperf.bw.rpt"
+            echo "   NIC $i: ${g:-0} Gb/s over the window ($(awk '/^IOPS:/ { printf "%.0f kIOPS", $2 / 1e3 }' "$r/fio.rpt" 2>/dev/null)," \
+                 "covered: $(awk '/^window_covered:/ { print ($2 == 1 ? "yes" : "NO") }' "$r/fio.rpt" 2>/dev/null))"
+        done
+    else
     # iperf3 server stats are written by run-netapp-tput.sh after its own
     # 80s wait; give those background jobs time to land their .rpt files.
     echo "waiting for iperf3 stats to be written..."
@@ -624,6 +747,7 @@ for ((j = 0; j < num_runs; j++)); do
         rcp_back "$setup_dir/reports/$exp-RUN-client-$j-nic$i/retx.rpt" \
                  "$setup_dir/reports/$RUN/retx-nic$i.rpt" 2>/dev/null
     done
+    fi
 
     cleanup
 done
@@ -753,6 +877,9 @@ python3 "$HERE/dualnic-results.py" dump \
     --meta client_hw_rate="${hw_rate:-none}" \
     --meta per_flow_bps="$flow_bw" \
     --meta mtu="$mtu" --meta ring_buffer="$ring_buffer" --meta sockbuf_mb="$buf" \
+    --meta gen="$gen" \
+    $( [ "$gen" = alias ] && printf -- '--meta %s ' alias_ws="$a_ws" alias_stride="$a_stride" alias_first="$a_first" \
+        alias_order="$a_order" alias_backing="$a_backing" alias_depth="$a_depth" alias_bs="$a_bs" alias_list="${a_list:-none}") \
     --meta dur_s="$dur" --meta cca="$cca" --meta cpu_util_cores="$active_cores" \
     ${PIPS_META[@]+"${PIPS_META[@]}"} \
     || echo "WARNING: could not write $results_file; the .rpt files are intact." >&2

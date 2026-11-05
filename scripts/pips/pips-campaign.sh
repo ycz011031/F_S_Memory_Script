@@ -13,6 +13,7 @@
 #   bash scripts/pips/pips-campaign.sh nic --dry-run    # the plan, ETA and commands only
 #   bash scripts/pips/pips-campaign.sh ssd --minimal --tmux   # the 0x0A07 rerun (below)
 #   bash scripts/pips/pips-campaign.sh ssd --paper --tmux     # the 0x0A07 paper list (below)
+#   bash scripts/pips/pips-campaign.sh nic --alias --tmux     # in-house aliasing load (below)
 #
 # Options:
 #   --tmux            run in a new tmux session (asks for the sudo password
@@ -56,6 +57,27 @@
 #                            map/unmap calls and VT-d invalidations per I/O
 #                     head, g100, e8: --runs runs per point (default 3). No
 #                     pending analysis (--pending adds it)
+#   --alias           the aliasing campaign (HANDOFF §8 "Alias campaign"):
+#                     fio and iperf3 replaced by the in-house generators
+#                     (scripts/pips/alias/, runner --gen alias): drives read
+#                     through VFIO, NICs take RDMA READ responses, every 4 KiB
+#                     landing on a page of a fixed pattern mapped once, so the
+#                     IOTLB misses are capacity or conflict misses by design,
+#                     never map/unmap. One sweep per pattern point. Phases:
+#                     ageom  the IOTLB's geometry, batching off (d1t0c1):
+#                            capacity curve, stride 1, ws 16 to 65536 pages;
+#                            conflict curve, ws 32, stride 2 to 8192 pages;
+#                            one device alone and both
+#                     acap   capacity misses, both devices: stride 1, ws 256,
+#                            4096, 65536; d1t0c1 pb0 vs d16t218c1 pb 0/1
+#                     aconf  conflict misses, both devices: ws 16/32/64 at
+#                            stride 4096 (16 MiB: a multiple of any set count
+#                            up to 4096, so every page in one set), same settings
+#                     Drives: bs 4k, 4 queues x qd 32 per drive. NICs: 4 QPs
+#                     x 16 READs of 4 KiB per NIC, line rate. --runs (default
+#                     1 here). Needs the IOMMU translating: drives any mode
+#                     but off (VFIO), NICs strict or lazy (the MR is the
+#                     kernel's). No pending analysis.
 #   --leg M           with --paper: the leg expected (strict, lazy, pt, off);
 #                     refused when the devices are not so (a reboot missed).
 #                     With --dry-run: plan that leg whatever this host is
@@ -127,7 +149,7 @@ case "$KIND" in
 esac
 PASS=("$KIND"); IN_TMUX=0
 for a in "$@"; do if [ "$a" = --tmux ]; then IN_TMUX=1; else PASS+=("$a"); fi; done
-DRY=0; ONLY=""; SKIP=""; ANALYSIS=1; PENDING=""; WIRE=1; HW=1; JOBS=""; STAMP=""; RETIRE=""; MINIMAL=0; PAPER=0; LEG_WANT=""; RUNS=3
+DRY=0; ONLY=""; SKIP=""; ANALYSIS=1; PENDING=""; WIRE=1; HW=1; JOBS=""; STAMP=""; RETIRE=""; MINIMAL=0; PAPER=0; LEG_WANT=""; RUNS=""; ALIAS=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --tmux) shift ;;
@@ -140,6 +162,7 @@ while [ $# -gt 0 ]; do
         --pending) PENDING=1; shift ;;
         --minimal) MINIMAL=1; shift ;;
         --paper) PAPER=1; shift ;;
+        --alias) ALIAS=1; shift ;;
         --leg) LEG_WANT="$2"; shift 2 ;;
         --runs) RUNS="$2"; shift 2 ;;
         --no-wire) WIRE=0; shift ;;
@@ -174,9 +197,10 @@ if [ -n "$RETIRE" ]; then
     exit 0
 fi
 STAMP=${STAMP:-c$(date +%m%d%H%M)}
-[ "$MINIMAL" = 1 ] && [ "$PAPER" = 1 ] && { echo "pips-campaign: --minimal or --paper, not both" >&2; exit 2; }
-# --minimal and --paper leave the pending 0x0A04/0x0A05 analysis out unless --pending.
-[ -n "$PENDING" ] || { if [ "$MINIMAL" = 1 ] || [ "$PAPER" = 1 ]; then PENDING=0; else PENDING=1; fi; }
+[ $(( MINIMAL + PAPER + ALIAS )) -gt 1 ] && { echo "pips-campaign: one of --minimal, --paper, --alias" >&2; exit 2; }
+# --minimal, --paper and --alias leave the pending 0x0A04/0x0A05 analysis out unless --pending.
+[ -n "$PENDING" ] || { if [ "$MINIMAL" = 1 ] || [ "$PAPER" = 1 ] || [ "$ALIAS" = 1 ]; then PENDING=0; else PENDING=1; fi; }
+[ -n "$RUNS" ] || { if [ "$ALIAS" = 1 ]; then RUNS=1; else RUNS=3; fi; }
 export PIPS_PB_MODEL="${PIPS_PB_MODEL-self,sweepc1,sweepc1f512}"
 case "$STAMP" in [A-Za-z]*) ;; *) echo "--stamp: must start with a letter" >&2; exit 2 ;; esac
 case "$STAMP" in *[!A-Za-z0-9]*) echo "--stamp: letters and digits only" >&2; exit 2 ;; esac
@@ -216,6 +240,21 @@ if [ "$PAPER" = 1 ]; then
            else
                echo "ERROR: the devices behind the switch are '$LEG', not one leg (strict, lazy, pt, off)." >&2
                echo "       bash scripts/pips/pips-iommu.sh show; a mix means groups differ (a runtime change left over?): reboot." >&2
+               exit 1
+           fi ;;
+    esac
+fi
+# --alias: the IOTLB has to translate the devices' DMA. Read-only check.
+if [ "$ALIAS" = 1 ]; then
+    AMODE=$(iommu_detect)
+    case "$KIND:$AMODE" in
+        ssd:strict|ssd:lazy|ssd:pt|nic:strict|nic:lazy) ;;
+        *) if [ "$DRY" = 1 ]; then
+               echo "pips-campaign: (dry run) IOMMU here: $AMODE; --alias $KIND needs $( [ "$KIND" = ssd ] && echo "it on (strict, lazy or pt)" || echo "strict or lazy")" >&2
+           else
+               echo "ERROR: --alias $KIND: the devices behind the switch are '$AMODE'." >&2
+               if [ "$KIND" = ssd ]; then echo "       VFIO needs the IOMMU on (strict, lazy or pt)." >&2
+               else echo "       The NICs' MR is translated only in strict or lazy mode (pt/off: no IOTLB to alias)." >&2; fi
                exit 1
            fi ;;
     esac
@@ -278,8 +317,27 @@ NIC_E8=( --modes nic0only "5 10 15 30" "uncapped" "$RUNS" )                     
 NIC_RCAP0="113 90 68"; NIC_E11=( "5" "uncapped" 1 )
 NIC_OPS=( "5 30" "uncapped" 1 )
 RUNNER_EXTRA=""        # runner options for the next sweep (ops: --iommu-ops 1)
+# --alias: pattern points "ws:stride" per phase; the load per device.
+ALIAS_GEOM_CAP="16:1 64:1 256:1 1024:1 4096:1 16384:1 65536:1"
+ALIAS_GEOM_CONF="32:2 32:8 32:32 32:128 32:512 32:2048 32:8192"
+ALIAS_CAP="256:1 4096:1 65536:1"
+ALIAS_CONF="16:4096 32:4096 64:4096"
+ALIAS_ON="16:218"      # batching on, against d1t0c1 pb0
+SSD_AGEOM=( --single --no-asy "4k" "4" "$RUNS" )                                          # both + drive 0 alone
+SSD_ALIAS=( --no-asy "4k" "4" "$RUNS" )                                                   # both
+NIC_AGEOM=( --modes "nic0only both" "4" "uncapped" "$RUNS" )                             # 4 QPs per NIC
+NIC_ALIAS=( "4" "uncapped" "$RUNS" )
+alias_extra() {   # <ws:stride> -> the runner options of that point
+    local w=${1%%:*} st=${1#*:}
+    if [ "$KIND" = ssd ]; then echo "--gen alias --ws $w --stride $st --order cyclic"
+    else echo "--gen alias --ws $w --stride $st --order cyclic --depth 16 --rdma-bs 4096"; fi
+}
+alias_npts() { set -- $1; echo $#; }
 
-if [ "$MINIMAL" = 1 ]; then
+if [ "$ALIAS" = 1 ]; then
+    PHASES=(ageom acap aconf)
+    [ "$KIND" = nic ] && MIN_PER_PT=1.6        # no iperf3 stats wait
+elif [ "$MINIMAL" = 1 ]; then
     if [ "$KIND" = ssd ]; then PHASES=(mini); else PHASES=(rcap uneven wire50); fi
 elif [ "$PAPER" = 1 ]; then
     # E11 (rcap0) is a switch feature, IOMMU-independent: the strict leg only.
@@ -308,6 +366,9 @@ est_points() {
         nic:e8)     echo $(( 4 * RUNS + 1 )) ;;
         nic:rcap0)  echo $(( 3 * (1 + 1) )) ;;
         nic:ops)    echo $(( 2 + 1 )) ;;
+        ssd:ageom|nic:ageom) echo $(( ($(alias_npts "$ALIAS_GEOM_CAP") + $(alias_npts "$ALIAS_GEOM_CONF")) * (2 * RUNS + 1) )) ;;
+        ssd:acap|nic:acap)   echo $(( $(alias_npts "$ALIAS_CAP") * (4 * RUNS + 1) )) ;;
+        ssd:aconf|nic:aconf) echo $(( $(alias_npts "$ALIAS_CONF") * (4 * RUNS + 1) )) ;;
         nic:rcap)   echo $(( 4 * (2 + 1) + 2 * 2 + 1 )) ;;
         nic:uneven) echo $(( 4 * 2 + 1 )) ;;
         nic:wire50) echo $(( 8 * 4 + 1 )) ;;
@@ -339,6 +400,9 @@ describe() {
         nic:e8)     echo "E8, IOMMU $LEG: NIC0 alone, 5/10/15/30 flows, d1t0c1, $RUNS runs" ;;
         nic:rcap0)  echo "E11: both NICs, 5 flows, d1t0, rate cap on NIC0's input only: rcap0 $NIC_RCAP0 (~47/37/28G)" ;;
         nic:ops)    echo "E7, IOMMU $LEG: map/unmap and VT-d invalidations per packet (--iommu-ops 1), d1t0c1, both NICs, 5 and 30 flows" ;;
+        ssd:ageom|nic:ageom) echo "alias, IOTLB geometry, d1t0c1: capacity curve (stride 1, ws $(echo "$ALIAS_GEOM_CAP" | sed 's/:1//g')) and conflict curve (ws 32, stride $(echo "$ALIAS_GEOM_CONF" | sed 's/32://g')); $( [ "$KIND" = ssd ] && echo "drive 0 alone and both" || echo "NIC0 alone and both")" ;;
+        ssd:acap|nic:acap)   echo "alias, capacity misses, both: stride 1, ws $(echo "$ALIAS_CAP" | sed 's/:1//g'); d1t0c1 pb0 vs d${ALIAS_ON%%:*}t${ALIAS_ON#*:}c1 pb 0/1" ;;
+        ssd:aconf|nic:aconf) echo "alias, conflict misses, both: stride 4096, ws $(echo "$ALIAS_CONF" | sed 's/:4096//g'); d1t0c1 pb0 vs d${ALIAS_ON%%:*}t${ALIAS_ON#*:}c1 pb 0/1" ;;
         nic:rcap)   echo "FPGA rate cap on both inputs (rcap $NIC_RCAPS: ~off/95/75/50G) at d1t0, and rcap $NIC_RCAP_HELD at d16t218c1 pb 0/1; NIC0 alone and both, 5 flows, 100G links" ;;
         nic:uneven) echo "NIC0's link at 50G, NIC1's at 100G (uneven load for the arbiter): both NICs, 5 and 5:30 flows, d1t0c1 and d16t218c1, pb 0/1" ;;
         nic:wire50) echo "both NICs' links at 50G: NIC0 alone and both, 5 and 30 flows, depths 1/4/16/64 x pb 0/1, cap on, w31; links put back after" ;;
@@ -385,7 +449,7 @@ clock_in() { date -d "+$1 min" '+%a %H:%M' 2>/dev/null || echo "+$(fmt_min "$1")
 
 plan() {
     local p n m tot=0
-    echo "pips-campaign $KIND$( [ "$MINIMAL" = 1 ] && echo " (minimal)")$( [ "$PAPER" = 1 ] && echo " (paper, IOMMU leg $LEG)"), stamp $STAMP, $(hostname), $(date '+%F %T'), repo $(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)"
+    echo "pips-campaign $KIND$( [ "$MINIMAL" = 1 ] && echo " (minimal)")$( [ "$ALIAS" = 1 ] && echo " (alias: in-house generators, IOMMU ${AMODE:-?})")$( [ "$PAPER" = 1 ] && echo " (paper, IOMMU leg $LEG)"), stamp $STAMP, $(hostname), $(date '+%F %T'), repo $(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)"
     echo "sweeps named dual$KIND-pips-<iommu>-$STAMP<phase>; ${MIN_PER_PT} min per run (estimate)"
     printf '  %-7s %5s %8s  %s\n' phase runs time what
     for p in "${RUN_PHASES[@]}"; do
@@ -616,10 +680,36 @@ phase_run() {
         nic:g100)  sweep_run g1 --cfgs "1:0" --caps 1 --pbs 0 --set "$THR" "${NIC_G[@]}"
                    sweep_run g --cfgs "$PAPER_ON" --caps 1 --pbs "0 1" --set "$THR" "${NIC_G[@]}" ;;
         nic:e8)    sweep_run e8 --cfgs "1:0" --caps 1 --pbs 0 --set "$THR" "${NIC_E8[@]}" ;;
+        ssd:ageom|nic:ageom|ssd:acap|nic:acap|ssd:aconf|nic:aconf) alias_phase "$p" ;;
         nic:rcap0) for q in $NIC_RCAP0; do
                        sweep_run "r0c$q" --cfgs "1:0" --caps 0 --pbs 0 --set "$THR rcap0=$q rcap1=0" "${NIC_E11[@]}"
                    done ;;
     esac
+}
+
+# ------------------------------------------------------------------ --alias
+# One sweep per pattern point, the generator's options in RUNNER_EXTRA.
+# Labels: ag = geometry, ac = capacity, af = conflict; w<ws>s<stride>.
+alias_phase() {
+    local p=$1 pt w st grid=() cfg=()
+    case "$p" in
+        ageom) for pt in $ALIAS_GEOM_CAP $ALIAS_GEOM_CONF; do
+                   w=${pt%%:*}; st=${pt#*:}
+                   if [ "$KIND" = ssd ]; then grid=( "${SSD_AGEOM[@]}" ); else grid=( "${NIC_AGEOM[@]}" ); fi
+                   RUNNER_EXTRA=$(alias_extra "$pt")
+                   sweep_run "agw${w}s$st" --cfgs "1:0" --caps 1 --pbs 0 --set "$THR" "${grid[@]}"
+               done ;;
+        acap|aconf)
+               local pts=$ALIAS_CAP tag=ac
+               [ "$p" = aconf ] && { pts=$ALIAS_CONF; tag=af; }
+               for pt in $pts; do
+                   w=${pt%%:*}; st=${pt#*:}
+                   if [ "$KIND" = ssd ]; then grid=( "${SSD_ALIAS[@]}" ); else grid=( "${NIC_ALIAS[@]}" ); fi
+                   RUNNER_EXTRA=$(alias_extra "$pt")
+                   sweep_run "${tag}w${w}s$st" --cfgs "1:0 $ALIAS_ON" --caps 1 --pbs "0 1" --set "$THR" "${grid[@]}"
+               done ;;
+    esac
+    RUNNER_EXTRA=""
 }
 
 # ------------------------------------------------------------------ --paper
@@ -729,7 +819,10 @@ sudo -n "$PIPS" status > "$OUT/status-at-start.txt" 2>&1 && say "status register
 free=$(df -Pk "$HOME" | awk 'NR == 2 { printf "%d", $4 / 1048576 }')
 [ "${free:-0}" -lt 20 ] && note "only ${free} GB free in $HOME: the TLP logs take ~1-2 MB per run"
 say "disk: ${free} GB free in $HOME; analysis -j $JOBS"
-if [ "$KIND" = ssd ]; then
+if [ "$KIND" = ssd ] && [ "$ALIAS" = 1 ]; then
+    say "alias: the drives leave the nvme driver for each run (vfio-pci, polled, no interrupts): no irq-placement check"
+    bash "$REPO/scripts/pips/alias/alias-vfio.sh" status > "$OUT/alias-vfio-at-start.txt" 2>&1
+elif [ "$KIND" = ssd ]; then
     # Both drives completing on one CPU livelocks it in strict mode (10-25).
     # The layout is per boot: after a reboot for another leg it may differ.
     bash "$REPO/scripts/ssd-irq-placement.sh" --check | tee "$OUT/irq-placement.txt"

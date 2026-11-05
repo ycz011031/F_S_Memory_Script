@@ -14,7 +14,13 @@ together, [LOCAL-SETUP.md](LOCAL-SETUP.md) for first-time provisioning.
   which sweep and design, which report generator reads what, the published
   pages). On the Windows analysis machine `claude.md` (git-ignored) adds its
   local paths, tools and editing gotchas.
-- **Last updated:** 2026-11-02: **the 0x0A07 paper campaign is in and
+- **Last updated:** 2026-11-05: **alias campaign set up, not run** (§8
+  "Alias campaign"): in-house generators replace fio and iperf3 (drives:
+  `alias-nvme` over VFIO; NICs: `alias-rdma` READs), fixed pages mapped
+  once in a (ws, stride) pattern that gives conflict or capacity misses;
+  runners `--gen alias`, `pips-campaign.sh ssd|nic --alias`. perf/VT-d PMU
+  on hold (user); misses from pcm-iio. Untested on the hosts.
+- **2026-11-02:** **the 0x0A07 paper campaign is in and
   analysed** (§8 "0x0A07 paper campaign results"; page "PIPS 0x0A07
   Campaign" v2): drives lazy/pt/off + the 10-28 rerun as strict, NICs all
   four modes; E7 has no data (no perf). 2026-10-31: set up
@@ -2721,8 +2727,74 @@ Results (page has the tables):
 (no perf), E14 (not written), NIC latency for E1 (iperf3 has none). Partly:
 E10 (drive strict 1 run; E11 1 run per cap).
 
+### Alias campaign (set up 2026-11-05, not run)
+
+**What and why (user, 11-05).** fio and iperf3 are replaced by in-house
+generators (`scripts/pips/alias/`, its README) that control which pages the
+devices write into: a fixed set mapped **once**, so the IOTLB misses are
+aliasing by design, not map/unmap. The starting point was the user's RDMA
+READ code (`rdma_script/`, local and git-ignored since 11-05), which pinned
+pages for maximum aliasing (conflict misses). At the user's request (11-05)
+the pattern also makes **capacity** misses: pages `first + i*stride`
+(i < ws). Stride 1 with ws above the IOTLB's entries gives capacity
+misses; a stride that is a multiple of the set count gives conflict
+misses. Both are aliasing, and they make the case for the batcher.
+- **Drives (user: VFIO, "regular DMA, manual fixed page assignment"):**
+  `alias-nvme` is a polled userspace NVMe driver over VFIO. The drives
+  are bound to vfio-pci for the runner's runs (`alias-vfio.sh`, put back
+  at exit and at the next start). The region is mapped at IOVA
+  `0x4000000000`, one PRP entry per 4 KiB page. **Read-only by
+  construction** (opcode whitelist, aborts on anything else).
+- **NICs (user: RDMA READ, data in the same direction as the campaigns):**
+  icx runs `alias-rdma --role client` and posts READs to a server on styx
+  (one per NIC, port `BASE_PORTS[i]+700`). icx's NIC writes the responses
+  into one MR registered once, one scatter entry per page. Note:
+  `rdma_script/common.c` set `max_rd_atomic = 1` (one READ in flight per
+  QP) and `path_mtu` 1024. The new tool uses several QPs, the devices'
+  rd_atom and the port MTU.
+- **Plumbing:** the runners' `--gen alias` (drives: `-J` queues, `--iodepth`
+  per queue; NICs: `-S` QPs, `--depth`, `--rdma-bs`; both: `--ws --stride
+  --first --order --page-list --backing-pages`). The generators write fio's
+  JSON and `_iops.1.log`, so `fio-sum`, the results, the sweeps, the TLP log
+  and pcm-iio are unchanged (the NIC runner writes `iperf.bw.rpt` from
+  them). The results add `gen`, `alias_*`.
+- **Campaign:** `pips-campaign.sh ssd|nic --alias [--runs N] --tmux`, one
+  sweep per pattern point. `ageom` (d1t0c1: capacity curve stride 1, ws
+  16-65536; conflict curve ws 32, stride 2-8192; one device alone and
+  both), `acap` (ws 256/4096/65536 stride 1) and `aconf` (ws 16/32/64,
+  stride 4096), the last two both devices, d1t0c1 pb0 vs d16t218c1 pb 0/1.
+  Drives bs 4k, 4 queues x qd 32; NICs 4 QPs x 16 READs of 4 KiB. 72 runs:
+  ~1h50 drives, ~2h30 NICs. Needs the IOMMU translating (drives any mode
+  but off; NICs strict or lazy), checked at start. **One boot, the current
+  strict line, serves both** (11-05): for the drives strict/lazy/pt are the
+  same experiment (vfio-pci attaches VFIO's own paging domain, replacing
+  the default domain, identity in pt included; nothing is unmapped during a
+  run). For the NICs the MR is mapped once, so strict and lazy should agree
+  (lazy is an optional check); pt/off don't translate it. No irq-placement check
+  for the drives (polled, no interrupts).
+- **Measuring misses:** **pcm-iio, as always** (`pcie.rpt`: `IOTLB_lookups`
+  0x40/0x01, `IOTLB_misses` 0x40/0x20, walk levels). The user asked (11-05)
+  why not just PCM: that's the plan; rdma_script's README suggested the VT-d
+  PMU through `perf`, which neither kernel has (E7).
+- **Open items:** (1) VT-d PMU / `perf` counters **on hold** (user, 11-05:
+  install perf later if the data is needed; skip for now). (2) Untested on
+  the hosts: C syntax-checked here with MinGW and stub headers, the shared
+  pattern/output code run natively and its output read by the real
+  `fio-sum` (window IOPS right, covered); runners and campaign `bash -n`
+  and `--dry-run`. First on the hosts: build on bigserver, icx, styx
+  (`alias-run.sh --build`; libibverbs-dev for rdma), then one by-hand run
+  each (README "By hand"), then the datapath sweeps. (3) bigserver is
+  shared: a bound drive vanishes from the kernel for the run (bind refuses
+  if anyone has it open). (4) The IOMMU groups behind PIPS decide whether
+  the idle drive must go to vfio-pci too (runner handles it; `alias-vfio.sh
+  status`). (5) NIC capacity points also count mlx5's MTT fetches (README
+  caveats). Analysis: the page-order tools read the TLP logs as before.
+  The miss curves come from the results JSONL (`IOTLB_misses` per I/O against
+  ws and stride); no report generator yet.
+
 ### Next
 
+Status 11-05: the alias campaign (above) is set up, not run: build and one by-hand run per host first, then `pips-campaign.sh ssd|nic --alias --tmux`; perf on hold.
 Status 11-02: the paper campaign is in and analysed (results above); the only open run is optional (item 9: drives 4k j16 per mode with interrupt-safe cores).
 Status 10-31: the paper campaign above is set up (not run): one IOMMU leg per boot, the user reboots between legs.
 Status 10-30: both reruns are in; **verdict: the study is done** (above).
