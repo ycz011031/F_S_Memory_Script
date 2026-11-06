@@ -29,6 +29,7 @@
 #                     apart, a line before and after each (alias-nvme.c): the
 #                     last line in nvme.txt names the step a freeze came in
 #                     (11-05: the host froze within 0.8 s of alias-nvme's exit)
+#   --exit-reverse    with --exit-steps and two drives: release the second first
 #   --no-d3           vfio-pci's disable_idle_d3=Y for the test (no D3hot when
 #                     the drive is idle), put back at the end
 #
@@ -40,7 +41,7 @@ set -u
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../../.." && pwd)
-DRIVES=01 WS=32 STRIDE=4096 QUEUES=4 QD=32 BS=4k SECS=90 PCM_AT=0 PCM_FOR=20 PANIC=0 FTRACE=0 NOD3=0 XSTEPS=0 SHOW=""
+DRIVES=01 WS=32 STRIDE=4096 QUEUES=4 QD=32 BS=4k SECS=90 PCM_AT=0 PCM_FOR=20 PANIC=0 FTRACE=0 NOD3=0 XSTEPS=0 XREV=0 SHOW=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --drives) DRIVES="$2"; shift 2 ;;
@@ -56,6 +57,7 @@ while [ $# -gt 0 ]; do
         --ftrace) FTRACE=1; shift ;;
         --no-d3) NOD3=1; shift ;;
         --exit-steps) XSTEPS="$2"; shift 2 ;;
+        --exit-reverse) XREV=1; shift ;;
         --show) SHOW="${2:-latest}"; [ $# -ge 2 ] && shift; shift ;;
         -h|--help) awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; exit 0 ;;
         *) echo "alias-hangtest: unknown option $1 (--help)" >&2; exit 2 ;;
@@ -103,7 +105,7 @@ slog() {   # one line to the terminal and to log.txt, on disk before going on
 }
 
 sudo -v || exit 1
-slog "alias-hangtest: into $OUT; drives $DRIVES, ws $WS stride $STRIDE, $QUEUES queues x qd $QD, bs $BS, ${SECS}s; pcm-iio $( [ "$PCM_AT" -gt 0 ] && echo "at ${PCM_AT}s for ${PCM_FOR}s" || echo off); panic $PANIC; ftrace $FTRACE; no-d3 $NOD3; exit-steps $XSTEPS"
+slog "alias-hangtest: into $OUT; drives $DRIVES, ws $WS stride $STRIDE, $QUEUES queues x qd $QD, bs $BS, ${SECS}s; pcm-iio $( [ "$PCM_AT" -gt 0 ] && echo "at ${PCM_AT}s for ${PCM_FOR}s" || echo off); panic $PANIC; ftrace $FTRACE; no-d3 $NOD3; exit-steps $XSTEPS; exit-reverse $XREV"
 slog "kernel $(uname -r); cmdline $(cat /proc/cmdline)"
 
 # The drives: serial -> BDF while they are still on nvme.
@@ -245,7 +247,7 @@ NVME=$(bash "$HERE/alias-run.sh" --build alias-nvme 2>&1 | tail -1)
 slog "alias-nvme start"
 sudo "$NVME" "${ARGS[@]}" --serial "$(IFS=,; echo "${SER[*]}")" --queues "$(IFS=,; echo "${QS[*]}")" \
     --cpus "$(IFS=/; echo "${CPUS[*]}")" --qd "$QD" --bs "$BS" --lba rand --ws "$WS" --stride "$STRIDE" \
-    --warm 10 --seconds "$SECS" --heartbeat 5 $( [ "$XSTEPS" != 0 ] && echo "--exit-steps $XSTEPS") 2>&1 |
+    --warm 10 --seconds "$SECS" --heartbeat 5 $( [ "$XSTEPS" != 0 ] && echo "--exit-steps $XSTEPS") $( [ "$XREV" = 1 ] && echo --exit-reverse) 2>&1 |
     while IFS= read -r l; do printf '%s %s\n' "$(date +%T.%3N)" "$l" >> "$OUT/nvme.txt"; sync "$OUT/nvme.txt" 2>/dev/null; echo "   $l"; done &
 NVME_PIPE=$!
 for _ in $(seq 50); do NVME_PID=$(pgrep -x alias-nvme | head -1); [ -n "$NVME_PID" ] && break; sleep 0.2; done

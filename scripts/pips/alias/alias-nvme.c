@@ -44,6 +44,7 @@
  *                        detach = IOMMU domain detach, unmap, unpin; container
  *                        close). Default 0: all at exit. For the 11-05 bigserver
  *                        freeze at exit: the last line names the step.
+ *   --exit-reverse       with --exit-steps and two drives: the second --dev first
  * Exit: 0 done, 2 usage/setup, 3 a read failed (the run is not valid).
  */
 #include "alias_common.h"
@@ -115,6 +116,7 @@ static uint64_t g_bs = 4096, g_cmd, g_backing, g_iova_base = 0x4000000000ull;
 static uint32_t g_qd = 32, g_k, g_nsid = 1;
 static int g_lba_rand = 1;
 static volatile int g_measure, g_stopping;
+static int g_exit_rev;
 
 /* ------------------------------------------------------------ registers */
 static uint32_t rd32(struct drive *d, uint32_t off)
@@ -625,7 +627,9 @@ static int cpu_of(const char *list, int k)
 }
 
 /* --exit-steps: what exit() does at once, one step at a time, each announced
- * before it starts (stdout is line-buffered; the hang test syncs each line). */
+ * 1 s before it starts (stdout is line-buffered; the hang test timestamps and
+ * syncs each line, which takes ms: an action right after its line could freeze
+ * the host before the line is on disk, as on 11-05 20:21). */
 static void step_pause(double s)
 {
     struct timespec ts = { (time_t)s, (long)((s - (double)(time_t)s) * 1e9) };
@@ -651,12 +655,19 @@ static void step_say(const char *what, const char *bdf)
 
 static void exit_steps(double pause)
 {
+    if (g_exit_rev && g_ndev == 2) {                 /* --exit-reverse: last drive first */
+        struct drive t = g_dev[0];
+        g_dev[0] = g_dev[1];
+        g_dev[1] = t;
+        printf("alias-nvme: exit step: releasing in reverse order (%s first)\n", g_dev[0].bdf);
+    }
     for (int i = 0; i < g_ndev; i++) {
         struct drive *d = &g_dev[i];
         struct vfio_region_info ci = { .argsz = sizeof(ci), .index = VFIO_PCI_CONFIG_REGION_INDEX };
         uint16_t cmd = 0;
         step_pause(pause);
         step_say("bus master off (config write) ...", d->bdf);
+        step_pause(1.0);
         if (!ioctl(d->dfd, VFIO_DEVICE_GET_REGION_INFO, &ci) && pread(d->dfd, &cmd, 2, (off_t)(ci.offset + 4)) == 2) {
             cmd &= (uint16_t)~0x0004;
             if (pwrite(d->dfd, &cmd, 2, (off_t)(ci.offset + 4)) != 2)
@@ -669,6 +680,7 @@ static void exit_steps(double pause)
             d->bar = NULL;
         }
         step_say("BAR0 unmapped; closing the device fd (vfio-pci release: FLR, config restore, D3hot) ...", d->bdf);
+        step_pause(1.0);
         close(d->dfd);
         d->dfd = -1;
         step_say("device fd closed", d->bdf);
@@ -680,6 +692,7 @@ static void exit_steps(double pause)
             if (d->ct != &g_ctr[c] || d->gfd < 0)
                 continue;
             step_say("group detach (IOMMU domain detach, unmap and unpin all) ...", d->bdf);
+            step_pause(1.0);
             if (ioctl(d->gfd, VFIO_GROUP_UNSET_CONTAINER))
                 printf("alias-nvme: exit step: VFIO_GROUP_UNSET_CONTAINER: %s\n", strerror(errno));
             close(d->gfd);
@@ -702,7 +715,7 @@ static void usage(void)
          "     [--cpus L[/L]] [--qd N] [--bs B] [--lba rand|seq] [--nsid N]\n"
          "     [--ws N] [--stride N] [--first N] [--order cyclic|shuffle|random] [--seed N]\n"
          "     [--page-list PATH] [--backing-pages N] [--iova-base A]\n"
-         "     [--warm S] [--seconds S] [--heartbeat S] [--ready-file PATH] [--exit-steps S]\n"
+         "     [--warm S] [--seconds S] [--heartbeat S] [--ready-file PATH] [--exit-steps S] [--exit-reverse]\n"
          "(the comment at the top of alias-nvme.c says what each does)");
 }
 
@@ -717,6 +730,7 @@ int main(int argc, char **argv)
         const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
 #define ARG(s) (!strcmp(a, s) && v && ++i)
         if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(); return 0; }
+        else if (!strcmp(a, "--exit-reverse")) g_exit_rev = 1;
         else if (ARG("--dev")) {
             if (g_ndev == MAXDEV)
                 die("at most %d drives", MAXDEV);
