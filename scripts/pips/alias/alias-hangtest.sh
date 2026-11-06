@@ -30,8 +30,8 @@
 #                     last line in nvme.txt names the step a freeze came in
 #                     (11-05: the host froze within 0.8 s of alias-nvme's exit)
 #   --exit-reverse    with --exit-steps and two drives: release the second first
-#   --exit-reset      with --exit-steps: VFIO_DEVICE_RESET (the open path's FLR)
-#                     each drive before closing it
+#   --exit-reset      (the default in alias-nvme now) VFIO_DEVICE_RESET each
+#                     drive before closing it; --exit-unsafe: the old exit
 #   --no-d3           vfio-pci's disable_idle_d3=Y for the test (no D3hot when
 #                     the drive is idle), put back at the end
 #
@@ -61,6 +61,7 @@ while [ $# -gt 0 ]; do
         --exit-steps) XSTEPS="$2"; shift 2 ;;
         --exit-reverse) XREV=1; shift ;;
         --exit-reset) XRESET=1; shift ;;
+        --exit-unsafe) XRESET=u; shift ;;
         --show) SHOW="${2:-latest}"; [ $# -ge 2 ] && shift; shift ;;
         -h|--help) awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; exit 0 ;;
         *) echo "alias-hangtest: unknown option $1 (--help)" >&2; exit 2 ;;
@@ -132,7 +133,7 @@ BOUND=0
 cleanup() {
     slog "cleanup: stopping the generator and pcm-iio, putting things back"
     if [ -n "${NVME_PID:-}" ] && sudo kill -INT "$NVME_PID" 2>/dev/null; then
-        for _ in $(seq 40); do sudo kill -0 "$NVME_PID" 2>/dev/null || break; sleep 0.5; done
+        for _ in $(seq 120); do sudo kill -0 "$NVME_PID" 2>/dev/null || break; sleep 0.5; done   # the stepwise release: ~17 s
     fi
     [ -n "${PCM_PID:-}" ] && sudo pkill -9 -f -- "-csv=$OUT/pcie.csv" 2>/dev/null
     if [ "$BOUND" = 1 ]; then
@@ -254,7 +255,7 @@ NVME=$(bash "$HERE/alias-run.sh" --build alias-nvme 2>&1 | tail -1)
 slog "alias-nvme start"
 sudo "$NVME" "${ARGS[@]}" --serial "$(IFS=,; echo "${SER[*]}")" --queues "$(IFS=,; echo "${QS[*]}")" \
     --cpus "$(IFS=/; echo "${CPUS[*]}")" --qd "$QD" --bs "$BS" --lba rand --ws "$WS" --stride "$STRIDE" \
-    --warm 10 --seconds "$SECS" --heartbeat 5 $( [ "$XSTEPS" != 0 ] && echo "--exit-steps $XSTEPS") $( [ "$XREV" = 1 ] && echo --exit-reverse) $( [ "$XRESET" = 1 ] && echo --exit-reset) 2>&1 |
+    --warm 10 --seconds "$SECS" --heartbeat 5 $( [ "$XSTEPS" != 0 ] && echo "--exit-steps $XSTEPS") $( [ "$XREV" = 1 ] && echo --exit-reverse) $( [ "$XRESET" = 1 ] && echo --exit-reset) $( [ "$XRESET" = u ] && echo --exit-unsafe) 2>&1 |
     while IFS= read -r l; do printf '%s %s\n' "$(date +%T.%3N)" "$l" >> "$OUT/nvme.txt"; sync "$OUT/nvme.txt" 2>/dev/null; echo "   $l"; done &
 NVME_PIPE=$!
 for _ in $(seq 50); do NVME_PID=$(pgrep -x alias-nvme | head -1); [ -n "$NVME_PID" ] && break; sleep 0.2; done

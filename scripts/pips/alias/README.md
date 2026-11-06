@@ -127,6 +127,18 @@ runner writes each NIC's Gb/s over the windows to `iperf.bw.rpt` as
   translate it (and since it is mapped once, they should agree), while pt
   is identity and off has no IOMMU, so no IOTLB to alias. The campaign
   refuses pt and off for the NICs.
+- **Releasing the drives (bigserver, 11-05).** Closing a drive makes vfio-pci
+  reset it (FLR), restore its config space and put it in D3hot. The 990 EVO
+  Plus (b4:00.0) claims Immediate Readiness (PCI Status bit 0), so kernel 5.15
+  skips the 100 ms wait after that FLR and writes its config straight away;
+  with that release the host froze 3 times out of 3 (no log, no pstore; once
+  the PIPS FPGA lost its bitstream). Resetting it first the way open does
+  (`VFIO_DEVICE_RESET`: command register cleared, FLR, restore) and then
+  closing released both drives cleanly. alias-nvme therefore always gives the
+  drives back step by step with that reset first (`--exit-steps S`, default
+  1 s between steps, ~17 s), also on an error exit; `--exit-unsafe` is the old
+  way. The runner waits 120 s for it after SIGINT before it would KILL. Never
+  `kill -9` alias-nvme by hand. `alias-hangtest.sh` is the tool for this.
 - **Interrupt remapping:** VFIO type1 refuses to attach a group on a host
   without interrupt remapping (EPERM at `VFIO_SET_IOMMU`) unless
   `vfio_iommu_type1 allow_unsafe_interrupts=1`. alias-nvme uses no
