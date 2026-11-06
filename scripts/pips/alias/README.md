@@ -132,7 +132,9 @@ runner writes each NIC's Gb/s over the windows to `iperf.bw.rpt` as
   Plus (b4:00.0) claims Immediate Readiness (PCI Status bit 0), so kernel 5.15
   skips the 100 ms wait after that FLR and writes its config straight away;
   with that release the host froze 3 times out of 3 (no log, no pstore; once
-  the PIPS FPGA lost its bitstream). Resetting it first the way open does
+  PIPS and the drives did not come back at the host reboot until the
+  FPGA was reprogrammed: the drives' PERST# is a constant, so only a
+  reconfiguration resets them). Resetting it first the way open does
   (`VFIO_DEVICE_RESET`: command register cleared, FLR, restore) and then
   closing released both drives cleanly once, but the next time b4 froze the
   host in that reset itself (~10 s after alias-nvme's abrupt CC.EN=0). b4's
