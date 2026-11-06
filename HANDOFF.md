@@ -17,7 +17,20 @@ an option is added).
   which sweep and design, which report generator reads what, the published
   pages). On the Windows analysis machine `claude.md` (git-ignored) adds its
   local paths, tools and editing gotchas.
-- **Last updated:** 2026-11-06 (evening): **icx's first alias2 launch
+- **Last updated:** 2026-11-07: **0x0A08 becomes the assumption-test build**
+  ([docs/PIPS-0A08-ASSUMPTION-TEST.md](docs/PIPS-0A08-ASSUMPTION-TEST.md)): the engine core
+  plus requester-ID slots, tag window and clash detector (fallback F2), leak monitor, tag
+  census, straddle / flow-control / head-of-line counters, completion capture; live tests
+  T0-T12 and the fallbacks F0-F4. Host-only check of the main assumption written now:
+  `scripts/pips/pips-rid-check.sh` (+ read-only module `scripts/pips/ridcheck/`), not yet
+  run on a host (parser checked here on synthetic debugfs dumps; module not compiled here).
+- **2026-11-06 (night):** **design of a background read engine in the
+  FPGA** (`pips_bg_rd`, target design `0x0A08`; user, 11-06): MRds under a PIPS
+  downstream port's requester ID to pinned pages in the device's IOMMU domain, completions
+  sunk before the router, per-read latency. Spec, register map (AXI segment `0xA402_0000`),
+  host software and experiment plan in [docs/PIPS-BG-READ-ENGINE.md](docs/PIPS-BG-READ-ENGINE.md),
+  for the hardware agent. Nothing built; no code changed.
+- **2026-11-06 (evening):** **icx's first alias2 launch
   (`c11060312`) ran only the first sweep of each phase** (12 sweeps, 96 runs,
   4h25): `a2_phase` read its spec lines on stdin and the NIC runner's ssh to
   styx swallowed the rest. Fixed (spec lines on fd 3, runner stdin
@@ -1116,6 +1129,8 @@ reanalysis likely found nothing either (no c1105 files left in ~).
 
 ### Next
 
+Status 11-07: **run `pips-rid-check.sh` on both hosts** (bigserver with `--module --pt --vfio-drive0`, icx with `--module --pt`; read-only apart from drive 0's short VFIO bind) and copy back `~/pips-rid-check-*.tar.gz`. Then the hardware agent builds `0x0A08` ([docs/PIPS-0A08-ASSUMPTION-TEST.md](docs/PIPS-0A08-ASSUMPTION-TEST.md)), and its live tests T0-T12 decide F0/F1/F2/F3/F4.
+Status 11-06 (night): **background read engine designed, not built** ([docs/PIPS-BG-READ-ENGINE.md](docs/PIPS-BG-READ-ENGINE.md)): next is the hardware agent's build of `0x0A08` (its §9, testbench §9.1, open questions §13), then host software S1-S8 (§10) and the bring-up X0 on bigserver (§12). The one assumption to test first: a PIPS downstream port's own requester ID translates through its device's IOMMU domain.
 Status 11-06 (later): **alias campaign 2 set up, not run** (section above): `pips-campaign.sh nic --alias2 --tmux` (icx, ~19 h 30), `pips-campaign.sh ssd --alias2 --tmux` (bigserver, ~5 h + reboot). Committed and pushed 11-06.
 Status 11-06: **the alias campaign is in and analysed** ("Alias campaign results" above; page "PIPS Alias Campaign" https://claude.ai/artifact/E5bkPCsqik67LjPQnTDR2q). Nothing new is set up: the next campaign (tools T1-T6, phases c/g/i/s/r) is a proposal on the page, waiting for the user.
 

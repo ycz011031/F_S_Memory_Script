@@ -309,6 +309,10 @@ falls back to default events and every column shifts.
 | `KNOWLEDGE-MAP.md` | doc: upstream structure, data flow, findings ledger |
 | `LOCAL-SETUP.md` | doc: provisioning worksheet for the icx pair |
 | `FILE-MAP.md` | doc: this file |
+| `docs/PIPS-0A08-ASSUMPTION-TEST.md` | doc: design `0x0A08`, the assumption-test build: the engine core plus test extensions (RID slots, tag window, clash detector, leak monitor, tag census, straddle / flow-control / head-of-line counters, completion capture), live tests T0-T12, fallbacks F0-F4, software for the tests |
+| `scripts/pips/pips-rid-check.sh` | entry, on bigserver / icx: host-only check that each PIPS downstream port's requester ID maps to its device's IOMMU domain (groups, debugfs context/PASID entries and page tables, `--module` kernel view, `--vfio-drive0` under VFIO); `~/pips-rid-check-<host>-<time>/` (`summary.txt`, `raw/`, tarball). Calls `ridcheck/`, `alias/alias-run.sh`, `alias/alias-vfio.sh` |
+| `scripts/pips/ridcheck/pips_iommu_peek.c`, `Makefile` | called by `pips-rid-check.sh --module`: read-only kernel module (built in the output folder) printing, per port/device pair, groups, domain types, same domain, Bus Master Enable, and `iommu_iova_to_phys` of given IOVAs through both |
+| `docs/PIPS-BG-READ-ENGINE.md` | doc: design of the FPGA background read engine `pips_bg_rd` (design `0x0A08`, not built): placement in `pips_control_plane`, PCIe descriptor fields, behaviour, register map at AXI `0xA402_0000`, build steps, testbench, host software plan (`pips bg`, alias-nvme background region, runner `--bg`), experiments X0-X5, open questions |
 | `docs/archive/*.md` | doc: sections moved verbatim out of `HANDOFF.md`, `CLAUDE.md`, `KNOWLEDGE-MAP.md` and the PIPS docs (2026-11-06), one file per retired design or log, each published as an artifact; index and URLs in HANDOFF "Archive" |
 | `docs/archive/mkpage.py` | manual: builds one artifact page per archive file, markdown embedded verbatim (`py -3 docs/archive/mkpage.py <out-dir> [name.md ...]`) |
 | `fands.patch` | data: the F&S kernel patch |

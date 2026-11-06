@@ -231,6 +231,7 @@ Environment variables for the analysis:
 |---|---|
 | `bash scripts/pips/pips-id.sh [-q]` | Is the FPGA our switch, and which design? The last line ends in `verdict=pips/not-pips/no-fpga/no-answer/no-access`. Exit 0 = ok. |
 | `bash scripts/pips/pips-iommu.sh show\|mode` | The IOMMU groups and mode behind the switch. `set strict\|lazy\|pt` changes them at runtime (by hand only; it unbinds and rebinds the drivers). |
+| `bash scripts/pips/pips-rid-check.sh [--module] [--pt] [--vfio-drive0] [--iova A,...] [--out DIR]` | Host-only check of the background read engine's main assumption: does each PIPS downstream port's own requester ID translate through the IOMMU domain of the device below it? Groups, the IOMMU's context/PASID entries (debugfs), `--pt` page tables at `--iova`, `--module` the kernel's domains and `iova_to_phys` (read-only module built here; needs `linux-headers-$(uname -r)`), `--vfio-drive0` all again with drive 0 in VFIO for 75 s (bigserver; refuses the 990s and a running holder). `~/pips-rid-check-<host>-<time>/summary.txt` + tarball. Exit 0 holds, 1 fails, 3 not decided. |
 | `bash scripts/pips/pips-pcie-caps.sh` | MPS, MRRS, relaxed ordering, tags, ACS and completion timeout along the path (E6). |
 | `bash scripts/ssd-irq-placement.sh [--check]` | bigserver, **after every reboot**: are the drives' interrupt CPUs safe for strict mode? |
 | `bash utils/iommu-mode.sh <iface\|nvmeXnY\|BDF>` | The mode the kernel actually applied to one device. |
