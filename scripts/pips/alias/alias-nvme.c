@@ -53,6 +53,8 @@
  *                        reset-first exit still froze once (b4's own reset, ~10 s
  *                        after an abrupt CC.EN=0); the resets at open, after the
  *                        nvme driver's shutdown, never did. ~27 s in all.
+ *   --exit-d3            before the reset, D3hot and back to D0 (PMCSR), as the
+ *                        drive goes at open (where b4's resets never froze)
  *   --exit-unsafe        the old exit: no reset first, everything closed at exit
  *                        (only to reproduce the freeze)
  *   --exit-reverse       two drives: release the second --dev first
@@ -712,6 +714,38 @@ static void release_on_exit(void)
 }
 
 static double g_exit_settle = 10;
+static int g_exit_d3;
+
+/* PMCSR power state (0 = D0, 3 = D3hot) through VFIO's config region, which
+ * hands it to the kernel (vfio_pci_set_power_state: the delays included). */
+static void pm_set(struct drive *d, int state)
+{
+    struct vfio_region_info ci = { .argsz = sizeof(ci), .index = VFIO_PCI_CONFIG_REGION_INDEX };
+    uint8_t pos = 0, id = 0;
+    uint16_t st = 0, csr = 0;
+    if (ioctl(d->dfd, VFIO_DEVICE_GET_REGION_INFO, &ci) ||
+        pread(d->dfd, &st, 2, (off_t)(ci.offset + 6)) != 2 || !(st & 0x10) ||
+        pread(d->dfd, &pos, 1, (off_t)(ci.offset + 0x34)) != 1) {
+        printf("alias-nvme: exit step: %s: no capability list\n", d->bdf);
+        return;
+    }
+    for (int n = 0; pos >= 0x40 && n < 48; n++) {
+        if (pread(d->dfd, &id, 1, (off_t)(ci.offset + pos)) != 1)
+            break;
+        if (id == 0x01)
+            break;
+        if (pread(d->dfd, &pos, 1, (off_t)(ci.offset + pos + 1)) != 1)
+            break;
+    }
+    if (id != 0x01 || pread(d->dfd, &csr, 2, (off_t)(ci.offset + pos + 4)) != 2) {
+        printf("alias-nvme: exit step: %s: no PM capability\n", d->bdf);
+        return;
+    }
+    csr = (uint16_t)((csr & ~3u) | (unsigned)state);
+    if (pwrite(d->dfd, &csr, 2, (off_t)(ci.offset + pos + 4)) != 2)
+        printf("alias-nvme: exit step: %s: PMCSR write: %s\n", d->bdf, strerror(errno));
+    step_pause(0.05);
+}
 static void exit_steps(double pause)
 {
     step_say("drives shut down; settling before the resets ...", NULL);
@@ -735,6 +769,21 @@ static void exit_steps(double pause)
                 printf("alias-nvme: exit step: %s: config write failed: %s\n", d->bdf, strerror(errno));
         }
         step_say("bus master off done", d->bdf);
+        if (g_exit_d3) {
+            /* At open the drive comes out of D3hot (vfio-pci's idle state)
+             * right before its FLR, and b4's resets there never froze; at
+             * exit it has been in D0 all along. Same here: D3hot, then D0. */
+            step_pause(pause);
+            step_say("D3hot via PMCSR (config write) ...", d->bdf);
+            step_pause(1.0);
+            pm_set(d, 3);
+            step_say("in D3hot", d->bdf);
+            step_pause(pause);
+            step_say("D0 via PMCSR ...", d->bdf);
+            step_pause(1.0);
+            pm_set(d, 0);
+            step_say("back in D0", d->bdf);
+        }
         if (g_exit_reset) {
             /* The open path's reset (pci_try_reset_function: save, command
              * register cleared, FLR, restore), which works on both drives,
@@ -789,7 +838,7 @@ static void usage(void)
          "     [--cpus L[/L]] [--qd N] [--bs B] [--lba rand|seq] [--nsid N]\n"
          "     [--ws N] [--stride N] [--first N] [--order cyclic|shuffle|random] [--seed N]\n"
          "     [--page-list PATH] [--backing-pages N] [--iova-base A]\n"
-         "     [--warm S] [--seconds S] [--heartbeat S] [--ready-file PATH] [--exit-steps S] [--exit-settle S] [--exit-reverse] [--exit-unsafe]\n"
+         "     [--warm S] [--seconds S] [--heartbeat S] [--ready-file PATH] [--exit-steps S] [--exit-settle S] [--exit-d3] [--exit-reverse] [--exit-unsafe]\n"
          "(the comment at the top of alias-nvme.c says what each does)");
 }
 
@@ -808,6 +857,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--exit-reset")) g_exit_reset = 1;     /* the default now */
         else if (!strcmp(a, "--exit-unsafe")) g_exit_reset = 0;
         else if (ARG("--exit-settle")) g_exit_settle = atof(v);
+        else if (!strcmp(a, "--exit-d3")) g_exit_d3 = 1;
         else if (ARG("--dev")) {
             if (g_ndev == MAXDEV)
                 die("at most %d drives", MAXDEV);
