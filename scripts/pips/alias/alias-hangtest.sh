@@ -22,9 +22,13 @@
 #   --ftrace          trace the kernel functions of the VFIO open/release path
 #                     (reset: FLR, bus reset, ready wait; power state; config
 #                     restore; IOMMU domain attach/detach and unmap) and of the
-#                     restore to nvme, fsynced per line to ftrace.txt: the last
-#                     line before a freeze names the step (11-05: the host froze
-#                     within 0.8 s of alias-nvme's exit, nothing logged)
+#                     restore to nvme into ftrace.txt: the trace buffer is
+#                     polled every 0.5 s and its new lines appended and fsynced
+#                     (a trace_pipe reader stalled on 11-05 after 27 lines)
+#   --exit-steps S    alias-nvme gives the drives back one step at a time, S s
+#                     apart, a line before and after each (alias-nvme.c): the
+#                     last line in nvme.txt names the step a freeze came in
+#                     (11-05: the host froze within 0.8 s of alias-nvme's exit)
 #   --no-d3           vfio-pci's disable_idle_d3=Y for the test (no D3hot when
 #                     the drive is idle), put back at the end
 #
@@ -36,7 +40,7 @@ set -u
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../../.." && pwd)
-DRIVES=01 WS=32 STRIDE=4096 QUEUES=4 QD=32 BS=4k SECS=90 PCM_AT=0 PCM_FOR=20 PANIC=0 FTRACE=0 NOD3=0 SHOW=""
+DRIVES=01 WS=32 STRIDE=4096 QUEUES=4 QD=32 BS=4k SECS=90 PCM_AT=0 PCM_FOR=20 PANIC=0 FTRACE=0 NOD3=0 XSTEPS=0 SHOW=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --drives) DRIVES="$2"; shift 2 ;;
@@ -51,6 +55,7 @@ while [ $# -gt 0 ]; do
         --panic) PANIC=1; shift ;;
         --ftrace) FTRACE=1; shift ;;
         --no-d3) NOD3=1; shift ;;
+        --exit-steps) XSTEPS="$2"; shift 2 ;;
         --show) SHOW="${2:-latest}"; [ $# -ge 2 ] && shift; shift ;;
         -h|--help) awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; exit 0 ;;
         *) echo "alias-hangtest: unknown option $1 (--help)" >&2; exit 2 ;;
@@ -87,7 +92,7 @@ slog() {   # one line to the terminal and to log.txt, on disk before going on
 }
 
 sudo -v || exit 1
-slog "alias-hangtest: into $OUT; drives $DRIVES, ws $WS stride $STRIDE, $QUEUES queues x qd $QD, bs $BS, ${SECS}s; pcm-iio $( [ "$PCM_AT" -gt 0 ] && echo "at ${PCM_AT}s for ${PCM_FOR}s" || echo off); panic $PANIC; ftrace $FTRACE; no-d3 $NOD3"
+slog "alias-hangtest: into $OUT; drives $DRIVES, ws $WS stride $STRIDE, $QUEUES queues x qd $QD, bs $BS, ${SECS}s; pcm-iio $( [ "$PCM_AT" -gt 0 ] && echo "at ${PCM_AT}s for ${PCM_FOR}s" || echo off); panic $PANIC; ftrace $FTRACE; no-d3 $NOD3; exit-steps $XSTEPS"
 slog "kernel $(uname -r); cmdline $(cat /proc/cmdline)"
 
 # The drives: serial -> BDF while they are still on nvme.
@@ -121,6 +126,7 @@ cleanup() {
         sleep 1
         sudo bash -c 'echo 0 > "$1/tracing_on"; echo nop > "$1/current_tracer"; : > "$1/set_ftrace_filter"' _ "$TR"
         [ -s "$OUT/ftrace.pid" ] && { fp=$(cat "$OUT/ftrace.pid"); sudo pkill -P "$fp" 2>/dev/null; sudo kill "$fp" 2>/dev/null; }
+        sudo rm -f /run/alias-hangtest-trace.* 2>/dev/null
         slog "ftrace off: $(grep -c . "$OUT/ftrace.txt" 2>/dev/null || echo 0) lines in ftrace.txt"
     fi
     if [ -n "${D3_SAVED:-}" ]; then
@@ -208,8 +214,17 @@ if [ "$FTRACE" = 1 ]; then
         done
         echo function > "$T/current_tracer"; echo 1 > "$T/tracing_on"' _ "$TR" $FUNCS)
     slog "ftrace on ($TR): $got"
-    sudo bash -c 'echo $$ > "$3"; cat "$1/trace_pipe" | while IFS= read -r l; do printf "%s %s\n" "$(date +%T.%6N)" "$l" >> "$2"; sync "$2" 2>/dev/null; done' \
-        alias-hangtest-ftrace "$TR" "$OUT/ftrace.txt" "$OUT/ftrace.pid" &
+    # Poll, don't stream: append the buffer's new lines (it only grows: few
+    # events) and fsync, twice a second.
+    sudo bash -c 'echo $$ > "$3"; n=0; t=/run/alias-hangtest-trace.$$
+        while :; do
+            grep -v "^#" "$1/trace" > "$t" 2>/dev/null
+            m=$(wc -l < "$t")
+            if [ "$m" -gt "$n" ]; then
+                tail -n +$((n + 1)) "$t" | sed "s/^/$(date +%T.%3N) /" >> "$2"; sync "$2" 2>/dev/null; n=$m
+            fi
+            sleep 0.5
+        done' alias-hangtest-ftrace "$TR" "$OUT/ftrace.txt" "$OUT/ftrace.pid" &
     PIDS+=($!)
 fi
 
@@ -219,7 +234,7 @@ NVME=$(bash "$HERE/alias-run.sh" --build alias-nvme 2>&1 | tail -1)
 slog "alias-nvme start"
 sudo "$NVME" "${ARGS[@]}" --serial "$(IFS=,; echo "${SER[*]}")" --queues "$(IFS=,; echo "${QS[*]}")" \
     --cpus "$(IFS=/; echo "${CPUS[*]}")" --qd "$QD" --bs "$BS" --lba rand --ws "$WS" --stride "$STRIDE" \
-    --warm 10 --seconds "$SECS" --heartbeat 5 2>&1 |
+    --warm 10 --seconds "$SECS" --heartbeat 5 $( [ "$XSTEPS" != 0 ] && echo "--exit-steps $XSTEPS") 2>&1 |
     while IFS= read -r l; do printf '%s %s\n' "$(date +%T.%3N)" "$l" >> "$OUT/nvme.txt"; sync "$OUT/nvme.txt" 2>/dev/null; echo "   $l"; done &
 NVME_PIPE=$!
 for _ in $(seq 50); do NVME_PID=$(pgrep -x alias-nvme | head -1); [ -n "$NVME_PID" ] && break; sleep 0.2; done

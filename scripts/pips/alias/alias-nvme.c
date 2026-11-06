@@ -37,6 +37,13 @@
  *   --iova-base A        IOVA of region page 0 (default 0x4000000000)
  *   --warm S --seconds S warm-up, then measure (0 = until SIGINT/TERM)
  *   --heartbeat S --ready-file PATH (touched when every queue is loaded)
+ *   --exit-steps S       after the run, give the drives back one step at a time
+ *                        with S seconds between steps and a line before and
+ *                        after each (bus master off, BAR unmap, device close =
+ *                        vfio-pci's release: FLR, config restore, D3hot; group
+ *                        detach = IOMMU domain detach, unmap, unpin; container
+ *                        close). Default 0: all at exit. For the 11-05 bigserver
+ *                        freeze at exit: the last line names the step.
  * Exit: 0 done, 2 usage/setup, 3 a read failed (the run is not valid).
  */
 #include "alias_common.h"
@@ -617,20 +624,92 @@ static int cpu_of(const char *list, int k)
     return n ? cpus[k % n] : -1;
 }
 
+/* --exit-steps: what exit() does at once, one step at a time, each announced
+ * before it starts (stdout is line-buffered; the hang test syncs each line). */
+static void step_pause(double s)
+{
+    struct timespec ts = { (time_t)s, (long)((s - (double)(time_t)s) * 1e9) };
+    while (nanosleep(&ts, &ts) && errno == EINTR)
+        ;
+}
+
+static void step_say(const char *what, const char *bdf)
+{
+    char path[160], st[32] = "?";
+    if (bdf) {
+        snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/power_state", bdf);
+        FILE *f = fopen(path, "r");
+        if (f) {
+            if (fgets(st, sizeof(st), f))
+                st[strcspn(st, "\n")] = 0;
+            fclose(f);
+        }
+        printf("alias-nvme: exit step: %s %s (power_state %s)\n", what, bdf, st);
+    } else
+        printf("alias-nvme: exit step: %s\n", what);
+}
+
+static void exit_steps(double pause)
+{
+    for (int i = 0; i < g_ndev; i++) {
+        struct drive *d = &g_dev[i];
+        struct vfio_region_info ci = { .argsz = sizeof(ci), .index = VFIO_PCI_CONFIG_REGION_INDEX };
+        uint16_t cmd = 0;
+        step_pause(pause);
+        step_say("bus master off (config write) ...", d->bdf);
+        if (!ioctl(d->dfd, VFIO_DEVICE_GET_REGION_INFO, &ci) && pread(d->dfd, &cmd, 2, (off_t)(ci.offset + 4)) == 2) {
+            cmd &= (uint16_t)~0x0004;
+            if (pwrite(d->dfd, &cmd, 2, (off_t)(ci.offset + 4)) != 2)
+                printf("alias-nvme: exit step: %s: config write failed: %s\n", d->bdf, strerror(errno));
+        }
+        step_say("bus master off done", d->bdf);
+        step_pause(pause);
+        if (d->bar) {
+            munmap((void *)d->bar, d->bar_size);
+            d->bar = NULL;
+        }
+        step_say("BAR0 unmapped; closing the device fd (vfio-pci release: FLR, config restore, D3hot) ...", d->bdf);
+        close(d->dfd);
+        d->dfd = -1;
+        step_say("device fd closed", d->bdf);
+    }
+    for (int c = 0; c < g_nctr; c++) {
+        step_pause(pause);
+        for (int i = 0; i < g_ndev; i++) {
+            struct drive *d = &g_dev[i];
+            if (d->ct != &g_ctr[c] || d->gfd < 0)
+                continue;
+            step_say("group detach (IOMMU domain detach, unmap and unpin all) ...", d->bdf);
+            if (ioctl(d->gfd, VFIO_GROUP_UNSET_CONTAINER))
+                printf("alias-nvme: exit step: VFIO_GROUP_UNSET_CONTAINER: %s\n", strerror(errno));
+            close(d->gfd);
+            for (int j = i + 1; j < g_ndev; j++)      /* a shared group closes once */
+                if (g_dev[j].gfd == d->gfd)
+                    g_dev[j].gfd = -1;
+            d->gfd = -1;
+            step_say("group detached and closed", d->bdf);
+        }
+        close(g_ctr[c].fd);
+        step_say("container closed", NULL);
+    }
+    step_pause(pause);
+    step_say("all released; exiting", NULL);
+}
+
 static void usage(void)
 {
     puts("sudo alias-nvme --dev BDF=PREFIX [--dev BDF=PREFIX] [--serial S[,S]] [--queues N[,N]]\n"
          "     [--cpus L[/L]] [--qd N] [--bs B] [--lba rand|seq] [--nsid N]\n"
          "     [--ws N] [--stride N] [--first N] [--order cyclic|shuffle|random] [--seed N]\n"
          "     [--page-list PATH] [--backing-pages N] [--iova-base A]\n"
-         "     [--warm S] [--seconds S] [--heartbeat S] [--ready-file PATH]\n"
+         "     [--warm S] [--seconds S] [--heartbeat S] [--ready-file PATH] [--exit-steps S]\n"
          "(the comment at the top of alias-nvme.c says what each does)");
 }
 
 int main(int argc, char **argv)
 {
     const char *queues = "4", *cpus = "", *serials = "", *ready = NULL;
-    double warm = 0, secs = 0;
+    double warm = 0, secs = 0, exit_pause = 0;
     int hb = 5;
     pattern_defaults(&g_pat);
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -672,6 +751,7 @@ int main(int argc, char **argv)
         else if (ARG("--seconds")) secs = atof(v);
         else if (ARG("--heartbeat")) hb = (int)parse_u64(a, v);
         else if (ARG("--ready-file")) ready = v;
+        else if (ARG("--exit-steps")) exit_pause = atof(v);
         else { usage(); die("unknown or incomplete option '%s'", a); }
 #undef ARG
     }
@@ -824,5 +904,7 @@ int main(int argc, char **argv)
     for (int i = 0; i < g_ndev; i++)
         nvme_teardown(&g_dev[i]);
     printf("alias-nvme: controllers disabled; rebind with alias-vfio.sh restore\n");
+    if (exit_pause > 0)
+        exit_steps(exit_pause);
     return err ? 3 : 0;
 }
