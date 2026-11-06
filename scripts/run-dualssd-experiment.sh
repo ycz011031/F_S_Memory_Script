@@ -278,8 +278,8 @@ FIO_MATCH='^(/[^ ]*/)?fio .*--name=dualssd[_]'
 fio_count() { local n; n=$(pgrep -c -f "$FIO_MATCH" 2>/dev/null); echo "${n:-0}"; }
 stop_fio() {    # SIGINT makes fio stop and still write its JSON
     sudo -n pkill -INT -f "$FIO_MATCH" >/dev/null 2>&1 || true
-    # alias-nvme gives the drives back step by step after SIGINT (~17 s: a
-    # reset before each close, alias-nvme.c --exit-steps). A KILL would leave
+    # alias-nvme gives the drives back step by step after SIGINT (~30 s: NVMe
+    # shutdown, settle, a reset before each close, alias-nvme.c --exit-steps). A KILL would leave
     # the close to the kernel, whose release froze bigserver on 11-05: wait
     # long, and say so loudly if it comes to that.
     local wait_s=30

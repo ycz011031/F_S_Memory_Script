@@ -48,6 +48,11 @@
  *                        right after the release FLR) froze the host 3 times out
  *                        of 3, and once left the PIPS FPGA unprogrammed; with the
  *                        open path's reset first it released cleanly.
+ *                        Before the steps: a normal NVMe shutdown (CC.SHN) per
+ *                        drive, then --exit-settle S (default 10) seconds: the
+ *                        reset-first exit still froze once (b4's own reset, ~10 s
+ *                        after an abrupt CC.EN=0); the resets at open, after the
+ *                        nvme driver's shutdown, never did. ~27 s in all.
  *   --exit-unsafe        the old exit: no reset first, everything closed at exit
  *                        (only to reproduce the freeze)
  *   --exit-reverse       two drives: release the second --dev first
@@ -102,7 +107,7 @@ struct drive {
     struct ctr *ct;
     volatile uint8_t *bar;
     uint64_t bar_off, bar_size;
-    uint64_t cap, to_ms, nsze, maxxfer, data_iova;
+    uint64_t cap, to_ms, nsze, maxxfer, data_iova, shn_ms;
     uint32_t dstrd, mqes, nsid, lba;
     uint8_t *asq;
     volatile uint8_t *acq;
@@ -389,6 +394,9 @@ static void nvme_init(struct drive *d)
     admin(d, &e);
     trim_copy(d->serial, d->idbuf + 4, 20);
     trim_copy(d->model, d->idbuf + 24, 40);
+    uint32_t rtd3e;                          /* resume/entry latency, us: the shutdown's limit */
+    memcpy(&rtd3e, d->idbuf + 88, 4);
+    d->shn_ms = rtd3e / 1000 < 5000 ? 5000 : rtd3e / 1000 > 30000 ? 30000 : rtd3e / 1000;
     uint8_t mdts = d->idbuf[77];
     d->maxxfer = mdts ? (4096ull << mdts) : (2u << 20);
     if (d->maxxfer > (2u << 20))
@@ -463,6 +471,27 @@ static void nvme_teardown(struct drive *d)
     for (int i = 0; d->q && i < d->nq; i++) {
         memset(&e, 0, sizeof(e)); e.dw[0] = 0x00; e.dw[10] = (uint32_t)d->q[i].qid; admin(d, &e);
         memset(&e, 0, sizeof(e)); e.dw[0] = 0x04; e.dw[10] = (uint32_t)d->q[i].qid; admin(d, &e);
+    }
+    /* A normal shutdown (CC.SHN = 01, wait for CSTS.SHST = 10), as the nvme
+     * driver does before it lets go of a drive, then CC.EN=0. The drive's
+     * FLR at release froze bigserver after an abrupt CC.EN=0 (11-05); after
+     * the nvme driver's shutdown it never did. No user data changes. */
+    uint64_t t0 = now_ns();
+    wr32(d, 0x14, (rd32(d, 0x14) & ~(3u << 14)) | (1u << 14));
+    for (;;) {
+        uint32_t s = rd32(d, 0x1c);
+        if (s == 0xffffffff)
+            die("%s: CSTS reads 0xffffffff during shutdown", d->bdf);
+        if (((s >> 2) & 3) == 2) {
+            printf("alias-nvme: %s: shutdown complete in %.0f ms\n", d->bdf, (double)(now_ns() - t0) / 1e6);
+            break;
+        }
+        if (now_ns() - t0 > d->shn_ms * 1000000ull) {
+            printf("alias-nvme: %s: WARNING: shutdown not complete after %" PRIu64 " ms (CSTS 0x%x)\n",
+                   d->bdf, d->shn_ms, s);
+            break;
+        }
+        usleep(1000);
     }
     wr32(d, 0x14, rd32(d, 0x14) & ~1u);
     wait_rdy(d, 0);
@@ -682,8 +711,11 @@ static void release_on_exit(void)
     }
 }
 
+static double g_exit_settle = 10;
 static void exit_steps(double pause)
 {
+    step_say("drives shut down; settling before the resets ...", NULL);
+    step_pause(g_exit_settle);
     if (g_exit_rev && g_ndev == 2) {                 /* --exit-reverse: last drive first */
         struct drive t = g_dev[0];
         g_dev[0] = g_dev[1];
@@ -757,7 +789,7 @@ static void usage(void)
          "     [--cpus L[/L]] [--qd N] [--bs B] [--lba rand|seq] [--nsid N]\n"
          "     [--ws N] [--stride N] [--first N] [--order cyclic|shuffle|random] [--seed N]\n"
          "     [--page-list PATH] [--backing-pages N] [--iova-base A]\n"
-         "     [--warm S] [--seconds S] [--heartbeat S] [--ready-file PATH] [--exit-steps S] [--exit-reverse] [--exit-unsafe]\n"
+         "     [--warm S] [--seconds S] [--heartbeat S] [--ready-file PATH] [--exit-steps S] [--exit-settle S] [--exit-reverse] [--exit-unsafe]\n"
          "(the comment at the top of alias-nvme.c says what each does)");
 }
 
@@ -775,6 +807,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--exit-reverse")) g_exit_rev = 1;
         else if (!strcmp(a, "--exit-reset")) g_exit_reset = 1;     /* the default now */
         else if (!strcmp(a, "--exit-unsafe")) g_exit_reset = 0;
+        else if (ARG("--exit-settle")) g_exit_settle = atof(v);
         else if (ARG("--dev")) {
             if (g_ndev == MAXDEV)
                 die("at most %d drives", MAXDEV);

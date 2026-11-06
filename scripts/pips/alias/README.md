@@ -134,10 +134,15 @@ runner writes each NIC's Gb/s over the windows to `iperf.bw.rpt` as
   with that release the host froze 3 times out of 3 (no log, no pstore; once
   the PIPS FPGA lost its bitstream). Resetting it first the way open does
   (`VFIO_DEVICE_RESET`: command register cleared, FLR, restore) and then
-  closing released both drives cleanly. alias-nvme therefore always gives the
+  closing released both drives cleanly once, but the next time b4 froze the
+  host in that reset itself (~10 s after alias-nvme's abrupt CC.EN=0). b4's
+  resets at open, after the nvme driver's normal shutdown, never froze. So
+  alias-nvme now shuts each drive down the same way (CC.SHN, wait for
+  CSTS.SHST), waits `--exit-settle S` (default 10 s), and then gives the
   drives back step by step with that reset first (`--exit-steps S`, default
-  1 s between steps, ~17 s), also on an error exit; `--exit-unsafe` is the old
-  way. The runner waits 120 s for it after SIGINT before it would KILL. Never
+  1 s between steps; ~30 s in all), also resetting first on an error exit;
+  `--exit-unsafe` is the old way. Not yet shown to be enough (HANDOFF §8
+  "Next"). The runner waits 120 s for it after SIGINT before it would KILL. Never
   `kill -9` alias-nvme by hand. `alias-hangtest.sh` is the tool for this.
 - **Interrupt remapping:** VFIO type1 refuses to attach a group on a host
   without interrupt remapping (EPERM at `VFIO_SET_IOMMU`) unless

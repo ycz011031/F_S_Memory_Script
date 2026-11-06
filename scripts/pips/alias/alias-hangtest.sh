@@ -133,7 +133,7 @@ BOUND=0
 cleanup() {
     slog "cleanup: stopping the generator and pcm-iio, putting things back"
     if [ -n "${NVME_PID:-}" ] && sudo kill -INT "$NVME_PID" 2>/dev/null; then
-        for _ in $(seq 120); do sudo kill -0 "$NVME_PID" 2>/dev/null || break; sleep 0.5; done   # the stepwise release: ~17 s
+        for _ in $(seq 180); do sudo kill -0 "$NVME_PID" 2>/dev/null || break; sleep 0.5; done   # shutdown, settle, stepwise release: ~30 s
     fi
     [ -n "${PCM_PID:-}" ] && sudo pkill -9 -f -- "-csv=$OUT/pcie.csv" 2>/dev/null
     if [ "$BOUND" = 1 ]; then
@@ -141,7 +141,7 @@ cleanup() {
     fi
     if [ -n "${TR:-}" ]; then
         sleep 1
-        sudo bash -c 'echo 0 > "$1/tracing_on"; echo nop > "$1/current_tracer"; : > "$1/set_ftrace_filter"' _ "$TR"
+        sudo bash -c 'echo 0 > "$1/tracing_on"; echo nop > "$1/current_tracer"; : > "$1/set_ftrace_filter"; [ -e "$1/events/rpm/enable" ] && echo 0 > "$1/events/rpm/enable"' _ "$TR"
         [ -s "$OUT/ftrace.pid" ] && { fp=$(cat "$OUT/ftrace.pid"); sudo pkill -P "$fp" 2>/dev/null; sudo kill "$fp" 2>/dev/null; }
         sudo rm -f /run/alias-hangtest-trace.* 2>/dev/null
         slog "ftrace off: $(grep -c . "$OUT/ftrace.txt" 2>/dev/null || echo 0) lines in ftrace.txt"
@@ -233,6 +233,9 @@ if [ "$FTRACE" = 1 ]; then
         for f in "$@"; do
             grep -qE "^$f( |\$)" "$T/available_filter_functions" && echo "$f" >> "$T/set_ftrace_filter" 2>/dev/null && printf "%s " "$f"
         done
+        for ev in rpm_resume rpm_suspend; do
+            [ -e "$T/events/rpm/$ev/enable" ] && echo 1 > "$T/events/rpm/$ev/enable" && printf "event:rpm/%s " "$ev"
+        done
         echo function > "$T/current_tracer"; echo 1 > "$T/tracing_on"' _ "$TR" $FUNCS)
     slog "ftrace on ($TR): $got"
     # Poll, don't stream: append the buffer's new lines (it only grows: few
@@ -266,7 +269,8 @@ if [ "$PCM_AT" -gt 0 ]; then
     while [ $((SECONDS - TS)) -lt "$PCM_AT" ] && kill -0 "$NVME_PIPE" 2>/dev/null; do sleep 0.5; done
     sudo modprobe msr
     slog "pcm-iio START (taskset -c $PCM_CORE $PCM_BIN/pcm-iio 1, ${PCM_FOR}s)"
-    sudo timeout -s KILL "$PCM_FOR" taskset -c "$PCM_CORE" "$PCM_BIN/pcm-iio" 1 -csv="$OUT/pcie.csv" > "$OUT/pcm-iio.out" 2>&1 &
+    # from utils/, as record-host-metrics.sh: pcm-iio reads opCode-<fam>-<model>.txt from the cwd
+    ( cd "$REPO/utils" && exec sudo timeout -s KILL "$PCM_FOR" taskset -c "$PCM_CORE" "$PCM_BIN/pcm-iio" 1 -csv="$OUT/pcie.csv" ) > "$OUT/pcm-iio.out" 2>&1 &
     PCM_PID=$!
     sleep 3
     slog "pcm-iio +3 s: $(grep -c . "$OUT/pcie.csv" 2>/dev/null || echo 0) csv lines"
