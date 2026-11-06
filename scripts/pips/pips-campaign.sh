@@ -337,6 +337,7 @@ alias_npts() { set -- $1; echo $#; }
 if [ "$ALIAS" = 1 ]; then
     PHASES=(ageom acap aconf)
     [ "$KIND" = nic ] && MIN_PER_PT=1.6        # no iperf3 stats wait
+    [ "$KIND" = ssd ] && MIN_PER_PT=1.4        # + bind/restore, alias-nvme's stepwise release (~17 s)
 elif [ "$MINIMAL" = 1 ]; then
     if [ "$KIND" = ssd ]; then PHASES=(mini); else PHASES=(rcap uneven wire50); fi
 elif [ "$PAPER" = 1 ]; then
