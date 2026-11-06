@@ -48,6 +48,7 @@ run by hand when needed · **orphan** = no caller and superseded · **data** /
 | PIPS switch: bring-up (enumeration, BAR0, regfile, DMA, DDR, empty log) | `sudo bash scripts/pips/pips-bringup.sh` | PIPS host |
 | PIPS switch: one fio run with the TLP log collected from FPGA DDR | `sudo bash scripts/pips/pips-fio-log.sh` | PIPS host |
 | PIPS switch: one register / test point / log by hand | `sudo scripts/pips/pips <command>` ([scripts/pips/README.md](scripts/pips/README.md)) | PIPS host |
+| Is the FPGA our PIPS switch, which design ID, which setup (one command on both hosts) | `bash scripts/pips/pips-id.sh [-s BDF] [-q]` (read-only; last line `pips_bdf= id= version= design_id= setup= verdict=`) | bigserver / icx |
 | PIPS switch: which build, which log format | `sudo scripts/pips/pips cfg` (`design_id=`, `log_format=`; design IDs: [scripts/pips/README.md](scripts/pips/README.md) "Design IDs") | PIPS host |
 | PIPS switch: same over JTAG | `source scripts/pips/pips-xsct.tcl` in XSCT | XSCT host |
 | PIPS switch stopped answering: save the state first | `bash scripts/pips/pips-hang-snapshot.sh` (read-only), then XSCT | PIPS host |
@@ -245,6 +246,7 @@ scripts/pips/pips-analyze.sh ssd|nic         one run per testbed, both designs, 
 scripts/pips/pips-timeout-pick.py            · pips-page-seq.py (batcher, parse_setting, fifo_limits)
 scripts/pips/pips-mwr-sizes.py, pips-addr-pattern.py   · pips-log-decode.py
 scripts/pips/pips-hang-snapshot.sh           read-only state capture when the switch stops answering
+scripts/pips/pips-id.sh                      read-only: our switch? design ID, setup (ssd / nic) on either host
 scripts/pips/pips-status-table.py            manifests -> each run's pips-status.txt (0x0A06): spills, stuck, MRd wait
 ```
 
@@ -394,6 +396,7 @@ falls back to default events and every column shifts.
 | `pips-iommu.sh` | entry; `pips-campaign.sh --paper` calls only `mode` and `show` (reads the leg): the IOMMU group type of every endpoint below the PIPS upstream port, at runtime (sysfs `iommu_groups/<g>/type`; strict -> lazy live, other changes unbind and rebind nvme / mlx5_core and wait for the drives by serial and the interfaces by name). `show`, `mode`, `check <m>`, `set <m>`; refuses routes, ssh, mounted drives, foreign group members; exit 3 refused, 4 a device did not come back |
 | `pips-pcie-caps.sh` | entry / called by `pips-campaign.sh --paper` (phase pcie): read-only lspci of the root port, PIPS ports and devices: link, MPS, MRRS, RO, NoSnoop, tags, IDO, completion timeout ranges and value, ACS, IOMMU group and mode → `caps.txt/.tsv`, `lspci-<bdf>.txt` |
 | `pips-status-table.py` | manual / called by `pips-campaign.sh`: sweep manifests → each run's page batcher status (`pips-status.txt`): overflow spills, stuck, longest MRd wait, and from 0x0A07 the refused share per input (`pips-bp.tsv`); flags, worst per setting, `--tsv` |
+| `pips-id.sh` | manual, either host (sources `pips-lib.sh`, runs `pips rd 0x800 2` and `pips cfg` under sudo, builds `pips` if needed): every 10ee function from sysfs, the PIPS ports (b048, b148, b348) and links, the devices below (NVMe → `setup=ssd`, network → `setup=nic`), BAR0 size/address/Mem+, ID "PIPS" and map v2.x, design ID with its FPGA commit (table in the script: add a line per build). Read-only. Exit 0 pips, 1 not-pips / no-answer, 3 no-fpga, 4 no-access |
 | `pips-hang-snapshot.sh` | manual, when the switch stops answering, before reprogramming: read-only capture of the Xilinx/Mellanox functions and the bridges above them (`lspci -vvv`, AER counters), `pips cfg`, the kernel log, `devlink health`, the newest sweep log → `~/pips-hang-<host>-<time>.tar.gz` |
 | `pips_sim.c` | data: BAR0 model for `make check`, any design (`PIPS_SIM_DESIGN`); never on a testbed |
 | `test-sim.sh` | called: by `make check` |

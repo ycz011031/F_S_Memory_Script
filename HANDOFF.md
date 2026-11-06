@@ -14,7 +14,12 @@ together, [LOCAL-SETUP.md](LOCAL-SETUP.md) for first-time provisioning.
   which sweep and design, which report generator reads what, the published
   pages). On the Windows analysis machine `claude.md` (git-ignored) adds its
   local paths, tools and editing gotchas.
-- **Last updated:** 2026-11-05: **alias campaign set up, not run** (§8
+- **Last updated:** 2026-11-05: new `scripts/pips/pips-id.sh`: one
+  read-only command for both hosts that says whether the FPGA is our PIPS
+  switch, its design ID (with the FPGA commit) and the setup (ssd / nic)
+  from what is below it. Tested here only on a fake sysfs tree with a stub
+  `pips` (NIC, drive, other bitstream, hung, wrong ID); not yet on a host.
+- **2026-11-05:** **alias campaign set up, not run** (§8
   "Alias campaign"): in-house generators replace fio and iperf3 (drives:
   `alias-nvme` over VFIO; NICs: `alias-rdma` READs), fixed pages mapped
   once in a (ws, stride) pattern that gives conflict or capacity misses;

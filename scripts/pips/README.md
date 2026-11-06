@@ -29,6 +29,13 @@ From `e389cca` on, every build reports a design ID (regfile +0x20, `pips cfg`
 prints `design_id=`, `pips info` a `DESIGN_ID` line). It goes up by one with
 every FPGA design update (`pips.tcl` `pips_design_id`).
 
+`bash scripts/pips/pips-id.sh` answers "is the FPGA ours, and which build" on
+either host with no BDF: it finds the Xilinx functions in sysfs, checks the
+PIPS ports, BAR0 and the "PIPS" ID, reads the design ID, and names the setup
+from what is below the switch (drives `ssd`, NICs `nic`). Read-only. Its
+design ID table (`design_note`) repeats the one below: add a line to both with
+every new build.
+
 | Design ID | FPGA repo | What the host sees |
 |---|---|---|
 | none | before `e389cca` | +0x20 answers DECERR; `pips cfg` prints `design_id=none` |
