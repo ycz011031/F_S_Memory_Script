@@ -132,8 +132,14 @@ fi
 declare -p SSD_SERIALS >/dev/null 2>&1 || {
     echo "SSD_SERIALS is not set in utils/setup-server.sh; see setup-server.sh.bigserver.example" >&2
     exit 1; }
+# Under a campaign's alias-nvme --hold (ALIAS_HOLD) the drives have no nvme
+# device: their PCI functions come from the holder's list.
 IOMMU=$(for s in "${SSD_SERIALS[@]}"; do
-            ssd_resolve "$s" && bash ../utils/iommu-mode.sh "$SSD_BDF"
+            if [ -n "${ALIAS_HOLD:-}" ] && b=$(awk -v s="$s" '$3 == s { print $2 }' "$ALIAS_HOLD/drives" 2>/dev/null) && [ -n "$b" ]; then
+                bash ../utils/iommu-mode.sh "$b"
+            else
+                ssd_resolve "$s" && bash ../utils/iommu-mode.sh "$SSD_BDF"
+            fi
         done | sort -u | paste -sd+)
 [ -n "$IOMMU" ] || exit 1
 
