@@ -370,29 +370,64 @@ static int post_io(struct client *c, uint32_t q, uint32_t slot)
     return r;
 }
 
+/* One attempt, at most 2 s (a dropped SYN would otherwise block for minutes).
+ * 0 = connected, else the errno: ECONNREFUSED (nothing listening yet) or
+ * ETIMEDOUT (no answer at all: a firewall on the server host drops it). */
+static int connect_once(const struct addrinfo *ai, int *out)
+{
+    int s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+    if (s < 0)
+        return errno;
+    int fl = fcntl(s, F_GETFL, 0);
+    fcntl(s, F_SETFL, fl | O_NONBLOCK);
+    int e = 0;
+    if (connect(s, ai->ai_addr, ai->ai_addrlen)) {
+        e = errno;
+        if (e == EINPROGRESS) {
+            struct pollfd pf = { .fd = s, .events = POLLOUT };
+            socklen_t l = sizeof(e);
+            if (poll(&pf, 1, 2000) <= 0)
+                e = ETIMEDOUT;
+            else if (getsockopt(s, SOL_SOCKET, SO_ERROR, &e, &l))
+                e = errno;
+        }
+    }
+    if (e) {
+        close(s);
+        return e;
+    }
+    fcntl(s, F_SETFL, fl);
+    *out = s;
+    return 0;
+}
+
 static int connect_tcp(const char *ip, int port)
 {
     char ps[16];
     snprintf(ps, sizeof(ps), "%d", port);
+    struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM }, *res = NULL;
+    if (getaddrinfo(ip, ps, &hints, &res))
+        die("bad --server-ip %s", ip);
+    printf("alias-rdma client: connecting to the server at %s:%d (TCP)\n", ip, port);
     uint64_t t0 = now_ns();
+    int s = -1, e = 0;
     for (int tries = 0; !g_stop; tries++) {
-        struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM }, *res = NULL;
-        if (getaddrinfo(ip, ps, &hints, &res) == 0) {
-            int s = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-            if (s >= 0 && connect(s, res->ai_addr, res->ai_addrlen) == 0) {
-                freeaddrinfo(res);
-                return s;
-            }
-            if (s >= 0)
-                close(s);
+        e = connect_once(res, &s);
+        if (!e) {
             freeaddrinfo(res);
+            return s;
         }
-        if (now_ns() - t0 > 30000000000ull)
-            die("no alias-rdma server at %s:%d after 30 s", ip, port);
-        if (tries % 10 == 0)
-            printf("alias-rdma client: waiting for the server at %s:%d\n", ip, port);
+        if (now_ns() - t0 > 25000000000ull) {
+            freeaddrinfo(res);
+            die("no alias-rdma server at %s:%d after 25 s: %s%s", ip, port, strerror(e),
+                e == ETIMEDOUT ? " (no answer: is a firewall on the server host dropping this port?)"
+                : e == ECONNREFUSED ? " (nothing listening: did the server start?)" : "");
+        }
+        if (tries % 5 == 0)
+            printf("alias-rdma client: waiting for the server at %s:%d: %s\n", ip, port, strerror(e));
         fflush(stdout);
-        usleep(200000);
+        if (e != ETIMEDOUT)
+            usleep(200000);
     }
     exit(2);
 }
