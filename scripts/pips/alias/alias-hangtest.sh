@@ -63,8 +63,19 @@ while [ $# -gt 0 ]; do
 done
 
 if [ -n "$SHOW" ]; then
-    [ "$SHOW" = latest ] && SHOW=$(ls -td "$HOME"/alias-hangtest-*/ 2>/dev/null | head -1)
-    [ -d "$SHOW" ] || { echo "alias-hangtest: no test folder ($SHOW)" >&2; exit 1; }
+    echo "== test folders (newest first): files, log.txt lines"
+    for d in $(ls -td "$HOME"/alias-hangtest-*/ 2>/dev/null | head -6); do
+        printf '   %s  %s files  %s log lines\n' "$d" "$(ls "$d" | wc -l)" "$(cat "$d/log.txt" 2>/dev/null | wc -l)"
+    done
+    # the newest folder with a log (a test stopped at its sudo prompt leaves an empty one)
+    if [ "$SHOW" = latest ]; then
+        SHOW=""
+        for d in $(ls -td "$HOME"/alias-hangtest-*/ 2>/dev/null); do
+            [ -s "$d/log.txt" ] && { SHOW=$d; break; }
+        done
+    fi
+    [ -d "$SHOW" ] || { echo "alias-hangtest: no test folder with a log.txt" >&2; exit 1; }
+    echo "== showing $SHOW"
     for f in log.txt tick.txt nvme.txt kmsg.txt pcm-iio.out ftrace.txt; do
         [ -f "$SHOW/$f" ] || continue
         n=15; [ "$f" = ftrace.txt ] && n=60
