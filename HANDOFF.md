@@ -1,9 +1,12 @@
-# Handoff — dual-NIC IOMMU contention on icx
+# Handoff — IOMMU contention testbeds behind the PIPS switch
 
-Everything needed to run this testbed, plus what is known, unknown and broken.
+Everything needed to run the two testbeds (icx: two NICs; bigserver: two NVMe
+drives, both behind the PIPS FPGA switch), plus what is known, unknown and broken.
 Companion docs: [FILE-MAP.md](FILE-MAP.md) for which script does what and
 calls what, [KNOWLEDGE-MAP.md](KNOWLEDGE-MAP.md) for how the repo fits
-together, [LOCAL-SETUP.md](LOCAL-SETUP.md) for first-time provisioning.
+together, [LOCAL-SETUP.md](LOCAL-SETUP.md) for first-time provisioning,
+[QRH.md](QRH.md) for every script option on one page (keep it in step when
+an option is added).
 
 - **Branch:** `icx-dualnic` on `ycz011031/F_S_Memory_Script`
 - **Upstream:** `host-architecture/Fast-and-Safe-IO-Memory-Protection` (remote `upstream`)
@@ -14,169 +17,63 @@ together, [LOCAL-SETUP.md](LOCAL-SETUP.md) for first-time provisioning.
   which sweep and design, which report generator reads what, the published
   pages). On the Windows analysis machine `claude.md` (git-ignored) adds its
   local paths, tools and editing gotchas.
-- **Last updated:** 2026-11-06 (later): **alias campaign 2 set up, not run** (§8 "Alias
+- **Last updated:** 2026-11-06 (evening): **icx's first alias2 launch
+  (`c11060312`) ran only the first sweep of each phase** (12 sweeps, 96 runs,
+  4h25): `a2_phase` read its spec lines on stdin and the NIC runner's ssh to
+  styx swallowed the rest. Fixed (spec lines on fd 3, runner stdin
+  /dev/null); the 11-05 reanalysis now also finds the manifests in
+  `~/pips-campaign-<kind>-c1105*/results/` and `utils/logs/`. Recovery: resume
+  the same stamp (§8 "Alias campaign 2", "First launch").
+- **2026-11-06 (later):** **alias campaign 2 set up, not run** (§8 "Alias
   campaign 2"): `--alias2` on both hosts; alias-rdma `--sge-bytes`/`--mtu`, alias-nvme
   per-drive patterns, `--cursor shared`, holder extras (v2), NIC READ latency in the results,
   the analysis's IOTLB simulation fixed for alias sweeps. Untested on the hosts.
-- **2026-11-06:** **the alias campaign is in and analysed** (§8 "Alias
-  campaign results"; page "PIPS Alias Campaign" https://claude.ai/artifact/E5bkPCsqik67LjPQnTDR2q): icx's IOTLB 256 entries
+- **2026-11-06:** **the alias campaign is in and analysed** (§8 "Alias campaign 1 in short", archived as
+  "Alias campaign results"; page "PIPS Alias Campaign" https://claude.ai/artifact/E5bkPCsqik67LjPQnTDR2q): icx's IOTLB 256 entries
   set-associative (< 16 ways), bigserver's ~96 with no set conflicts; two devices that fit
   alone thrash together; misses cost nothing measurable; the batcher doesn't move them.
   Next campaign proposed on the page (not set up).
-- **2026-11-05:** new `scripts/pips/pips-id.sh`: one
-  read-only command for both hosts that says whether the FPGA is our PIPS
-  switch, its design ID (with the FPGA commit) and the setup (ssd / nic)
-  from what is below it. Tested here only on a fake sysfs tree with a stub
-  `pips` (NIC, drive, other bitstream, hung, wrong ID); not yet on a host.
-- **2026-11-05:** **alias campaign set up, not run** (§8
-  "Alias campaign"): in-house generators replace fio and iperf3 (drives:
-  `alias-nvme` over VFIO; NICs: `alias-rdma` READs), fixed pages mapped
-  once in a (ws, stride) pattern that gives conflict or capacity misses;
-  runners `--gen alias`, `pips-campaign.sh ssd|nic --alias`. perf/VT-d PMU
-  on hold (user); misses from pcm-iio. Untested on the hosts.
-- **2026-11-02:** **the 0x0A07 paper campaign is in and
-  analysed** (§8 "0x0A07 paper campaign results"; page "PIPS 0x0A07
-  Campaign" v2): drives lazy/pt/off + the 10-28 rerun as strict, NICs all
-  four modes; E7 has no data (no perf). 2026-10-31: set up
-  (§8 "0x0A07 paper campaign"): `pips-campaign.sh ssd|nic --paper
-  --leg <mode> --tmux`, the user's experiment list E1, E2, E5-E13 (E2b, E3,
-  E4, E15 out of scope), one IOMMU leg per launch: the campaign runs the leg
-  of the mode the host booted with (strict, lazy, pt, off) and never changes
-  it; the user reboots between legs (~2h50 per leg per host). New:
-  `pips-pcie-caps.sh` (E6), `utils/iommu-ops.sh` + the runners'
-  `--iommu-ops 1` (E7). Untested on the hosts.
-- **2026-10-30:** **the 0x0A07 NIC rerun is in; verdict: the
-  switch study is done** (§8 "0x0A07 NIC results" and "Verdict"; report page
-  "PIPS 0x0A07 Campaign" https://claude.ai/artifact/91VNbNGeJVyfuLLH8acGvY,
-  hand-written `dualssd/dualssd-pips-0a07-report.html`). Measure: page
-  switches as the writes leave the switch (user, 10-30: misses and bandwidth
-  don't matter, the testbed's IOMMU is clean, unlike production). NICs at
-  the **legal floor** (completions leave at once: 2.29 per packet vs 2.28,
-  one NIC alone 2.24); drives 4k/16k within 20-40% of it; the only gap left
-  is drives at 64k/1m (2.3-2.8x, spills saturate: 8 page segments too few).
-  The FPGA rate cap splits a NIC's packets (R6's prediction confirmed). One
-  optional build (more segments) only if large drive I/Os matter.
-- **2026-10-28 (evening):** **the 0x0A07 drive rerun is in and
-  result 10 is solved** (§8 "0x0A07 drive results"): with page batching off
-  the drives' page switches are back to 0x0A05's level (sent / measured
-  arrival median 0.85, 0x0A05 0.81, 0x0A06 1.19; d64 16k 5.2 against 0x0A06's
-  9.9) and the model at the log's own setting fits within 2% at d16-64; with
-  page batching on, d64 16k / 64k / 1m fall from 8.3 / 9.1 / 5.9 to 2.6 / 3.4
-  / 3.5. Throughput and IOTLB misses unchanged (+0.8%, -1.8% median; strict
-  mode). Data `dualssd/1028/`, tables `report-gen/c1028.py`. The NIC rerun is
-  not back yet.
-- **Earlier 2026-10-28:** **FPGA design 0x0A07 is built** (FPGA repo
-  `28ff5b6`): rate caps on both inputs and the output (regfile reg4), counters
-  of the cycles each input was refused (and the rate cap's part), and a
-  **changed read flush** (no longer preempts the other input's drain: on
-  0x0A06 it interleaved the two devices packet by packet, the likely cause of
-  0x0A06 result 10's excess page switches). Tools support it (`pips cfg set
-  rcap=`, `pips counters`, counters sampled every 2 s per run into
-  `pips-bp.tsv`, `pips_stat_bp_frac_*`; sweeps `--set rcap0=`, tag
-  `r<a>x<b>x<c>`; hwtest checks reg4). **To run: the minimal rerun of the
-  0x0A06 campaign on 0x0A07,** `pips-campaign.sh ssd|nic --minimal --tmux`
-  (§8 "0x0A07 minimal rerun": drives as the 0x0A06 main sweep at 4 depths;
-  NICs with the Ethernet and the FPGA rate cap at representative points);
-  `make check` not run yet (no Linux here). Open items: §8 "Next", status
-  10-28; items 0b and 1 canceled.
-- **2026-10-26: the 0x0A06 campaign ran on both hosts**
-  (bigserver `c10251425`, 18h11, 828 points; icx `c10251157`, 22h27, 332
-  points; switch answered throughout, no soft lockups, no stuck). Results in
-  §8 "0x0A06 campaign results"; data in `dualssd/1026/`, `dualnic/1026/`
-  (local, git-ignored; FILE-MAP §7), tables from
-  `dualssd/report-gen/c1026.py`. Headlines: page batching groups pages
-  (runs per I/O -28% drives, -50% NICs at depth 64) but IOTLB misses and
-  throughput don't move (strict mode: every visit misses anyway); it ends
-  the NICs' pause frames; the NIC splitting is the NIC's receive backlog,
-  decided by frame spacing on its wire (Ethernet forced to 50G: whole
-  packets alone at every setting). Report page "PIPS 0x0A06 Campaign"
-  (https://claude.ai/artifact/L3U8deVtMb4nHmb91AscK3, hand-written
-  `dualssd/dualssd-pips-0a06-report.html`), with the next steps (§8 "Next").
-- **2026-10-25:** the campaign script
-  (`bash scripts/pips/pips-campaign.sh ssd|nic --tmux`, §8 "0x0A06
-  campaign"); FPGA design **0x0A06** (the page batcher,
-  `9673e37` + `d44fdd0`) supported by the tools (`pips cfg set pb= pushoff=
-  quantum= thr=`, `pips status`, tags `p1 o1 q<N> w<N>`); the sweeps take
-  `--pbs`/`--set`; NIC runs take uneven flows (`5:30`), hardware pacing
-  (`hw50`) and record retransmits and pause/discard counters; the campaign
-  script. `make check` passed on bigserver (10-25, after `693c60a5f`).
-- **2026-10-20 (NIC splitting):** why one NIC alone splits its packets and
-  two together don't is in §8 item 13: the gap between a NIC's packets on
-  its wire decides it; styx's shared dual-port card is the suspect
-  (untested; tests in §8 "Next" item 5). Dual-NIC runs never recorded
-  retransmits.
-- **Earlier, 2026-10-20 (later):** page order **recovered from the
-  10-19 listings** without the raw logs (§8 item 12): each device's own order
-  is exact from the order as sent; the batcher model runs on it with I/O
-  bursts and an output rate fitted to each log's recorded wait; checks
-  within a few % from 16 KiB up. The NIC model's grant gap was wrong too
-  (charged at every drain; two NICs taking turns don't pay it):
-  `pips-page-seq.py` now charges it only on a re-grant to the same input.
-  Page v8 (Figures 3-6 redrawn: each device's own order instead of "as
-  arrived", both designs' logs, FIFO 128/512 lines; TL;DR, Limits, bullets).
-  Page v9 (after user review): why d1t0c1 is below strict alternation, and
-  why the NICs' by-NIC and by-page lines coincide (§8 item 12). Page v10:
-  the "ideal" is replaced by two reference lines the user asked for: a
-  **floor** (the best any batcher could do holding D TLPs per device, free
-  to reorder, no FIFO/time/link/ordering) and a flat **raw** line (the
-  arrival order, unbatched; modelled until the hosts rerun).
-  2026-10-20: the 10-19 analysis came back
-  (`dualssd/1019/pips-analyze-ssd-20261019-1723/`, `dualnic/1019/pips-analyze-nic-20261019-1723/`).
-  Payload or control by size: a size rule holds (drives: ring = 4 DW,
-  RELIABLE on drive 0, 99.88% on drive 1, which also writes small payload
-  pieces; NICs: ring = 16 DW, 100%), the same on 0x0A04 and 0x0A05. The drive
-  page-order model failed: its waits ran to ~1,400 µs because the output's
-  logged times lack the stalls inside packets on the Gen3 x8 uplink, which
-  `pkt_wait` counts (§8 "0x0A04 results" item 11). Fixed in
-  `pips-page-seq.py` (stalls put back, link rate fitted per log and
-  calibrated per sweep, each input's order kept); rerun pending. The NIC run
-  left out the 0x0A05 sweep (no manifest in `~`; `pips-analyze.sh` now also
-  looks in `utils/logs/<sweep>/`). Page v7: Table 11 (payload or control by
-  size, `report-gen/sizes.py`) and the drive-model caveat in the TL;DR and
-  Limits.
-  2026-10-19 (later): the model charges a 3-cycle grant gap
-  per drain, the page's Figures 4/6 average each point's logs and draw an
-  ideal line that only fits the window; one host script, `pips-analyze.sh`,
-  reruns page order and payload-or-control by length on both designs (§8,
-  "0x0A04 results" item 10, "Next" item 0).
-  2026-10-19: the depth sweep ran on design **`0x0A05`**
-  (`0x0A04` with 512-beat batching FIFOs): drives all eight settings, NICs
-  stopped during `d24t255c1` when the switch stopped answering (§8, "0x0A05
-  depth sweep"). Depth doesn't move throughput; the bigger FIFO triples the
-  wait on a full link. The batcher model in `pips-page-seq.py` now holds its
-  output to the uplink: it had sent the drives' TLPs at twice the Gen3 x8
-  rate, which flattened its depth lines; page order needs a regrab on both
-  hosts (§8, "Next" item 0). Report: "PIPS 0x0A04–0x0A05 Sweeps".
-  2026-10-17: the **depth sweep** is set up (§8, "Depth
-  sweep"): depths 1–64, cap on only, timeouts picked so depth can win
-  (`pips-timeout-pick.py`); on `0x0A04` a FIFO can't reach depth > 18 (drives)
-  / > 10 (NICs), so d24/d36/d64 (and d16 on the NICs) are capped by the full
-  trigger. Every PIPS sweep now has a sweep ID and a manifest of its runs;
-  log parsers read the manifest ([scripts/pips/SWEEP-LOGS.md](scripts/pips/SWEEP-LOGS.md)).
-  2026-10-16: `pips-page-seq.py` rebuilds the arrival order
-  and models the batcher on it; regrab pending (§8, "Next" item 0). Page order
-  on the `0x0A04` logs, drives and
-  NICs (§8, "0x0A04 results" item 8; the cap at depth 1 doubles page switches,
-  misses don't move); first `0x0A04` sweeps, strict, drives and
-  NICs (§8, "0x0A04 results"); the C/D "extra inbound writes" withdrawn as a
-  `pcm-iio` undersampling artifact (§7). 2026-10-15: PIPS switch design `0x0A04` (drain depth cap,
-  new TLP log format), the PIPS sweeps crossed with the cap, a dual-NIC PIPS
-  sweep, and the design ID on every artifact (§8). 2026-10-11: dual-SSD sweeps
-  on switch design D (§7, "Fifth result"). icx last updated 2026-10-04: the
-  uncapped flow sweep (§4.1) and the IOMMU counters checked against Intel's
-  Ice Lake event list (§4.3).
-- **PIPS switch (§8):** the FPGA switch the drives (bigserver) and now the NICs
-  sit behind. Its batcher setting and, from design `0x0A03`, its drain depth
-  cap are swept on both testbeds with a TLP log in every run. Every result
-  names the switch's design ID, which also picks the log decoder.
-- **Headline:** IOMMU strict and IOMMU off give the same throughput in every
-  configuration run so far. Reasons are speculated in §4.1; the experiments
-  that would settle them are in §5.
-- **Second testbed (2026-10-05):** the same experiment with two NVMe SSDs and
-  fio on bigserver, a Skylake-SP host (§7). Strict vs off block-size sweep
-  done: strict caps 4k reads at 40% of off (§7, "Third result"). Switch
-  design D (2026-10-10) shares the uplink evenly where A and C starved
-  drive 0; use it for IOMMU work (§7, "Fifth result").
+- **Earlier entries** (11-05 back to 09-29): [docs/archive/handoff-log.md](docs/archive/handoff-log.md).
+- **Where the study stands (11-06):**
+  - **Build:** design `0x0A07` (§8 "Switch designs") is the only one in use.
+    0x0A02-0x0A06 are retired; their results are in the archive (below) and
+    on their report pages (§8).
+  - **Batcher study: done** (§8 "Verdict", 10-30), judged on page order
+    only: NICs at the legal floor, drives 4k/16k within 20-40% of it, drives
+    64k/1m 2.3-2.8x (page segments run out). One optional build (more
+    segments) only if large drive I/Os matter.
+  - **Paper campaign on 0x0A07, four IOMMU modes: done** (11-02, §8
+    "0x0A07 in short"). Batching costs the hosts nothing measurable; page
+    order doesn't move IOTLB misses; strict costs throughput only for drives
+    at 4k; for the NICs the IOMMU mode doesn't matter.
+  - **Alias campaign 1: done** (11-06, §8 "Alias campaign 1 in short"):
+    icx's IOTLB has 256 entries, set-associative; bigserver's ~96, no set
+    conflicts; a miss costs nothing measurable; the batcher doesn't move
+    aliasing misses.
+  - **Alias campaign 2: set up (`634b53777`); icx's first launch ran 1 sweep
+    per phase (stdin bug, fixed), to be resumed** (§8 "Alias campaign 2").
+- **Headline across both testbeds:** IOMMU strict costs throughput only
+  where every I/O is mapped and unmapped and the I/O is small: drives at 4k
+  (strict ~30-40% of off). Everywhere else (NICs at any flow count, drives
+  from 16k up) strict and off move the same bytes.
+
+## Archive: retired designs and old logs
+
+Moved out verbatim on 2026-11-06, headings kept: a reference such as
+HANDOFF §8 "0x0A06 campaign results" or §7 "Fifth result" still finds its
+text; look its heading up in this table. Each file is tracked in git and
+published as an artifact (rebuild a page: `py -3 docs/archive/mkpage.py
+<out-dir>`, then publish to the same URL).
+
+| Era | Moved here (headings) | File | Artifact |
+|---|---|---|---|
+| icx and bigserver before PIPS, 09-29 to 10-11 | §4.1, §4.2, §5 (icx); §7 "First result" to "Fifth result", "Next on bigserver"; KNOWLEDGE-MAP §6 | [pre-pips.md](docs/archive/pre-pips.md) | https://claude.ai/artifact/G5s7nD5CRPLV646Jq6QrhT |
+| PIPS 0x0A02-0x0A05, 10-11 to 10-20 | §8 sweep and report bullets, "Depth sweep", "0x0A04 results" (items 1-13), "0x0A05 depth sweep"; SWEEP-LOGS "The 10-17 depth sweep", "Earlier runs on the hosts"; PIPS README "First hardware run"; PIO-MANUAL §12, §15 first item | [pips-0a02-0a05.md](docs/archive/pips-0a02-0a05.md) | https://claude.ai/artifact/FiRJK1qrLUmWXMAqjtE17A |
+| PIPS 0x0A06, 10-23 to 10-26 | "0x0A06 campaign", "0x0A06 campaign results" (R1-R10) | [pips-0a06.md](docs/archive/pips-0a06.md) | https://claude.ai/artifact/HW13EiQXS5414G5ASfyZna |
+| PIPS 0x0A07 campaigns, 10-28 to 11-02 | "0x0A07 minimal rerun", "0x0A07 drive results", "0x0A07 NIC results", "0x0A07 paper campaign", "0x0A07 paper campaign results" | [pips-0a07.md](docs/archive/pips-0a07.md) | https://claude.ai/artifact/3iQfW7DoaUFDhcwMx2wfqn |
+| Alias campaign 1, 11-05/06 | "Alias campaign", "Alias campaign results" (+ follow-up); "Next" statuses of 11-05: the bigserver freeze debug log, the NIC smoke tests | [pips-alias-1.md](docs/archive/pips-alias-1.md) | https://claude.ai/artifact/VJj7kKdHEfRyksGJ5zLeZM |
+| Logs | the changelog (11-05 back to 09-29); "Next" statuses 11-02 back to 10-20 and its item lists (0-5, the 10-26 lists) | [handoff-log.md](docs/archive/handoff-log.md) | https://claude.ai/artifact/RV2WxMKKri8YBcBSJMssSZ |
+| CLAUDE.md (local) | its "State as of" notes, 10-20 to 11-06 | [claude-md-state-log.md](docs/archive/claude-md-state-log.md) | https://claude.ai/artifact/6sWcrEA4pqrrJTZQeoGAjD |
 
 ---
 
@@ -409,211 +306,33 @@ silently falls back to defaults without IOMMU events, shifting every column.
 Re-run `discover-pcie-topology.sh` and update `PCIE_PATTERN` in
 `setup-server.sh`. If the NICs end up on **different** root ports you may gain
 per-NIC counters but lose the shared IOMMU, and then the contention experiment
-no longer measures contention. Check which IOMMU unit each NIC is behind with
-the command in §5 item 1.
+no longer measures contention. Check which IOMMU unit each NIC is behind
+(IOMMU on; substitute the new addresses):
+```bash
+for d in 0000:99:00.0 0000:9a:00.0; do
+    echo "$d -> $(basename "$(readlink -f /sys/bus/pci/devices/$d/iommu)")"
+done                                       # same dmarN = shared IOMMU
+```
 
 ---
 
 ## 4. Results so far
 
-### 4.1 Flow sweep, IOMMU strict vs off (2026-09-29)
+### 4.1-4.2 icx before PIPS (09-29 and earlier): archived
 
-**Expected:** with the IOMMU on, throughput drops as flows increase (the
-paper's flow experiment). **Observed:** no throughput difference between strict
-and off at any flow count.
-
-**What was run.** `dualnic_flow_sweep.sh` defaults, once per IOMMU boot setting:
-NIC0 alone at 5 flows as a datapath check, then both NICs together at 5, 10,
-15 and 30 flows per NIC. Uncapped, 3 repeats each, MTU 4000, ring 1024,
-`tcp_rmem` fixed at 2 MB and `tcp_wmem` at 1 MB (autotuning off), DCTCP with
-ECN on, 20 s measurement window.
-
-- strict: `intel_iommu=on iommu.strict=1`, NIC domain type `DMA`; one pass
-- off: `intel_iommu=off`; two passes
-
-Result files are on icx in `~/`: `dualnic-flowsweep-strict-3`, `-off-1`,
-`-off-2` (`.jsonl` + `.txt`). A local copy may sit in the git-ignored `dualnic/`. **`strict-1` and `strict-2` are invalid**: two
-sweeps ran at once and killed each other's traffic. The runner now refuses a
-second copy (§2).
-
-**Means over 3 repeats** (throughput in Gbps; per-NIC split in brackets):
-
-| Flows/NIC | NICs | Tput strict | Tput off (pass 1 / 2) | PCIe wr strict | CPU % strict | CPU % off (1 / 2) | Misses/Gbps strict |
-|---|---|---|---|---|---|---|---|
-| 5 | NIC0 alone | 96.1 | 96.2 / 95.2 | 100.6 | 73.2 | 67.8 / 66.9 | 33,394 |
-| 5 | both | 105.7 (41.4 + 64.3) | 105.7 / 105.7 | 110.5 | 62.7 | 62.3 / 62.4 | 34,791 |
-| 10 | both | 105.7 (52.8 + 52.9) | 105.6 / 105.5 | 110.6 | 63.2 | 63.3 / 63.3 | 34,852 |
-| 15 | both | 97.5 (48.7 + 48.7) | 94.9 ± 2.7 / 96.2 | 102.2 | 62.8 | 62.7 / 62.6 | 35,320 |
-| 30 | both | 48.5 (24.2 + 24.2) | 48.5 / 48.4 | 50.6 | 61.4 | 55.9 / 56.0 | 36,324 |
-
-Run-to-run standard deviation is ≤ 0.15 Gbps everywhere except off pass 1 at
-15 flows. PCIe write with the IOMMU off matched strict within ~2 Gbps. CPU % is
-the mean over the active NICs' receiver cores (5 per NIC).
-
-#### Derived metrics
-
-**IOMMU counters, strict.** Rates are per second (`pcm-iio` samples every 1 s).
-"Per 4 KB written" divides by PCIe write traffic, which runs 4.5% above TCP
-throughput in every configuration (headers, descriptors, completions).
-
-| Flows/NIC | NICs | Lookups/s | Misses/s | Miss rate | Lookups per 4 KB written | Misses per 4 KB written | 4K PWC hits per miss | Upper-level PWC hits per miss | Mem accesses per miss |
-|---|---|---|---|---|---|---|---|---|---|
-| 5 | NIC0 alone | 28.2 M | 3.36 M | 11.9% | 9.2 | 1.09 | 1.02 | 0.005 | 4.1 |
-| 5 | both | 31.1 M | 3.84 M | 12.4% | 9.2 | 1.14 | 1.05 | 0.016 | 5.2 |
-| 10 | both | 31.2 M | 3.86 M | 12.4% | 9.2 | 1.14 | 1.07 | 0.025 | 5.4 |
-| 15 | both | 28.9 M | 3.61 M | 12.5% | 9.3 | 1.16 | 1.08 | 0.028 | 5.5 |
-| 30 | both | 14.4 M | 1.84 M | 12.7% | 9.4 | 1.19 | 1.05 | 0.022 | 5.6 |
-
-PWC is the page-walk cache. "Upper-level" is the 2M, 1G and 512G PWC hits
-combined. Lookups are *first* lookups: a transaction can look up the IOTLB more
-than once, and the event counts only the first (§4.3).
-
-**Receiver CPU cost:** cores busy per 100 Gbps, i.e. mean CPU % × active
-cores ÷ throughput.
-
-| Flows/NIC | NICs | strict | off (pass 1 / 2) |
-|---|---|---|---|
-| 5 | NIC0 alone | 3.8 | 3.5 / 3.5 |
-| 5 | both | 5.9 | 5.9 / 5.9 |
-| 10 | both | 6.0 | 6.0 / 6.0 |
-| 15 | both | 6.4 | 6.6 / 6.5 |
-| 30 | both | 12.7 | 11.5 / 11.6 |
-
-- **The miss rate is flat at ~12%** (11.9% → 12.7%; run-to-run SD ≤ 0.03
-  points). Flow count barely moves it.
-- **About one miss per 4 KB page written (1.1–1.2), and ~9 lookups per page.**
-  This fits each fresh receive page missing once, with its remaining writes
-  hitting.
-- **Walks are shallow.** 4K PWC hits about equal misses, and upper-level PWC
-  hits are 0.5–2.8% of misses. That fits each walk needing only the final
-  page-table read, which is the cheap case.
-- **Memory accesses per miss is the one IOMMU counter that grows with flows:**
-  4.1 → 5.6. Its meaning is unverified. It also reads 75–138 k/s with the IOMMU
-  off, so it counts something besides translation.
-- **Strict's CPU cost:** +8% alone, +10% at 30 flows, nothing at 5–15 flows with
-  both NICs.
-- **Two NICs cost 55–70% more receiver CPU per Gbps than one** (5.9 vs 3.5–3.8 at 5
-  flows), with the IOMMU on or off.
-- **Receiver CPU per Gbps doubles from 10 to 30 flows** in both modes (6.0 →
-  11.5–12.7), while total receiver CPU stays flat or falls.
-
-#### Observed
-
-1. **Throughput is the same with the IOMMU strict and off**, at every flow
-   count.
-2. **Translation is active in strict mode, but misses look cheap.** At 5 flows
-   with both NICs: ~31 M IOTLB lookups/s, ~3.8 M misses/s (~12%). Page-walk-cache
-   4K hits (4.0 M/s) and context-cache hits (4.0 M/s) about equal the misses,
-   so nearly every miss is served by the page-walk cache. Misses per Gbps rise
-   only 4.4% from 5 to 30 flows. With the IOMMU off these counters read 0.
-3. **The only visible cost of strict is CPU**, and only in two places: NIC0
-   alone (+5 to 6 points) and 30 flows (+5.4 points, about +10% relative). At
-   5–15 flows with both NICs there is no CPU difference.
-4. **Both NICs at 5–10 flows sit at the shared-uplink ceiling:** 110.5 Gbps PCIe
-   write, 105.7 Gbps throughput. At 5 flows the split is uneven (NIC1 ≈ 64,
-   NIC0 ≈ 41) in both modes and all passes; at ≥ 10 flows it is even.
-5. **Throughput falls off a cliff above 10 flows, identically in both modes:**
-   97.5 at 15 flows, 48.5 at 30, each NIC exactly 24.2 at 30. PCIe write falls
-   with it (50.6), so traffic really dropped; it is not a parsing artifact.
-   From 15 flows up, per-NIC throughput × flows is constant (48.7 × 15 ≈
-   24.2 × 30 ≈ 725–731), so each NIC's rate scales as 1/flows. The receiver
-   cores are *less* busy at 30 flows than at 5.
-6. **NIC0 alone at 5 flows runs at line rate in both modes.** 96 Gbps against a
-   TCP maximum of ~97.8 Gbps on 100G at MTU 4000.
-
-#### Speculated reasons (not established)
-
-**A. No configuration was limited by the IOMMU.** Every point had another,
-tighter limit:
-
-| Configuration | Binding limit |
-|---|---|
-| NIC0 alone, 5 flows | the 100G port (line rate) |
-| Both, 5–10 flows | the shared x8 Gen4 uplink |
-| Both, 15–30 flows | the cliff (reason C), identical in both modes |
-
-The IOMMU can only cost throughput when it is the tightest limit. The paper's
-drop appears with **one NIC as flows increase**. That configuration was not run:
-NIC0 alone was only run at 5 flows. *Confidence: high that this masks the
-effect; it does not by itself explain the missing CPU cost at 5–15 flows.*
-
-**B. The stock 6.8 kernel may already avoid the cost the paper measured.** The
-paper's "IOMMU on" baseline is stock 6.0.3. Strict mode costs throughput when
-receive buffers are mapped and unmapped constantly: each unmap invalidates the
-IOTLB and page-walk caches, so later misses need slow walks to memory. Newer
-mlx5 drivers are believed to recycle receive pages through `page_pool` while
-keeping them DMA-mapped, which would make unmaps and invalidations rare. That
-is believed, not verified, and it is not known in which kernel it landed.
-Observation 2 fits this: misses are served from the page-walk cache, as if it
-is rarely flushed. **Caveat:** `IOMMU_mem_access` is ~5 per miss (19.9 M/s
-against 3.8 M/s), which does not fit walks ending in cache. Intel's description
-of that counter does not settle what it counts (§4.3), so this evidence is
-suggestive only. *Tests: §5 item 2 (hardware invalidation counts) and item 3
-(map/unmap counts).*
-
-**C. The 30-flow cliff is not the IOMMU and not the uplink.** It is identical
-with the IOMMU off, and at ~50 Gbps the uplink is half idle. Both NICs land on
-exactly the same number, which points at a resource each NIC has its own share
-of:
-- **Sender CPU** (prime suspect, never measured): at 30 flows styx runs 60
-  iperf3 senders on 14 physical 2.0 GHz Broadwell cores, 4–5 per core.
-- **Receiver per-core saturation:** each icx core runs 6 iperf3 servers. The
-  10-core CPU average could hide one or two cores at 100%. Per-core numbers are
-  in `cpu_util.rpt`, not in the JSON.
-- **TCP behaviour** (losses, retransmits, ECN marks): not collected at all.
-
-Receiver CPU per Gbps doubles at 30 flows (derived metrics). Two readings fit.
-Either per-flow overhead on the receiver is the limit, with the 10-core average
-hiding saturated cores. Or slower flows simply batch worse, with fewer bytes
-per interrupt and per GRO merge, and the cost is an effect of the cliff rather
-than its cause. Per-core CPU separates the two.
-
-*Confidence: low on which one; high that it is not the IOMMU. Test: §5 item 6.*
-
-**D. More flows barely grows the IOMMU working set here.** aRFS steers each
-flow to the receive queue of the core its iperf3 server runs on. With 5 server
-cores per NIC, only about 5 receive rings are active per NIC at any flow count.
-Extra flows only add sockets holding up to 2 MB of received data each. If B
-holds, those buffers stay mapped and do not churn. That would fit misses per
-Gbps rising only 4.4% from 5 to 30 flows.
-
-**E. The uneven 5-flow split** (NIC1 64 vs NIC0 41) is probably arbitration in
-the PCIe switch or flow placement under uplink saturation. It is unexplained,
-consistent across runs, and harmless to the totals.
-
-**F. Two NICs cost 55–70% more receiver CPU per Gbps than one.** With both NICs
-each core carries ~10.6 Gbps instead of ~19.2, so fixed per-interrupt and
-per-wakeup costs are spread over fewer bytes. Backpressure from the saturated
-uplink may add to it. Not investigated.
-
-### 4.2 Earlier: capped at 30 Gbps per NIC, 8 flows (before 2026-09-29)
-
-Ring 1024, MTU 4000, one run each:
-
-| | tput | PCIe_wr | IOTLB misses | misses / Gbps |
-|---|---|---|---|---|
-| nic0 alone | 30.000 | 31.404 | 1,057,452 | 33,672 |
-| nic1 alone | 30.000 | 31.466 | 1,057,468 | 33,606 |
-| **both** | 60.000 | 62.687 | 2,167,475 | **34,576** |
-
-**+2.8% IOTLB misses per Gbps with both NICs active, and no throughput loss** —
-each NIC held exactly 30 Gbps. At 62.7/126 = 50% uplink utilization, neither the
-link nor the Broadwell sender was binding, so this is attributable to the IOMMU.
-
-The two baselines agree to 0.002%, which shows the NICs are symmetric. It does
-**not** establish run-to-run variance — `--runs 1` was used. A 2.8% effect is not
-defensible until repeated.
-
-Uncapped, for reference: single NIC ~97 Gbps, both 105.7 Gbps at 110.5 Gbps PCIe
-write (88% of the uplink). Link-bound, so throughput there says nothing about the
-IOMMU. Normalized it showed +4.2%, but under backpressure.
-
-In the `both` breakdown, `PWC_4K_hits` (2,207,682), `CTXT_cache_hits` (2,205,155)
-and `IOTLB_misses` (2,167,475) are nearly equal while 512G/1G/2M hits are 3–4
-orders smaller — essentially every miss resolves via a 4K page-walk-cache hit.
-But `IOMMU_mem_access` is 10.3M, 4.7 per miss, which does not obviously fit
-walks terminating in cache. Intel's event description does not settle what that
-counter measures (§4.3).
+The flow sweep strict vs off (09-29), the capped 8-flow run, the derived
+metrics and the speculated reasons A-F are in
+[docs/archive/pre-pips.md](docs/archive/pre-pips.md). In short (NICs on the board's PCIe switch,
+kernel 6.8):
+- Strict and off gave the same throughput at every flow count (5-30 per NIC).
+  Both NICs together sat at the shared x8 Gen4 uplink (105.7 Gbps TCP, 110.5
+  PCIe write); 30 flows fell to 48.5 Gbps in both modes (a host limit, not
+  the IOMMU).
+- Strict: ~12% IOTLB miss rate, ~1.1 misses and ~9 lookups per 4 KB written,
+  misses served by the 4K page-walk cache. Its only cost was receiver CPU
+  (NIC0 alone +8%, 30 flows +10%).
+- The later PIPS campaigns repeated this: for the NICs the IOMMU mode doesn't
+  matter (§8 "0x0A07 in short").
 
 ### 4.3 What the IOMMU counters can and cannot show
 
@@ -654,109 +373,14 @@ off. `PWC_CACHE_FILLS` would give an independent count to compare it with.
 
 ---
 
-## 5. Next experiments and open items
+## 5. Next experiments and open items (icx, 09-29): archived
 
-In order of what each one decides. Commands run on icx from
-`~/F_S_Memory_Script`.
-
-1. **Simpler switch design.** As of 2026-10-15 the NICs sit behind the PIPS
-   switch (§8), whose batcher and drain cap are now swept with
-   `dualnic_pips_sweep.sh`. The steps below still apply to the new placement.
-   It removes the bias from the earlier topology: both NICs behind one PCIe
-   switch with a single x8 Gen4 uplink, which capped every 2-NIC run at
-   ~105.7 Gbps (§4.1 A).
-   **Keep the IOMMU shared** if contention is still the question: NICs behind
-   different IOMMU (DMAR) units have nothing to contend for (§1). With the
-   IOMMU on, check which unit each NIC is behind:
-   ```bash
-   for d in 0000:99:00.0 0000:9a:00.0; do    # substitute the new addresses
-       echo "$d -> $(basename "$(readlink -f /sys/bus/pci/devices/$d/iommu)")"
-   done                                       # same dmarN = shared IOMMU
-   ```
-   Then re-run `discover-pcie-topology.sh`, update `PCIE_PATTERN` (§3), and
-   check the new link widths with `sudo lspci -vv -s <addr> | grep -E 'LnkCap:|LnkSta:'`.
-
-2. **Record the missing IOMMU events (§4.3) before the next sweep,** at least
-   the invalidation counts and page-walker saturation. Add lines to
-   `utils/opCode-6-106.txt`. Then update the column offsets in
-   `record-host-metrics.sh`, which reads fixed CSV columns that new events
-   shift, and add the new keys to `PCIE_KEYS` in `scripts/dualnic-results.py`.
-   More events mean more time-sharing of `pcm-iio`'s 4 counters per stack, so
-   check one run on icx before a sweep.
-
-3. **Does 6.8 map and unmap per packet? (~5 min, booted strict. Tests §4.1 B.)**
-   Needs `linux-tools-$(uname -r)` for `perf`.
-   ```bash
-   ./scripts/run-dualnic-experiment.sh -E diag-maps --nics 1 --nic-index 0 -S 5 -C 5 --uncapped > ~/diag-maps.log 2>&1 &
-   sleep 60
-   sudo perf stat -e iommu:map,iommu:unmap -a -- sleep 5
-   ethtool -S enp153s0f0np0 | grep -E 'rx_pp_|cache_'
-   wait
-   ```
-   At ~96 Gbps, receive data arrives at ~3 M 4 KB pages/s. If unmaps run near
-   that rate, strict is churning as in the paper, and B is wrong. If they are
-   far below it, pages are recycled while still mapped. Then the paper's effect
-   will not reproduce on this kernel: do item 5.
-
-4. **Single-NIC flow sweep, strict vs off, at the paper's flow counts. Tests
-   §4.1 A.** Removes the shared uplink. Once per IOMMU setting:
-   ```bash
-   ./scripts/sosp24-experiments/dualnic_flow_sweep.sh "5 10 20 40" uncapped 3 nic0only
-   ```
-
-5. **Boot the paper's baseline kernel, stock 6.0.3,** if item 3 shows
-   recycling. Build it per `README.md` (no patch is needed for the "IOMMU on"
-   baseline) and re-run item 4. Only then compare against the F&S-patched
-   kernel.
-
-6. **Explain the 30-flow cliff. Tests §4.1 C.** It sits exactly where the
-   paper's effect should appear, so it would hide an IOMMU drop even on the
-   right kernel.
-   ```bash
-   ./scripts/run-dualnic-experiment.sh -E diag-f30 --nics 2 -S 30 -C 30 --uncapped > ~/diag-f30.log 2>&1 &
-   sleep 60
-   ssh yz69@192.17.100.255 'top -b -n 1 | head -25'   # sender cores at 100%?
-   top -b -n 1 | head -25                              # receiver
-   wait
-   cat utils/reports/diag-f30-RUN-server-0/cpu_util.rpt   # per-core receiver CPU
-   # NIC0 alone at 30 flows: ~24 again means a per-NIC limit, not a 2-NIC effect
-   ./scripts/run-dualnic-experiment.sh -E diag-f30-nic0 --nics 1 --nic-index 0 -S 30 -C 30 --uncapped
-   ```
-
-7. **Make the IOMMU the tightest limit,** once items 2–6 say it can matter:
-   - **Fewer receiver cores** (1–2 per NIC via `SERVER_CORES`). The CPU becomes
-     the limit, so strict's CPU cost (§4.1 observation 3) turns into lost
-     throughput.
-   - **Ring-buffer sweep, 256 → 4096.** A larger working set is the mechanism
-     F&S targets, and no dual-NIC ring sweep has been run.
-   - **MTU 1500.** About 2.7× more packets per byte.
-   - **Rate capped below the uplink** (e.g. 40 Gbps per NIC), so the link never
-     binds.
-
-**Still open from before**
-
-- **`IOMMU_mem_access` semantics.** ~5 per miss (§4.1 B, §4.2), and non-zero
-  with the IOMMU off. Intel's description does not explain either (§4.3).
-  Compare it against `PWC_CACHE_FILLS` once that is recorded (item 2).
-- **`Part0` is confirmed live** (non-zero misses that scale with load) but was
-  never cross-checked against a traffic-carrying Part in `pcm-iio` directly.
-- **Broadwell ceiling:** ~97 Gbps on one link. Whether it can drive two links
-  near line rate is untested. styx's two ports are one Gen3 card, so they may
-  share a ~126 Gbps slot as well.
-- **The capped 8-flow result (§4.2) is still `--runs 1`.**
-
-**Instrumentation gaps** (each limits what the numbers above can show)
-
-- **Sender CPU is never recorded.**
-- **Per-core CPU is only in `cpu_util.rpt`,** not in the JSON.
-- **Retransmits are never collected.** The runner copies `retx.rpt` from styx,
-  but styx never writes one.
-- **`membw.rpt` had no values.** The old awk parser matched only older PCM's
-  `NODE n` lines. `utils/parse_membw.py` (2026-10-10) also reads current PCM's
-  `SKT n`, which should fill the `Node<N>_*_bw` fields in the dual-NIC JSON
-  too. Not yet checked on icx.
-- **Several IOMMU events are not programmed:** page-walk-cache lookups and
-  misses, invalidations, and page-walker saturation (§4.3, item 2).
+The list as of 09-29/10-15 (items 1-7, "Still open from before",
+"Instrumentation gaps") is in [docs/archive/pre-pips.md](docs/archive/pre-pips.md). Item 1 was
+done (the NICs moved behind PIPS, 10-15). Item 3 (map/unmap counts) became the
+paper campaign's E7, which has no data: `perf` runs on neither kernel. Never
+done: item 2 (the unrecorded IOMMU events of §4.3), item 5 (the paper's 6.0.3
+kernel), item 6 (the 30-flow cliff), and `IOMMU_mem_access`'s meaning.
 
 ---
 
@@ -764,6 +388,9 @@ In order of what each one decides. Commands run on icx from
 
 - **This kernel is not the paper's.** icx runs stock `6.8.0-110-generic`; the
   paper's baselines are on 6.0.3. The IOMMU cost may not reproduce (§4.1 B).
+- **icx now boots `6.12.43-vanilla`** (since at least 10-26; §1 and §4 are
+  from the 6.8 days). A vanilla kernel has no `linux-tools-$(uname -r)`
+  package: `perf` would have to come from its source tree.
 - **Uncapped 2-NIC throughput cannot show an IOMMU cost.** It is pinned at
   ~105.7 Gbps by the shared uplink whatever the IOMMU does.
 - **Two experiments at once zero each other's traffic.** Each kills iperf3 on
@@ -1080,406 +707,21 @@ layout: its runs are directly under `utils/logs/` and `utils/reports/` as
   per-I/O churn §4.1 B suspects mlx5's page recycling avoids. 4k reads maximise
   it per byte.
 
-### First result: strict, 4k random reads (2026-10-05)
+### Results before PIPS (10-05 to 10-11): archived
 
-Means of 3 runs, iodepth 32 per instance. Mean latency is from Little's law
-(I/Os in flight ÷ IOPS); fio's own latency is in `fio.rpt`.
-
-| Instances per drive | 9100 PRO alone | 990 EVO Plus alone | Both | Both ÷ sum of alone | Both: CPU µs per I/O | Both: misses per I/O |
-|---|---|---|---|---|---|---|
-| 1 | 225K | 182K | 365K | 90% | 5.7 | 1.36 |
-| 2 | 237K | 368K | 507K | 84% | 8.1 | 1.38 |
-| 4 | 431K | 532K | 669K | 69% | 10.3 | 1.50 |
-| 8 | 603K | 674K | 739K | 58% | 17.2 | 1.71 |
-
-**Observed**
-
-1. **More instances give more IOPS, with diminishing returns.** From 1 to 8
-   instances: ×2.7 on the 9100 PRO, ×3.7 on the 990 EVO Plus, ×2.0 for both
-   together. GB/s is IOPS × 4 KiB. The PCIe link is never the limit: 25 of
-   63 Gbps at most.
-2. **One instance is about one core:** 1.0–1.2 cores busy, ~5.2–5.5 µs of CPU
-   per I/O, ~200K IOPS.
-3. **CPU per I/O roughly doubles from 1 to 8 instances** on either drive, and
-   triples in the 8-instance co-run (5.7 → 17.2 µs). Mean latency rises from
-   ~140–175 µs to ~380–690 µs. Each I/O costs more as concurrency rises.
-4. **The co-run at J instances per drive matches one drive at 2J**, on the 990
-   EVO Plus. IOPS: 365K vs 368K, 507K vs 532K, 669K vs 674K. Misses per I/O
-   and CPU per I/O match too: 1.50 vs 1.54 and 10.3 vs 10.2 µs at J = 4.
-   Throughput follows the total instance count, not the number of drives; the
-   second drive adds nothing a second set of instances on the first would not.
-5. **The 9100 PRO does not scale from 1 to 2 instances** (225K → 237K) while
-   using twice the CPU. The 990 EVO Plus doubles (182K → 368K).
-6. **Misses per I/O rise only modestly with concurrency** (~1.1–1.2 → 1.4–1.7).
-   CPU per I/O rises much faster.
-7. **Both drives split node 2 into the same 4 NVMe hardware queues**:
-   CPUs 36–40, 41–45, 46–49 and 50–53. Each queue has one interrupt, and in
-   strict mode the unmap and invalidation run in that completion path. The
-   `SSD_CORES` split puts the 9100 PRO's instances on fewer queues: at
-   2 instances its cores 36 and 37 share one queue, while the 990 EVO Plus's
-   45 and 46 use two. Number of queues used:
-
-   | Instances | 9100 PRO (36–44) | 990 EVO Plus (45–53) |
-   |---|---|---|
-   | 1 | 1 | 1 |
-   | 2 | 1 | 2 |
-   | 4 | 1 | 2 |
-   | 8 | 2 | 3 |
-8. **In an 8-instance co-run, the interrupt CPUs of the queues in use are at
-   100%; nothing else is.** `mpstat` and `/proc/irq/*/effective_affinity_list`,
-   2026-10-05:
-
-   | Queue (CPUs) | 9100 PRO interrupt CPU | 990 EVO Plus interrupt CPU |
-   |---|---|---|
-   | 36–40 | 38 | 40 |
-   | 41–45 | 43 | 45 |
-   | 46–49 | 47 | 48 |
-   | 50–53 | 51 | 52 |
-
-   The queues in use had interrupt CPUs 38 and 43 (9100 PRO) and 45, 48 and
-   52 (990 EVO Plus): all five at 100%. The interrupt CPUs of unused queues
-   (40, 47, 51) were 60–75% busy, like the other fio cores. The other fio
-   cores sat 23–40% idle, most on the queue serving five instances (CPUs
-   36–40, one interrupt CPU). `%irq` read 0 everywhere: this kernel counts
-   interrupt time as `%sys`.
-
-**Speculated reasons (not established)**
-
-- **A host-side limit shared by both drives**, given 3 and 4. They share only
-  `dmar7`: each drive has its own IOMMU domain, IOVA allocator and NVMe
-  queues. In strict mode every unmap waits synchronously for an IOTLB
-  invalidation through `dmar7`'s single invalidation queue, under a lock, so
-  invalidations from every core serialize. The co-run plateaus near
-  740K IOPS, about one invalidation every 1.35 µs. 6 fits: the cost is in
-  keeping translations current, not in translating. **Tests:** the
-  IOMMU-off sweep (it should scale with CPU per I/O roughly flat), lazy mode
-  (`iommu.strict=0`, batched invalidations), and
-  `sudo perf top -C 36-53` during an 8-instance co-run, looking for time in
-  `qi_submit_sync` or spinlocks under the intel-iommu flush path.
-- **A per-queue limit instead (favoured since 8; refuted by the second
-  result, below).** Each queue's completions
-  run on its one interrupt CPU. In strict mode that includes every unmap and
-  its synchronous invalidation. At 8 instances those CPUs are saturated, and
-  the fio cores wait on them. The plateau would then be set by how many
-  queues, and so interrupt CPUs, a configuration uses, not by a limit shared
-  through `dmar7`. Observation 4 may be the same effect, since the matched
-  pairs used similar numbers of queues. **Test:** spread each drive's
-  instances over all 4 queues and keep fio off the interrupt CPUs. IOPS
-  rising well past ~740K means a per-queue limit; a ceiling near 740K means a
-  global one. Then the IOMMU-off sweep with the same placement shows how much
-  of the per-completion cost is the IOMMU.
-- **Core placement, for 5 and 7.** The guess that the 9100 PRO has fewer
-  queues was wrong (7). But its instances do sit on fewer queues, which fits
-  5. A queue is not a hard cap, though: on one queue the 9100 PRO went from
-  237K at 2 instances to 431K at 4. Where each queue's interrupt lands
-  (`/proc/irq/<n>/effective_affinity_list`) and per-core CPU (`cpu_utils` in
-  each `cpu_util.rpt`) should settle it. It also means the two drives'
-  single-drive numbers are not comparable as run. With the interrupt CPUs of
-  8, an order that gives each drive all 4 queues from 4 instances up, and
-  keeps fio off every interrupt CPU up to 5 instances per drive, is
-  `"36,41,46,50,37,40,45,48,52"` and `"39,42,49,53,44,38,43,47,51"`. From 6
-  instances up, each drive's extra instances sit on the *other* drive's
-  interrupt CPUs, which are idle in single-drive runs. Interrupt CPUs are
-  assigned at boot and may move after the IOMMU reboot: re-check them first.
-
-### Second result: strict, 4k, interrupt-aware placement (2026-10-05)
-
-`dualssd-sweep-strict-4`, with `SSD_CORES` as recommended above: each drive
-uses all 4 queues from 4 instances up, and fio stays off the interrupt CPUs up
-to 5 instances. Means of 3 runs.
-
-| Instances per drive | 9100 PRO alone | 990 EVO Plus alone | Both | Both ÷ sum of alone | Both: misses per I/O | Both: CPU µs per I/O | Both: latency µs |
-|---|---|---|---|---|---|---|---|
-| 1 | 226K | 227K | 366K | 81% | 1.26 | 6.4 | 175 |
-| 2 | 377K | 374K | 597K | 80% | 1.43 | 7.1 | 214 |
-| 4 | 562K | 589K | 605K | 53% | 1.76 | 13.4 | 422 |
-| 8 | 564K | 596K | 713K | 61% | 1.84 | 20.6 | 718 |
-
-**Expected ceilings at 4 KiB, if only the hardware limited:**
-
-| Limit | 4 KiB IOPS | GB/s | `PCIe_wr` reads |
-|---|---|---|---|
-| Shared uplink, Gen3 x8 | ~1.55–1.7M total | ~6.4–7.0 | ~51–56 Gbps |
-| Each drive's link, Gen4 x4 | ~1.6M per drive | ~6.4–7.0 | ~51–56 Gbps |
-| 990 EVO Plus 1TB, rated | 850K | | |
-| 9100 PRO 1TB, rated (on Gen5) | 1.85M | | |
-
-How the link rows are derived:
-- **Raw rate:** 8 GT/s × 8 lanes × 128/130 = 63 Gbps (7.88 GB/s).
-- **Per-I/O traffic:** a 4 KiB read arrives as 16 PCIe writes of 256 B (32 of 128 B at a smaller max payload), each with ~26 B of header and framing. A command fetch and a completion entry add ~100 B.
-- **Efficiency:** that leaves ~90% of the raw rate with 256 B max payload, ~83% with 128 B. The max payload in use is not yet checked.
-- **`PCIe_wr` column:** it counts payload only, so link saturation reads ~51–56 Gbps there, not 63.
-
-Both drives together should therefore reach ~1.5–1.6M IOPS, limited by the uplink. One drive alone should reach ~850K for the 990 EVO Plus (the drive's limit) and ~1.6M for the 9100 PRO (its link). Observed: 713K at most for both together, about 2.9 GB/s and 23.7 Gbps `PCIe_wr`, which is under half the uplink ceiling. Each drive alone plateaus at 560–600K.
-
-**Observed**
-
-1. **The earlier asymmetry between the drives was placement.** With the same
-   placement, the drives match at 1 and 2 instances (226K/227K, 377K/374K).
-2. **Each drive alone plateaus at ~560–600K from 4 instances.** From 4 to 8,
-   IOPS stay flat while latency doubles (~220 → ~440 µs) and CPU per I/O rises
-   from ~6 to ~10.5 µs.
-3. **Both drives together barely exceed one drive** at 4 instances each:
-   605K vs 562K and 589K, although the co-run has 8 queues and 8 separate
-   interrupt CPUs. This fails the per-queue test set in "First result". The
-   ceiling stays near 600–700K, so it is a limit shared by both drives.
-4. **At equal total instances and IOPS, the co-run costs more than one drive.**
-   Both at 4 each (8 total, 605K) vs one drive at 8 (564K, 596K): misses per
-   I/O 1.76 vs 1.32 and 1.50 (+17–33%). CPU per I/O 13.4 vs 10.5 and 10.2 µs
-   (+28–31%). Latency is about the same. This is the first sign of contention
-   between the two drives in the IOMMU itself. Caveat: the single-drive run at
-   8 puts instances on the other drive's interrupt CPUs, so the placements are
-   not identical.
-
-**Reading (not established).** Below half the link ceiling and below either
-drive's rating, the shared limit is on the host side. The drives share
-`dmar7`: its IOTLB, page walker and invalidation queue. The per-queue
-explanation above is refuted. The IOMMU-off sweep with the same placement
-decides it. If the IOMMU is the limit, the co-run should go well past 713K
-toward the uplink ceiling (~1.5M, LINK BOUND), and the 990 EVO Plus alone
-toward 850K. If the off sweep also stalls near 600–700K, look at the IIO
-stack and the PCIe switch instead.
-
-### Third result: block-size sweep, strict vs IOMMU off (2026-10-05)
-
-`dualssd_bs_sweep.sh`: both drives, 4 instances each, means of 3 runs, once
-per IOMMU boot setting.
-
-| Block | Off: IOPS | Off: GB/s (fio) | Off: `PCIe_wr` | Strict: IOPS | Strict: GB/s | Strict: `PCIe_wr` | Strict ÷ off | Strict: misses per 4 KiB | CPU µs per I/O, off → strict |
-|---|---|---|---|---|---|---|---|---|---|
-| 4k | 1,644K | 6.73 | 54.8 | 652K | 2.67 | 22.1 | 40% | 1.63 | 4.35 → 12.69 |
-| 16k | 418K | 6.86 | 55.7 | 400K | 6.56 | 53.3 | 96% | 1.40 | 9.82 → 10.23 |
-| 64k | 69.8K | 4.58 | 53.2 | 69.1K | 4.53 | 52.8 | 99% | 1.21 | 25.0 → 27.9 |
-| 256k | 20.8K | 5.46 | 54.4 | 20.8K | 5.44 | 54.3 | 100% | 1.15 | 46.5 → 53.5 |
-| 1m | 6.1K | 6.44 | 55.6 | 6.1K | 6.43 | 55.6 | 100% | 1.10 | 129.6 → 161.4 |
-
-**Observed**
-
-1. **IOMMU off, 4k: 1.64M IOPS at 54.8 Gbps `PCIe_wr`,** the shared uplink's
-   ceiling as predicted (1.55–1.7M IOPS, 51–56 Gbps). The link estimate holds.
-2. **Strict, 4k: 652K, 40% of off.** Latency is 392 vs 156 µs, and CPU per
-   I/O 2.9× (12.7 vs 4.35 µs). The ~600–700K ceiling of the earlier strict
-   sweeps is the strict IOMMU.
-3. **From 16k up, both modes sit at the link** (53–56 Gbps `PCIe_wr`) and
-   match within 4%.
-4. **The strict cost is per I/O, not per IOTLB miss.** At 16k, strict serves
-   2.24M misses/s (400K × 5.6) at full link rate. At 4k it stops at
-   1.06M misses/s (652K × 1.63). Misses per 4 KiB fall only slightly with block
-   size, from 1.63 to 1.10.
-5. **Strict's extra CPU per I/O grows with block size,** from +8 µs at 4k to
-   +32 µs at 1 MiB, as more pages are unmapped per I/O. It no longer limits
-   throughput above 4k.
-6. **With the IOMMU off, `IOTLB Miss` still reads ~0.06–0.13 per I/O.** On icx
-   it read 0. Treat it as this counter's floor on Skylake.
-7. **Open: fio and `PCIe_wr` disagree from 64k up.** fio reports 4.5–6.4 GB/s
-   where `PCIe_wr` says 6.6–6.95 GB/s, in both modes, with almost no
-   run-to-run spread. Up to 16k they agree within 2%. Candidate causes:
-   - throughput changing across the windows: fio's IOPS average all windows,
-     while `PCIe_wr` covers only its own
-   - thermal throttling of a drive
-   - inbound writes that are not fio data
-
-   The per-window IOPS in each `fio.rpt` test the first, and the per-second
-   logs show throughput over time.
-
-   **Checked 2026-10-05:** not time variation and not heat. Each drive's IOPS
-   are the same in the CPU, PCIe and memory windows within 1%, and match
-   fio's post-ramp figure. Both drives sit at 45–48 °C with zero
-   thermal-throttle events. Split by drive (GB/s, IOMMU off; strict within 3%):
-
-   | Block | 9100 PRO | 990 EVO Plus | fio total | `PCIe_wr` | PCIe − fio |
-   |---|---|---|---|---|---|
-   | 16k | 0.92 | 5.93 | 6.86 | 6.96 | +0.10 (+1%) |
-   | 64k | 2.70 | 1.88 | 4.58 | 6.66 | +2.08 (+45%) |
-   | 1m | 0.14 | 6.30 | 6.44 | 6.95 | +0.51 (+8%) |
-
-   - **The saturated uplink is shared very unevenly,** and the split flips
-     with block size. At 1 MiB the 9100 PRO completes 133 reads/s; with 128
-     in flight, each waits ~1 s.
-   - **Some inbound writes are never completed fio data:** 2.1 GB/s at 64k,
-     the same in both IOMMU modes.
-   - **None of this touches the 4k result.** There fio and `PCIe_wr` agree
-     within 2%, and strict runs far below the link.
-
-   **Resolved 2026-10-05 (`dualssd-bssweep-strict-2`, each drive alone,
-   strict):** the extra writes come from the 990 EVO Plus. For each drive
-   alone, `PCIe_wr` is that drive's traffic only:
-
-   | Block | 9100 PRO: fio / `PCIe_wr` GB/s | 990 EVO Plus: fio / `PCIe_wr` GB/s |
-   |---|---|---|
-   | 16k | 4.86 / 4.95 (+2%) | 5.92 / 6.00 (+1%) |
-   | 64k | 6.85 / 6.96 (+2%) | **1.89 / 3.94 (+108%)** |
-   | 1m | 6.94 / 7.05 (+2%) | 6.40 / 6.92 (+8%) |
-
-   `dmesg` at boot: `nvme nvme1: allocated 64 MiB host memory buffer`. The 990
-   EVO Plus is DRAM-less and keeps its working cache in 64 MiB of host RAM. Its
-   reads and writes of that buffer are DMA through the same root port and
-   IOMMU. `PCIe_wr` counts them; fio does not. `dmesg` shows no I/O timeouts
-   or link errors.
-
-   That is the most likely explanation, not a proven one. `PCIe_rd_tput` in
-   the same runs' `pcie.rpt` should show matching reads of host memory if the
-   drive uses the buffer as a staging area.
-   - **fio is the throughput measure.** `PCIe_wr` is the link load, including
-     the 990 EVO Plus's buffer traffic from 64k up. LINK BOUND stays right
-     because it is about the link.
-   - **The 990 EVO Plus alone is slow at 64k:** 1.89 GB/s at 4.4 ms latency,
-     the same with the IOMMU off. That is the drive, not the link or the
-     IOMMU.
-   - **Its buffer traffic is also translated by the IOMMU,** through long-lived
-     mappings with no map/unmap churn, so it adds IOTLB lookups that are not
-     fio's. At 64k its misses per 4 KiB are 1.17 vs the 9100 PRO's 1.10.
-   - **Each drive alone reaches the link at 1 MiB** (6.9 and 6.4 GB/s).
-     Together, the switch starves the 9100 PRO (above). Large-block co-runs
-     show switch arbitration, not the IOMMU.
-   - The buffer can be turned off with the kernel parameter
-     `nvme.max_host_mem_size_mb=0`, which slows that drive. It needs a reboot
-     on a shared machine; not done.
-
-**Reading (not established).** The strict ceiling comes from the per-I/O
-map, unmap and synchronous IOTLB invalidation, not from translating. That is
-the cost F&S ideas 2 and 3 (§2.1 of KNOWLEDGE-MAP) target. **Test:** lazy mode
-(`iommu.strict=0`, batched invalidations) at 4k. If lazy comes close to off,
-the invalidation is the cost.
-
-### Fourth result: cross sweeps on three switch designs (2026-10-06)
-
-`dualssd_cross_sweep.sh --single` with `--membw 0`, one run per point: 4k–1m
-× 1/2/4/8 instances, both drives and drive 0 alone. Six sweeps, three switch
-designs (RTL), each strict and off. Full report with figures and every value,
-now including design D (Fifth result):
-https://claude.ai/artifact/AcYH8Ff2Drt5kon44un3gX (private; local copy
-`dualssd/dualssd-xsweeps-report.html`, results in `dualssd/1006/`, both
-ignored by git). **Do not pool sweeps across designs.**
-
-| Design | strict | off |
-|---|---|---|
-| A | `dualssd-xsweep-strict-1` (00:07–00:42) | `dualssd-xsweep-off-1` (00:55–01:30) |
-| B | `dualssd-xsweep-strict-2` (12:48–13:24) | `dualssd-xsweep-off-2` (10:23–10:58) |
-| C | `dualssd-xsweep-strict-4` (14:11–14:46) | `dualssd-xsweep-off-3` (15:19–15:54) |
-
-The mapping is inferred from order and numbering, not recorded; to be
-confirmed. The data supports it for A and B (a design's strict and off sweeps
-share the same link split from 16k up). For C it doesn't fully agree:
-`off-3` matches `off-1` within 4.4% everywhere.
-
-1. **Link sharing is the design difference.** With the link full, B splits it
-   43–53% (drive 0 50% at 16k, 53% at 1m; 75% at 64k). A and C starve drive 0:
-   12–18% at 16k, 2% at 1m on A (237 ms mean latency vs 9.4 ms on B), 1% at 8k
-   off.
-2. **B moves more at large blocks:** 5.26 vs 4.48–4.58 GB/s at 64k (+15%),
-   6.70 vs 6.44–6.50 at 1m, in both IOMMU modes. It gives the 990 EVO Plus
-   less of the link, and that drive's host-buffer traffic costs ~1.1 extra link
-   bytes per byte read at 64k (~0.1 at 1m).
-3. **The IOMMU ceiling does not depend on the design:** strict 724–735K IOPS
-   at 4k/8 instances on all three, 44–45% of off (1,645K, link-bound). CPU/IO
-   2.4–3.0×. p99 267–296 ms strict vs 0.5–1.8 ms off.
-4. **C strict only:** at 4k/4–8 instances, 15.6/20.6 Gbps more inbound writes
-   than read data (7.9/14.8 with drive 0 alone) and ~2× misses per 4 KiB
-   (2.80/3.17 vs 1.58–1.89); drive 0 alone slower at J=1 (183K vs 227–236K at
-   4k) and at 64k (97–99K vs 104–105K). Hypothesis: address width. With the
-   IOMMU on, Linux gives the drives IOVAs below 4 GiB (3-DW TLP headers); off,
-   physical addresses above 4 GiB (4-DW). Test: strict with `iommu.forcedac=1`.
-   Repeat first (the four points ran back to back, 14:15–14:18). **Repeated
-   on design D (Fifth result, item 4):** the extra writes come back, larger,
-   on another day; the 64k slowness does not.
-   **Withdrawn 2026-10-16 (§8, "0x0A04 results"):** the extra writes and
-   ~2× misses are a `pcm-iio` artifact, not traffic. They appear only in runs
-   where `pcm-iio` logged 1–5 one-second samples instead of 17, and every
-   `pcm-iio` rate in such a run reads ~2× high. On 0x0A04 the switch's own
-   log shows 1.01× fio's data at those points. C's records predate
-   `pcie_samples`, but its extra writes sit at the same points.
-5. Strict sweeps differ by up to 26% below the link limit (4k, 1–2 instances;
-   B fastest, C slowest). Not attributed to the switch until repeated: one run,
-   shared host.
-6. The 990 EVO Plus has 1.6 GB written, so most of its random reads hit
-   unwritten blocks (1.48M IOPS at 4k, above its 850K rating). It acts as a
-   fast DMA source, not a loaded SSD.
-
-### Fifth result: design D shares the link fairly (2026-10-10)
-
-`dualssd_cross_sweep.sh --single --asy`, one run per point: 4k–1m × 1–32
-instances per drive, drive 0 alone, and uneven co-runs (2/4/8 against 16/32,
-both ways round). One switch design, D: the RTL in use on 2026-10-10. What
-changed from A–C is not recorded here. Results in `dualssd/1010/`; the report
-above now covers D too. The sweeps reuse the names `strict-1` and `off-2`, so
-keep them apart from the 10-06 files of the same name.
-
-| Design | strict | off |
-|---|---|---|
-| D | `dualssd-xsweep-strict-1` (10-10 18:48–22:19) | `dualssd-xsweep-off-2` (10-10 23:43 – 10-11 03:14) |
-
-`dualssd-xsweep-off-1` stopped at the datapath check (no `pcm-iio` rows),
-before `a268b81f7` kept such runs with the IOMMU off; `off-2` is the rerun.
-
-1. **The starvation of A and C is gone.** Drive 0's share of the fio bytes,
-   8 instances per drive:
-
-   | Block | A off | C off | B off | D off | D strict |
-   |---|---|---|---|---|---|
-   | 4k | 10% | 10% | 52% | 48% | 55% (IOMMU-bound, link not full) |
-   | 8k | 1% | 1% | 43% | 43% | 49% |
-   | 16k | 13% | 14% | 50% | 51% | 47% |
-   | 64k | 59% | 59% | 75% | 69% | 68% |
-   | 1m | 2% | 2% | 53% | 49% | 49% |
-
-   - It holds at 16 and 32 per drive (16k 47–51%, 1m 49%), in both IOMMU
-     modes. Per-drive p99 at 1m, 8 instances: 119 / 123 ms on D, against
-     2.9 s / 66 ms on A.
-   - 8k at 43% is drive 0's own ceiling: alone it tops out at 360K at 8k
-     (KEPT% 100).
-   - 64k at 68–69% of fio bytes is about 50/50 on the link. `PCIe_wr` is
-     53.8 Gbps (6.7 GB/s) against 4.97 GB/s of fio data; the extra ~1.7 GB/s is
-     the 990 EVO Plus's host memory buffer. Each drive uses ~3.3–3.5 GB/s of
-     the link.
-2. **Uneven co-runs: fair from 16k up.** With the IOMMU off, the light drive
-   keeps 91–100% of its even-run IOPS (`vsLOW`) at 16k and 100% at 64k and
-   1m. Both orientations agree within a few percent.
-3. **At 4–8k against 32 instances the light drive loses about half, from the
-   core split, not the switch.**
-   - 2+32 gives the light drive 1 core (1+17) and 4+32 gives it 2 (2+16):
-     2 instances per core, against 1 in the even run `vsLOW` compares with.
-   - Its IOPS match what that many cores give alone. Off, 4k: 252K on 1 core
-     against 288K for 1 instance alone; 500K on 2 cores against 545K for 2.
-     Against 16 it keeps its cores and 92–102% of its IOPS.
-   - The link is not always full there. Off, 8k, 32+2 halves drive 1 (232K
-     against 464K) at 39.6 Gbps `PCIe_wr`; off, 4k, 32+2 runs at 50.4.
-   - Strict, 4k: the light drive also loses against 16 (`vsLOW` 70–89%). That
-     is the shared IOMMU, the contention under study. The even run at 4 per
-     drive is itself uneven (476K / 210K), so `vsLOW` over 100% there
-     (120–123%) means nothing.
-4. **Below the link, D strict matches design C.** This repeats C's 4k
-   anomaly (Fourth result, item 4) on another day and another design.
-   - Drive 0 / drive 1 at 4k: 159K / 203K at 1 instance (C: 158 / 208),
-     476K / 210K at 4 (C: 469 / 218), 410K / 334K at 8 (C: 403 / 329).
-   - Drive 0 alone at 1 instance: 186.5K (C: 183K; A, B: 227–236K).
-   - Extra inbound writes at 4k: 22.3 / 27.9 / 23.8 Gbps with both drives at
-     4 / 8 / 16 (C: 15.6 / 20.6), and 7.6 / 10.5 / 16.9 / 12.7 Gbps with
-     drive 0 alone at 4 / 8 / 16 / 32. IOMMU off: 0.9–1.4 Gbps.
-     **Not real (2026-10-16):** these are exactly D's 14 strict 4k runs with
-     1–5 `pcm-iio` samples (inbound writes 1.38–2.43× fio); its 7 runs with
-     17 samples read 1.02×. Same for the misses below (§8, "0x0A04 results").
-   - Misses per 4 KiB at 4 and 8 instances: 2.65 and 3.60 (C: 2.80 and 3.17).
-   - C's slow 64k with drive 0 alone (97–99K) does not recur: 103–105K.
-   - **LINK BOUND misfires here.** The summary flags the 4k strict uneven rows
-     4+16, 32+4 and 8+16 (`PCIe_wr` 54–60 Gbps) while fio moves ~3.07 GB/s
-     (~25 Gbps). On C and D in strict mode at 4k, judge the link by fio's GB/s.
-5. **The strict ceiling does not move with more instances.** 4k: 744K at 8 per
-   drive, 753K at 16 (45% of off's 1,648K). 8k: 5.98 GB/s at 8, 5.92–5.96 at
-   16–32. CPU per I/O at 4k rises from 18.2 to 20.1 µs and p99 at 16 per drive
-   reaches 1.67 s / 1.08 s. The miss rate peaks at 8.6% at 8 and falls to 7.0%
-   at 16.
-6. **Missing points.** Strict, 4k: 32+32, 8+32 and 32+8 failed (`pcm-iio`
-   logged no rows; exit 3, not recorded), so there is no strict 4k co-run at
-   32 per drive. Off: the 4k co-runs at 1 and 2 per drive and the 8k co-run at
-   1 were kept with `PCIe_wr` and IOMMU values `n/a`. 1m at 32 per drive ran in
-   both modes, p99 ~0.45 s per drive; `dmesg` was not checked.
-
-**Reading.** The switch fairness problem of A and C is fixed in D, and D is
-the design to use for IOMMU work: its link split does not depend on the IOMMU
-mode or the load. Its strict 4k anomaly is C's, so the address-width test
-(Next, item 0) can run on D.
-
+The First to Fifth results (strict 4k, interrupt-aware placement, block-size
+sweep strict vs off, cross sweeps on switch designs A-C, design D) are in
+[docs/archive/pre-pips.md](docs/archive/pre-pips.md); report "Dual-SSD Cross Sweeps"
+https://claude.ai/artifact/AcYH8Ff2Drt5kon44un3gX. In short:
+- **Strict caps 4k random reads at ~40% of off** (652K vs 1.64M IOPS, off at
+  the Gen3 x8 uplink). From 16k up both modes sit at the link. The cost is
+  per I/O (map, unmap, synchronous invalidation), not per IOTLB miss.
+- **fio must run off the drives' interrupt CPUs** (Second result;
+  `scripts/ssd-irq-placement.sh` checks a boot's layout).
+- **Switch designs A and C starved drive 0** on a full link; B and D share it
+  about evenly. D was the design for IOMMU work until PIPS.
+- The "extra inbound writes" at strict 4k on C and D were a `pcm-iio`
+  undersampling artifact (withdrawn 10-16; Traps below).
 ### Counters on Skylake
 
 `opCode-6-85.txt` is the paper's own event set (its Cascade Lake is also model
@@ -1554,48 +796,11 @@ mode or the load. Its strict 4k anomaly is C's, so the address-width test
   Those two runs are incomplete; ignore them.
 - `cpu_util.py` now parses `sar` output in both 12- and 24-hour locales. It
   previously needed the 12-hour format, and bigserver's locale is unchecked.
-
-### Next on bigserver
-
-0. **After the cross sweeps (2026-10-06 and 10-10), in this order** (commands
-   in the report's "Next runs"):
-   - **Address pattern, on design D.** (The extra-writes rationale below is
-     withdrawn, see the Fourth result, item 4; the `forcedac` test no longer
-     has a target. The IOVA tracing is partly covered by
-     `pips-addr-pattern.py` on the PIPS logs, §8.) D repeats C's strict 4k anomaly
-     (Fifth result, item 4), so C's planned repeat can run on D: strict at
-     4k, 4/8 instances, 3 runs, for the run-to-run spread. Record the IOVAs
-     the drives get with the `iommu:map`/`iommu:unmap` tracepoints (about
-     0.5 s per point; tracing perturbs the run, so not during measurements):
-     their width, spread and reuse distance, which should drive the miss
-     rate. Then strict with `iommu.forcedac=1` (IOVAs above 4 GiB, 64-bit
-     TLPs as with the IOMMU off) on D, with A or B as control.
-   - **Uneven co-runs with the light drive at one core per instance.** The
-     x+32 points at 4k/8k lose half the light drive's IOPS to the core split
-     (Fifth result, item 3). Needs a change to the runner's split in
-     `run-dualssd-experiment.sh`.
-   - **More instances: done on D.** Strict stops gaining at 8 per drive at
-     both 4k (744K, 753K at 16) and 8k (5.98 GB/s). `--iodepth 64` is the
-     remaining way to add load.
-   - **Why `pcm-iio` logged no rows** in 6 runs on 2026-10-10 (listed under
-     "fio is checked against the measurement windows" above): look at those
-     runs' `pcm-iio.out`.
-1. **Lazy mode (`iommu.strict=0`):** the block-size sweep, or at least 4k.
-   Then the instance sweep with `--single` in each mode, for the full
-   strict / lazy / off comparison below the link (1–2 instances).
-   `dualssd_cross_sweep.sh --single` covers both in one run per mode. Re-check
-   the interrupt CPUs after each reboot. Each reboot and grub change affects
-   everyone on the machine; agree on them with the other users first.
-   PCIe max payload size, if still wanted:
-   `for d in b0:00.0 b1:00.0 b3:00.0 b4:00.0; do echo "$d $(sudo lspci -vv -s $d | grep -A2 'DevCtl:' | grep -o 'MaxPayload [0-9]* bytes')"; done`
-2. **What the CPU time goes to,** if needed: `perf` is not installed for this
-   kernel (`linux-tools-5.15.0-177-generic`). `mpstat` cannot separate it,
-   because interrupt time shows up as `%sys` here.
-3. **Stay at 4k (or 8k) for IOMMU comparisons.** There the data is clean:
-   fio and `PCIe_wr` agree, there is no buffer traffic from the 990 EVO Plus,
-   and strict runs below the link.
-4. **The PIPS sweep on design `0x0A04`:** strict done 2026-10-16; IOMMU off
-   still to run (§8, "Next").
+- **Drive b4 (990 EVO Plus) can freeze the whole host when it is reset after
+  a load under vfio-pci** (5 of 6 times on 11-05; never at open). It claims
+  Immediate Readiness, so 5.15 skips the wait after its FLR (§8 "Next",
+  "bigserver freeze at b4's reset"). The drive alias campaigns therefore hold
+  the drives and end with a reboot.
 
 ---
 
@@ -1609,58 +814,27 @@ works, every register, and the log format:
 [scripts/pips/PIO-MANUAL.md](scripts/pips/PIO-MANUAL.md); the tools and test
 points: [scripts/pips/README.md](scripts/pips/README.md).
 
-- **Drives:** bigserver, both NVMe drives behind PIPS (since 2026-10-11).
-  The first PIPS sweeps ran 2026-10-13 on design `0x0A02`:
-  `dualssd-pips-{off,strict}-1-{d1t0,d4t22,d8t22,d16t64}` (local copies in
-  `dualssd/1013/`).
-- **NICs:** behind PIPS as of 2026-10-15, one per downstream port. Run the NIC
+- **Drives:** bigserver, both NVMe drives behind PIPS since 2026-10-11 (first
+  PIPS sweeps 10-13, design `0x0A02`).
+- **NICs:** behind PIPS since 2026-10-15, one per downstream port. Run the NIC
   experiments on that server, as before on icx (§2); `run-dualnic-experiment.sh`
   finds the NICs below the switch by their PCI path.
-- **Design `0x0A04`, 2026-10-15/16, strict only, cap off and on:** drives
-  `dualssd-pips-strict-1-id0a04-{d1t0,d4t22,d8t22,d16t64}[c1]` (700 of 720
-  runs; local copies in `dualssd/1016/`, with `traffic-ssd.txt`) and NICs
-  `dualnic-pips-strict-1-id0a04-*` on icx (104 runs; `dualnic/1016/`, with
-  `traffic-nic.txt`). Results below, "0x0A04 results".
-- **Design `0x0A05`, 2026-10-17/18, the depth sweep (strict, cap on, depths
-  1–64):** drives `dualssd-pips-strict-dsweep1-id0a05-*` (702 of 720 runs,
-  all eight settings; `dualssd/1019/`), NICs
-  `dualnic-pips-strict-dsweep1-id0a05-*` (22 of 32 points and the datapath
-  check, then the switch stopped answering; `dualnic/1019/`, with the
-  kernel log `jounalctl.txt` and the manifest). Results below, "0x0A05 depth
-  sweep".
-- **Reports (artifacts):** "PIPS Batcher Sweeps"
-  (https://claude.ai/artifact/XsrLugEhsaMzY6vwARSLGU) is design 0x0A02 only
-  (drives, IOMMU off and strict, page-order Figures 5–6); "PIPS 0x0A04–0x0A05
-  Sweeps" (https://claude.ai/artifact/MbNxzaJ5KgmuM59PPC4NcA, was "PIPS
-  0x0A04 Sweeps") is 0x0A04, drives and NICs, with what pcm logged on icx and
-  the page order (Figures 3–6, Tables 6–7), the depth sweep's times (Figure
-  7, Table 8) and 0x0A05's results (Figure 8, Tables 9–10, the NIC stop;
-  generator `a05.py`). "PIPS 0x0A06 Campaign"
-  (https://claude.ai/artifact/L3U8deVtMb4nHmb91AscK3) is the 0x0A06
-  campaign (results R1-R8 below, the splitting rule, next steps); it is
-  hand-written (`dualssd/dualssd-pips-0a06-report.html`, numbers from
-  `c1026.py`'s output, no generator) except its page-order section
-  (v2, Figures 6-9: `report-gen/page6.py` splices `seq6-section.html`, the
-  `seqrec6.py` index and `seqarr6.js` between `<!--SEQ6-BEGIN/END-->`; data
-  `dualssd/seq6/<kind>/*.json` published as `seq/<kind>/`). "PIPS TLP Patterns"
-  (https://claude.ai/artifact/Ni2PkBjsera7xFxx6wJdF2) is 0x0A04 and 0x0A05,
-  drives and NICs: page switches and visits per I/O for every log (as sent,
-  as entered, on the uplink; data writes only) and a viewer of each log's
-  listing excerpt (`report-gen/tlpdump.py`, data from the campaign's
-  `analyze-pending/`); since v3 (10-26) it is instead the averaged summary of
-  the page-order figures for 0x0A04, 0x0A05 and 0x0A06 (one chart per drive
-  block size and one for the NICs, `report-gen/sumpage.py`; the viewer stays
-  local as `dualssd/dualssd-pips-tlp-viewer.html`). v5 (10-26): every line
-  from the measured arrival order (result 10 of the 0x0A06 campaign; v1-v4
-  used seqrec's synthetic arrivals). v4 (10-26): a second NIC
-  chart, capped at 50 Gbps per NIC (0x0A06 only, the earlier designs never ran
-  it), a pooled model FIFO ("all": every log at every FIFO, now the default)
-  and a table of the model checks (own setting vs log) per design and group. Both generators are in the git-ignored `dualssd/report-gen/` (README
-  there: `py -3 build.py` for 0x0A02, `py -3 page4.py` for 0x0A04–0x0A05,
-  from the local copies; Tables 6-7 come from `seq4.py` (first grab),
-  Figures 3-6 from `seqarr.py` + `seqarr.js` reading the `pips-seq-grab.sh`
-  output unpacked in `dualssd/1016/` and `dualnic/1016/`; every generator and
-  input is listed in FILE-MAP §7).
+- Every sweep and campaign so far, with its data folder: the archive files
+  (top of this file) and FILE-MAP §7.
+
+**Report pages (artifacts), one per design or campaign:**
+
+| Page | Covers | Built from (git-ignored `dualssd/`) |
+|---|---|---|
+| "Dual-SSD Cross Sweeps" https://claude.ai/artifact/AcYH8Ff2Drt5kon44un3gX | drives before PIPS, switch designs A-D (10-06, 10-10) | `dualssd-xsweeps-report.html`, generator not kept |
+| "PIPS Batcher Sweeps" https://claude.ai/artifact/XsrLugEhsaMzY6vwARSLGU | 0x0A02, drives, IOMMU off and strict (10-13) | `report-gen/build.py` |
+| "PIPS 0x0A04–0x0A05 Sweeps" https://claude.ai/artifact/MbNxzaJ5KgmuM59PPC4NcA | 0x0A04 drives and NICs, 0x0A05 depth sweep (v10) | `report-gen/page4.py` |
+| "PIPS 0x0A06 Campaign" https://claude.ai/artifact/L3U8deVtMb4nHmb91AscK3 | 0x0A06 campaign R1-R8, page order (v2) | hand-written `dualssd-pips-0a06-report.html` + `report-gen/page6.py` |
+| "PIPS 0x0A07 Campaign" https://claude.ai/artifact/91VNbNGeJVyfuLLH8acGvY | 0x0A07 minimal rerun, verdict, paper campaign (v2) | hand-written `dualssd-pips-0a07-report.html` |
+| "PIPS TLP Patterns" https://claude.ai/artifact/Ni2PkBjsera7xFxx6wJdF2 | averaged page-order summary, 0x0A04-0x0A07 (v6) | `report-gen/sumpage.py` |
+| "PIPS Alias Campaign" https://claude.ai/artifact/E5bkPCsqik67LjPQnTDR2q | alias campaign 1 (v1) | `report-gen/page1105.py` |
+
+How each page is rebuilt: `dualssd/report-gen/README.txt` and FILE-MAP §7.
 
 ### Switch designs (design ID)
 
@@ -1728,860 +902,49 @@ runs and a manifest of them (`~/<NAME>.manifest.tsv`, also
 globbing `utils/logs`: [scripts/pips/SWEEP-LOGS.md](scripts/pips/SWEEP-LOGS.md)
 (format, rules, this campaign's names and counts, earlier runs to ignore).
 
-### Depth sweep (set up 2026-10-17 for `0x0A04`; ran on `0x0A05`)
+### Retired designs: what each found
 
-It ran on design `0x0A05`, whose 512-beat FIFOs lift the FIFO limit
-described below; results in "0x0A05 depth sweep".
+The sections themselves are archived (table at the top): 0x0A02-0x0A05 in
+[pips-0a02-0a05.md](docs/archive/pips-0a02-0a05.md), 0x0A06 in
+[pips-0a06.md](docs/archive/pips-0a06.md), the 0x0A07 campaigns in
+[pips-0a07.md](docs/archive/pips-0a07.md). One line each:
+- **0x0A02** (10-13, drives, off and strict): first PIPS sweeps; the batcher
+  setting changes how a full link is shared, not the throughput.
+- **0x0A04** (10-15/16, strict, cap off and on): the drain cap moves a full
+  link's split, not its total; d1t0c1 holds one NIC to 75-78 Gbps; the v2
+  log works (804 logs FULL); `pcm-iio` undersampling found (C/D's extra
+  writes withdrawn). Page order: the cap at depth 1 doubles page switches;
+  misses don't move.
+- **0x0A05** (10-17/18, depth sweep 1-64, cap on): depth doesn't move
+  throughput; the 512-beat FIFO makes the wait on a full link ~3x longer
+  (4.2-4.7 µs mean); the NIC sweep stopped at `d24t255c1` when the switch
+  stopped answering.
+- **Page-order method** (10-19 to 10-26, "0x0A04 results" items 8-13, 0x0A06
+  result 10): lines from the measured arrival order (`seq.jsonl`), the model's
+  output held to the uplink with the stalls put back, the grant gap charged
+  only on a re-grant to the same input.
+- **0x0A06** (10-25/26, page batcher): page batching regroups pages (runs per
+  I/O -28% drives, -50% NICs at d64) but strict mode's misses and throughput
+  don't move; it ends the NICs' pause frames; page segments spill constantly;
+  the knobs have no effect; reads wait up to 262 µs on a full uplink; NIC
+  packet splitting is the NIC's receive backlog, decided by frame spacing on
+  its wire. Result 10 (excess page switches) traced to the read flush.
 
-Changes from the 10-15/16 sweeps, nothing else: depths 1, 2, 4, 8, 16, 24, 36,
-64; drain cap on only; NICs co-run only (no NIC-alone runs) with one datapath
-check, before `d1t0c1`; names `dualssd-pips-strict-dsweep1` and
-`dualnic-pips-strict-dsweep1`. Drives ~12 h (8 × 1.5 h), NICs ~1.5 h.
+### 0x0A07 in short
 
-**Times.** On the 10-15/16 logs the timeout, not the depth, ended most batches
-wherever the uplink had room: at 4 KiB 1 + 1, d4t22 and d8t22 waited alike
-(0.14 / 0.16 µs) and d16t64 0.34 µs, because 22 or 64 cycles is shorter than D
-TLPs take to arrive. A burst comes at about link rate: a drive's 256 B TLP
-(Gen4 x4) or a NIC's 512 B TLP (the 512-bit datapath) every ~9 cycles of 4 ns.
-The drives' recorded waits fit 9–14 cycles (`pips-timeout-pick.py
---validate`), so depth D needs about gap × (D − 1) plus the last TLP's beats,
-and T = 14 (D − 1) + 8 is just past that for either gap: `2:22 4:50 8:106
-16:218`; 255 (the 8-bit maximum, 1.02 µs) from depth 24. Modelled share of
-drains the depth trigger asks for (`pips-timeout-pick.py --eval` on the 10-16
-d1t0 records; synthetic arrivals, so estimates):
-
-| Setting | Drives, light points (gap 9.2 / 14) | NICs, both at 30 flows | Same depth before |
-|---|---|---|---|
-| `d2t22c1` | 97 / 97% | 85% | – |
-| `d4t50c1` | 86 / 86% | 71% | `d4t22c1`: 73 / 53%, NICs 44% |
-| `d8t106c1` | 72 / 72% | 56% | `d8t22c1`: 32 / 4%, NICs 2% |
-| `d16t218c1` | 55 / 53% | never (full trigger) | `d16t64c1`: 19 / 2% |
-| `d24t255c1`, `d36t255c1`, `d64t255c1` | never (d24: 17–19% on a full uplink, drive 1's 144 B writes) | never | – |
-
-Light points are those whose output is below 85% of the uplink (drives: 4 KiB,
-and 8 KiB at 1 + 1; NICs: both at 30 flows). On a full uplink the FIFO backlog
-meets any depth the FIFO can hold (drives ≥ 97%, NICs 89–98%). The rest time
-out (a 4 KiB read is 16 data TLPs, its completion entry and an interrupt) or
-are flushed by a read (0.8 per drive I/O).
-
-**The FIFO caps the depth on `0x0A04`.** Each input FIFO holds 128 beats of
-64 B; it stops taking packets at 109 and its full trigger asks for a drain
-above 93 (`axi4_mwr_batch.v`: FIFO_DEPTH 128, MAX_PKT_BEATS 16). A 256 B TLP is
-5 beats and a 512 B one 9, so a drive batch can't reach more than 18 packets
-and a NIC batch more than 10. d24, d36 and d64 on the drives, and d16 up on the
-NICs, are batches ended by the full trigger or the timeout, never by depth,
-and their cap never binds. **d36 and d64 are the same setting in effect on
-both testbeds, and d24 is too on the NICs.** The model on the NICs' real
-arrivals agrees: d16t255, d32t255 and d64t255 came out identical at every
-point (`dualnic/1016/seq-dualnic-0a04-arr`). Going deeper needs a build with a
-larger FIFO_DEPTH; the time field also stops at 255 cycles.
-
-After the sweep: page order and trigger shares on the real arrival order,
-`bash scripts/pips/pips-seq-grab.sh --manifest ~/<sweep>.manifest.tsv -j 8`
-(the model runs each log's own setting and the sweep's other seven;
-`model[].triggers` in `seq.jsonl`).
-
-Compare cap off against on per setting:
-
-```bash
-python3 scripts/dualssd-results.py summary ~/dualssd-pips-strict-2-id0a04-d8t22.jsonl \
-    ~/dualssd-pips-strict-2-id0a04-d8t22c1.jsonl
-python3 scripts/dualnic-results.py summary ~/dualnic-pips-strict-1-id0a04-*.jsonl
-python3 scripts/pips/pips-mwr-sizes.py utils/logs/dualssd-pips-strict-2-id0a04-d8t22 \
-    utils/logs/dualssd-pips-strict-2-id0a04-d8t22c1 --by cfg,bs
-```
-
-Can the switch tell payload from control writes (completion entries,
-descriptor write-backs) by size? On every log on the host, drives or NICs, a
-line per log as it goes, the verdict per kind and design at the end
-([scripts/pips/README.md](scripts/pips/README.md), "Payload or control"):
-
-```bash
-python3 scripts/pips/pips-traffic.py --csv ~/traffic-sizes.csv --jsonl ~/traffic.jsonl | tee ~/traffic.txt
-```
-
-### 0x0A04 results (2026-10-15/16, strict)
-
-The cap and the v2 log work on hardware: all 804 logs FULL, no drops,
-`pkt_wait` plausible. Details and figures in the report (above).
-
-1. **Drives, the cap moves a full link's split, not its total.** 4k/8k: median
-   change per setting within ±0.6%. Link full: drive 0's share 47% → 53–56%
-   at 16k (d1t0, d4t22, d8t22; d16t64c1 barely moves it), 49% → 46–48% at
-   1m; at 64k drive 0 +8–11%, drive 1 −8–11%, total +3–4% at every point
-   (drive 1's 64k reads cost ~2× link bytes).
-2. **Drives, cap off repeats 0x0A02** within 2.4% (median) from 2 per drive,
-   equal at 64k/1m. **Except drive 0 at 1 instance per drive:** 16–31% slower
-   at 4–16k in all 8 settings (8k: 145–149K vs 195–206K); drive 1 unchanged.
-   Build or boot, not batcher; untested which.
-3. **Time in the batcher (v2 `pkt_wait`, out port, mean):** strict 4k 1+1:
-   0.06 µs d1t0, 0.14 d4t22, 0.16 d8t22, 0.34 d16t64 (p99 0.6–0.9); the cap
-   adds nothing there. Link full: 0.9–1.6 µs in every setting; the cap raises
-   the p99 (64k: 3.0–3.2 vs 2.4 µs). 0x0A02's hold estimate for d16t64
-   (0.66 µs) was ~2× high.
-4. **`pcm-iio` undersampling (gotcha above).** 84 of 124 strict 4k runs have
-   1–3 samples (same 12 points in every setting, from 4+4 up), and 20 more
-   had none and were dropped (8+32 ×8, 32+32 ×7, 32+8 ×5). In those runs
-   `pcm-iio` writes read 2.02× fio (median) while the switch's output reads
-   1.01×. This withdraws the C/D extra-writes result (§7).
-5. **NICs (icx):** one NIC 85–97 Gbps in every setting but d1t0c1, two NICs
-   105–107 at 5–10 flows; IOTLB misses per Gbps within −1.1/+2.4% of d1t0.
-   **d1t0c1 holds one NIC to 75–78 Gbps (−18 to −21%)** at every flow count
-   (one TLP per drain); two NICs lose ≤1.5%. d16t64/c1: −5 to −11% for one
-   NIC at 30 flows (ran last; drift not ruled out). Two NICs at 30 flows:
-   48 Gbps in every setting, the §4.1 cliff. PIPS splits 5 flows evenly
-   (53.5 + 53.5), where the direct path gave 41 + 64 (§4.1, item E).
-6. **`traffic-ssd.txt` includes stale logs**: 16 `datapath-4k-j1` checks, the
-   21 TLP logs of runs dropped for missing `pcm-iio` rows (1 on 0x0A02, 20
-   on 0x0A04), and one 10-11 bring-up log (`pips-fio-20261011-225629`,
-   design "none"). Its verdicts don't change, but per-sweep counts are 91
-   logs, not 90. Move or delete the bring-up log on bigserver.
-7. **What pcm logged on icx** (NIC records, means over 20 s): `pcm-iio`
-   inbound PCIe writes/reads, IOTLB lookups and misses, context-cache hits,
-   page-walk-cache hits at 4K/2M/1G/512G, IOMMU memory accesses; `pcm-memory`
-   DRAM read/write per node. No sample count is kept, but writes are
-   0.98–1.10× the switch's output and lookups 0.98–1.09 per switch TLP in all
-   96 runs: no undersampling on icx. 9.2–9.4 lookups and 1.09–1.21 misses per
-   4 KiB, miss rate 11.9–12.8%, 4.2–5.7 memory accesses per miss, as on 09-29
-   (§4.1). Settings differ by ≤ 3% (misses/4K) and ≤ 7% (accesses/miss) per
-   point; d1t0c1 is the high end. Node-0 DRAM writes (4.4–9.4 GB/s one NIC)
-   stay below the ~12 GB/s DMA rate (likely DDIO).
-8. **Page order (`pips-seq-grab.sh`, 7 drive + 5 NIC points × 8 settings,
-   96 logs, all found; unpacked in `dualssd/1016/seq-dualssd-pips-strict-1-id0a04/`
-   and `dualnic/1016/seq-dualnic-pips-strict-1-id0a04/`):**
-   - Drives, cap off: d16t64 cuts page switches per 4 KiB page only at 4k
-     (4.81–4.98 → 4.16–4.53), as on 0x0A02; link full (16k/64k/1m) all four
-     settings give the same order.
-   - **d1t0c1 alternates the drives TLP by TLP on a full link**: 1.10–1.36
-     TLPs per run on out, page switches ×2.1–2.3 at 16k/1m, ×1.6 at 64k,
-     ×1.4–1.7 at 4k. Cap at depth 4: +6–29%, 8: +1–15%, 16: −4/+6%. Each
-     drive's own stream is unchanged (drive 0: 2 TLPs per run, two pages
-     alternating, from 16k up).
-   - **NICs:** a packet is 8 × 512 B TLPs (7 × 128 DW + 112 DW, 4032 B) into
-     one page, then a 64 B completion; ~1.1 completion writes per packet (the
-     sends' too). Cap off, both NICs: 2.6–3.1 page switches per packet, each
-     NIC 86–97% of packets in one run. d1t0c1 with both: ×1.8–3.3.
-     **NIC0 alone splits its own packets** (2–3 at once, a TLP each) when held
-     0.37–0.48 µs (d1t0c1, d4t22c1 at 5 flows, d16t64/c1): 5.4–8.6 switches
-     per packet vs 2.3–2.6 at 0.13–0.14 µs (d1t0). Both NICs at 24–54 Gbps
-     each don't split at 0.2–0.8 µs, so the wait alone doesn't decide it.
-   - **Misses don't follow the order:** pcm-iio misses per 4 KiB within 5%
-     across the 8 settings at every point (16k: 1.50 for d1t0 and d1t0c1 at
-     2.25× the switches; NIC0 alone: d4t22c1 splits like d1t0c1 at 95.5 Gbps
-     and 1.095 misses vs d1t0's 1.096). The 64-entry simulated IOTLB agrees
-     within 2% per point. Lookups per 4 KiB don't move (one per TLP).
-   - Tool fix after the grab: `pips-page-seq.py --kind nic` now ends a packet's
-     visit at its short last TLP, not at any completion of its NIC (which,
-     with several queues in flight, closed pages early: false `gap` marks,
-     open pages undercounted). Runs, visits, what-if and IOTLB sims were not
-     affected; the report ignores the grab's NIC `gap` marks. Regrab only if
-     NIC open-page counts are needed.
-   - **The what-if baseline was wrong (user review):** it regrouped windows of
-     the *output*, already shaped by the setting, and placed each setting at
-     W = depth. A depth-D batcher groups at its inputs (D packets of one
-     drive, or TIME cycles), about 2D+ output TLPs when both send, so the
-     recorded diamonds beat the "by drive" line (4k 8+8: d4t22 4.47 vs 4.78
-     at W = 4; d8t22 4.42 vs 4.55 at W = 8). Fixed in `pips-page-seq.py`:
-     arrival order rebuilt from `pkt_wait` (stream `arr`) and `--model`, the
-     `axi4_mwr_batch.v` batcher (triggers, snapshot drains, cap, round robin,
-     reads behind their input's writes; output cycles per TLP measured from
-     the log) run on it; `--model self` checks it against each log. Needs the
-     regrab below; the 0x0A04 page's Figures 4 and 6 are still the old ones.
-
-9. **Arrival order and the batcher model, NICs (regrab 10-16 21:45, repo
-   2c5c8a367, `dualnic/1016/seq-dualnic-0a04-arr/`, 104 logs = 12 points +
-   `f5-datapath` × 8; the grab filter now drops any name with "datapath"):**
-   - Model vs recorded page switches: on each log's own arrival order −1% to
-     +5% (single NIC exact: one input can't be reordered), except d1t0c1 at
-     15/30 flows (+6%, +11%). From d1t0's arrival order, both NICs: every
-     setting within −1%/+5%, d1t0c1 −3%/−8%.
-   - **Model limit:** output cycles per TLP come from back-to-back same-input
-     pairs; in d1t0c1 logs every drain is 1 TLP, so the pairs include the
-     ~3-cycle gap before the RTL re-grants the same input (data/128 reads 12
-     cycles, not 9) and the model backs up (absurd waits). Model waits also
-     omit the fixed pipeline latency (up to 0.13 µs low). Fix if needed: model
-     the re-grant gap and count a packet for the depth trigger at its EOP, then
-     regrab. The page leaves d1t0c1 out as a starting order.
-   - Both NICs arrive interleaved (4.4–5.8 page switches per packet in d1t0
-     logs); d1t0 sends 2.8–3.1 (queueing on a full link groups them). Depth
-     8 at time 255: −7% to −16% from depth 1; flat beyond (full trigger at ~10
-     NIC TLPs); bound at 64: 2.62–2.68.
-   - One NIC: arrival order = order sent in all 64 logs; d1t0 2.3–2.6, cap at
-     depth 1/4 7.9–9.2, d8t22/d16t64 2.6–3.5 / 5.9–6.5 at 5 flows, 5.3–9.2
-     from 10. NIC1 like NIC0. All of it is the NIC's own reaction.
-   - Page "PIPS 0x0A04 Sweeps" v3 (2026-10-17): Figures 3–6 rebuilt from this
-     (generator `dualssd/report-gen/seqarr.py` + `seqarr.js`; per-point data
-     files `dualssd/seqdata/<kind>/<point>.json`, published beside the page as
-     `seq/<kind>/<point>.json` via the Artifact `files` map). Drives pending.
-
-10. **Drive regrab in, and the model's uplink (2026-10-19).** The 10-16
-    drive regrab (`dualssd/1016/seq-dualssd-0a04-arr/`, 720 logs) is on the
-    page (Figures 3–4, the bullets from `seqarr.drive_points()`). On it the
-    model failed its own check: +21% page switches against the recorded
-    ones (median of 630 logs, d1t0c1 left out; +35% at 8 and 16 KiB, +4% at
-    64 KiB), waits 0.15–0.26 µs where d1t0's logs show 0.6–1.5 µs from 16
-    KiB up. Cause: each TLP's output time was the median of back-to-back
-    pairs within a drain, 5 cycles per 256 B TLP, the 512-bit datapath; the
-    logs' output takes 9.2 cycles per TLP on a full link (Gen3 x8), with the
-    link stalls between the pairs. In the model the FIFOs rarely filled, so
-    drains stayed small and depth hardly mattered. Fixed: `--link` (default
-    `gen3x8` drives, `gen4x8` NICs) holds each TLP to payload + 22 B at 96% of
-    the raw link rate; the NICs' model doesn't change (the datapath is the
-    slower). Also, and real: with the cap off a backlogged FIFO drains whole
-    at any depth (recorded cap-off settings agree from 16 KiB); 0x0A04's FIFO
-    stops at 18 drive TLPs; "by drive" can't undo drive 0's own two-page
-    interleave (only the by-page line falls, 57–58% at 64 KiB / 1 MiB from
-    depth 1 to 64). New model groups `sweepc1` (cap on, where depth sets the
-    drain size) and FIFO-size suffixes (`sweepc1f512`, `d24t255c1f512`); the
-    page's Figures 4/6 offer whichever sweeps a grab has. Figure 6 lists
-    both-NIC points only: in all 64 one-NIC logs the by-NIC line is flat
-    (one input can't be reordered); their by-page and bound lines fall up
-    to 43% only where the NIC itself interleaved packets.
-    Same day, after user review: (a) **grant gap**: the model now charges one
-    cycle per 64-byte beat and 3 cycles per new drain (`--grant-gap`), not
-    the measured pair median. d1t0c1 logs show the gap (drive 256 B TLPs 8-9
-    cycles vs 5, NIC 512 B 12 vs 9) because every drain there is one TLP; the
-    old model took 12 for every TLP when run from a d1t0c1 log (the "absurd
-    waits") and 9 per one-TLP drain when predicting d1t0c1 from others. (b)
-    **Depth 1 is round robin only with the cap on**: the plotted sweep is cap
-    off (a grant drains the whole FIFO); at 16 KiB its depth 1 gives 5.05-8.56
-    page switches per page vs 8.72-12.71 recorded with d1t0c1, the model's
-    own d1t0c1 8.39-11.41 (rest: the uplink). The regrab's `sweepc1` starts
-    at round robin. (c) **Ideal line = windows only**: the arrival order in
-    windows of D TLPs per device (n x D in all), each grouped by page, no
-    FIFO, time limit, link or ordering (from each log's `windows_arr`,
-    `seqarr.window_ideal`); falls from as-arrived to 1.6-2.1 at 64. It can sit
-    above the cap-off model at small D (a cap-off drain is the whole
-    backlog). (d) **Lines averaged over every log of a point** (runs of the
-    same flow); old-grab d1t0c1 logs count for as-arrived and the ideal only.
-    (e) **NIC by-NIC = by-page is real**: with both NICs each NIC writes one
-    packet at a time (own stream 7.1-7.7 TLPs per run, 86-97% of packets
-    whole; listing `seq-d1t0-f10-both.txt`: offsets 000-e00 of one page, then
-    its entry), except d1t0c1 at 5 flows (1.01 TLPs per run), where by-page
-    falls below. Page v6.
-11. **The 10-19 grab: the drive model ran away; the arrival rebuild lacked
-    the uplink's stalls (2026-10-20).** `pips-analyze.sh` on both hosts
-    (repo 8a00e1f74; `dualssd/1019/pips-analyze-ssd-20261019-1723/`, 1,440
-    logs, both sweeps; `dualnic/1019/pips-analyze-nic-20261019-1723/`, the
-    0x0A04 sweep only). NICs: the page-switch self check matched (median
-    0.0% over all 12 points), but at 5 and 10 flows with both NICs its waits
-    ran to 30-1,400 µs: the grant gap at every drain (item 12; an earlier
-    note here said the waits matched, which held only for the median per
-    setting over all points). Drives: every setting's
-    model wait ~1,000-1,450 µs against 1.4-1.9 recorded, from a nominal load
-    (model cycles over the log's true time per TLP) of 0.78 up, and
-    page-switch self check +15% (0x0A04) / +18% (0x0A05) median. Cause: the
-    output's times are rebuilt from `pkt_length` (beats) and `pkt_gap`, and a
-    stall **inside** a packet is in neither (PIO-MANUAL §8.4), while
-    `pkt_wait` counts it. On a Gen3 x8 uplink the 512-bit datapath stalls
-    about a third of the time (synthetic: 35-42% at 80-97% load), so the
-    logged output covers ~60% of the recording, in_sop = out_sop - wait came
-    out early by the stalls of the packets that left during the wait, the
-    arrivals ran faster than the link, and the model (now charging the link)
-    never drained. The same error swapped one drive's TLPs: drive 1 "arrived"
-    with ~480 open pages, sent with ~34 (`seq-d16t64c1-1m-j32-both.txt`,
-    `arr` listing: offsets 300-200 of one page). The 10-16 grab had it too
-    (its model, at the datapath rate, matched the compressed clock instead),
-    so Figure 4's as-arrived/ideal start and Table 6's as-arrived numbers
-    for the drives are inflated. Fix (`pips-page-seq.py`): put the stalls
-    back (each packet holds the output for max(beats, link time), the
-    model's rule; link rate fitted so the rebuilt output ends at the
-    trailer's duration; `out_times()`, `fit_stalls()`), keep each input's
-    output order (the batcher never reorders an input), and run the model at
-    the fitted rate. Logs with saturated gaps would pull the fit slow (idle
-    past the gap looks like stalls), so `pips-seq-grab.sh` first calibrates:
-    `--calibrate` on every log, the median of the clean ones (one segment,
-    >= 10% lost) is the floor `--link-rate` for all (`calibrate.txt`).
-    Checked on synthetic logs written the way the hardware logs (stalls
-    dropped): the fit recovers the link to 0.1%, the model's own setting
-    matches the logged order (12.99 vs 13.00) and wait (0.73 vs 0.72 µs);
-    the committed code gave 200-400 µs waits on the same logs
-    (`test-sim.sh`, "stalls inside packets"). The NICs (Gen4 x8, ~no stalls)
-    are not expected to change by this fix; their grant gap is (item 12).
-12. **Recovered without the raw logs, and the grant gap (2026-10-20).**
-    The 10-19 grab's listings (`seq-<setting>-<point>.txt`, 600 runs as sent
-    from record 100,000, 600-3,500 TLPs) are exact, and the batcher never
-    reorders an input, so each device's own arrival order is the listing
-    filtered to it. `dualssd/report-gen/seqrec.py` (git-ignored) runs
-    pips-page-seq's `batcher()` on it: each I/O (drive command, NIC packet,
-    ending at its completion entry) arrives as a burst at the device's pace
-    (9 cycles per 256 B drive TLP, 10 per 512 B NIC TLP), idle between I/Os
-    so each device keeps its share of the log's true rate; I/Os over 64
-    TLPs arrive evenly (credit-paced); the output's rate is fitted (from the
-    raw link rate down) so the log's own setting waits as recorded; the
-    listing runs twice (warm-up). Lines scaled to the whole log by recorded
-    page switches. The check (own setting vs the log's own listing, not
-    fitted): drives 0x0A04 median per setting -4.5% to +7.8% from 16 KiB up,
-    -4% to +5% at 4-8 KiB; 0x0A05 depths 4-64 -3% to +4%; misses at 0x0A05
-    d1t0c1/d2t22c1 at 8-16 KiB (+15% to +39%); NICs -10% to +15% at 5-15
-    flows, +6% to +24% at 30. Evenly paced arrivals failed at 4 KiB (+73% to
-    +97%): bursts matter. A pure full-backlog model (no time) worked on
-    0x0A04 (FIFOs full) but not 0x0A05 (FIFOs half full). Findings (page v8,
-    Figure 4 bullets from `seqarr.order_points()`): depth 1 is round robin
-    only in the window ideal (16.6-17.5 page switches per page at 16 KiB);
-    recorded d1t0c1 is 9.3-12.7 because each I/O's read flushes its drive's
-    FIFO (a quarter of the TLPs at 16 KiB, 8 per drive, leave in such
-    drains) and an idle input lets the other go on; the model's cap-on line
-    follows the ideal to the FIFO's size (0x0A04: flat from 16 at 18 drive
-    TLPs; 0x0A05 goes on), the recorded 0x0A05 settings lie near it; the
-    model's waits (fixed arrival pace) don't reach 0x0A05's recorded
-    4.2-4.7 µs. **Grant gap**: two NICs carry ~105 Gbps under d1t0c1, which
-    12 cycles per 512 B TLP (85 Gbps max) can't, so the gap is hidden when
-    the grant goes to the other input; one NIC alone pays it (80 Gbps).
-    `batcher()` now charges it only for a new drain from the input served
-    last (or the very first, or a pass-through packet); `test-sim.sh` asserts
-    9 cycles alternating, 12 for one input.
-    **After user review (v9).** (a) "Recorded is below the ideal at low
-    depth": v8's ideal took windows of D TLPs per device from each device's
-    own order, which at D = 1 is strict alternation (16.6-17.5 page switches
-    per page at 16 KiB). Recorded d1t0c1 is 9.3-12.7 on 0x0A04 and 6.9-8.2 on
-    0x0A05 (whole logs, not a sampling artifact): the RTL alternates only
-    when both channels request at the packet boundary (round-robin
-    tie-break, `axi4_mwr_batch.v` ~l.1561); otherwise the requesting channel
-    gets the next drain, and a flush holds the grant. In d1t0c1's recorded
-    order at 16 KiB, 8% of TLPs leave in a flush before a read and 49% in
-    other one-drive stretches of one-TLP drains (0x0A05: 5% and 78%, which
-    the model doesn't reproduce: +39%). The v8 bullet that said "a quarter
-    of the TLPs leave in flush drains" came from one model run and was
-    wrong. The ideal is now d1t0c1's recorded order regrouped in windows of
-    2D TLPs (`windows` in `seq.jsonl`, ideal policy: whole log, exact),
-    0x0A04's or 0x0A05's d1t0c1 by the FIFO selector: at 16 KiB 9.3-12.7 at
-    1 (d1t0c1 itself), 2.5-2.9 at 16, 1.8-2.0 at 64. (b) "NICs should be more
-    chaotic than drives, but by NIC = by page": with both NICs each NIC's
-    own order has 6.8-7.7 TLPs per run, 85-97% of packets in one run (whole
-    logs), so grouping a drain by page has nothing to undo; exception
-    d1t0c1 at 5 flows (1.0 TLPs per run), where the recovered by-page line
-    falls 9.18 -> 4.95 and by NIC stays 9.18. One NIC alone is chaotic
-    (cap-on settings and d16t64: 1.0-1.9 TLPs per run, 0-49% whole), but
-    single-NIC points are out of Figure 6 by request. Why alone and not
-    together: item 13 (the NIC's packet rate on its wire; styx suspected,
-    untested). Drives are the more
-    interleaved: drive 0 always two pages at once, drive 1 at 64 KiB
-    1.6-1.9 TLPs per run.
-    **v10: floor and raw (user: "the ideal was supposed to represent the
-    floor").** Floor(D) = per device, its own order (exact, from the
-    listing) sent by a batcher holding the next D TLPs: stay on the current
-    page while any held TLP has it, else start the oldest held TLP's page or
-    the most-held page (the better of the two; an achievable floor, not a
-    proven minimum); the two devices never interleave within a run.
-    `seqrec.floor_runs()`, `raw_floor()`; cached in `rawfloor.json` by `py -3
-    seqrec.py --rawfloor` (seconds, 8 processes). At 16 KiB: 3.4-5.2 page
-    switches per page at depth 1 (each drive's own runs) to 1.1-1.4 at 64;
-    NICs 2.3-3.1 to 1.3-1.5. Raw = the modelled arrival order (seqrec's
-    I/O-burst arrivals merged by time), unbatched, averaged over the point's
-    logs: drives 8.5-10.6 at 16 KiB, 17.9-18.6 at 64 KiB, 14.2-17.5 at 1 MiB;
-    NICs 4.7-7.1. The user expected raw at or slightly above d1t0c1; that
-    holds at 64 KiB and 1 MiB, but at 16 KiB recorded d1t0c1 (9.3-12.7) is
-    above the modelled raw: with a queue, one TLP per drain splits each
-    drive's I/O bursts. Per log (d1t0c1's own listing) raw was slightly above
-    d1t0c1 everywhere (12.75 vs 12.35 at 16 KiB); the average over all 16
-    logs is lower. The host rerun measures the arrival order and settles it.
-13. **Why one NIC alone splits its packets and two together don't
-    (2026-10-20).** From the 10-16 JSONL and the 10-19 grab's listings
-    (`dualssd/report-gen/nicorder.py`, output `dualnic/1019/nicorder.txt`;
-    no raw logs).
-    - **The NIC's packet rate decides it, not the wait.** Alone (93-96
-      Gbps) a NIC splits (1.0-1.9 TLPs per run, 0-49% of packets whole)
-      where its wait is pinned, p50 about p99 (d4t22c1 0.46/0.48 µs, d16t64
-      0.43/0.45, d1t0c1 0.60/0.63): its FIFO stays full and it is held TLP
-      by TLP. Under d1t0 (0.12/0.29 µs) it writes whole packets. Together
-      (49-54 Gbps each) the waits are longer (p50 0.68-0.88, p99 1.1-1.4 µs)
-      and the FIFOs fill (on 0x0A05 the waits grow with the FIFO), the
-      output never idles 1 µs (one segment, out gap 0.04 cycles per TLP at
-      111 Gbps: the switch is the limit), yet each NIC writes whole packets
-      (7.1-7.3 TLPs per run, 86-91% whole).
-    - **One rule fits every point:** a NIC opens its next packet when the
-      current one takes longer to get into the switch than the gap to the
-      next packet on its wire. It then writes one TLP of each open packet
-      in turn, one packet per receive queue (4-5 open; their completions go
-      to different CQs), and stays split until the wire idles (alone logs
-      have 27-225 output gaps of 1 µs or more; d4t22c1 f5 NIC0's 600-run
-      sample is whole, 6.5 TLPs per run, its whole log 1.11). Alone the gap
-      is one 100G frame time (4,038 B, 0.32 µs) and an unheld packet needs
-      about 0.3 µs; together the gap is about 0.6 µs. The co-run exception
-      fits: d1t0c1 at 5 flows splits (1.01), where a packet alternates TLP
-      by TLP with the other NIC (about 16 slots, 0.6 µs, its gap). Where
-      packets stay whole the share still follows the rate (d1t0: 83-87%
-      alone, 86-91% at 49-54 Gbps, 95-96% at 24 Gbps).
-    - **Styx's order is the same in both cases.** Each packet's completion
-      address names its receive queue: at 5-10 flows consecutive packets on
-      a wire come from different queues 92-99% of the time, alone and
-      together (styx's card turns its send queues per packet). The
-      difference is when styx's frames arrive, not their order.
-    - **Suspect on styx (not tested):** both test ports are one dual-port
-      card on one Gen3 link (width never checked), so one PCIe read path
-      and TX engine feed both ports. Alone it sends one port back to back
-      at 100G. Together it can't feed two ports at line rate (Gen3 x16 raw
-      is 126 Gbps, the same as icx's uplink); turning send queues per
-      packet across both ports, it puts a frame on each wire about every
-      other frame time. Other styx-side candidates: pause frames (global
-      pause left at the driver default on both hosts, PFC off; never
-      counted), the sender CPU (14 cores busy together, 7 alone; the
-      same-queue share rises to 0.18/0.34 at 15/30 flows together only),
-      TCP (DCTCP with nothing marking ECN, fixed 1 MB send / 2 MB receive
-      buffers). **Retransmits were never recorded:** client mode of
-      `run-netapp-tput.sh` writes no `retx.rpt`, so the runner's copy-back
-      fails silently in every dual-NIC run.
-    - Tests: "Next" item 5.
-
-### 0x0A05 depth sweep (2026-10-17/18, strict, cap on)
-
-1. **Drives: depth doesn't move throughput where the link has room.** At 4
-   and 8 KiB every depth 2–64 is within 0.4% of d1t0c1 (median per
-   setting). d1t0c1 on 0x0A05 matches d1t0c1 on 0x0A04 within −0.9/+1.0%
-   per block size.
-2. **Full link: deeper drains move the split, the total follows.** Drive
-   0's share of IOPS at 1 MiB: 34% (d1t0c1) → 57% (d64); 64 KiB 72 → 76%;
-   16 KiB 50 → 41%. Uplink 52.8–55.2 Gbps in every setting. Total vs
-   d1t0c1: −3.0% at 16 KiB, up to +2.5% at 64 KiB, +1.4% at 1 MiB (d64). On
-   0x0A04 d1t0c1 gave drive 0 46% at 1 MiB: the FIFO size alone moves it.
-3. **Time in the switch:** full link 4.2–4.7 µs mean, p99 9–16 µs in every
-   setting (0x0A04: 1.5 µs, p99 2.4–3.2): the queue in front of the uplink
-   is 4× longer. Light (4k 1+1): 0.07 µs at d1, 0.57 at d16, 0.90–0.93 µs
-   from d24 (the 1.02 µs time limit ends the batches).
-4. **Drive 0 at 1 per drive still slow:** 154–158K (4k), 146–148K (8k),
-   136–138K (16k), as on 0x0A04 (0x0A02: 185–229K, 195–206K, 174–178K).
-   `pcm-iio` < 10 samples in 110 runs at 4/8 KiB; 18 runs dropped at 4k with
-   32 instances (no rows).
-5. **NICs (both, 5–30 flows):** 107.1 Gbps at 5 flows in every setting but
-   d1t0c1 (106.1), 105.4–105.6 at 10, 95.6–96.4 at 15, 48.4–48.9 at 30, as
-   on 0x0A04; misses per 4 KiB 1.13–1.20. Waits at 5 flows 1.25–2.83 µs (p99
-   3.0–7.2) vs 0.64–0.83 on 0x0A04. Datapath check (NIC0 alone, 5 flows,
-   d1t0c1) 80.9 Gbps (78.2 on 0x0A04).
-6. **Modelled trigger shares with 512 beats** (`pips-timeout-pick.py --fifo
-   512`, synthetic arrivals; `dualssd/report-gen/deep/eval-*-f512.*`):
-   depths 24–64 now reachable: depth asks for 84–96% of drains on a full
-   drive uplink, but 0–28% at light points, where the 255-cycle time limit
-   ends a batch at 16–20 drive / ≤ 12.6 NIC TLPs. A deeper light-load batch
-   needs a wider time field.
-7. **The NIC sweep's stop (icx, 10-17).** `d24t255c1` f10 finished 23:50:36
-   (log FULL, normal throughput); its results were written 23:53:26 (usually
-   ~75 s later). 23:51:39 the root port above PIPS (96:02.0) logged CmpltTO
-   for a CPU read at BAR offset 0x230 of a NIC function (mlx5 health
-   buffer); 23:52:07 a second (0x23c), and NIC 99:00.0 CmpltTO on its own
-   17-DW DMA read (MRd32, RO) plus correctable Bad TLP, Bad DLLP, Replay
-   Timer Timeout; more at 23:53:27, 23:56:07–10 (another function's BAR,
-   +0x1000 = internal timer). f15 failed 23:56:12; setting d36 read PIPS's ID
-   0xFFFFFFFF. So reads in both directions through the switch stopped, then
-   its own BAR: the whole switch, not just the write path. Speculation, not
-   established: (a) a hang in the batcher/output path that only the bigger
-   FIFO reaches: a NIC's MRd and its completions enter only once its batching
-   FIFO is empty and hold the input meanwhile; d24t255c1 is the first NIC
-   setting deeper than 0x0A04 could hold (216 beats) and mostly time-ended at
-   light load; drives ran d24–d64 for 4.5 h without a fault (5-beat TLPs,
-   few completions); (b) the FPGA's link dropped: the NIC's replay timeouts
-   mean the downstream port stopped ACKing, and the root port masks Surprise
-   Down (AER mask 0x04101020), so a link drop would show only as these
-   timeouts and all-ones reads; (c) the NIC alone: unlikely (two functions
-   and PIPS's BAR failed). Next time, before reprogramming: `bash
-   scripts/pips/pips-hang-snapshot.sh` (read-only: lspci -vvv up the chain,
-   AER counters, `pips cfg`, kernel log, devlink health, sweep log), then
-   XSCT `pips_cfg`/`pips_dma` and the board temperature.
-
-### 0x0A06 campaign (set up 2026-10-25, ran 10-25/26; results below)
-
-`scripts/pips/pips-campaign.sh ssd|nic` (`--dry-run` for the exact commands).
-Design 0x0A06 only; no reboot (IOMMU as booted, strict), no PCIe retrain.
-Decisions, with the user (10-25):
-
-- **Completion threshold 31 DW on both inputs (`w31`) in every phase but
-  `thr`.** Erring high is safe (data taken for a completion only costs
-  batching and adds a fence); a completion taken for data loses the fence.
-  0x0A04/0x0A05 logs (`*/1019/pips-analyze-*/traffic.txt`): drive completions
-  4 DW, mlx5 16 DW; NIC data from 32 DW (69 writes) and 48 DW; drive 1 writes
-  data of 4-32 DW (about 0.5% of its writes) and 36 DW (14%), so 31 keeps
-  the 36s as data. `thr` runs the exact entry size (4 drives, 16 NICs).
-- **Drives:** instances 1, 2, 4, 8, 16 (32 dropped: same as 16); uneven only
-  2/4/8 on drive 0 + 16 on drive 1 (the heavy side moved little). `main` = 8
-  depths x `page_batch_en` 0/1, cap on (640 runs); `cap0` d1/d8/d64 cap off;
-  `push` o1; `quant` 64/256/1024 beats; `thr` 4 DW; `drv0` drive 0 alone and
-  1+1, 16+16 at 4k-1m on d1t0 cap off/on (Next items 2, 4). Knob phases use a
-  smaller grid: 4k/16k/1m x 1/4/16 + 2+16.
-- **NICs:** flows 5, 10, 15, 30 and uneven 5:30, 30:10 (heavy side
-  alternating), uncapped and **capped at 50 Gbps per NIC**, 100 together:
-  under the weakest shared link (the switch's Gen4 x8 uplink, ~107 Gbps of
-  payload measured; styx's one Gen3 x16 card, 126 raw). `mainlo` depths 1-16,
-  `mainhi` 24-64 last of the switch phases (d24 stopped 0x0A05's sweep).
-- **Packet splitting (§8 item 13):** `alone` NIC0 alone vs both, 5 flows,
-  uncapped / 50 / 25 Gbps (iperf3 `-b`), at d1t0 (clean on 0x0A04), d16t64
-  (split, cap off) and d4t22c1 (split), `page_batch_en` 0/1. On 0x0A06 with
-  `page_batch_en` 0 the FIFO is 1536 rows, so a long hold no longer fills it:
-  whole packets there would mean **backpressure (posted credits withheld by
-  the FPGA's downstream port) causes the splitting**, not the wait itself.
-  `hw` paces in styx's NIC (mlx5 `tx_maxrate`, even frame spacing) instead of
-  iperf3's bursts. `wire` forces NIC0's link to 50G at both ends (Ethernet
-  only; restored after): frames 0.64 us apart, the co-run spacing, alone.
-  Every NIC run now records client retransmits and pause/discard deltas.
-- **Hardware the user may add later (not in this run):** an ingress rate
-  limiter on each of the three ports; per-input counts of cycles the
-  batcher refused input while data waited (turns "probably credits" into a
-  measurement); a register for the downstream link speed.
-- **If the switch hangs:** snapshot at once, later switch phases skipped,
-  loud warnings, analysis and packing go on.
-- **2026-10-25, first run, bigserver: soft lockups.** About 1h40 in (stamp
-  `c10251207`), right after the 80 clean `d1t0c1` runs (`page_batch_en` 0 and
-  1), as `d2t22c1w31` (`page_batch_en` 0) began: CPUs 40 and 45 (fio cores,
-  the drives' interrupt CPUs) stuck 22-150 s in `nvme_irq` → `nvme_unmap_data`
-  → `iommu_dma_unmap_page` → `qi_flush_iotlb` → `qi_submit_sync` (strict
-  mode's synchronous IOTLB invalidation, dmar7); an `awk` waiting on them in
-  `smp_call_function_single`; `sar`, `pcm-iio` killed, fio outlived by the
-  window, the point FAILED. 6 more lockups after 13:48. The switch's status
-  over that run was clean (no stuck, no spill, MRd wait max 13.6/11.4 us), no
-  AER, no NVMe timeouts, no DMAR faults; no profiler running (`sep5`,
-  `socwatch2_16`, `vtsspp` loaded, 0 users). **Cause: interrupt placement,
-  not the switch.** The lockups began with the campaign's first run (12:07,
-  170 by 14:00; nearly every point FAILED, mostly "pcm-iio logged no rows":
-  pcm-iio hangs behind the stuck CPUs), and d1t0c1 alone reproduces them. In
-  this boot (11:49) both drives' blk-mq queues for CPUs 36-40 interrupt CPU
-  40 and for 41-45 CPU 45 (nvme0 q4/q5, nvme1 q5/q6); only 46-49 and 50-53
-  have separate ones (49/53 drive 0, 48/52 drive 1). `SSD_CORES` put both
-  drives on 36-45 and fio on 40, 45, 48, 49, 52, 53, so CPUs 40/45 did every
-  strict invalidation of both drives' completions (one dmar7 queue) while
-  running fio: livelock. Fix (no reboot; managed IRQs can't move):
-  `SSD_CORES=( "36,41,37,42,38,43" "46,50,47,51,49,53" )`,
-  `SSD_SPLIT_CORES=0` (uneven runs no longer borrow the other drive's cores);
-  `scripts/ssd-irq-placement.sh --check` verifies it and the drive campaign
-  refuses to start without it. Every run now records `kernel_soft_lockups`
-  (summaries flag them), and the campaign stops its sweeps on 2+ lockups in
-  one heartbeat. Each drive now uses 2 queues (was 4 in §7's 10-05 layout):
-  not directly comparable with the 0x0A04/0x0A05 drive sweeps. Likely also
-  behind their "pcm-iio < 10 samples" runs (Next item 3).
-- **2026-10-25, icx:** `retx.rpt` permission denied: `record-host-metrics.sh`
-  (sudo, retransmits on by default) writes its own root-owned `retx.rpt`;
-  the client's nstat count is now `retx-client.rpt` (fixed; earlier runs of
-  this campaign have no client retransmits).
-- **When the tarballs are back:** unpack in `dualssd/<MMDD>/`,
-  `dualnic/<MMDD>/`; `results/` has the summaries (`~/<sweep>.txt`, with the
-  status table), `status.txt` the stuck/spill/wait check, `analyze-new/` the
-  page order (recorded and arrival, listings), `analyze-pending/` the
-  0x0A04/0x0A05 model rerun (item 0's checks).
-
-### 0x0A06 campaign results (2026-10-26)
-
-Data: `dualssd/1026/pips-campaign-ssd-c10251425/` (bigserver, started 10-25
-14:25 on `693c60a5f`, 18h11), `dualnic/1026/pips-campaign-nic-c10251157/`
-(icx, started 10-25 11:57 on `9b36f3e6c`, 22h27). Tables:
-`py -3 dualssd/report-gen/c1026.py [ssd|nic]`, saved as
-`dualssd/1026/c1026-ssd.txt` and `dualnic/1026/c1026-nic.txt`. Every phase
-ran; the switch answered to the end; no stuck flag, no soft lockup (the
-placement fix held), no pcm-iio run under 10 samples; every page-order log
-analysed (828 + 318). Each point ran once. Noise, from the points two phases
-repeat (drv0 vs main, cap0 vs drv0, 14 pairs): Gb/s median 0.8% (max 3.5%),
-IOTLB misses per 4 KiB median 2.1% (max 5.9%). The NIC campaign started
-before the retransmit fix: its `retx_pct` is 0 for want of data, not a
-measurement.
-
-1. **Page batching regroups pages but changes neither misses nor
-   throughput, on both hosts.** Drives (`main`, 40 points per setting):
-   `page_batch_en` 1 cuts runs per I/O on the uplink by 2% at d1 up to 28%
-   at d64 (44% at 1m), TLPs per run 2.4 → 3.5; IOTLB misses per 4 KiB
-   (pcm-iio) change by -1.0 to +0.3% (noise), Gb/s by 0 to -1.1%. NICs (12
-   points per setting): runs per I/O 4.9 → 2.5 at d64, TLPs per run 2.8 →
-   5.5; misses per Gb 36.6k at every setting either way. The model's
-   strict-mode IOTLB (1x64) agrees: about -1%. Reason: in strict mode every
-   page visit is a miss (its entry was invalidated when the last I/O on it
-   completed), so the floor is one miss per page; measured 1.09 per 4 KiB at
-   1m, 1.25-1.4 at 4-16k. Regrouping removes only re-misses from thrashing,
-   which a 64-entry IOTLB rarely sees with these open-page counts. Batching
-   can only show in a non-strict (lazy) mode, which needs a reboot.
-2. **Page batching ends the NICs' pause frames.** With `page_batch_en` 0,
-   d1t0c1 and d16-d64 have NIC pause frames and receive discards (d1t0c1:
-   45k pauses, 321k discards per run on average; d36/d64: 35k, 290k) and
-   uncapped 5-flow both-NIC throughput drops to 104.7-106.4 Gbps; with 1,
-   zero pauses at every depth and 107.1 Gbps everywhere. One NIC alone,
-   uncapped: pb0 d16t64 93.8 Gbps, 58k pauses, 612k discards; pb1 95.3, none.
-   d4t22c1: pb0 90.3, 100k pauses, 1.38M discards; pb1 95.5, none.
-3. **Page batching runs out of page segments constantly.** Overflow
-   (`0x28`) on almost every pb1 run: drives a few hundred to thousands per
-   run at 4k, saturated (65535 per input) on many; NICs saturated on nearly
-   all. The 16-bit counter hides how often; batching works between spills.
-4. **Knobs (`cap0`, `push` o1, `quant` 64/256/1024, `thr` 4 DW / 16 DW):
-   no effect beyond noise** on Gb/s or misses, either host. Cap off at depth
-   1 regroups more (runs per I/O -38 to -65%) with the same misses. The
-   uneven flows (5:30, 30:10) still give each NIC the same rate (48/48,
-   42/42 Gbps): the arbiter (and the quantum) never had uneven load to
-   divide. 30 flows per NIC: 48 Gbps total at every setting, as without the
-   switch and with the IOMMU off on 10-01: a host limit.
-5. **Read waits (`0x2C`).** Drives: an MRd waited up to 262 us (pb0) /
-   219 us (pb1), median per run 104/63 us at 64k, 21-32 us at 4-8k, at every
-   depth including d1t0c1: reads queue behind the input's writes in the
-   1536-row FIFO when the Gen3 x8 uplink is full (bufferbloat, not the
-   hold). No AER or timeouts seen. NICs: at most 12.8 us (pb0), 8.7 (pb1).
-6. **NIC packet splitting (item 13) is the NIC's receive backlog; frame
-   spacing on its wire decides it.** NIC0's own order (in0 TLPs per run, 8
-   = whole 4000-byte packets, 1 = fully interleaved), pb0:
-   - Ethernet forced to 50G (`wire`, 0.64 us per frame): **whole packets
-     alone** at d16t64 (7.22) and d4t22c1 (7.24), where at 100G alone they
-     split (1.03, 1.03, with pauses and discards). Both NICs: whole (7.20,
-     7.24).
-   - Paced at 50G on a 100G wire: split anyway. iperf3 `-b` alone: d16t64
-     5.53, d4t22c1 2.06; styx's hardware shaper (`tx_maxrate`, `hw`) alone:
-     3.13, 2.66; both NICs at 50G each: 4.08, 2.85 (iperf3), 7.17, 1.27
-     (shaper). Pacing still sends line-rate bursts.
-   - Uncapped, both NICs: whole at every setting (7.2-7.3); one alone at
-     d1t0 (no hold): mostly whole (6.68, no pauses).
-   So a NIC splits when frames arrive at 100G faster than the switch takes
-   its writes at that setting (a hold, or two NICs' paced bursts at once):
-   its receive buffer backs up (pause frames, discards) and it writes
-   several packets at once. Styx's shared card matters only because, with
-   both ports busy, it spaces each port's frames ~0.6 us apart. **An FPGA
-   ingress rate limiter would slow the NIC's writes and so (predicted) cause
-   splitting, not prevent it;** to match alone and together, slow the wire
-   (`wire` phase: `ethtool -s ... speed 50000` both ends).
-   **The rule (page R6):** a NIC keeps its packets whole while it writes
-   each packet before the next frame arrives. At 100G a frame takes ~0.32
-   us on the wire; the packet plus completion takes ~0.27 us up Gen4 x8 at
-   the fitted 60.5 B/cycle: ~50 ns slack (estimate). NIC0 alone at 100G,
-   mean `pips_in0_wait_mean`: d1t0 31-47 ns whole (6.7-6.9 TLPs per run),
-   held settings with pb1 80-83 ns partly split (4.66, 3.30, no pauses),
-   pb0 147-239 ns fully split with pauses; frames ~0.6 us apart (both NICs
-   uncapped) stay whole at 200-345 ns. Splitting doesn't move misses
-   (0x0A04 item 8).
-7. **Drive 0 alone (`drv0`, Next items 2 and 4).** One drive at 1m: 55.3
-   Gb/s at d1t0, 54.0 at d1t0c1 (-2.3% at j1 and j16): the per-drain cap's
-   re-grant gap binds a drive slightly. Both drives at 1m: 53.4-53.7 total
-   (alternating inputs costs ~3% of the Gen3 x8 uplink). Smaller sizes: no
-   cap effect beyond noise.
-8. **Pending model rerun (item 0).** NICs: the model on the arrival order
-   matches the recorded order (runs per I/O ratio median 1.000 / 1.015,
-   waits 0.39/0.39 and 0.85/0.86 us; link fit 60.5 B/cycle, Gen4 x8). Drives:
-   runs match (1.04 / 1.01) but **waits come out 3x low** (0.40 vs 1.44 us
-   on 0x0A04, 1.17 vs 3.57 on 0x0A05) and the uplink calibration fits 35.5
-   B/cycle, above Gen3 x8's raw 31.5 (expected 30-31): about 30% of each
-   log's time is missing and the fit hides it in a too-fast link. Open.
-9. **Page order on 0x0A06 (page v2, Figures 6-9; `report-gen/seqrec6.py`,
-   `page6.py`).** The 0x0A04-0x0A05 page's Figures 3-6 for the main sweeps
-   (drives 40 points, NICs 12 two-NIC points, 8 depths, pb0 and pb1): the
-   batcher model (0x0A05's rules, FIFO 1536 or 512) on each device's own
-   order from the pb0 logs, floor, raw, recorded pb0/pb1 marks. NICs: the
-   model fits (own setting within +-7%, median per depth and rate); pb0
-   page switches per packet 9.0 (50G) / 8.0 (uncapped) at d1, 4.5 / 3.9 at
-   d16, back up to 5.6 / 5.0 at d64 (the pause/splitting depths); pb1 at
-   d64 2.9 / 2.5, below the by-page line (3.6 / 2.9), 1.8x the floor (1.6 /
-   1.4). **Superseded by result 10** (the raw and model lines here are
-   seqrec's synthetic arrivals, not the measured order). Drives, as first
-   read: the model doesn't fit pb0 on a full link (own setting
-   16-49% fewer page switches than recorded at 16k-1m; 4k within 12%, 8k
-   within 10% to d8 then 19-30% low), where it fit 0x0A04 within a few %:
-   likely `wrr_en` tied 1 (above), so pb0 is not 0x0A05's arbiter. pb0 at
-   d16-64 sends about the raw order (16k 10.3 vs raw 10.8; 64k 14.1-14.3 vs
-   18.2; 1m 10.1-10.4 vs 15.3); pb1 at d64 8.6 / 9.0 / 5.9 (16k/64k/1m),
-   -16/-36/-41%, still 3-4x the by-page line (2.7 / 2.2 / 1.7) and far
-   above the floor (1.2-1.4): consistent with the constant spills (result
-   3). To check the arbiter: rerun a few drive points with wrr off, if a
-   build allows it, or model the WRR in `pips-page-seq.py`'s batcher.
-10. **Methodology correction: lines from the measured arrival order
-   (10-26, summary page v5).** The model, floor and raw lines on all three
-   page-order pages (0x0A04-0x0A05 v8-v10, 0x0A06 v2, summary v1-v4) come
-   from `seqrec.py`/`seqrec6.py`: each device's own order with **synthetic**
-   arrival times (I/O bursts at a fixed pace, link fitted to the recorded
-   wait), the 10-20 stopgap (§8 item 12: "the host rerun measures the
-   arrival order and settles it"). The rerun is in: every log of the
-   campaign's analysis has the measured arrival order (`interleave.arr`,
-   `windows_arr`: in_sop = out_sop - pkt_wait, stalls put back) and, for
-   0x0A04/0x0A05 (`analyze-pending/`), the batcher model run on it
-   (`model`: self, the sweep's settings, sweepc1 at both FIFOs);
-   `pips-seq-grab.sh` runs no model on 0x0A06 sweeps. Measured arrivals are
-   far less interleaved than the synthetic ones: raw (windows_arr w=1, on
-   the marks' scale, pb0 logs) 4k 5.4, 8k 6.5, 16k 7.6, 64k 13.3, 1m 9.5,
-   NICs 5.8, NICs 50G 7.1, against synthetic 6.2, 8.7, 10.5, 18.4, 15.6, 6.5,
-   8.1. The arrival order hardly depends on the design (16k: 0x0A05 7.0,
-   0x0A06 pb0 7.0; 0x0A04 8.4-9.1, its 128-row FIFO pushes back). The model
-   on the measured order at each log's own setting: 0x0A05 within 1.5%
-   (median, d16-64) at every block size and the NICs, 0x0A04 0-8% (cap off
-   and on), up to +15% at d1-8 (8-16k). So: **0x0A04/0x0A05 batch below
-   their arrival order as the model says** (0x0A05 d64 16k/64k/1m 4.7 /
-   10.9 / 6.7; arrival 7.0 / 13.5 / 10.0; model 5.1 / 11.0 / 6.5), and
-   **0x0A06 pb0 sends more page switches than arrived** (d64 10.3 / 14.1 /
-   10.1 against its own arrival 7.0 / 13.1 / 9.2; 8k 6.2 vs 5.75; NICs 6.0
-   vs 6.3, about arrival), twice the model at 16k, from the same arrival
-   order as 0x0A05. Result 9's "pb0 sends about the raw order" and "the
-   model doesn't fit pb0" were artifacts of the synthetic raw/model. The
-   difference lies between arrival and the uplink (0x0A06's drains and
-   input choice); known rule difference `wrr_en` tied 1 (open-page WRR per
-   beat instead of round robin), plus 1536 rows and its pipeline; not
-   confirmed. pb1: arrival not measurable (the rebuild holds each input to
-   its output order, which pb1 breaks: its `arr` reads 3.6 at 16k against
-   pb0's 6.3), so compare with pb0's: pb1 d64 16k 8.6 (above arrival 7.0),
-   64k 9.0, 1m 5.9 (below), NICs 2.5 (at the model's by-page 2.5). To do:
-   (a) rerun the 0x0A06 analysis on the hosts with `--model` (pips-seq-grab
-   `--manifest ... --model self,deep,sweepc1,sweepc1f512` on the main
-   sweeps, pb0 logs) for its own-setting check and 1536-row lines; (b) redo
-   the 0x0A04-0x0A05 page's Figures 3-6 and the 0x0A06 page's Figures 6-9
-   from `seq.jsonl` (model, windows_arr) instead of seqrec; (c) to test the
-   arbiter, a build with `wrr_en` in a register. Summary page v5
-   (`sumpage.py`) already uses the measured order: raw = windows_arr w=1
-   (pb0 logs of every design), model = host model cap on t255 at depths
-   1-64, FIFO 128/512 (0x0A04/0x0A05 logs), floor = seqrec's (each device's
-   own order; needs no cross-device timing), checks = host model at own
-   setting.
-
-### 0x0A07 minimal rerun (set up and ran 2026-10-28; results below)
-
-Why rerun: 0x0A07 changes the read flush, which acts with `page_batch_en`
-0 too (`axi4_mwr_batch_pp`'s arbiter serves both modes). On 0x0A06 a read
-waiting at either input preempted the other input's drain episode; on the
-drives (reads waiting on both ports nearly always on a full link) the two
-devices left interleaved packet by packet. That is the likeliest cause of
-result 10's "0x0A06 pb0 sends more page switches than arrived" (twice the
-model at 16k, from the same arrival order as 0x0A05), ahead of `wrr_en`. So
-every 0x0A06 page-order number that involves both drives is suspect; the
-miss and throughput results (1, 2, 4) are unlikely to move (strict mode).
-
-`bash scripts/pips/pips-campaign.sh ssd --minimal --tmux` (bigserver) and
-`... nic --minimal --tmux` (icx); `--dry-run` shows the commands. The
-switch must report 0x0a07 (the campaign takes the design it finds at the
-start and refuses a change). Phases:
-- drives `mini`: depths 1, 4, 16, 64 (d1t0, d4t50, d16t218, d64t255) x
-  `page_batch_en` 0/1, cap on, w31; 4k/16k/64k/1m x 1/4/16 per drive +
-  2+16: 129 runs, ~2h15, then ~35 min analysis.
-- NICs (user, 10-28: the Ethernet cap and/or the FPGA rate cap instead of
-  iperf3 pacing, a few representative points, not the full sweep); 59 runs,
-  ~2h35, then ~20 min analysis:
-  - `rcap`, links at 100G: the FPGA rate cap on both inputs (`--set
-    rcap=N`), NIC0 alone and both, 5 flows uncapped. At d1t0 (no hold) rcap
-    0 / 214 / 169 / 113 (~off / 95 / 75 / 50 Gb/s of NIC writes: a 512-byte
-    write is 9 beats, so rcap ≈ 2.25 x Gb/s); at d16t218c1 pb 0/1 rcap 113.
-    Tests result 6's prediction that a rate limiter on a NIC port causes
-    splitting (it holds the NIC's writes, so its receive buffer backs up);
-    `pips_stat_cap_hold_frac_*` shows where the cap binds.
-  - `uneven`: NIC0's link forced to 50G at both ends, NIC1 at 100G: both
-    NICs, 5 and 5:30 flows, d1t0c1 and d16t218c1, pb 0/1. The uneven load
-    the arbiter never had on 0x0A06 (result 4).
-  - `wire50`: both links at 50G (the matched alone-vs-together condition of
-    result 6, 100 Gb/s together under the uplink's ~107): NIC0 alone and
-    both, 5 and 30 flows, d1t0c1, d4t50c1, d16t218c1, d64t255c1 x pb 0/1
-    (d64 last). The NIC counterpart of the drives' `mini`.
-  - The links are put back as found after the phases (also on exit);
-    `--no-wire` leaves out `uneven` and `wire50`.
-- Rate caps are written by every sweep setting (0 unless `--set rcap`; the
-  original goes back at the end). No knob phases (no effect on 0x0A06,
-  result 4), no pending 0x0A04/0x0A05 analysis (`--pending`).
-- New in every run: `pips-bp.tsv` (the counters every 2 s; a sample is
-  skipped when `pips log-wait` holds the BAR0 lock, gaps stay well under the
-  17 s wrap) and in the `.rpt`/JSONL `pips_stat_bp_frac_0/1` (refused share of
-  the run's cycles, setup included), `pips_stat_cap_hold_frac_*`,
-  `pips_stat_bp_valid`, `pips_stat_bp_max_gap_s`. `pips-status-table.py` and
-  the summaries' status tables print REFUSED_% per input.
-- Analysis runs the batcher model on the new logs (`PIPS_PB_MODEL`, default
-  `self,sweepc1,sweepc1f512`): on pb0 logs `self` is the log's setting without
-  `w31` (`pips-page-seq.py` now strips the page batcher fields; on 0x0A06 logs
-  `--model self` used to fail to parse), so `seq.jsonl` has the own-setting
-  check that result 10 (a) asked for. pb1 logs get the sweep lines only
-  (meaningless there: arrival not measurable).
-
-Before it: program 0x0A07 on both boards, `sudo bash
-scripts/pips/pips-bringup.sh` (hwtest now checks reg4 and the counters), and
-`make -C scripts/pips check` on one host (the 0x0A07 tests in `test-sim.sh`
-are new and have not run). Check after: `status.txt` (stuck, spills, MRd
-wait: the new flush lets a read wait for the other input's episode too, and
-0x0A06 already reached 262 us on the drives), then compare pb0 page switches
-per packet with the arrival order and the model (result 10's numbers: d64
-16k/64k/1m 0x0A06 pb0 10.3/14.1/10.1, arrival 7.0/13.1/9.2, 0x0A05 model
-5.1/11.0/6.5); on the NICs, TLPs per run of NIC0 (whole packets ≈ 7-8)
-against the rcap level, REFUSED_% and the cap's share, and pause frames.
-
-### 0x0A07 drive results (2026-10-28, strict, cap on)
-
-`bigserver` `c10281318`, 129 runs in 2h24 (repo `58e001439`), switch
-answered to the end, stuck 0. Data `dualssd/1028/pips-campaign-ssd-c10281318/`
-(`results/`, `status.txt`, `analyze-new/seq-*/seq.jsonl` with the model);
-tables `py -3 dualssd/report-gen/c1028.py` (saved `dualssd/1028/c1028-ssd.txt`),
-against 0x0A05 (`1026/.../analyze-pending`, dsweep1) and 0x0A06 (`1026/...
-main`) at the common points: depths 1/4/16/64, 4k/16k/64k/1m, 1/4/16 per drive
-and 2+16, both drives. Page switches per 4 KiB page, marks scale.
-
-1. **Result 10 is solved: the read flush was the cause.** pb0 sends below its
-   measured arrival order again, as 0x0A05 does: sent / arrival median 0.85
-   [0.69, 1.31] over the 16 depth x size cells (0x0A05 0.81 [0.63, 1.18],
-   0x0A06 1.19 [0.78, 2.27]). d64 16k / 64k / 1m: 0x0A07 5.2 / 10.9 / 7.1,
-   0x0A05 4.5 / 10.9 / 6.7, 0x0A06 9.9 / 14.1 / 10.1. The arrival order is the
-   same on all three (16k 6.2-7.6). `wrr_en` (still tied 1) is not needed to
-   explain it.
-2. **The model fits 0x0A07 pb0 as it fits 0x0A05** (own setting vs log,
-   median per cell): within 2% at d16-64 at every size; at d1-4 it
-   overcounts as on 0x0A05 (16k d1 +58% vs 0x0A05 +52%; 64k/1m d1-4 +8 to
-   +19%, 0x0A05 +2 to +11%). Result 10 (a) for the drives is answered by
-   0x0A07; the 0x0A06 logs need no model rerun.
-3. **Page batching (pb1) now groups pages much better**: d64 16k / 64k / 1m
-   2.6 / 3.4 / 3.5 (0x0A06 8.3 / 9.1 / 5.9, -68 / -62 / -41%); d16 2.7 / 4.1
-   / 3.7. 16k d64 is at the old by-page line (2.7, result 9) and under pb0's
-   5.2 by half. 4k hardly changes (3.3 vs pb0 3.7). At d1 pb1 ≈ pb0.
-4. **Throughput and IOTLB misses don't move** (128 points, 0x0A07 / 0x0A06):
-   Gb/s median 1.008 [0.964, 1.148], misses per 4 KiB 0.982 [0.875, 1.206]
-   (16k and 64k -2 to -7%, 1m 0). Strict mode: every page visit misses
-   anyway (result 1), so the better grouping doesn't show in the counters.
-5. **Status:** stuck 0 everywhere. pb1 spills as on 0x0A06 (64k/1m saturate
-   the 16-bit count at 65535; result 3). MRd wait > 25 us at 25 of 128
-   points (0x0A06 60 of the same 134 setting-point rows), max 136 us (d4t50c1
-   64k 4 per drive, pb0; 0x0A06 262 us), median 21 us (0x0A06 24): the new
-   flush did not lengthen read waits. Refused cycles (new counters): 0.2-3%
-   at 4k, 30% at 16k with 1 job per drive, 50-70% per input from 16k with
-   more load and at 64k/1m, i.e. the Gen3 x8 uplink is full (53 Gb/s at
-   1m); cap share 0 (no rate cap set).
-
-So for the drives 0x0A07 replaces 0x0A06: the 0x0A06 page's drive page-order
-figures (6-9) and the summary page's 0x0A06 lines are superseded by these.
-
-6. **Legal floor (10-30, `report-gen/floor7.py` → `floor7.json`).** The
-   floor (seqrec.floor_runs: hold a device's next D TLPs, free to reorder)
-   ignores the switch's completion rule: a completion leaves as soon as its
-   older data has and seals every older open batch (`axi4_page_batch_ch.v`
-   header, "urgent"; `ctrl_push` only decides whether it also pulls the
-   batches ahead of it). The legal floor cuts each device's order at its
-   completions and groups only the data between them. From the 0x0A07 pb0
-   listings, d64: 4k 2.74 (floor 1.11), 16k 1.86 (1.22), 64k 1.49 (1.32), 1m
-   1.25 (1.22). pb1 d64 against it: 4k 3.29 (x1.20), 16k 2.61 (x1.40), 64k
-   3.43 (x2.30), 1m 3.46 (x2.77). Every pb1 64k/1m run saturates the spill
-   count (65535 per input), 4k/16k spill hundreds to thousands: the 64k/1m
-   gap is page-segment capacity (8 per device; a spilled drive goes to
-   arrival order until its overflow is granted).
-
-### 0x0A07 NIC results (2026-10-30, strict)
-
-`icx` `c10281317`, 59 runs, 4h01 (sweeps 3h50, an hour over the estimate),
-switch answered, stuck 0, links put back to 100G (NIC1's read "Unknown" once,
-then 100G). Data `dualnic/1028/pips-campaign-nic-c10281317/`; tables `py -3
-dualssd/report-gen/c1028.py nic` (saved `dualnic/1028/c1028-nic.txt`, with
-0x0A06 reference rows). Page switches per packet, marks scale.
-
-1. **The FPGA rate cap splits NIC0's packets, as 0x0A06 result 6
-   predicted.** NIC0 alone, 100G link, d1t0: uncapped 95.1 Gb/s, 6.42 TLPs
-   per run (84% of packets in one run), no pauses; rcap 214 / 169 / 113
-   (~95 / 75 / 50G): 88.2 / 69.3 / 46.9 Gb/s (93% of the intended level, so
-   rcap ≈ 2.25 x Gb/s holds), 1.10 / 1.07 / 1.14 TLPs per run, cap held
-   12.7 / 27.3 / 46.3% of cycles, ~91-97k pause frames, 1.3-1.4M discards,
-   retransmits 0.46-0.80%. d16t218c1 rcap 113: the same (pb1 2.51 TLPs per
-   run, still split). Both NICs: rcap 214/169 whole (7.2, 7.1; cap 0.4/4.3%,
-   each NIC's 53.5 is below the cap), rcap 113 split (1.11, 164k pauses,
-   2.4M discards). The rate cap cannot stand in for a slower NIC; the wire
-   speed can.
-2. **Uneven links (NIC0 50G, NIC1 100G):** the arbiter gives NIC1 what NIC0
-   leaves (48.8 / 55.9-58.3 Gb/s), not an even split. d1t0c1 (write-by-write
-   alternation) holds the 100G NIC: NIC1 split (1.04 pb0, 1.01 pb1), 50-64k
-   pauses, 0.6-1.1M discards, 8.5-8.8 page switches per packet. d16t218c1
-   pb0: NIC1 partly split (4.95), no pauses, 2.90; pb1 both whole (7.16 /
-   7.11), 2.46. 5:30 flows: uplink not full (95 Gb/s), nothing splits.
-3. **Both links at 50G (`wire50`): no splitting anywhere** (7.1-7.7 TLPs per
-   run, 88-97% one-run, zero pauses and discards, alone and both, every
-   depth, pb0 and pb1). Page switches per packet, both NICs, 5 flows, d1 / 4
-   / 16 / 64: pb0 7.91 / 3.53 / 2.66 / 2.37, pb1 6.83 / 2.94 / 2.29 / 2.29;
-   one NIC alone 2.23-2.27; arrival 5.6; floor 2.30 / 2.27 / 1.69 / 1.32;
-   **legal floor 2.28 from d4**. 30 flows: pb0 4.98 / 3.14 / 2.68 / 2.51, pb1
-   4.50 / 2.76 / 2.47 / 2.46, alone 2.37-2.40, legal 2.07. 0x0A06 at the same
-   50 Gb/s by iperf3 pacing on 100G links: pb0 3.57-4.87, pb1 3.02-3.08 at
-   d16-64 (split packets). **From d16 two NICs send what one alone does, and
-   pb1 sits on the legal floor.** Each packet is 8 writes to its own page
-   then a 16 DW completion to a completion-queue page (listing), so 2 per
-   packet is the minimum while completions leave at once.
-4. **Model** (own setting vs recorded, pb0): wire50 within 0.5-0.8% at
-   d16-64, 2% at d4, 6-9% at d1; rate-cap runs within 1%; uneven d16 <1%, d1
-   +6-8%.
-5. **Status:** stuck 0; MRd wait max 14 us; refused 0.2-10.5% at 50G, the
-   cap's share dominating on capped runs; pb1 spills ≤ 2k per run at 50G
-   (0x0A06 by pacing: saturated), 65535 at uneven d1t0c1p1. Counter sampler
-   valid in all runs (max gap 3.4 s). Sizes: completions 16 DW, RELIABLE.
-
+- **Minimal rerun** (drives 10-28, NICs 10-30): result 10 solved (pb0 back to
+  0x0A05's page switches; the model within 2% at d16-64); pb1 d64 16k / 64k /
+  1m 8.3 / 9.1 / 5.9 -> 2.6 / 3.4 / 3.5; NICs at the legal floor (2.29 per
+  packet vs 2.28); the FPGA rate cap splits a NIC's packets. Then the
+  verdict (next section).
+- **Paper campaign** (11-01/02; legs strict, lazy, pt, off): batching costs
+  nothing measurable (Gb/s -0.8..-2.1%, fio p99 within 1.2%); page order is
+  the switch's, not the IOMMU's (within ±3% across modes); page order
+  doesn't move IOTLB misses; strict costs throughput only for drives at 4k
+  (j4: strict 16.2, lazy 46.2, pt 54.0, off 53.9 Gb/s); NICs within 0.3%
+  across modes. E7 (map/unmap counts) has no data: no `perf` on either
+  kernel. Drives' strict leg was refused at start (interrupt layout); the
+  10-28 rerun stands in (user, 11-02).
 ### Verdict (2026-10-30): the switch study is done
 
 The question the user asked ("is the study over, or do we keep adding to the
@@ -2600,30 +963,12 @@ FPGA?"), judged on page order only:
   ~1.3): it delays when the host learns an I/O finished, a trade this clean
   testbed can't judge; a separate study.
 
-### 0x0A07 paper campaign (set up 2026-10-31, ran 11-01; results below)
+### IOMMU legs (copied from the paper campaign, still the boot lines to use)
 
-The user's experiment list for the paper (10-31), on 0x0A07. **No reboot and
-no GRUB change inside a campaign** (user rule: reboots and kernel
-command-line changes are the user's). In scope: E1, E2, E5-E14 minus the
-ones below; out of scope (user, 10-31): E2b (F&S kernel), E3 (commodity
-switch), E4 (data integrity), E15 (more page segments).
-
-**One IOMMU leg per launch** (user, 10-31, second version: no runtime IOMMU
-change at all). `--paper` reads the mode the host booted with from the
-devices behind the switch (`pips-iommu.sh mode`: strict = `DMA`, lazy =
-`DMA-FQ`, pt = `identity`, off = no IOMMU group) and runs that leg; the
-sweeps name themselves by it (`dual<kind>-pips-<mode>-<stamp>...`). The user
-reboots between legs. `--leg M` refuses to start unless the devices are M
-(catches a missed reboot); with `--dry-run` it plans leg M on any machine.
-`--runs N` sets the runs per point of head, g100 and e8 (default 3).
-
-**Trap (icx, 11-01):** a command line with `intel_iommu_on` (underscore, a
-typo) is ignored: the kernel boots with the IOMMU off and `--leg lazy` is
-refused ("the devices ... are off"). It must be `intel_iommu=on`. icx was
-booted `6.12.43-vanilla` (since at least 10-26; the 6.8 in §1-6 is older): every leg must
-run on the same kernel (compare `cmdline.txt` in the tarballs), and a
-vanilla kernel has no `linux-tools-$(uname -r)` package (`perf` from its
-source tree, `make -C tools/perf`, or the ops sweeps are skipped).
+One IOMMU mode per boot; campaigns read the booted mode and never change it
+(user rule: reboots and GRUB are the user's). icx boots `6.12.43-vanilla`
+(since at least 10-26): every leg must run on the same kernel. A typo such as
+`intel_iommu_on` (underscore) is ignored and boots with the IOMMU off.
 
 | Leg | Kernel command line (iommu tokens in `GRUB_CMDLINE_LINUX_DEFAULT`) | Group type |
 |---|---|---|
@@ -2632,265 +977,40 @@ source tree, `make -C tools/perf`, or the ops sweeps are skipped).
 | pt | `intel_iommu=on iommu=pt` (no `iommu.strict`) | `identity` |
 | off (optional) | `intel_iommu=off` | no group |
 
-```bash
-bash scripts/pips/pips-campaign.sh ssd --paper --leg strict --dry-run   # plan, ETA, commands
-bash scripts/pips/pips-campaign.sh ssd --paper --leg strict --tmux      # bigserver
-bash scripts/pips/pips-campaign.sh nic --paper --leg strict --tmux      # icx
-# reboot with the lazy line, then --leg lazy; reboot with the pt line, then --leg pt;
-# reboot back to the strict line at the end
-```
+`scripts/pips/pips-iommu.sh mode` reads it from the devices behind the switch;
+`pips-campaign.sh --leg M` refuses to start unless the devices are M.
+### Alias campaign 1 in short (11-05/06)
 
-| Phase | Experiment | What runs (per leg) | Runs |
-|---|---|---|---|
-| `pcie` | E6 | `pips-pcie-caps.sh`: lspci of root port, switch ports, devices: MPS, MRRS, RO, NoSnoop, tags, IDO, completion timeout ranges and value, ACS, IOMMU group/mode → `pcie/caps.txt`; `cmdline.txt` | 0 |
-| `head` (drives) | E1, E2, E5, E10, E13 | d1t0c1 pb0 (batching off) vs d16t218c1 and d64t255c1 pb 0/1; 4k/16k/64k/1m x 4/16 per drive. Results carry Gb/s, CPU, misses by walk level (L1/L2/L3), fio p99, pkt_wait p50/p99 | 122 |
-| `g100` (NICs) | E1, E2, E5, E9, E10 | the same settings, both NICs, 5 and 30 flows, uncapped, 100G links. E9's d16/d64 page switches come from its logs | 32 |
-| `e8` (NICs) | E8 | NIC0 alone, 5/10/15/30 flows, d1t0c1 (strict leg vs pt leg = E8) | 13 |
-| `rcap0` (NICs, strict leg only) | E11 | both NICs, 5 flows, d1t0, rate cap on input 0 (NIC0) only: `rcap0` 113/90/68 (~47/37/28 Gb/s: 113 held NIC0 at 46.9 on 10-28) | 6 |
-| `ops` | E7 | the runner's `--iommu-ops 1`: `perf stat` of `iommu:map`, `iommu:unmap`, `intel_iommu:qi_submit` beside the pcm-iio window, with the drives' reads or the NICs' rx packets of the same seconds → `iommu_ops_*_per_io`, `_unmap_per_4k`, `_qi_per_unmap`. Software counts (no VT-d invalidation PMU on either CPU); pt and off should read ~0 | 4 / 3 |
+Setup, results, the 11-06 follow-up and the 11-05 bring-up log are in
+[docs/archive/pips-alias-1.md](docs/archive/pips-alias-1.md); page "PIPS Alias Campaign"
+https://claude.ai/artifact/E5bkPCsqik67LjPQnTDR2q; tools
+[scripts/pips/alias/README.md](scripts/pips/alias/README.md); data
+`dualssd/1105/`, `dualnic/1105/` (tables `py -3 dualssd/report-gen/c1105.py`,
+model `geom1105.py`). In-house generators replace fio and iperf3: drives
+`alias-nvme` (polled NVMe over VFIO), NICs `alias-rdma` (RDMA READs from
+styx); a fixed set of pages `first + i*stride` (i < ws) mapped once, so the
+misses are aliasing by design. Both hosts strict, 72 runs each.
+1. The pattern sets the misses: 0 to ~1 per 4 KiB page; lookups per page =
+   TLPs per page (drives 17.6, NICs 9.1).
+2. **icx (Ice Lake-SP): 256 entries, set-associative, LRU, fewer than 16
+   ways**, set index = low IOVA page bits (128x2, 64x4, 32x8 fit; the follow-up
+   rules out 2 ways).
+3. **bigserver (Skylake-SP): ~96 entries, no set conflicts**; its soft knee
+   came from alias-nvme's per-queue cursors drifting.
+4. Two devices that fit alone thrash together.
+5. **A miss costs nothing measurable** (Gb/s within -0.24..+0.15%; up to 1.77
+   M misses/s drives, 3.43 M/s NICs).
+6. **The batcher doesn't move aliasing misses** (drives within 0.01 per page,
+   NICs within 0.08).
+7. Page order and cost as in the paper campaign.
 
-ETA per leg (estimates: 1.05 min per drive run, 2.6 per NIC run, analysis at
--j 16): drives every leg ~2h12 sweeps, ~2h50 packed; NICs strict ~2h21
-sweeps, ~2h40 packed; NICs lazy/pt/off ~2h05, ~2h25. `--dry-run` prints the
-clock times.
-
-E12 (write sizes) comes from the analysis (`analyze-new`, lengths) of the
-same sweeps; E14 (bubble remover) is model code, not a run, not written.
-
-Before each leg: `git pull`; `perf` must run (`sudo apt install
-linux-tools-$(uname -r)`, per kernel; else the ops sweeps are skipped with a
-note); the switch must report design 0x0a07 (refused otherwise). After a
-reboot also §3 "Check after a reboot" (icx) and, on bigserver, `bash
-scripts/ssd-irq-placement.sh` (the interrupt layout is per boot: the strict
-leg refuses an unsafe one; other legs note it and go on, since the 10-25
-livelock needs strict's synchronous invalidations).
-
-`scripts/pips/pips-iommu.sh` (`show|mode|check|set`) can still change a
-group's type at runtime by hand; the campaign only reads (`mode`, `show`).
-Kernel rule if ever used: before 6.4 (bigserver's 5.15) a group changes only
-if it holds one device, bridges included.
-
-Check after each leg: `README.txt` (the leg and command line), `notes.txt`,
-`iommu-at-start.txt` / `iommu-at-end.txt` (same mode), the mode in every
-sweep's name; ops runs' `iommu-ops.rpt` (`iommu_ops_map/_unmap/_qi`, -1 =
-tracepoint missing). Analysis to write when the tarballs are back (local,
-like `c1028.py`): E1/E10 mean and spread per point, E2 misses per I/O
-strict/lazy/pt x pb0/pb1, E5 pkt_wait percentiles, E7 per-I/O counts per
-mode, E8 NIC0 alone strict vs pt, E9 page switches at 100G against the
-floors, E11 NIC0/NIC1 Gb/s per rcap0, E13 walk-level misses pb0 vs pb1.
-
-### 0x0A07 paper campaign results (2026-11-02)
-
-Tarballs in `dualssd/1101/1101/`, `dualnic/1101/1101/` (unpacked beside
-them; FILE-MAP §7). Tables `py -3 dualssd/report-gen/c1101.py [ssd|nic]`,
-aggregates `agg1101.py`, floors `floor11.py`. Page: "PIPS 0x0A07 Campaign" v2
-https://claude.ai/artifact/91VNbNGeJVyfuLLH8acGvY (results per experiment and
-an experiment status table with the unavailable ones marked); the summary
-"PIPS TLP Patterns" v6 adds 0x0A07.
-
-What ran: drives lazy `c11011320`, pt `c11011925`, off `c11020003` (head,
-122 runs each, 3 per point); NICs strict `c11010108` (g100, e8, rcap0), lazy
-`c11011329`, pt `c11011926`, off `c11020003` (g100, e8). **Drives strict
-`c11010137` refused at start** (that boot put drive 0's interrupts on fio
-cores 37, 42); per the user (11-02) the **10-28 rerun stands in** for it
-(same kernel, cores, build, grid; 1 run per point). Checked: at 64k/1m it
-agrees with the three new legs within 1% (Gb/s), 2% (page switches), 5%
-(wait). **ops (E7) skipped in all 8 legs: `perf` runs on neither kernel**
-(bigserver 5.15.0-177-generic, icx 6.12.43-vanilla; icx has been on 6.12
-since at least 10-26, the "6.8" in §1-6 is older). Switch fine, stuck 0, no
-soft lockups.
-
-Results (page has the tables):
-1. **Batching costs the hosts nothing measurable (E1, E5).** d64 + page
-   batching vs d1t0c1, median over 8 drive points: Gb/s -0.8..-2.1%, CPU
-   +-0.2 points, fio p99 within 1.2%, every mode. Switch wait p99 4-26 us,
-   under 3% of the lowest fio mean latency (155 us, 4k).
-2. **Page order is the switch's, not the IOMMU's (E2, E9).** From 16k up page
-   switches per page agree within +-3% across the 4 modes at every setting;
-   d64 + page batching 1.3-1.5x legal floor at 4k/16k, 2.4-2.8x at 64k/1m
-   (segments run out, spill counter saturated) in every mode.
-3. **Page order doesn't move IOTLB misses (E2, E13).** pb1/pb0 drive misses
-   x1.000 strict, x0.995 lazy; NIC misses per Gb/s within ~2%. Misses ~1 per
-   4 KiB page in strict and lazy (compulsory). Walk-level misses unchanged.
-4. **Strict is the host cost, only at 4k (E2).** Drives 4k j4: strict 16.2,
-   lazy 46.2, pt 54.0, off 53.9 Gb/s. Strict: L1/L2 walk misses ~0.7 per 4 KiB
-   (lazy 0.002). 16k strict -7%; 64k/1m equal. Lazy cuts misses 22% at 4k
-   only.
-5. **NICs: IOMMU mode doesn't matter (E1, E8).** Both NICs within 0.3% across
-   modes. NIC0 alone (d1t0c1 splits its packets in every mode, ~80 Gb/s):
-   strict -1.7% at 30 flows, +1..+7 CPU points. NIC lazy misses = strict's
-   (mlx5 page pool keeps pages mapped).
-6. **100G (E9):** 5 flows, d64 + page batching 2.31 per packet vs legal floor
-   2.28; d1 and d64 without page batching split every packet (8.9-9.0, ~140k
-   pause frames, 2.2M discards per run). 30 flows host-limited at ~48.6 Gb/s
-   (as on 0x0A06).
-7. **E11:** rcap0 113/90/68 -> NIC0 40.6/33.7/26.8 Gb/s (86-96% of intent),
-   NIC1 takes the rest (total 105-106), NIC0 splits with pauses.
-8. **E12:** drive completions 4 DW, data 64 DW (drive 1 also 36 DW, 18-19%);
-   NIC completions 16 DW, data 128 DW 87% / 112 DW 12%; rules hold
-   99.04-100% / 99.999-100%, every mode. **E6:** identical PCIe settings in
-   every boot (MPS 256 bigserver / 512 icx, RO and NoSnoop on below the root
-   port, PIPS ports without ACS but each device in its own group with its
-   downstream port).
-9. **Confounded cell:** drives 4k j16 are CPU-bound and depend on each boot's
-   interrupt placement: pt (drive 0 completing on its own fio cores) 53.9 vs
-   off 46.4 Gb/s. Compare modes at 4k on j4. A fair j16 comparison needs a
-   rerun with `SSD_CORES` that avoid the interrupt CPUs in every boot.
-
-**Not available (write around it):** E2b, E3, E4, E15 (out of scope), E7
-(no perf), E14 (not written), NIC latency for E1 (iperf3 has none). Partly:
-E10 (drive strict 1 run; E11 1 run per cap).
-
-### Alias campaign (set up 2026-11-05, ran 11-05/06; results below)
-
-**What and why (user, 11-05).** fio and iperf3 are replaced by in-house
-generators (`scripts/pips/alias/`, its README) that control which pages the
-devices write into: a fixed set mapped **once**, so the IOTLB misses are
-aliasing by design, not map/unmap. The starting point was the user's RDMA
-READ code (`rdma_script/`, local and git-ignored since 11-05), which pinned
-pages for maximum aliasing (conflict misses). At the user's request (11-05)
-the pattern also makes **capacity** misses: pages `first + i*stride`
-(i < ws). Stride 1 with ws above the IOTLB's entries gives capacity
-misses; a stride that is a multiple of the set count gives conflict
-misses. Both are aliasing, and they make the case for the batcher.
-- **Drives (user: VFIO, "regular DMA, manual fixed page assignment"):**
-  `alias-nvme` is a polled userspace NVMe driver over VFIO. The drives
-  are bound to vfio-pci for the runner's runs (`alias-vfio.sh`, put back
-  at exit and at the next start). The region is mapped at IOVA
-  `0x4000000000`, one PRP entry per 4 KiB page. **Read-only by
-  construction** (opcode whitelist, aborts on anything else).
-- **NICs (user: RDMA READ, data in the same direction as the campaigns):**
-  icx runs `alias-rdma --role client` and posts READs to a server on styx
-  (one per NIC, port `BASE_PORTS[i]+700`). icx's NIC writes the responses
-  into one MR registered once, one scatter entry per page. Note:
-  `rdma_script/common.c` set `max_rd_atomic = 1` (one READ in flight per
-  QP) and `path_mtu` 1024. The new tool uses several QPs, the devices'
-  rd_atom and the port MTU.
-- **Plumbing:** the runners' `--gen alias` (drives: `-J` queues, `--iodepth`
-  per queue; NICs: `-S` QPs, `--depth`, `--rdma-bs`; both: `--ws --stride
-  --first --order --page-list --backing-pages`). The generators write fio's
-  JSON and `_iops.1.log`, so `fio-sum`, the results, the sweeps, the TLP log
-  and pcm-iio are unchanged (the NIC runner writes `iperf.bw.rpt` from
-  them). The results add `gen`, `alias_*`.
-- **Campaign:** `pips-campaign.sh ssd|nic --alias [--runs N] --tmux`, one
-  sweep per pattern point. `ageom` (d1t0c1: capacity curve stride 1, ws
-  16-65536; conflict curve ws 32, stride 2-8192; one device alone and
-  both), `acap` (ws 256/4096/65536 stride 1) and `aconf` (ws 16/32/64,
-  stride 4096), the last two both devices, d1t0c1 pb0 vs d16t218c1 pb 0/1.
-  Drives bs 4k, 4 queues x qd 32; NICs 4 QPs x 16 READs of 4 KiB. 72 runs:
-  ~1h50 drives, ~2h30 NICs. Needs the IOMMU translating (drives any mode
-  but off; NICs strict or lazy), checked at start. **One boot, the current
-  strict line, serves both** (11-05): for the drives strict/lazy/pt are the
-  same experiment (vfio-pci attaches VFIO's own paging domain, replacing
-  the default domain, identity in pt included; nothing is unmapped during a
-  run). For the NICs the MR is mapped once, so strict and lazy should agree
-  (lazy is an optional check); pt/off don't translate it. No irq-placement check
-  for the drives (polled, no interrupts).
-- **Measuring misses:** **pcm-iio, as always** (`pcie.rpt`: `IOTLB_lookups`
-  0x40/0x01, `IOTLB_misses` 0x40/0x20, walk levels). The user asked (11-05)
-  why not just PCM: that's the plan; rdma_script's README suggested the VT-d
-  PMU through `perf`, which neither kernel has (E7).
-- **Open items:** (1) VT-d PMU / `perf` counters **on hold** (user, 11-05:
-  install perf later if the data is needed; skip for now). (2) Untested on
-  the hosts: C syntax-checked here with MinGW and stub headers, the shared
-  pattern/output code run natively and its output read by the real
-  `fio-sum` (window IOPS right, covered); runners and campaign `bash -n`
-  and `--dry-run`. First on the hosts: build on bigserver, icx, styx
-  (`alias-run.sh --build`; libibverbs-dev for rdma), then one by-hand run
-  each (README "By hand"), then the datapath sweeps. (3) bigserver is
-  shared: a bound drive vanishes from the kernel for the run (bind refuses
-  if anyone has it open). (4) The IOMMU groups behind PIPS decide whether
-  the idle drive must go to vfio-pci too (runner handles it; `alias-vfio.sh
-  status`). Checked 11-05 on bigserver: separate groups, b3:00.0 (nvme0,
-  SSD 0) in group 236 with its PIPS downstream port b2:00.0, b4:00.0
-  (nvme1, SSD 1) in 237 with b2:01.0 (the switch's ports have ACS), so each
-  drive binds alone; the ports stay on pcieport. (5) NIC capacity points also count mlx5's MTT fetches (README
-  caveats). Analysis: the page-order tools read the TLP logs as before.
-  The miss curves come from the results JSONL (`IOTLB_misses` per I/O against
-  ws and stride); no report generator yet.
-
-### Alias campaign results (2026-11-06)
-
-Tarballs in `dualssd/1105/`, `dualnic/1105/`, unpacked beside them
-(`pips-campaign-ssd-c11052324/`, `pips-campaign-nic-c11051944/`). Tables `py -3
-dualssd/report-gen/c1105.py [ssd|nic|json|floor]` (writes `dualssd/1105/c1105-ssd.txt`,
-`dualnic/1105/c1105-nic.txt`, `c1105.json`, floors `floor1105.json`); IOTLB model
-`geom1105.py` (`geom1105.json`); page `page1105-head.py` + `page1105.py`. Page "PIPS Alias
-Campaign" (v1) https://claude.ai/artifact/E5bkPCsqik67LjPQnTDR2q.
-
-What ran: both hosts strict, 72 runs each (52 points + 20 datapath runs; 1 run per
-point): bigserver 11-05 23:24 -> 01:11 in hold mode (no freeze, rebooted at the end as
-planned); icx 19:44 -> 23:20. Switch answered, stuck 0, no soft lockups; spill counts only
-in pb1 runs. The datapath runs are real loads at the sweep's pattern (drives both, NICs
-NIC0 alone): kept as geometry data (`dp` in c1105.json), not in batcher comparisons.
-
-Results (page has the figures and tables):
-1. **The pattern sets the misses:** 0 to ~1 per 4 KiB page, nothing mapped during a run.
-   Lookups per page = TLPs per page (drives 17.6, NICs 9.1); a page misses at most once
-   per visit (1.01-1.08 at the top). Skylake's `IOTLB_hits` excludes misses, Ice Lake's
-   `IOTLB_lookups` includes them.
-2. **icx (Ice Lake-SP): 256 entries, set-associative, LRU, fewer than 16 ways**, set index
-   = low IOVA page bits. NIC0 alone ws 256 -> 0.09, 1024 -> 1.01; ws 32 misses from stride
-   32 on; ws 16 at stride 4096 (one set) misses (0.99). 128x2, 64x4, 32x8 all fit the 34
-   points (one cursor, strictly cyclic); 16x16 and fully associative don't.
-3. **bigserver (Skylake-SP): ~96 entries, no set conflicts** (64 pages sharing their low
-   bits fit at stride up to 8192). Soft knee (both ws 64 -> 0.32, alone 256 -> 0.63)
-   explained by alias-nvme's per-queue cursors (`cursor_init(q, nq)`: 4 cursors drift);
-   model 1x96 random/LRU with drifting cursors fits 31 points (Σ|err| 0.26-0.37).
-4. **Two devices that fit alone thrash together:** icx ws 256 0.09 -> 1.03, ws 32 stride
-   8 0.06 -> 1.00 (same sets); bigserver ws 64 0 -> 0.32.
-5. **A miss costs nothing here:** Gb/s within -0.24..+0.15% of the no-miss mean (drives
-   alone 37.1, both 54.3; NICs alone 81.8, both 103.9), drive latency unchanged; up to
-   1.77 M misses/s drives, 3.43 M/s NICs; icx ~6 IOMMU memory accesses per miss when pages
-   are >= 8 MiB apart (3.0 up to 2 MiB apart), still no effect. All runs link- or
-   device-bound (drives both: refused 60/47%; NIC0 alone: d1t0c1 one-input limit).
-6. **The batcher doesn't move aliasing misses:** d1/d16 x pb0/pb1, drives within 0.01
-   per page (0.03 at aconf ws 64), NICs within 0.08 (d16 pb1 lowest at the conflict
-   points, up to 5%, 1 run: repeat first). Misses depend on reuse distance (hundreds of
-   page visits), the switch regroups within 1-2 open pages per device.
-7. **Page order/cost as on the paper campaign:** d16 pb1 drives 4.0-4.2 page switches per
-   page (legal floor 3.1-3.7), NICs 2.95 (2.7-3.1); drives -1.0% (pb1) / -1.6% (pb0) Gb/s
-   at d16, NICs 0.
-
-**Not available:** NIC READ latency (alias-rdma writes `lat_ns`, the NIC runner doesn't
-copy it into the results, the pack leaves the JSON on icx); per-device misses (pcm-iio per
-IOMMU unit). **Not usable:** the host analysis's IOTLB simulation (`pips-seq-grab.sh` passes
-`--strict` for every "-strict-" sweep and `--iotlb 1x64,16x4,64x1`: wrong model for pages
-mapped once, wrong geometries).
-
-**Next (proposed on the page, nothing set up yet):** tools T1 (seq-grab: no `--strict` for
-alias sweeps, `--iotlb` per host: icx 32x8,64x4,128x2, bigserver 1x96,1x64,1x128; rerun
-`pips-analyze.sh` on the 11-05 manifests = the switch's measured ceiling on aliasing
-misses), T2 (NIC READ latency into the results), T3 (per-device `--ws1 --stride1
---first1`, also in the holder's `load`), T4 (`alias-nvme --cursor shared`), T5 (many
-patterns per sweep, one datapath run), T6 optional 2 MiB backing. Campaign (~148 runs,
-icx ~2h40, bigserver ~55 min, one strict boot each): c-small (`--rdma-bs` 2048-256 x ws
-64/4096: find a miss cost), c-walk (ws 32, stride 32-262144), c-lat (1 QP depth 1, T2),
-g-ways/g-sets/g-fine (icx ways and sets; bigserver with T4), i-share/i-place (sharing
-curve; NIC1 shifted by `--first1` into free sets, predicted 0 misses), s-quantum (grant
-quantum 4095 on the thrashing pairs, predicted no change), r-rep (3 runs of the batcher
-grid at 2 patterns per host). Decision gates on the page.
-
-**Follow-up (11-06, with the user):** bigserver's drive 0 has `sgls : 0` (no NVMe SGL),
-so a drive command can't scatter below a page: drives stay at <= 1 miss per 4 KiB and
-~1.1 M commands/s per drive. pcm-iio lookups per page are identical at every switch
-setting (drives 18.41/17.57, NICs 9.09-9.10, d1 vs d16 pb1): every TLP is looked up
-whatever the order, so page switches can cost only through misses, i.e. when a page is
-evicted between two of its own TLPs. At d1 a page comes back every ~40-150 ns; evicting it
-from bigserver's ~96 LRU entries in that gap needs ~1 G misses/s from anything else
-(random replacement: ~100 M/s for a 10% chance), beyond any uplink or walker. So an FPGA
-MRd adversary (proposed by the user: 1-DW reads from the switch to keep the IOMMU busy)
-can't by itself make 8 vs 4 page switches per I/O visible on bigserver. The case where
-switches become misses is icx with the device's own rotation: all pages in one set (stride
-4096), more open pages than ways (16-32 QPs per NIC, path MTU 512-1024: needs an
-`alias-rdma --mtu` cap; QPs up to 64 already), then pb1 should cut misses. The listing
-excerpt (aconf, ~4 pages open in one set, 1.03 misses/page) rules out 2 ways on icx (4 or
-8 remain). Order proposed: icx rotation, icx `--rdma-bs 512/256` (walker capacity, no
-code), then the MRd adversary only if misses follow switches but throughput stays flat
-(as a calibrated walker load on icx, reads at ~28 B of uplink per miss, NIC RID spoofed
-with reserved tags and a completion sink; hit-only control runs for the bandwidth it
-takes).
-
+Missing in campaign 1: NIC READ latency, per-device misses; the host
+analysis's IOTLB simulation was wrong for alias sweeps (`--strict`). Follow-up
+(11-06): drive 0 has no NVMe SGL (at most 1 miss per 4 KiB); page switches can
+cost only through misses, which needs pages evicted between two of their own
+TLPs: on icx with one set and more open pages than ways (campaign 2's
+`n2rot`). Campaign 2 adds the latency, per-device patterns and the fixed
+simulation.
 ### Alias campaign 2 (set up 2026-11-06, not run)
 
 Asked by the user (11-06): a comprehensive run on icx that checks everything
@@ -2977,154 +1097,62 @@ Analysis when the tarballs are back: unpack in `dualssd/<MMDD>/`,
 `alias_cursor`, `alias_sge_bytes`, `alias_rdma_mtu`, `lat_us_nic*`) and
 `geom1105.py` (shared cursor = 1 cursor), then a page.
 
+**First launch (icx, 11-06, `c11060312`):** done in 4h25 with 12 sweeps, the
+first of each phase (96 runs). Cause: `a2_phase` fed its spec lines to a
+`while read` loop on stdin; the NIC runner's `ssh` to styx inherited that
+stdin and ate the remaining lines, so each phase ended after one sweep. The
+dry run never runs ssh, so it showed all 151. Fixed: the loop reads on fd 3
+and `sweep_run` gets `</dev/null`. The 11-05 reanalysis found nothing in `~`
+(those manifests were no longer there); it now also looks in
+`~/pips-campaign-<kind>-c1105*/results/` and `utils/logs/<sweep>/manifest.tsv`.
+Recovery, same stamp (its `progress.tsv` skips the 12 done sweeps; the
+analysis and the tarball then cover all of them; ~17 h left):
+`rm ~/pips-campaign-nic-c11060312/DONE; bash scripts/pips/pips-campaign.sh nic
+--alias2 --stamp c11060312 --tmux`. A bigserver alias2 launch from
+`634b53777` may have the same fault (whatever in its runner reads stdin):
+its README's `sweeps:` line shows 6 names if so; resume it the same way
+(`rm .../DONE`, `--stamp <its stamp>`).
+
 ### Next
 
 Status 11-06 (later): **alias campaign 2 set up, not run** (section above): `pips-campaign.sh nic --alias2 --tmux` (icx, ~19 h 30), `pips-campaign.sh ssd --alias2 --tmux` (bigserver, ~5 h + reboot). Committed and pushed 11-06.
 Status 11-06: **the alias campaign is in and analysed** ("Alias campaign results" above; page "PIPS Alias Campaign" https://claude.ai/artifact/E5bkPCsqik67LjPQnTDR2q). Nothing new is set up: the next campaign (tools T1-T6, phases c/g/i/s/r) is a proposal on the page, waiting for the user.
-Status 11-05: the alias campaign (above) is set up, not run: build and one by-hand run per host first, then `pips-campaign.sh ssd|nic --alias --tmux`; perf on hold.
-Status 11-05 (later): **bigserver died during the first drive smoke test** (`alias-smoke-ssd0` or `-both`; ssh lost, power cycled). Cause unknown until the logs are in: `bash scripts/pips/alias/alias-postmortem.sh` after the reboot (tarball `~/alias-postmortem-bigserver-*.tar.gz`). Suspects, all new with vfio-pci and never exercised through PIPS before: vfio-pci's reset of the drive when the device is opened and closed (FLR, or a secondary bus reset of the PIPS downstream port b2:00.0 if no FLR: `reset_method` in `now/summary.txt`); vfio-pci's idle D3hot and the bridge's runtime suspend below the FPGA (`power_state`); a fatal PCIe error through the switch escalated by the platform (BMC SEL, `Hardware Error` lines). The page batcher keeps the full 52-bit page number, so the 0x40_0000_0000 IOVA is not it. Do not rerun the drive smoke test before reading the logs. **Postmortem (11-05 19:32):** `alias-smoke-ssd0` (SSD 0 alone, ws 64 stride 1) ran clean to the end (522 kIOPS, 2.14 GB/s, mean 61 us; controllers disabled, restored). `alias-smoke-both` (ws 32 stride 4096, 496 MiB span) loaded both drives (b3 863 + b4 794 kIOPS = 6.8 GB/s, the Gen3 x8 uplink's limit) and the host died between its t=30 s and t=40 s heartbeats, ~19:13:30 = t~31 s = the start of the pcm-iio window (warm 10 + 1 s + CPU window 20 s). Kernel log: last line vfio-pci's config init of both drives (19:12:59, after its FLRs); then nothing (no lockup, AER, DMAR, MCE). BMC SEL: no entry for 11-05 (last 10-25; older Bus Uncorrectable / IERR entries Feb-Oct). No AER counters now; PIPS answers (`pips cfg` d1t0c1). Two things changed from the clean run at once: both drives (uplink saturated) and the conflict pattern (IOTLB miss per write). Next: bridge windows (`now/windows.txt`), how boot -2 ended (18:42:59), then bisect (both drives stride 1; one drive conflict; no pcm-iio) with netconsole to catch the last kernel lines. **Checked:** boot -2 ended in a clean reboot (systemd shutdown), so one hang only. The windows are clear: every bridge from root port b0:00.0 (ACS ReqRedir+ CmpltRedir+ UpstreamFwd+) through PIPS b1:00.0 to b2:00.0/b2:01.0 decodes only e0c00000-e0efffff (32-bit, no prefetchable window), nowhere near the IOVAs; 0x10000000 and 0x4000000000 are RAM in /proc/iomem, which doesn't matter in VFIO's own domain. The journal's very last entry is the sudo session opening `pcm-iio` (19:13:30.x), nothing after: the host died as pcm-iio started, with both drives under VFIO at 6.8 GB/s and a miss per page. In the clean ssd0 run pcm-iio started the same way (one drive, no misses: IOTLB_hits 9.4 M/s, misses 0). Bisect order: (1) the hung load by hand, no pcm-iio, 90 s; survives -> pcm-iio is part of it; (2) runner, both drives stride 1; (3) runner, drive 0 alone, conflict pattern; each with netconsole to icx. **Revised (user, 11-05): bigserver's bring-up must be self-contained** (icx runs its own campaign; no netconsole to it). Tool: `scripts/pips/alias/alias-hangtest.sh` (kernel log, heartbeat, 1 Hz tick fsynced to bigserver's disk; `--pcm-at 31` starts pcm-iio as the runner does; `--panic` arms lockup/stall/NMI panics so pstore keeps the backtraces; `--show` after a reboot). Steps: T1 `--panic` (the hung load, no pcm-iio); T2 `--pcm-at 31 --panic` (the hung case, should reproduce); T3 `--stride 1 --ws 64 --pcm-at 31 --panic` (both drives, no misses); T4 `--drives 0 --pcm-at 31 --panic` (one drive, misses). Stop at the first hang; after each power cycle `alias-hangtest.sh --show`. **T1 (11-05 19:49, kernel 5.15.0-177, pstore backend erst, nmi_watchdog 1):** the hung load ran its full 100 s clean (b3 862.6 kIOPS mean 148 us, b4 795.2 kIOPS mean 161 us, 6.8 GB/s steady), printed "controllers disabled" (19:51:17), and the host then appears to hang before the script's next 10 s check ("alias-nvme ended" never printed): i.e. at alias-nvme's exit (VFIO unmap/close: vfio-pci's release does an FLR and leaves the drive in D3hot) or the restore to nvme. So the load itself is fine; both hangs came at a PCIe config-space event with both drives under VFIO (pcm-iio's start scans every device's config space; vfio-pci release resets). The single-drive run did both (pcm-iio, release) without a hang. Waiting for `--show` after the power cycle (tick.txt pins the second, kmsg.txt the kernel's last lines). **`--show` (19:59):** last tick 19:51:16.846, "controllers disabled" 19:51:17.074, then nothing: the whole host froze within ~0.8 s of alias-nvme's exit (the 1 Hz tick on another CPU stopped too), no kernel line, no pstore record although lockup panics were armed with ERST. A platform-level freeze at vfio-pci's release of the two drives (per drive: FLR, config restore, D3hot; a bus reset through the PIPS port if the FLR fails; IOMMU domain detach). Next: T1 again with `--ftrace` (the release path's kernel functions, fsynced per line: the last one names the step), then the same with `--no-d3`. **T1 + `--ftrace` (20:06):** froze the same way ("controllers disabled" 20:08:14.955, then nothing), so the exit freeze reproduces (2 of 2 with both drives; 0 of 1 with one drive). The trace_pipe reader stalled after 27 lines (still in the open path, 20:06:34), so the release wasn't captured. It did show the open path working per drive: D3hot -> D0, FLR (`pcie_flr`), `pci_dev_wait` ~108 ms later, domain attach. After bind both drives sit in D3hot (vfio-pci idle), their bridges D0, reset_method `flr bus`. Changed: the trace is now polled from the buffer (appended and fsynced every 0.5 s), and `alias-nvme --exit-steps S` (`alias-hangtest.sh --exit-steps 3`) releases one step at a time with a synced line around each: bus master off, BAR unmap, device fd close (vfio-pci release: FLR, restore, D3hot), group detach (domain detach, unmap, unpin), container close. **`--exit-steps 3` (20:19):** froze again, but drive 0 (b3) was released cleanly first (bus master off, BAR unmap, close = FLR + restore + D3hot: `power_state D3hot` after). Drive 1 (b4): "bus master off done" 20:21:49.935, then nothing; the next step (3 s later) was BAR unmap + close of b4's device fd, whose announcement may not have reached disk (printed right before close(); the reader takes ms per line). So the freeze is in b4's release (most likely its FLR / ready wait / restore / D3hot), not in releasing two drives as such. Note b2:01.0 (b4's PIPS port) has an empty `reset_method`, b2:00.0 `bus`; the only clean single-drive run was drive 0. Changed: every announced step now waits 1 s before acting; `--exit-reverse` releases b4 first. Next: `--show` of 20:19 (tick.txt: alive at ~20:21:52.9?; ftrace.txt polled), then `--exit-steps 3 --exit-reverse --ftrace --panic` (b4 first: freezes -> b4-specific; b3 then freezes -> the second release). **`--show` of 20:19:** last tick 20:21:52.445, b4's close at ~20:21:52.94, no tick after: **the freeze is b4's release**, within 0.5 s (the trace poller caught nothing of it). The polled trace has b3's whole release: close -> D0 -> load saved state -> `pcie_flr` -> `pci_dev_wait` 105 ms later -> `pci_restore_state` -> `pci_disable_device` -> D3hot. **b4's FLR is never followed by `pci_dev_wait`, at open too (both traced runs): in 5.15 `pcie_flr` returns at once when the device has `imm_ready` (PCI Status bit 0, Immediate Readiness), so the kernel restores b4's config space right after the FLR, with no 100 ms wait.** b3 has no `imm_ready`. Lead: b4 (990 EVO Plus) claims Immediate Readiness, and the release path's FLR (device still enabled, after 100 s of load) followed at once by config writes through PIPS freezes the platform; the open path's FLR (`pci_try_reset_function`: command register cleared first, drive just out of D3hot) works. The clean single-drive run used b3. Turning b4's FLR off would make vfio-pci fall back to a bus reset through the PIPS port (worse). Test next: `--exit-steps 3 --exit-reset` (VFIO_DEVICE_RESET = the open path's FLR, before the close); the hang test now logs each drive's Immediate Readiness bit (`setpci STATUS`). **20:52: PIPS did not come back.** In the boot after the 20:21 freeze (up 20:29:09) the PIPS subtree did not enumerate: no b2:00.0, b3:00.0, b4:00.0 in `lspci`, only the four other drives (f1-f4) on nvme. The two earlier power cycles had brought PIPS back. So the freeze at b4's release leaves the FPGA switch wedged at least sometimes (it may be part of the freeze, not just the drive). Recovery: check the root port b0:00.0 link (`lspci -s b0:00.0 -vv`, `pips-id.sh`), reprogram 0x0A07 (user), reboot (user). Every further freeze test risks the switch needing a reprogram. **Recovered (user, 11-05 evening):** first read as a lost bitstream; corrected by the user later: the board never lost power and the FPGA stayed programmed (a fresh Vivado instance shows no bitstream property). The PCIe tree failed to come up at the host reboot; reprogramming plus another reboot brought it back. Reading of `pips.tcl` (FPGA `28ff5b6`): host PERST# (`sys_reset`, inverted) resets all three PCIe IPs, and the switch logic (batcher, regfile, PIO, routing) sits on `aresetn_upstream` from the IP's user_reset, so a host reboot should clear a jam in the pipeline. The drives' PERST# (`perst_0`/`perst_1`, pins BD23/AU21) are tied to a constant, and the drives run on board power: nothing but a reconfiguration (I/Os go to their configuration state) or a board power cycle gives them a fundamental reset. The user then added: no Xilinx function at all (`lspci | grep -i xilinx` empty), so the switch's own upstream port b1:00.0 was gone, not just the drive path; a stuck b4 cannot explain that (the upstream port is its own `pcie_versal` IP in `Switch_Port_Upstream` mode with its own GT quads, refclk and reset). Candidates: (1) the uplink did not train after the cold host power cycle (slot refclk and PERST# went away while the board stayed powered; GT relock vs the BIOS's training window; intermittent, the two earlier power cycles came back); (2) the BIOS hid root port b0:00.0 after an error; (3) upstream-side state that PERST# does not reset. Next time, try a warm `sudo reboot` before reprogramming (comes back = (1)); in Vivado's hardware manager `axis_ila_0` probe0 is the upstream port's user_reset (stuck asserted = the upstream IP never came out of reset). Before either: `lspci -s b0:00.0 -vv` (LnkSta, DLActive), `lspci -s b1:00.0`, and over JTAG `pips_cfg` plus the downstream ports' link state, to tell an untrained uplink from a dead downstream port. Next run: `alias-hangtest.sh --exit-steps 3 --exit-reset --ftrace --panic`. **21:30, `--exit-reset`: clean.** Immediate Readiness confirmed: b3 status 0x0010 (0), b4 0x0011 (1). Same load (845 + 812 kIOPS), then per drive bus master off, VFIO_DEVICE_RESET, close (D3hot after), groups detached, containers closed; both back on nvme. So the release freeze is vfio-pci's release FLR on b4 (Immediate Readiness: no 100 ms wait before the config restore), and the open path's reset first avoids it (n=1 clean vs 3/3 frozen). **Fix (default now):** alias-nvme always releases step by step with VFIO_DEVICE_RESET before each close (`--exit-steps S`, default 1 s, ~17 s per run), also on die() (atexit); `--exit-unsafe` = old. `run-dualssd-experiment.sh` `stop_fio` waits 120 s for alias-nvme after SIGINT (was 30) and warns before a KILL. README caveat "Releasing the drives". **Still open: the runner's freeze at pcm-iio's start** (19:13, during the load, both drives). Next: `alias-hangtest.sh --pcm-at 31 --ftrace --panic` (T2, with the safe exit), then the runner smoke test `alias-smoke-both2`. **21:38, T2: froze at b4's `VFIO_DEVICE_RESET`** (announced 21:40:50.927, reset at ~51.93, last tick 51.303): b3's whole release clean again; so b4's reset after the load can freeze the host by either path (release-path FLR 3/3, open-style reset 1 of 2). pcm-iio did not really run: it exited at once without `opCode-6-85.txt` (the hang test ran it from its own folder; the runner runs it from `utils/`), so the pcm-iio question is still open; while it ran it runtime-resumed/suspended some PCI device every ~0.5 s (device not named in the trace). Pattern: b4's ~6 resets at open (after the nvme driver's normal shutdown, idle) never froze; the exit resets came 0-12 s after alias-nvme's abrupt CC.EN=0 and froze 4 of 5 (the pass: 20 s after). **Changed:** alias-nvme's teardown now does a normal NVMe shutdown (CC.SHN=01, waits CSTS.SHST=10, limit RTD3E clamped 5-30 s), then CC.EN=0; the release waits `--exit-settle` 10 s before its steps (~30 s per exit; campaign estimate 1.6 min/run). Hang test: pcm-iio from `utils/`, trace adds the `rpm:rpm_resume`/`rpm_suspend` events (device names). Next: the same T2 (`--pcm-at 31 --ftrace --panic`); check PIPS enumerated first after each freeze. **21:56, T2 again: pcm-iio fine, b4's reset froze again.** pcm-iio ran its 20 s mid-load from `utils/` (1649 csv lines; 845 + 812 kIOPS throughout): the runner's 19:13 freeze at pcm-iio start did not reproduce (open, not blocking). Both drives shut down normally (5 / 6 ms), 10 s settle, b3 released fully, then the host froze at b4's `VFIO_DEVICE_RESET` (ssh dropped). Tally for b4's reset after an alias-nvme run: 5 freezes of 6 (release path 3/3, open-style 2/3), with or without a clean shutdown and settle; b4's ~7 resets at open: 0 freezes. Remaining difference: at open b4 comes out of D3hot (vfio-pci idle) right before its FLR; at exit it has been in D0 throughout. **Added `--exit-d3`** (alias-nvme and the hang test): D3hot then D0 through PMCSR before each drive's reset. If that also freezes: swap the two drives' slots (does the freeze follow the 990 EVO Plus or port b2:01.0?), or put a drive without Immediate Readiness behind b2:01.0. **Decision (user, 11-05 late): hold the drives instead of releasing them** ("if it's only the final release, I can accept removing the tree and rebooting at the end"). Built: `alias-nvme --hold DIR` (open and init once; loads on command through `DIR/cmd`; between loads queues kept, region remapped for a new pattern; heartbeat `DIR/alive`; SIGINT/TERM stop a load, SIGHUP ignored; a fatal error never exits: drives held, heartbeat stops) and `alias-stability.sh` (~20 min: 14 loads, PIPS cfg toggled in the pauses, pcm-iio in 7; BMC IPMI watchdog, hard reset after 120 s without a pet, petted by a root loop only while the holder's heartbeat is < 45 s old; panic-on-lockup + `kernel.panic=10`; ends `sync; systemctl reboot -ff`, user-approved for this test). Not used: the user's `echo 1 > .../0000:97:00.0/remove` (97:00.0 is icx's PIPS; bigserver's is b1:00.0): removing a device vfio-pci holds waits for the holder to release it, i.e. the reset that freezes. Why the whole host freezes (explained to the user): a CPU stuck in hardware on a PCIe access that never completes takes no interrupts, not even NMIs; the other CPUs then wait on it. Only C syntax (MinGW + stubs), `bash -n` and `--dry-run` checked here. **Stability test ran (11-05 late): 14 of 14 loads ok** in hold mode (base, conflict ws 16/32/64 at stride 4096, capacity ws 4096/65536, stride 512, shuffle, random, drive 0 only, drive 1 only; PIPS cfg toggled d1t0 pb0 / d16t218 pb1 in the pauses; pcm-iio 1649 rows in each of its 7 loads); no freeze; ended in the reboot. Next: put hold mode into the drive runner and the alias campaign (one holder per campaign, the runner sends `load` commands instead of binding and starting alias-nvme per run; campaign ends with the reboot). The stability test also ended cleanly: watchdog off, reboot -ff, the host back 22:54, PIPS there, both drives on nvme.
 
+Older statuses (11-05 back to 10-20) and the item lists of 10-19/20 and
+10-26: [docs/archive/handoff-log.md](docs/archive/handoff-log.md); the 11-05 alias bring-up
+statuses (the bigserver freeze debug log, the NIC smoke tests):
+[docs/archive/pips-alias-1.md](docs/archive/pips-alias-1.md).
+
+**Open, all optional** (still not done, from those lists):
+- One build with more page segments per device (drives 64k/1m), only if large
+  drive I/Os matter (Verdict).
+- Drives 4k j16 per IOMMU mode with `SSD_CORES` off the interrupt CPUs of
+  every boot (paper campaign result 9).
+- PIPS counters and knobs not built: a 32-bit overflow count (`0x28`
+  saturates at 65535), FIFO occupancy high-water, MRd wait mean or histogram,
+  hold only when the other input waits, a FIFO limit register, `wrr_en` in a
+  register.
+- `perf` / VT-d PMU on hold (user, 11-05): E7's map/unmap counts need `perf`
+  built for each kernel.
+- b4's `reset_method` (below), which would let the drives be released per run
+  again.
+
+#### Drive alias campaign, hold mode (bigserver)
 **Drive alias campaign, hold mode (set up 11-05 late, user: "ready for the full campaign"):**
 `bash scripts/pips/pips-campaign.sh ssd --alias --tmux` on bigserver (72 runs, ~1h20 of sweeps, ~1h55 packed; then it reboots the host). Before the sweeps it binds both drives and starts one `alias-nvme --hold ~/pips-campaign-ssd-<stamp>/hold` (queues 4, qd 32, bs 4k: the alias grids'), then `alias-guard.sh arm` (BMC watchdog 120 s, petted while the holder's heartbeat is fresh; panic on lockup, `kernel.panic=10`). Each runner call gets `ALIAS_HOLD`: the run's load is a command to the holder (`load NAME MASK WS STRIDE ORDER WARM SECONDS OUTDIR READY`), stopped by `hold/stop`; no bind, no restore, no block device (`vfio:<bdf>` in the results' `devices`). At the end: analysis, pack, `DONE`, guard disarmed, `sync; systemctl reboot -ff` (`--no-reboot` leaves it to the user). **Resume (user, 11-05):** every launch looks at `~/.pips-campaign-<kind>-<mode>.current`; a half-done campaign (no `DONE`) is picked up: `progress.tsv` lines `start`/`done` per sweep, done sweeps skipped (their manifests counted for the analysis), a sweep cut short runs again as `<label>r<n>`; in the same boot the holder and the petter are reused; after a reboot (a hang reset by the BMC) the drives are on nvme again and a new holder starts. `--fresh` starts a new campaign. Also fixed: `dualssd_pips_sweep.sh` and `dualssd_sweep.sh` name the sweep by the IOMMU mode of each drive, found through nvme: under `ALIAS_HOLD` they take the BDFs from `hold/drives`. Not yet run on the host: checked here are `bash -n`, the dry run, the resume detection (fake folder), the progress lines; the C with MinGW and stubs. The NIC side (icx) is unaffected: there `--sync-client` now syncs styx before the alias-rdma check (`b4a0c6cab`).
+
+#### bigserver freeze at b4's reset (11-05)
+
+Summary of the 11-05 debug log (verbatim in the alias archive): bigserver
+froze, whole host, no kernel line, no pstore, no BMC entry, when drive b4
+(990 EVO Plus, `b4:00.0`, behind PIPS port `b2:01.0`) was reset after an
+alias-nvme load: vfio-pci's release FLR 3 of 3, the open-style
+`VFIO_DEVICE_RESET` 2 of 3, with or without a clean NVMe shutdown first; b4's
+resets at open (idle, out of D3hot) never froze; b3 never froze. After one
+freeze the PIPS tree did not enumerate at the next boot (no Xilinx function;
+FPGA still programmed; reprogram plus reboot fixed it; next time try a warm
+reboot first). Fix chosen by the user: hold mode (above); `alias-stability.sh`
+passed 14 of 14 loads. Debug tools: `scripts/pips/alias/alias-hangtest.sh`
+(`--show`), `alias-postmortem.sh`.
 Status 11-05 (b4 freeze, outside confirmation): the user found public reports (Linux 7.3 fix 0f8b5d90d179, Phoronix / Hardware Busters / Arch / Proxmox threads) that the Samsung 990 PRO [144d:a80c] and 990 EVO Plus [144d:a80d] claim Immediate Readiness but read ~0 for up to ~7 ms after an FLR; the kernel then skips the post-FLR wait and its config restore hits a drive that is not answering. 7.3 adds a quirk that ignores the bit for these IDs. That is our trace exactly (b4: no `pci_dev_wait` after `pcie_flr`; status 0x0011). Our 5.15.0-177 lacks the quirk (the trace proves it). On a desktop the restore is just lost; behind PIPS the access to a silent drive froze the host (our inference). Runtime options, no reboot: `reset_method` of b4 empty (no reset at all: vfio-pci then skips the FLR at open and release; nvme's own CC.EN reset on rebind) or `bus` (SBR on b2:01.0, only b4 below it, with the kernel's full wait; untested on PIPS's port). If the empty reset_method passes, drives can be released per run again and hold mode + `reboot -ff` become optional. The D3hot/AER report (Proxmox) does not match: no D3hot error, no AER, no SEL entry here.
-Status 11-05 (NIC smoke): both hosts build alias-rdma (icx mlx5_2/mlx5_4, styx mlx5_1; RoCE GID 3, MTU 2048, rd_atom 16). `alias-smoke-nic0` failed at start: the server on styx listened on TCP 3700 but no connection arrived, and the client was stuck in its first `connect()` to 192.168.10.52:3700 (no "waiting" line), i.e. SYNs dropped, not refused. Suspect a firewall on styx: iperf3 only ever opened TCP styx -> icx (servers on icx), never icx -> styx. alias-rdma's connect now times out per attempt (2 s) and names the cause (no answer = firewall, refused = no server). Checks for the user: the TCP probe and styx's firewall rules (ufw / iptables / nft); if styx filters, open 3700 and 4700 from 192.168.10.0/24 and 192.168.100.0/24, or flip the hello so styx connects to icx.
-Status 11-05 (NIC smoke passed): the TCP probe was open (the first failure was likely the stale styx copy, or a leftover server; not a firewall). `alias-smoke-nic0` (ws 64 stride 1, 4 QPs x 16 READs of 4 KiB): 95.9 Gb/s, 2.93 M pages/s, **0 IOTLB misses** (64 pages fit). `alias-smoke-nics` (both, ws 4096 stride 1 each = 8192 pages): 51.9 + 51.9 Gb/s (uplink-bound, 106 Gb/s PCIe write; equal split = round robin d1t0), 3.17 M pages/s, **3.28 M misses/s = ~1 per page** (capacity), PWC_4K hits ~= misses, ~3 IOMMU memory accesses per miss, ~9 lookups per 4 KiB page. The generator and the counters behave as designed. Next: `pips-campaign.sh nic --alias --tmux` on icx (72 runs, ~2h30). The drive side waits on bigserver's postmortem.
-Status 11-02: the paper campaign is in and analysed (results above); the only open run is optional (item 9: drives 4k j16 per mode with interrupt-safe cores).
-Status 10-31: the paper campaign above is set up (not run): one IOMMU leg per boot, the user reboots between legs.
-Status 10-30: both reruns are in; **verdict: the study is done** (above).
-The items below are kept for reference; none is needed. The only one still
-worth a build is more page segments (drives 64k/1m), and only if large drive
-I/Os matter. Status 10-28 evening: the drive rerun is in (above, result 10
-solved). Status 10-28 (0x0A07 built): first
-the minimal rerun above. From the
-hardware list below, 0x0A07 delivered the per-input refused-cycle counter
-and the rate limiter; still not built: a 32-bit overflow count (`0x28`
-still saturates at 65535), FIFO occupancy high-water, MRd wait mean or
-histogram, hold only when the other input waits, the FIFO limit register,
-`wrr_en` in a register (result 10 (c)). The rate cap is now usable as the
-test knob below: NIC writes of 512 bytes take 9 beats, so `rcap0` ≈ 2.25 x
-the NIC's payload Gb/s (50G ≈ 113, 95G ≈ 214; calibrate on d1t0 first, the
-counters' cap share shows when it binds). Result 10 (a) is in the rerun's
-analysis for 0x0A07; for the 0x0A06 logs it needs `PIPS_PB_MODEL="self,sweepc1,sweepc1f512"
-bash scripts/pips/pips-analyze.sh <kind> --sweeps "" --manifest <each main
-sweep's manifest>` on the hosts. (b), redrawing the 0x0A04-0x0A05 page's
-Figures 3-6 and the 0x0A06 page's Figures 6-9 from `seq.jsonl`, is still
-open; the 0x0A06 drive figures may be superseded by 0x0A07's.
 
-Status 10-26 (from the 0x0A06 campaign, results above): item 0 ran (NICs
-match; drives: waits 3x low, link fit 35.5 B/cycle, open: result 8); item
-3 answered (no run under 10 samples after the placement fix); item 4
-answered (result 7: -2.3% at 1m); item 5's decisive question answered by
-the `wire` phase (result 6). New, in order of use:
-The question to settle first: can page order move IOTLB misses on these
-hosts at all? In strict mode no (result 1). Software and runs, in order:
-- **Count maps and unmaps (no reboot, ~5 min, §5 item 3, never run):**
-  `sudo perf stat -e iommu:map,iommu:unmap -a -- sleep 5` during a 5-flow
-  NIC run and a 4k drive run; unmaps per 4 KiB written. ~1 = compulsory
-  misses (strict invalidation); far fewer (mlx5 `page_pool` keeping pages
-  mapped) = capacity misses from a working set far beyond the IOTLB, where
-  the lever is the ring size (`ethtool -G ... rx`), not the switch.
-- **Lazy mode without a reboot (decisive for the page batcher):**
-  `echo DMA-FQ | sudo tee /sys/kernel/iommu_groups/<g>/type` per group.
-  Check first: that 5.15 (bigserver) / 6.8 (icx) accept it (may need the
-  driver unbound), that the devices behind PIPS have groups of their own
-  and no boot or RAID disk shares one. Back to strict needs the driver
-  unbound or a reboot. Then pb0 vs pb1 on a small set (drives d8/d64 at
-  4k, 16k, 1m; NICs 5 flows). Misses falling with pb1 = the page batcher
-  has its case; if not, order isn't the lever on these IOMMUs.
-- **Superpage probe:** fio 2 MiB blocks on hugepage buffers
-  (`--iomem=mmaphuge`) on one drive; misses per 4 KiB well below 1 means
-  2 MiB IOMMU mappings work (may be stopped by `max_hw_sectors_kb` or IOVA
-  alignment).
-- **Uneven load for the arbiter:** NIC0's link at 25G or 50G, NIC1 at 100G,
-  so `grant_quantum` has unequal inputs (result 4). Link speed, not pacing
-  (result 6).
-- **Latency in the summaries:** fio completion latency p50/p99, pb0 vs pb1,
-  to see result 5's read waits at the application.
-- **Drive model waits** (result 8): find the ~30% of each drive log's time
-  the output timing lacks before trusting modelled drive waits.
-
-Hardware (PIPS), in order:
-- **Counters:** 32-bit overflow (`0x28` saturates, result 3); per-input
-  cycles refused while the device had data (measures result 6's
-  backpressure); per-input FIFO occupancy high-water; MRd wait mean or
-  histogram, not only the maximum.
-- **Hold only when another input is waiting:** a lone NIC at 100G has ~50 ns
-  slack per frame, so any hold costs it (result 2's single-NIC table) and
-  there is nothing to batch against; pass a lone input through as d1t0
-  does.
-- **A FIFO limit register** (rows per input, 128-1536): bigger FIFOs added
-  time in the switch (0x0A05) and read waits (0x0A06, result 5) without
-  uplink throughput; sweeping it gives read wait against throughput.
-- **The rate limiter:** fine on drive ports; on NIC ports predicted to split
-  packets and cause pause frames (result 6). Build it with the
-  refused-cycles counter. For alone-vs-together NIC comparisons use link
-  speed. As a test knob: step it 95G -> 50G on a 100G link at d1t0 to find
-  where splitting starts.
-- **More page segments,** only if lazy mode shows misses moving: a segment
-  holds one page, a NIC packet fills one, so 8 segments = 8 packets in
-  flight; 64-row segments (one 4 KiB page) would double the count in the
-  same memory.
-
-0. **Rerun the analysis on both hosts with the stall rebuild and the new
-   grant gap** (items 11-12; the 10-19 run is in
-   `*/1019/pips-analyze-*-20261019-1723/`, its models unusable, its length
-   verdicts fine; the page shows the listing-based recovery meanwhile). bigserver: `bash
-   scripts/pips/pips-analyze.sh ssd --no-lengths -j 16 --tmux` (page order
-   only: the lengths are in; calibration ~5 min per sweep, then ~3 h at -j
-   16); icx: `bash scripts/pips/pips-analyze.sh nic --tmux` (both sweeps now
-   that the 0x0A05 manifest is found under `utils/logs/`, and lengths for
-   0x0A05; <1 h). Watch: `tmux attach -t pips-analyze-<kind>` or `tail
-   ~/pips-analyze-<kind>-*/analyze.log`; check each sweep's `uplink rate ...
-   median fit of N clean logs` line (bigserver: expect ~30-31 B/cycle, about
-   98% of Gen3 x8's raw 31.5; icx: few or no clean logs, fine). Copy the
-   tarballs back, unpack in `dualssd/1020/` and `dualnic/1020/`. Then:
-   check the whole-log model against the recorded order (`seq.jsonl`:
-   `model[]` own setting vs `recorded`; waits near the recorded 1.5 µs;
-   `arrival.lost`, `arrival.held`, `link.fitted`) and against the
-   listing-based recovery (`report-gen/seqrec.json`). If it holds, give
-   `seqarr.py` a whole-log source (its `log_data()` now reads seqrec's
-   lines; the whole-log grab has `model[]` and `windows_arr` per log),
-   rebuild, publish; add the NICs' 0x0A05 `traffic.jsonl` to
-   `sizes.FILES`.
-0b. **CANCELED, closed 10-28 (user):** finish the NIC depth sweep on 0x0A05
-   (d24 repro, `dsweep1b`). Superseded: 0x0A06 ran d24-d64 on the NICs
-   without a stop, and 0x0A07 is the build now.
-1. **CANCELED, closed 10-28 (user):** IOMMU off on `0x0A04`/`0x0A05`.
-2. **Build or boot for drive 0:** drive 0 alone and 1+1 at 4–16k, 1 instance,
-   on the 0x0A04 and 0x0A02 bitstreams within one boot, then after a reboot.
-3. **`pcm-iio` samples:** read `pcm-iio.out` and `pcie.csv` (every stack,
-   every second) in a few-sample run folder, e.g.
-   `utils/logs/dualssd-pips-strict-1-id0a04-d1t0/4k-j8-both-RUN-0/`; make
-   the summaries flag runs with `pcie_samples` < 10.
-4. **One input through d1t0c1:** one drive alone at 1m, d1t0 vs d1t0c1, to
-   see whether the per-drain limit that holds one NIC to 78 Gbps binds a drive.
-5. **Styx and the NICs' packet splitting** (§8 item 13). All on a cap-on
-   setting where one NIC splits (d4t22c1), 5 flows:
-   - Read-only, styx (user confirmed 10-20: both icx NICs are cabled to
-     the one dual-port card): `bash scripts/nic-host-snapshot.sh ens1f0np0
-     ens1f1np1` (PCIe path with link, MPS/MRRS, the kernel's bandwidth
-     line; pause, offloads, rings, coalescing, mlnx_qos, qdisc; TCP
-     sysctls; counters). Run it again around a NIC0-alone and a both run
-     for the pause/retransmit deltas; on icx the same for
-     `tx_pause_ctrl_phy`, `rx_discards_phy`, `rx_out_of_buffer`. Styx
-     reached 96 Gbps on one port, so its card can't be Gen3 x8 (63 Gbps
-     raw); Gen3 x16 (126 raw) feeds about one port, not two.
-   - Decisive: NIC0 alone while styx loads its other port without touching
-     PIPS (pktgen or UDP on `ens1f0np0` to a MAC icx's NIC1 filters in
-     hardware). If NIC0's rate drops and its packets turn whole, the shared
-     card spaces the frames. Second: NIC0 alone held to ~53 Gbps by a
-     hardware shaper on styx's port (`mlnx_qos --ratelimit`, even frame
-     spacing) vs `iperf3 -b` at the same rate (bursts).
-   - Fix the harness: write `retx.rpt` on the client (`nstat` delta per run).
-   - Proposed with the user (10-20), now that page order is the topic: cap
-     each NIC so alone and together run at the same per-NIC rate (about
-     45-50 Gbps: two together under the switch's 107 and styx's card), so
-     alone vs together differs only by the other NIC. The cap has to space
-     frames the way the card does in co-run. `iperf3 -b` (the runner's
-     `--bandwidth`) paces in bursts, with frames back to back at 100G
-     inside each; `--fq-rate` with the fq qdisc spaces 64 KB TSO bursts,
-     not frames; a hardware shaper on styx's port (`mlnx_qos -r`) may space
-     frames (untested). Check first: one NIC0-alone run per method at the
-     cap, grab its order, look for 7+ TLPs per run. The uncapped sweeps
-     stay as the full-link case.

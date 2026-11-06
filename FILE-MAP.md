@@ -7,8 +7,13 @@ branch `icx-dualnic`), and in §7 the git-ignored analysis tree (`dualssd/`,
 
 - Testbed state, results and how to run: [HANDOFF.md](HANDOFF.md)
   (§1–6 dual-NIC on icx, §7 dual-SSD on bigserver)
+- Retired designs' results and old logs, moved verbatim out of HANDOFF and
+  the PIPS docs on 2026-11-06: [docs/archive/](docs/archive/) (index with the
+  artifact URLs: HANDOFF "Archive")
 - Background on the upstream artifact and its traps: [KNOWLEDGE-MAP.md](KNOWLEDGE-MAP.md)
 - First-time provisioning of the icx pair: [LOCAL-SETUP.md](LOCAL-SETUP.md)
+- Every script option on one page (campaign modes, `--tmux`, `--dry-run`,
+  resume, sweeps, runners, alias tools): [QRH.md](QRH.md)
 - PIPS tools, design IDs, the batcher model: [scripts/pips/README.md](scripts/pips/README.md);
   reading one sweep's logs: [scripts/pips/SWEEP-LOGS.md](scripts/pips/SWEEP-LOGS.md);
   the switch itself: [scripts/pips/PIO-MANUAL.md](scripts/pips/PIO-MANUAL.md)
@@ -304,6 +309,8 @@ falls back to default events and every column shifts.
 | `KNOWLEDGE-MAP.md` | doc: upstream structure, data flow, findings ledger |
 | `LOCAL-SETUP.md` | doc: provisioning worksheet for the icx pair |
 | `FILE-MAP.md` | doc: this file |
+| `docs/archive/*.md` | doc: sections moved verbatim out of `HANDOFF.md`, `CLAUDE.md`, `KNOWLEDGE-MAP.md` and the PIPS docs (2026-11-06), one file per retired design or log, each published as an artifact; index and URLs in HANDOFF "Archive" |
+| `docs/archive/mkpage.py` | manual: builds one artifact page per archive file, markdown embedded verbatim (`py -3 docs/archive/mkpage.py <out-dir> [name.md ...]`) |
 | `fands.patch` | data: the F&S kernel patch |
 | `Fast & Safe IO Memory Protection.pdf` | doc: the paper |
 | `.gitignore` | the Linux kernel's ignore file plus repo entries; ignores `.*`, `utils/setup-server.sh`, `utils/logs/`, `utils/reports/`, `/dualnic/`, `/dualssd/`, `claude.md` (local Claude Code instructions and pointers) |
@@ -406,7 +413,7 @@ falls back to default events and every column shifts.
 | `test-sim.sh` | called: by `make check` |
 | `Makefile` | builds `pips`; `check` builds `pips-sim` and runs `test-sim.sh` |
 | `README.md` | doc: test points, order, expected values |
-| `SWEEP-LOGS.md` | doc: how to read one PIPS sweep's logs and nothing else: sweep ID, manifest format, rules for a parser, names, the 10-17 depth sweep, earlier runs to ignore |
+| `SWEEP-LOGS.md` | doc: how to read one PIPS sweep's logs and nothing else: sweep ID, manifest format, rules for a parser, names (the 10-17 depth sweep and the earlier runs to ignore: archived, `docs/archive/pips-0a02-0a05.md`) |
 | `PIO-MANUAL.md` | doc: everything about the PIO, BAR0, regfile, log DMA and TLP log, collected from the FPGA and AXI4-switch repos plus the hardware runs |
 
 ### `utils/`

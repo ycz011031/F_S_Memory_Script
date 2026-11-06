@@ -713,14 +713,6 @@ or the PIO's own limits.
 
 ## First hardware run (bigserver, 2026-10-11)
 
-The build had `e389cca`'s 32 KB BAR0 and 16-register regfile (its design ID
-was not yet printed). IOMMU off, both drives behind PIPS.
-
-- `pips-bringup.sh`: every step passed. The S2MM register offsets (PG021) held:
-  the `S2MM_DA` round trip, DMASR bits, and a recording end to end.
-- Window cost: 0.16 µs per 32-bit write, 0.89 µs per read (DDR). `log-clear`
-  took 0.18 s and a full 4 MiB `log-dump` 0.83 s.
-- `pips-fio-log.sh` with the defaults: 1.62M IOPS, 6.64 GB/s, the shared Gen3 x8
-  uplink's ceiling (HANDOFF §7: 1.64M with the IOMMU off). The region filled
-  in 4.4 ms: 262,143 records, none dropped. `out` carried 53.9 Gbps of MWr
-  payload, in0 and in1 about half each.
+Moved to [docs/archive/pips-0a02-0a05.md](../../docs/archive/pips-0a02-0a05.md)
+(2026-11-06): `pips-bringup.sh` passed every step; the window costs 0.16 µs
+per 32-bit write and 0.89 µs per read.

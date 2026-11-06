@@ -122,39 +122,9 @@ folders: give them the `log_dir`s from the manifest, not `utils/logs`.
 - **Settings:** `d8t106c1` = depth 8, time 106 cycles (4 ns each), drain cap
   on; `m1` = `batch_mrd` on. No `c1` = cap off.
 
-## The 10-17 depth sweep
+## Earlier sweeps
 
-Strict, design `0x0a05` (0x0a04 with 512-beat batching FIFOs; the sweep was
-planned on 0x0a04 and ran on the newer build), cap on only, eight settings in
-this order:
-`d1t0c1 d2t22c1 d4t50c1 d8t106c1 d16t218c1 d24t255c1 d36t255c1 d64t255c1`
-(why these times: HANDOFF §8, "Depth sweep").
-
-| | Drives (bigserver) | NICs (icx) |
-|---|---|---|
-| sweep | `dualssd-pips-strict-dsweep1` | `dualnic-pips-strict-dsweep1` |
-| points per setting | 90: 5 block sizes × 18 co-runs | 4: 5, 10, 15, 30 flows per NIC, both NICs |
-| datapath checks | one per setting (8) | one, before `d1t0c1` only |
-| manifest rows | 728, of them 720 points | 33, of them 32 points |
-| ran (10-17/18) | 702 of 720 points, all logs FULL (18 dropped at 4 KiB for missing `pcm-iio` rows) | 22 of 32 points + the datapath check: stopped during `d24t255c1` (after f10) when the switch stopped answering; `d24` f15/f30, `d36`, `d64` not run |
-
-The NIC sweep's missing settings go in a new sweep (`--tag dsweep1b`), not
-under `dsweep1`: its manifest and sweep ID stay as they ended. A page-order
-grab of `dsweep1` reads its manifest and so takes the 22 NIC runs that have a
-log (`pips-seq-grab.sh --manifest`).
-If the hosts are booted with the IOMMU off, `strict` reads `off` in the names.
-
-## Earlier runs on the hosts (none has a sweep ID)
-
-- bigserver: `dualssd-pips-{off,strict}-1-{d1t0,d4t22,d8t22,d16t64}` (design
-  `0x0a02`, v1 logs, 10-13); `dualssd-pips-strict-1-id0a04-*` (`0x0a04`,
-  10-15/16); `pips-fio-*` (bring-up, one with design "none"); `dualssd-sweep-*`,
-  `dualssd-xsweep-*`, `dualssd-bssweep-*` (no TLP logs); every sweep's
-  `datapath-*` runs.
-- icx: `dualnic-pips-strict-1-id0a04-*-RUN-server-0` (10-15/16, with one-NIC
-  runs and datapath checks); `dnflows-*`, `dualnic-flowsweep-*` (no switch).
-- `~` on both: `seq-*` page-order grabs, `traffic*` reports. The grabs from
-  before 2026-10-19 (`seq-dualssd-0a04-arr`, `seq-dualnic-0a04-arr`) ran the
-  batcher model without the uplink limit (`pips-page-seq.py --link`) or the
-  grant gap; regrab with `pips-analyze.sh` (one run per host, both designs,
-  its own output name).
+The 10-17 depth sweep's names and counts, and the earlier runs on the hosts
+that have no sweep ID (to ignore), moved to
+[docs/archive/pips-0a02-0a05.md](../../docs/archive/pips-0a02-0a05.md) on
+2026-11-06. Every sweep since then has a manifest: read it.

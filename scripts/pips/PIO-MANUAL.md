@@ -802,21 +802,11 @@ widen the DMA back to 2 GB and keep the constants.
 
 ## 12. Hardware results so far (bigserver, 2026-10-11)
 
-- **First run:** BAR0 1 KB, which led to §11.1. After the fix (build with
-  `e389cca`'s changes), `pips-bringup.sh` passed every step:
-  - registers, counters and `BUS_NUM`;
-  - BRAM at the F1 offsets, with 8-byte and byte writes;
-  - regfile write/read-back and restore;
-  - DMA registers;
-  - DDR 4 KB and page switching;
-  - the window error path (`0xB000_0000`: DECERR, `WIN_ERR` correct, clears);
-  - an empty recording (16 bytes, trailer, stop enable_low).
-- **fio** with a recording (§8.9): 1.62M IOPS, 6.64 GB/s, the uplink's limit.
-  Before the PIO build, HANDOFF §7 measured 1.64M with the IOMMU off. No new
-  kernel errors, no link or error-bit changes, `PIO_STATUS` and `WIN_STATUS` 0.
-- **Window cost** as in §5.
-- **Sticky error bits** on the USP and both drives (`CorrErr+ UnsupReq+`,
-  `AdvNonFatalErr+`) were present before the run and unchanged by it.
+The first bring-up's results moved to
+[docs/archive/pips-0a02-0a05.md](../../docs/archive/pips-0a02-0a05.md)
+(2026-11-06): every `pips-bringup.sh` step passed after the BAR0 fix (§11.1);
+fio with a recording reached the uplink's limit (1.62M IOPS, 6.64 GB/s).
+Every design since (0x0A04-0x0A07) has run its campaigns on both hosts.
 
 ---
 
@@ -869,10 +859,6 @@ volatile.
 
 ## 15. Open items
 
-- Design `0x0A04` on hardware: the drain cap (reg1) and v2 logs have only run
-  against the software model (`make check`). First run: `pips-bringup.sh`
-  (the regfile step flips reg1), then one `pips-fio-log.sh` and a look at
-  `pkt_wait` and `in0 + in1 = out` in its decode.
 - D19's narrowed DMA address range: `BD 41-1266` critical warning; decide
   (§11.2).
 - `CTRL0–7` are not connected to anything. The regfile is reachable from the

@@ -948,14 +948,17 @@ a2_describe() {
 }
 a2_phase() {
     local lab ex cfgs pbs st g pps
-    while IFS='|' read -r lab ex cfgs pbs st g pps; do
+    # The spec lines come in on fd 3, not stdin: the runner's ssh (styx) and
+    # anything else that reads stdin would swallow the rest of them (11-06:
+    # every phase ran only its first sweep).
+    while IFS='|' read -r -u 3 lab ex cfgs pbs st g pps; do
         a2_grid "$g"
         if [ "$KIND" = ssd ]; then RUNNER_EXTRA="--gen alias $ex --order cyclic"
         else RUNNER_EXTRA="--gen alias --order cyclic --depth 16 --rdma-bs 4096 $ex"; fi
         # a later --order/--depth/--rdma-bs in $ex wins (the runners take the last)
         [ "$KIND" = ssd ] && case "$ex" in *--order*) RUNNER_EXTRA="--gen alias $ex" ;; esac
-        sweep_run "$lab" --cfgs "$cfgs" --caps 1 --pbs "$pbs" --set "$THR${st:+ $st}" "${A2G[@]}"
-    done < <(a2_specs "$1")
+        sweep_run "$lab" --cfgs "$cfgs" --caps 1 --pbs "$pbs" --set "$THR${st:+ $st}" "${A2G[@]}" </dev/null
+    done 3< <(a2_specs "$1")
     RUNNER_EXTRA=""
 }
 # s2place's page lists: per drive its own (seed differs), distinct pages.
@@ -1261,8 +1264,17 @@ if [ "$ANALYSIS" = 1 ] && [ "${#MANIFESTS[@]}" -gt 0 ]; then
     rm -f "$OUT/analyze-new.tar.gz"
 fi
 if [ "$ANALYSIS" = 1 ] && [ "$ALIAS2" = 1 ]; then
+    # The 11-05 manifests: in ~ (as the sweeps left them), else the copies in
+    # that campaign's folder, else the sweep folders in utils/logs; one per sweep.
     shopt -s nullglob
-    old=( "$RESULTS"/dual"$KIND"-pips-strict-c1105[0-9][0-9][0-9][0-9]a[gcf]w*s*.manifest.tsv )
+    old=(); declare -A seen=()
+    for m in "$RESULTS"/dual"$KIND"-pips-strict-c1105[0-9][0-9][0-9][0-9]a[gcf]w*s*.manifest.tsv \
+             "$HOME"/pips-campaign-"$KIND"-c1105*/results/dual"$KIND"-pips-strict-c1105[0-9][0-9][0-9][0-9]a[gcf]w*s*.manifest.tsv \
+             "$REPO"/utils/logs/dual"$KIND"-pips-strict-c1105[0-9][0-9][0-9][0-9]a[gcf]w*s*/manifest.tsv; do
+        n=$(basename "$m" .manifest.tsv); [ "$n" = manifest ] && n=$(basename "$(dirname "$m")")
+        [ -n "${seen[$n]:-}" ] && continue
+        seen[$n]=1; old+=("$m")
+    done
     shopt -u nullglob
     if [ "${#old[@]}" -gt 0 ]; then
         margs=(); for m in "${old[@]}"; do margs+=(--manifest "$m"); done
@@ -1271,7 +1283,7 @@ if [ "$ANALYSIS" = 1 ] && [ "$ALIAS2" = 1 ]; then
             note "reanalysis of the 11-05 sweeps exited $? (analyze-1105/analyze.log)"
         rm -f "$OUT/analyze-1105.tar.gz"
     else
-        note "no 11-05 alias manifests in $RESULTS: no reanalysis"
+        note "no 11-05 alias manifests (~, ~/pips-campaign-$KIND-c1105*/results, utils/logs): no reanalysis"
     fi
 fi
 if [ "$ANALYSIS" = 1 ] && [ "$PENDING" = 1 ]; then

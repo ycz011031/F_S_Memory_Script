@@ -432,36 +432,7 @@ measured path.
 
 ## 6. Status
 
-The live status is [HANDOFF.md](HANDOFF.md) ("Last updated", and §8 "Next").
-As of 2026-10-19: strict and off give the same throughput everywhere so far
-(icx, bigserver); the PIPS switch's batcher (designs 0x0A02-0x0A05, depth up
-to 64 with a 512-beat FIFO on 0x0A05) changes how a full link is shared and
-the page order the IOMMU sees, not the throughput or the IOTLB misses; the
-page-order model is being rerun on the hosts with its uplink and grant-gap
-fixes (`pips-analyze.sh`).
-
-The early-October plan below is kept for its history; its items 1-4 are done
-(HANDOFF §2-4).
-
-**Done (early October)**
-
-- Fork created, `master` pushed as a pristine mirror, `local-setup` pushed
-- Minimal traffic path written; all five scripts syntax-checked, error paths tested
-- Testbed config written for the 192.168.10.0/24 link
-- LF endings pinned so scripts survive a Windows-authored round trip
-
-**Next (as planned then)**
-
-1. Run `preflight.sh` on icx, fix what it flags, then `run-traffic.sh`
-2. Establish the Broadwell's sender ceiling — raise `NUM_FLOWS` until it plateaus
-3. Only then layer measurement back on: build PCM, capture Part C of
-   `LOCAL-SETUP.md`, rewrite `parse_pciebw` to resolve by header name
-4. With correct counters, run the stock-kernel baselines: boot icx with
-   `intel_iommu=off`, then `intel_iommu=on iommu.strict=1`, and run the wrappers
-   each time. That is Figs 2, 3, 7 and 8a — the full IOMMU-overhead result,
-   with no patched kernel required.
-5. Build the F&S kernel only if the baselines show a gap worth closing
-
-**Open questions** — Parts B and C of [LOCAL-SETUP.md](LOCAL-SETUP.md): what
-`restart.sh` should do, whether hostCC is in scope, whether MLC is installed, and
-the PCM CSV header layout.
+The live status is [HANDOFF.md](HANDOFF.md) ("Last updated", "Where the study
+stands", and §8 "Next"). This section's 10-19 status and the early-October
+plan (done items, next as planned then, open questions) moved to
+[docs/archive/pre-pips.md](docs/archive/pre-pips.md) on 2026-11-06.
