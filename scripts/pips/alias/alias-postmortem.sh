@@ -9,7 +9,9 @@
 # SSD 0 and 1); their bridges are added. --hours: how far back to look for the
 # runner's output (default 24). Into ~/alias-postmortem-<host>-<time>/, then
 # that .tar.gz:
-#   boots.txt          the boot list, last -x (crash = no clean shutdown)
+#   boots.txt          the boot list, last -x, and how each of the last 3
+#                      boots ended (its last journal lines; a clean one shows
+#                      systemd's shutdown, a hang just stops)
 #   kernel-prev*.txt   the previous boot's kernel log: all, the last 400 lines,
 #                      and the lines that matter (vfio, nvme, pcieport, AER,
 #                      DMAR, MCE, lockups, Call Trace); /var/log/kern.log* if
@@ -21,12 +23,16 @@
 #   runs/              the runner's console logs and run folders from the last
 #                      N hours (alias-nvme.out: its heartbeat every 10 s)
 #   now/               the drives and bridges now: driver, lspci -vvv,
-#                      reset_method, power state; vfio modules; cmdline
+#                      reset_method, power state; vfio modules; cmdline;
+#                      iomem.txt (/proc/iomem) and windows.txt: each bridge's
+#                      memory windows from the drives up to the root port,
+#                      checked against the IOVAs alias-nvme uses (a window
+#                      that holds one routes the drive's DMA to a peer)
 #   pips-now/          scripts/pips/pips-hang-snapshot.sh (the switch now)
 set -u
 
 HERE=$(cd "$(dirname "$0")" && pwd)
-REPO=$(cd "$HERE/../.." && pwd)
+REPO=$(cd "$HERE/../../.." && pwd)
 HOURS=24
 BDFS=()
 while [ $# -gt 0 ]; do
@@ -53,8 +59,16 @@ step 1 "boots: is the previous boot in the journal, did it shut down cleanly"
     sudo journalctl --list-boots --no-pager 2>&1 | tail -5
     echo "== last -x (last 20)"
     last -x -n 20 2>&1
+    for b in -1 -2 -3; do
+        echo "== boot $b: its last 12 journal lines"
+        sudo journalctl -b "$b" -n 12 --no-pager 2>&1 | cut -c1-200
+    done
 } > "$OUT/boots.txt"
 sed -n '/list-boots/,/last -x/p' "$OUT/boots.txt" | grep -v '^==' | sed 's/^/    /'
+for b in -1 -2 -3; do
+    echo "    boot $b ended with:"
+    sudo journalctl -b "$b" -n 4 --no-pager -o short-precise 2>&1 | grep -v '^--' | cut -c1-150 | sed 's/^/      /'
+done
 
 step 2 "the previous boot's kernel log"
 PERSIST=1
@@ -73,6 +87,8 @@ else
     done
 fi
 tail -n 400 "$OUT/kernel-prev-all.txt" > "$OUT/kernel-prev-tail.txt"
+echo "    the previous boot's last 6 journal lines (any source):"
+tail -6 "$OUT/journal-prev-tail.txt" 2>/dev/null | cut -c1-150 | sed 's/^/      /'
 grep -E -i 'vfio|nvme|pcieport|aer|dmar|iommu|dma.?fault|hardware error|mce|machine check|cmpltto|completion timeout|surprise|link (down|up)|soft lockup|hard lockup|rcu.*stall|watchdog|hung task|call trace|bug:|oops|panic|b[234]:0[01]\.0|d3|reset' \
     "$OUT/kernel-prev-all.txt" > "$OUT/kernel-prev.txt"
 echo "    $(wc -l < "$OUT/kernel-prev.txt") matching lines; the last 8:"
@@ -150,6 +166,35 @@ for b in "${ALL[@]}"; do
     [ -e "$d" ] && timeout 20 sudo lspci -vvv -s "$b" > "$OUT/now/lspci-$b.txt" 2>&1
 done
 grep -E '^== 0000|^driver|^reset_method|^power_state|ABSENT' "$OUT/now/summary.txt" | sed 's/^/    /'
+
+# The IOVAs alias-nvme puts DMA at (control region, data region; its
+# defaults) against every bridge window from the drives up to the root port.
+# In a window, a switch routes the TLP to that port instead of upstream.
+sudo cat /proc/iomem > "$OUT/now/iomem.txt" 2>&1
+UP=()
+for b in "${BDFS[@]}"; do
+    p=$(readlink -f "/sys/bus/pci/devices/$b" 2>/dev/null) || continue
+    while [ -e "$p/vendor" ]; do UP+=("$(basename "$p")"); p=$(dirname "$p"); done
+done
+{
+    echo "IOVAs used: control 0x10000000-0x1fffffff, data from 0x4000000000 (span up to 1 GiB)"
+    for b in $(printf '%s\n' "${UP[@]}" | sort -u); do
+        echo "== $b $(cat /sys/bus/pci/devices/$b/class 2>/dev/null)"
+        timeout 20 sudo lspci -vv -s "$b" 2>/dev/null | grep -E 'behind bridge|Region [0-9]|Bus: primary|ACSCtl|ACSCap' | sed 's/^\s*/   /'
+    done
+    echo "== /proc/iomem lines that hold 0x10000000 or 0x4000000000"
+    # bash arithmetic, not awk: Ubuntu's mawk has no strtonum
+    while IFS= read -r line; do
+        r=${line%% :*}; r=${r//[[:space:]]/}
+        lo=$((16#${r%-*})) hi=$((16#${r#*-})) 2>/dev/null || continue
+        for a in 0x10000000 0x1fffffff 0x4000000000 0x403fffffff; do
+            if [ $((lo <= a && hi >= a)) = 1 ]; then echo "$line"; break; fi
+        done
+    done < "$OUT/now/iomem.txt"
+} > "$OUT/now/windows.txt" 2>&1
+echo "    bridge windows and ACS (now/windows.txt):"
+grep -E '^==|behind bridge|ACSCtl|iomem' "$OUT/now/windows.txt" | cut -c1-150 | sed 's/^/      /'
+sed -n '/iomem lines/,$p' "$OUT/now/windows.txt" | tail -n +2 | sed 's/^/      /'
 
 step 7 "the switch now (pips-hang-snapshot.sh)"
 bash "$REPO/scripts/pips/pips-hang-snapshot.sh" -o "$OUT/pips-now" --since "1 hour ago" 2>&1 | sed 's/^/    /'
