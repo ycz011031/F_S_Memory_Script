@@ -79,7 +79,13 @@
 # Read-only as fio: the generator builds no command but Identify, queue
 # setup and Read. Its per-queue output is fio's (fio-ssd<i>-<k>.json and
 # _iops.1.log), so fio-sum and the results are the same; the results add
-# gen=alias and alias_* (pattern). The IOMMU must be on (VFIO needs a group;
+# gen=alias and alias_* (pattern).
+# ALIAS_HOLD=<dir> (set by pips-campaign.sh ssd --alias): a running
+# alias-nvme --hold has the drives for the whole campaign; each run sends it a
+# load command (<dir>/cmd) and ends the load with <dir>/stop, and the runner
+# never binds, resolves block devices, or restores (releasing the drives
+# froze bigserver, HANDOFF §8). The holder's queues, qd and bs are fixed
+# (<dir>/config): -J, --iodepth and --bs must match. The IOMMU must be on (VFIO needs a group;
 # pt is fine and translates: VFIO's domain is its own).
 #
 # Exit status 3: this configuration could not be measured (fio instances died,
@@ -192,13 +198,29 @@ CPU_MODEL=$(awk -F: '/^model[[:space:]]*:/{gsub(/ /,"",$2); print $2; exit}' /pr
 if [ "$ssds" -eq 1 ]; then ACTIVE=( "$ssd_index" ); else ACTIVE=( 0 1 ); fi
 
 ALIAS_DIR="$HERE/pips/alias"
-if [ "$gen" = alias ] && ls /run/alias-vfio/* >/dev/null 2>&1; then
+HOLD=""
+if [ "$gen" = alias ] && [ -n "${ALIAS_HOLD:-}" ]; then
+    HOLD=$ALIAS_HOLD
+    grep -q '^ready' "$HOLD/state" 2>/dev/null && [ -s "$HOLD/drives" ] && [ -s "$HOLD/config" ] || {
+        echo "ERROR: ALIAS_HOLD=$HOLD: no ready holder there (state: $(cat "$HOLD/state" 2>/dev/null))" >&2; exit 1; }
+elif pgrep -f 'alias-nvm[e] .*--hold ' >/dev/null 2>&1; then
+    echo "ERROR: an alias-nvme --hold has the drives (a campaign's holder). Run through it" >&2
+    echo "       (ALIAS_HOLD=<its dir>), or end it with a reboot; never restore or kill it." >&2
+    exit 1
+elif [ "$gen" = alias ] && ls /run/alias-vfio/* >/dev/null 2>&1; then
     echo "-- drives left on vfio-pci by an earlier alias run: putting them back on nvme"
     sudo -n bash "$ALIAS_DIR/alias-vfio.sh" restore || echo "WARNING: alias-vfio.sh restore failed (status: bash $ALIAS_DIR/alias-vfio.sh status)" >&2
 fi
 
 DEVS=(); BDFS=()
 for i in "${ACTIVE[@]}"; do
+    if [ -n "$HOLD" ]; then
+        read -r _ hb hs < <(awk -v i="$i" '$1 == i' "$HOLD/drives")
+        [ -n "${hb:-}" ] && [ "${hs:-}" = "${SSD_SERIALS[$i]}" ] || {
+            echo "ERROR: the holder has no SSD $i (${SSD_SERIALS[$i]}): $HOLD/drives" >&2; exit 1; }
+        DEVS[$i]="vfio:$hb"; BDFS[$i]=$hb
+        continue
+    fi
     ssd_resolve "${SSD_SERIALS[$i]}" || exit 1
     DEVS[$i]=$SSD_DEV; BDFS[$i]=$SSD_BDF
 done
@@ -206,7 +228,7 @@ done
 # too when it shares their IOMMU group (no ACS on the switch's ports: VFIO
 # then needs every endpoint of the group on vfio-pci, even for one drive alone).
 ALIAS_BIND=()
-if [ "$gen" = alias ]; then
+if [ "$gen" = alias ] && [ -z "$HOLD" ]; then
     for i in "${ACTIVE[@]}"; do ALIAS_BIND+=( "${BDFS[$i]}" ); done
     for i in 0 1; do
         [[ " ${ACTIVE[*]} " == *" $i "* ]] && continue
@@ -275,8 +297,32 @@ FIO_MATCH='^(/[^ ]*/)?fio .*--name=dualssd[_]'
 # --gen alias: the generator, by its binary path at the start of the command
 # line (sudo's own line starts with sudo). It also writes its JSON on SIGINT.
 [ "$gen" = alias ] && FIO_MATCH='^(/[^ ]*/)?alias-nvm[e] --dev '
-fio_count() { local n; n=$(pgrep -c -f "$FIO_MATCH" 2>/dev/null); echo "${n:-0}"; }
+# Under a holder: "1" while its heartbeat (<dir>/alive, each second) is fresh
+# and says load.
+hold_loading() {
+    local a; a=$(cat "$HOLD/alive" 2>/dev/null)
+    [ -n "$a" ] && [ $(( $(date +%s%3N) - ${a%% *} )) -lt 10000 ] && [ "${a##* }" = load ]
+}
+fio_count() {
+    if [ -n "$HOLD" ]; then hold_loading && echo 1 || echo 0; return; fi
+    local n; n=$(pgrep -c -f "$FIO_MATCH" 2>/dev/null); echo "${n:-0}"
+}
+# The load's lines from the holder's log into $L/alias-nvme.out, once its
+# done line is there (<dir>/done: "<n> NAME ok|FAILED").
+hold_collect() {   # <name> <out>
+    for _ in $(seq 60); do [ "$(awk '{ print $2 }' "$HOLD/done" 2>/dev/null)" = "$1" ] && break; sleep 1; done
+    awk -v n="'$1'" 'index($0, "hold: load") && index($0, n) { on = 1 } on { print } on && index($0, n) && /(done|FAILED); idle/ { exit }' \
+        "$HOLD/holder.txt" > "$2" 2>/dev/null
+    grep -q "^[0-9]* $1 ok" "$HOLD/done" 2>/dev/null || echo "WARNING: the holder's load $1: $(cat "$HOLD/done" 2>/dev/null)" >&2
+}
 stop_fio() {    # SIGINT makes fio stop and still write its JSON
+    if [ -n "$HOLD" ]; then   # the load ends, the holder keeps the drives
+        hold_loading || return 0
+        touch "$HOLD/stop"
+        for _ in $(seq 60); do hold_loading || return 0; sleep 1; done
+        echo "WARNING: the holder's load did not end 60 s after $HOLD/stop" >&2
+        return 0
+    fi
     sudo -n pkill -INT -f "$FIO_MATCH" >/dev/null 2>&1 || true
     # alias-nvme gives the drives back step by step after SIGINT (~30 s: NVMe
     # shutdown, settle, a reset before each close, alias-nvme.c --exit-steps). A KILL would leave
@@ -318,7 +364,20 @@ preflight() {
     miss=""
     for t in $( [ "$gen" = fio ] && echo fio) python3 sar lspci; do command -v "$t" >/dev/null || miss="$miss $t"; done
     [ -n "$miss" ] && PROBLEMS+=("missing tools:$miss")
-    if [ "$gen" = alias ]; then
+    if [ -n "$HOLD" ]; then
+        read -r _ hq _ hd _ hbs < "$HOLD/config"
+        bsb=$(numfmt --from=iec "${bs^^}" 2>/dev/null || echo "$bs")
+        echo "   holder: $(cat "$HOLD/state") in $HOLD; queues $hq, qd $hd, bs $hbs"
+        for i in "${ACTIVE[@]}"; do
+            [ "${JOBS[$i]}" = "$hq" ] || PROBLEMS+=("SSD $i: -J ${JOBS[$i]}, but the holder runs $hq queues per drive")
+        done
+        [ "$iodepth" = "$hd" ] || PROBLEMS+=("--iodepth $iodepth, but the holder runs qd $hd")
+        [ "$bsb" = "$hbs" ] || PROBLEMS+=("--bs $bs, but the holder runs bs $hbs")
+        [ "$a_first" = 0 ] && [ -z "$a_list" ] && [ "${a_backing:-0}" = 0 ] && [ "$a_lba" = rand ] ||
+            PROBLEMS+=("under a holder only --ws, --stride and --order change per run (not --first, --page-list, --backing-pages, --lba)")
+        a=$(cat "$HOLD/alive" 2>/dev/null)
+        [ -n "$a" ] && [ $(( $(date +%s%3N) - ${a%% *} )) -lt 10000 ] || PROBLEMS+=("the holder's heartbeat is stale: $HOLD/alive '$a'")
+    elif [ "$gen" = alias ]; then
         if ALIAS_NVME=$(bash "$ALIAS_DIR/alias-run.sh" --build alias-nvme 2>&1 | tail -1) && [ -x "$ALIAS_NVME" ]; then
             echo "   alias-nvme: $ALIAS_NVME"
         else
@@ -381,6 +440,7 @@ $(printf '%s\n' "$others" | sed 's/^/      /')")
         dev=${DEVS[$i]}; bdf=${BDFS[$i]}
         model=$(cat /sys/bus/pci/devices/"$bdf"/nvme/nvme*/model 2>/dev/null | head -1 | xargs)
         echo "   SSD $i: ${SSD_SERIALS[$i]} -> $dev ($bdf, $model)"
+        [ -n "$HOLD" ] && continue        # held by vfio-pci: no block device, nothing to check
         [ -b "$dev" ] || PROBLEMS+=("$dev is not a block device")
         # Busy drives: a mount or an md/LVM/dm holder means someone else's I/O
         # on the device under test, or someone else's data in use.
@@ -492,7 +552,9 @@ echo "=============================================================="
 
 preflight
 uplink_gbps=$(shared_link_gbps $(for i in "${ACTIVE[@]}"; do echo "${BDFS[$i]}"; done))
-if [ "$gen" = alias ]; then
+if [ -n "$HOLD" ]; then
+    echo "   drives held by the campaign's alias-nvme --hold ($(cat "$HOLD/state")): no bind, no restore"
+elif [ "$gen" = alias ]; then
     # The drives leave the nvme driver for this runner's runs; cleanup puts them back.
     ALIAS_BOUND=1
     sudo -n bash "$ALIAS_DIR/alias-vfio.sh" bind "${ALIAS_BIND[@]}" || {
@@ -527,7 +589,22 @@ for ((j = 0; j < num_runs; j++)); do
 
     # ---------------------------------------------------------------- load
     want=0; fio_pids=()
-    if [ "$gen" = alias ]; then
+    if [ -n "$HOLD" ]; then
+        # The campaign's holder runs the load: one command, ready when loaded.
+        mask=0; for i in "${ACTIVE[@]}"; do mask=$(( mask | (1 << i) )); done
+        rm -f "$L/alias-ready"
+        echo "load $RUN $mask $a_ws $a_stride $a_order $warm $fio_runtime $L $L/alias-ready" > "$HOLD/cmd.tmp" &&
+            mv "$HOLD/cmd.tmp" "$HOLD/cmd"
+        for _ in $(seq 300); do [ -e "$L/alias-ready" ] && break; sleep 0.2; done
+        if [ ! -e "$L/alias-ready" ]; then
+            echo "ERROR: the holder did not load the drives in 60 s. Its log:" >&2
+            tail -15 "$HOLD/holder.txt" | sed 's/^/    /' >&2
+            stop_fio
+            exit 3
+        fi
+        want=1
+        echo "   holder: load $RUN on drives mask $mask, ws $a_ws stride $a_stride $a_order"
+    elif [ "$gen" = alias ]; then
         # One generator for every active drive: one VFIO process per group.
         aargs=(); acpus=(); aq=(); aser=()
         for i in "${ACTIVE[@]}"; do
@@ -615,10 +692,12 @@ for ((j = 0; j < num_runs; j++)); do
         bad_run=1
     fi
     stop_fio
+    [ -n "$HOLD" ] && hold_collect "$RUN" "$L/alias-nvme.out"
     # Wait for these PIDs only. A bare `wait` also waits for the console-log
     # tee started by `exec > >(tee ...)`, which never exits while this script
-    # runs: the run hangs forever after the last measurement window.
-    wait "${fio_pids[@]}" 2>/dev/null
+    # runs: the run hangs forever after the last measurement window (and
+    # under a holder there are none).
+    [ ${#fio_pids[@]} -gt 0 ] && wait "${fio_pids[@]}" 2>/dev/null
     [ "$pips_log" = 1 ] && pips_collect
 
     # IOPS over exactly the measurement windows, and proof that every instance

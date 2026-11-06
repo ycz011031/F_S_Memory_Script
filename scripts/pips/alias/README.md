@@ -149,7 +149,11 @@ runner writes each NIC's Gb/s over the windows to `iperf.bw.rpt` as
   once, run every load on command, never release them, and end with an
   immediate reboot (`sync; systemctl reboot -ff`: no process is stopped, so
   nothing is released). Never `kill` the holder: its exit is the release.
-  `alias-stability.sh` tests it. The runner waits 120 s for a one-shot
+  `alias-stability.sh` tested it (14 of 14 loads, 11-05). The drive campaign
+  uses it: `pips-campaign.sh ssd --alias` starts one holder, the runner sends
+  each run's load to it (`ALIAS_HOLD=<dir>`: no bind, no restore, no block
+  device; -J 4, qd 32, bs 4k fixed), the guard reboots a hung host, and the
+  campaign ends with the reboot. The runner waits 120 s for a one-shot
   alias-nvme after SIGINT before it would KILL. Never
   `kill -9` alias-nvme by hand. `alias-hangtest.sh` is the tool for this.
 - **Interrupt remapping:** VFIO type1 refuses to attach a group on a host
@@ -180,6 +184,7 @@ runner writes each NIC's Gb/s over the windows to `iperf.bw.rpt` as
 | `alias-rdma.c` | RDMA READ generator: `--role client` (host under test), `--role server` (styx) |
 | `alias-run.sh` | builds for this host when needed, then runs (`--build`, `--path`) |
 | `alias-vfio.sh` | `bind`, `restore`, `status`: nvme ↔ vfio-pci |
+| `alias-guard.sh` | `arm DIR HOLD [TIMEOUT]` / `disarm DIR` / `status DIR`: the BMC IPMI watchdog (hard reset when not petted for TIMEOUT s), a root petter that pets it while the holder's heartbeat is fresh, and the kernel's panic on lockup with `kernel.panic=10`; used by `pips-campaign.sh ssd --alias` (same boot: keeps the running petter) |
 | `alias-stability.sh` | ~20 min test of the hold design on bigserver: one `alias-nvme --hold` keeps both drives for the whole test and runs 14 loads (patterns, one drive or both, PIPS batcher setting changed in the pauses, pcm-iio in half of them); BMC watchdog (hard reset when the host freezes or the holder's heartbeat is stale), panic-on-lockup with `kernel.panic=10`; ends with `sync; systemctl reboot -ff` (`--no-reboot`, `--no-wd`, `--dry-run`) |
 | `alias-hangtest.sh` | one drive load by hand with the kernel log, its heartbeat and a 1 Hz tick fsynced to the host's own disk, optional pcm-iio at a set second and `--panic` (lockup → pstore); `--show` after a reboot (the 11-05 bigserver hang bisect) |
 | `alias-postmortem.sh` | after a host died in a run: the previous boot's kernel log, panic and BMC records, the runner's output, the drives and the switch now (read only) |

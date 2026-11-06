@@ -78,6 +78,13 @@
 #                     1 here). Needs the IOMMU translating: drives any mode
 #                     but off (VFIO), NICs strict or lazy (the MR is the
 #                     kernel's). No pending analysis.
+#                     Drives (11-05): ONE alias-nvme --hold keeps both drives
+#                     for the whole campaign (releasing drive 1 after a load
+#                     froze bigserver, HANDOFF §8); the runner sends it each
+#                     load (ALIAS_HOLD). Guarded by the BMC watchdog and the
+#                     kernel's panic on lockup (alias-guard.sh). The campaign
+#                     ENDS WITH A REBOOT (sync; systemctl reboot -ff: nothing
+#                     released; --no-reboot to leave it to you)
 #   --leg M           with --paper: the leg expected (strict, lazy, pt, off);
 #                     refused when the devices are not so (a reboot missed).
 #                     With --dry-run: plan that leg whatever this host is
@@ -89,6 +96,16 @@
 #   --no-hw           NIC: leave out the hardware-paced phase
 #   -j N              logs at a time in the analysis (default: half the CPUs, at most 16)
 #   --stamp S         the label prefix of this campaign's sweeps (default c<MMDDhhmm>)
+#   --fresh           start a new campaign even if a half-done one of this
+#                     kind is there (it stays as it is)
+#   --no-reboot       ssd --alias: at the end, leave the drives held and the
+#                     reboot to you (sync; sudo systemctl reboot -ff)
+# Resume: every launch looks for a half-done campaign of the same kind and
+# mode (~/.pips-campaign-<kind>-<mode>.current names its stamp; DONE in its
+# folder once packed). If there is one it picks it up: sweeps already done
+# (progress.tsv) are skipped, a sweep that was cut short runs again as
+# <label>r<n>, the analysis and the packing run over all of them. Otherwise
+# it starts fresh. Relaunch with the same command after a crash or a reboot.
 #   --retire S        run nothing: move campaign S's files out of the way into
 #                     ~/pips-retired/S/ (its ~/dual<kind>-pips-*-S* results and
 #                     manifests, ~/pips-campaign-<kind>-S[.tar.gz], and its run
@@ -149,7 +166,7 @@ case "$KIND" in
 esac
 PASS=("$KIND"); IN_TMUX=0
 for a in "$@"; do if [ "$a" = --tmux ]; then IN_TMUX=1; else PASS+=("$a"); fi; done
-DRY=0; ONLY=""; SKIP=""; ANALYSIS=1; PENDING=""; WIRE=1; HW=1; JOBS=""; STAMP=""; RETIRE=""; MINIMAL=0; PAPER=0; LEG_WANT=""; RUNS=""; ALIAS=0
+DRY=0; ONLY=""; SKIP=""; ANALYSIS=1; PENDING=""; WIRE=1; HW=1; JOBS=""; STAMP=""; RETIRE=""; MINIMAL=0; PAPER=0; LEG_WANT=""; RUNS=""; ALIAS=0; FRESH=0; REBOOT=1
 while [ $# -gt 0 ]; do
     case "$1" in
         --tmux) shift ;;
@@ -169,6 +186,8 @@ while [ $# -gt 0 ]; do
         --no-hw) HW=0; shift ;;
         -j) JOBS="$2"; shift 2 ;;
         --stamp) STAMP="$2"; shift 2 ;;
+        --fresh) FRESH=1; shift ;;
+        --no-reboot) REBOOT=0; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "pips-campaign: unknown option $1 (--help)" >&2; exit 2 ;;
     esac
@@ -196,6 +215,7 @@ if [ -n "$RETIRE" ]; then
     echo "pips-campaign: retired $n item(s) of campaign $RETIRE ($KIND) into $R ($(du -sh "$R" 2>/dev/null | cut -f1))"
     exit 0
 fi
+STAMP_GIVEN=$STAMP
 STAMP=${STAMP:-c$(date +%m%d%H%M)}
 [ $(( MINIMAL + PAPER + ALIAS )) -gt 1 ] && { echo "pips-campaign: one of --minimal, --paper, --alias" >&2; exit 2; }
 # --minimal, --paper and --alias leave the pending 0x0A04/0x0A05 analysis out unless --pending.
@@ -259,6 +279,20 @@ if [ "$ALIAS" = 1 ]; then
            fi ;;
     esac
 fi
+# Resume: a half-done campaign of this kind and mode is picked up.
+if [ "$ALIAS" = 1 ]; then MODE_KEY=alias; elif [ "$PAPER" = 1 ]; then MODE_KEY=paper-$LEG
+elif [ "$MINIMAL" = 1 ]; then MODE_KEY=minimal; else MODE_KEY=full; fi
+POINTER="$HOME/.pips-campaign-$KIND-$MODE_KEY.current"
+RESUME=0
+if [ -z "$STAMP_GIVEN" ] && [ "$FRESH" = 0 ] && [ -s "$POINTER" ]; then
+    s=$(cat "$POINTER")
+    if [ -d "$HOME/pips-campaign-$KIND-$s" ] && [ ! -e "$HOME/pips-campaign-$KIND-$s/DONE" ]; then
+        STAMP=$s; RESUME=1
+        echo "pips-campaign: RESUMING the half-done $KIND $MODE_KEY campaign $s: $(grep -c '^done' "$HOME/pips-campaign-$KIND-$s/progress.tsv" 2>/dev/null || echo 0) sweep(s) done so far (--fresh for a new one)"
+    fi
+elif [ -n "$STAMP_GIVEN" ] && [ -d "$HOME/pips-campaign-$KIND-$STAMP" ] && [ ! -e "$HOME/pips-campaign-$KIND-$STAMP/DONE" ]; then
+    RESUME=1
+fi
 if [ "$IN_TMUX" = 1 ] && [ "$DRY" = 0 ]; then
     # Keep the stamp: the tmux copy must name the same folder.
     relaunch_in_tmux "$SELF" "${PASS[@]}" --stamp "$STAMP"
@@ -269,6 +303,7 @@ OUT="$HOME/pips-campaign-$KIND-$STAMP"
 SWEEPS_DIR="$REPO/scripts/sosp24-experiments"
 if [ "$KIND" = ssd ]; then
     DRV="$SWEEPS_DIR/dualssd_pips_sweep.sh"; MIN_PER_PT=1.05
+    . "$REPO/utils/setup-server.sh" 2>/dev/null || true      # SSD_SERIALS, SSD_CORES (the holder)
 else
     DRV="$SWEEPS_DIR/dualnic_pips_sweep.sh"; MIN_PER_PT=2.6
 fi
@@ -337,7 +372,7 @@ alias_npts() { set -- $1; echo $#; }
 if [ "$ALIAS" = 1 ]; then
     PHASES=(ageom acap aconf)
     [ "$KIND" = nic ] && MIN_PER_PT=1.6        # no iperf3 stats wait
-    [ "$KIND" = ssd ] && MIN_PER_PT=1.6        # + bind/restore, alias-nvme's shutdown, settle, stepwise release (~30 s)
+    [ "$KIND" = ssd ] && MIN_PER_PT=1.1        # one holder for the campaign: no bind or release per run
 elif [ "$MINIMAL" = 1 ]; then
     if [ "$KIND" = ssd ]; then PHASES=(mini); else PHASES=(rcap uneven wire50); fi
 elif [ "$PAPER" = 1 ]; then
@@ -513,6 +548,20 @@ sweep_run() {
         printf ' %q' "$@"; echo
         return 0
     fi
+    # Resume: a sweep done before is only counted; one cut short runs again
+    # under a new label (the runner never reuses run names).
+    local base=$label prev n T=$'\t'
+    if grep -q "^done$T$base$T" "$OUT/progress.tsv" 2>/dev/null; then
+        prev=$(awk -F'\t' -v b="$base" '$1 == "done" && $2 == b { print $4; exit }' "$OUT/progress.tsv")
+        if [ -s "$prev" ]; then
+            MANIFESTS+=("$prev"); NAMES+=("$(basename "$prev" .manifest.tsv)")
+            say "sweep $base: done before (resumed): skipped"
+            return 0
+        fi
+    fi
+    n=$(grep -c "^start$T$base$T" "$OUT/progress.tsv" 2>/dev/null); n=${n:-0}
+    if [ "$n" -gt 0 ]; then label="${base}r$n"; note "sweep $base was cut short before ($n start(s)): runs again as $label"; fi
+    printf 'start\t%s\t%s\t%s\n' "$base" "$label" "$(date '+%F %T')" >> "$OUT/progress.tsv"
     switch_ok || { switch_dead "before sweep $label"; return 1; }
     CUR_LABEL=$label; echo "$CUR_PHASE $label" > "$OUT/.state"
     say "sweep $label ($CUR_PHASE): $(describe "$CUR_PHASE")"
@@ -539,6 +588,9 @@ sweep_run() {
         STOPPED=1; note "sweep $label stopped by hand"
     fi
     [ "$rc" = 0 ] || [ "$rc" = 130 ] || note "sweep $label exited $rc"
+    if [ -n "$m" ] && [ "$rc" != 130 ] && [ "$STOPPED" = 0 ]; then
+        printf 'done\t%s\t%s\t%s\n' "$base" "$label" "$m" >> "$OUT/progress.tsv"
+    fi
     if grep -qs 'ID reads 0xffffffff' "$REPO/utils/logs/$nm/pips-sweep.log" || ! switch_ok; then
         switch_dead "during sweep $label"
     fi
@@ -772,8 +824,71 @@ phase_links() {
     return 0
 }
 
+# ------------------------------------------------------------------ ssd --alias: the holder
+# One alias-nvme --hold for the whole campaign: in this boot it is reused (a
+# resumed campaign); after a reboot the drives are on nvme again and a new one
+# is started. Never stopped here: the campaign ends with a reboot.
+HOLD_DIR="$OUT/hold"
+hold_fresh() {   # a holder of this campaign, up in this boot, heartbeat fresh
+    local pid a
+    grep -q '^ready' "$HOLD_DIR/state" 2>/dev/null || return 1
+    pid=$(awk '{ print $2 }' "$HOLD_DIR/state")
+    a=$(cut -d' ' -f1 "$HOLD_DIR/alive" 2>/dev/null)
+    [ -n "$pid" ] && sudo -n kill -0 "$pid" 2>/dev/null && [ -n "$a" ] && [ $(( $(date +%s%3N) - a )) -lt 10000 ]
+}
+hold_up() {
+    mkdir -p "$HOLD_DIR" || return 1
+    if hold_fresh; then say "holder: already up from before ($(cat "$HOLD_DIR/state")): reused"; return 0; fi
+    if pgrep -f 'alias-nvm[e] .*--hold ' >/dev/null 2>&1; then
+        echo "ERROR: an alias-nvme --hold is running that is not this campaign's: $(pgrep -af 'alias-nvm[e] .*--hold ' | head -1)" >&2
+        echo "       It holds the drives; end it only with a reboot (sync; sudo systemctl reboot -ff)." >&2
+        return 1
+    fi
+    local i s b c nv bdfs=() sers=() cpus=()
+    nv=$(bash "$HERE/alias/alias-run.sh" --build alias-nvme 2>&1 | tail -1)
+    { [ -x "$nv" ] && "$nv" --help 2>&1 | grep -q -- --hold; } || { echo "ERROR: alias-nvme (with --hold) does not build: $nv" >&2; return 1; }
+    for i in 0 1; do
+        s=${SSD_SERIALS[$i]:-}; b=""
+        for c in /sys/class/nvme/nvme*; do
+            [ "$(tr -d ' ' < "$c/serial" 2>/dev/null)" = "$s" ] && b=$(basename "$(readlink -f "$c/device")")
+        done
+        if [ -z "$b" ]; then
+            echo "ERROR: SSD $i ($s) is not on nvme and no holder runs. bash scripts/pips/alias/alias-vfio.sh status;" >&2
+            echo "       on vfio-pci with nothing holding it: sudo bash scripts/pips/alias/alias-vfio.sh restore; else reboot." >&2
+            return 1
+        fi
+        bdfs+=("$b"); sers+=("$s"); cpus+=("${SSD_CORES[$i]}")
+    done
+    rm -f "$HOLD_DIR"/state "$HOLD_DIR"/alive "$HOLD_DIR"/done* "$HOLD_DIR"/cmd* "$HOLD_DIR"/stop
+    printf '0 %s %s\n1 %s %s\n' "${bdfs[0]}" "${sers[0]}" "${bdfs[1]}" "${sers[1]}" > "$HOLD_DIR/drives"
+    echo "queues 4 qd 32 bs 4096" > "$HOLD_DIR/config"       # the alias grids: 4 per drive, the runner's qd 32, bs 4k
+    sudo -n bash "$HERE/alias/alias-vfio.sh" bind "${bdfs[@]}" || { echo "ERROR: could not bind the drives" >&2; return 1; }
+    say "holder: starting alias-nvme --hold $HOLD_DIR (log hold/holder.txt)"
+    echo "==== $(date '+%F %T') holder start" >> "$HOLD_DIR/holder.txt"
+    sudo -n setsid "$nv" --dev "${bdfs[0]}=$HOLD_DIR/init-ssd0" --dev "${bdfs[1]}=$HOLD_DIR/init-ssd1" \
+        --serial "${sers[0]},${sers[1]}" --queues 4,4 --cpus "${cpus[0]}/${cpus[1]}" --qd 32 --bs 4k --lba rand \
+        --ws 64 --stride 1 --heartbeat 10 --hold "$HOLD_DIR" >> "$HOLD_DIR/holder.txt" 2>&1 < /dev/null &
+    for _ in $(seq 120); do grep -q '^ready' "$HOLD_DIR/state" 2>/dev/null && break; sleep 0.5; done
+    if ! grep -q '^ready' "$HOLD_DIR/state" 2>/dev/null; then
+        echo "ERROR: the holder did not come up in 60 s: $(tail -5 "$HOLD_DIR/holder.txt" | tr '\n' ' ')" >&2
+        if ! pgrep -f 'alias-nvm[e] .*--hold ' >/dev/null 2>&1; then
+            sudo -n bash "$HERE/alias/alias-vfio.sh" restore "${bdfs[@]}"     # never opened: safe
+        else
+            echo "       It is still running: leave it; reboot (sync; sudo systemctl reboot -ff)." >&2
+        fi
+        return 1
+    fi
+    say "holder: ready ($(cat "$HOLD_DIR/state")); the drives are held until the reboot at the end"
+}
+guard() { bash "$HERE/alias/alias-guard.sh" "$@" 2>&1 | while IFS= read -r l; do say "$l"; done; return "${PIPESTATUS[0]}"; }
+
 # ------------------------------------------------------------------ dry run
 if [ "$DRY" = 1 ]; then
+    [ "$RESUME" = 1 ] && echo "(dry run) a launch now RESUMES campaign $STAMP ($(grep -c '^done' "$OUT/progress.tsv" 2>/dev/null || echo 0) sweep(s) done); --fresh starts a new one"
+    if [ "$KIND" = ssd ] && [ "$ALIAS" = 1 ]; then
+        echo "(dry run) before the sweeps: bind both drives, alias-nvme --hold $HOLD_DIR, alias-guard.sh arm (BMC watchdog 120 s, panic on lockup);"
+        echo "          every run: ALIAS_HOLD=$HOLD_DIR (load command, no bind/restore); at the end: $( [ "$REBOOT" = 1 ] && echo "sync; systemctl reboot -ff" || echo "drives left held (--no-reboot)")"
+    fi
     plan
     echo
     echo "commands:"
@@ -782,13 +897,19 @@ if [ "$DRY" = 1 ]; then
 fi
 
 # ------------------------------------------------------------------ preflight
-[ -e "$OUT" ] || [ -e "$OUT.tar.gz" ] && { echo "pips-campaign: $OUT exists; pass another --stamp" >&2; exit 1; }
+if [ "$RESUME" = 0 ] && { [ -e "$OUT" ] || [ -e "$OUT.tar.gz" ]; }; then
+    echo "pips-campaign: $OUT exists; pass another --stamp" >&2; exit 1
+fi
 mkdir -p "$OUT/snapshots" "$OUT/results" "$OUT/sweeplogs" "$OUT/runs" || exit 1
+rm -f "$OUT/.lockup-stop"
+echo "$STAMP" > "$POINTER"
 exec > >(trap '' INT TERM; exec tee -a "$OUT/campaign.log") 2>&1
 exec 7>/tmp/pips-campaign.lock
 flock -n 7 || { echo "ERROR: another pips-campaign is running (/tmp/pips-campaign.lock)" >&2; exit 1; }
 sudo -n true 2>/dev/null || { echo "ERROR: sudo needs a password: run with --tmux, or 'sudo -v' first" >&2; exit 1; }
 ( while sleep 240; do sudo -n -v 2>/dev/null; done ) & SUDO_KEEP=$!
+[ "$RESUME" = 1 ] && banner "RESUMING campaign $STAMP ($(date '+%F %T')): $(grep -c '^done' "$OUT/progress.tsv" 2>/dev/null || echo 0) sweep(s) done before are skipped" \
+    "a sweep cut short runs again as <label>r<n>; progress.tsv"
 plan | tee "$OUT/plan.txt"
 echo
 pips_build || { echo "ERROR: cannot build $PIPS" >&2; exit 1; }
@@ -821,8 +942,11 @@ free=$(df -Pk "$HOME" | awk 'NR == 2 { printf "%d", $4 / 1048576 }')
 [ "${free:-0}" -lt 20 ] && note "only ${free} GB free in $HOME: the TLP logs take ~1-2 MB per run"
 say "disk: ${free} GB free in $HOME; analysis -j $JOBS"
 if [ "$KIND" = ssd ] && [ "$ALIAS" = 1 ]; then
-    say "alias: the drives leave the nvme driver for each run (vfio-pci, polled, no interrupts): no irq-placement check"
+    say "alias: one alias-nvme --hold keeps both drives (vfio-pci, polled, no interrupts: no irq-placement check) for the whole campaign"
     bash "$REPO/scripts/pips/alias/alias-vfio.sh" status > "$OUT/alias-vfio-at-start.txt" 2>&1
+    hold_up || exit 1
+    guard arm "$OUT/guard" "$HOLD_DIR" 120 || { echo "ERROR: the hang guard did not arm (above); the holder keeps the drives: reboot to end" >&2; exit 1; }
+    export ALIAS_HOLD=$HOLD_DIR
 elif [ "$KIND" = ssd ]; then
     # Both drives completing on one CPU livelocks it in strict mode (10-25).
     # The layout is per boot: after a reboot for another leg it may differ.
@@ -875,6 +999,13 @@ heartbeat() {
 heartbeat & HB=$!
 on_exit() {
     kill "$HB" 2>/dev/null
+    if [ "$KIND" = ssd ] && [ "$ALIAS" = 1 ] && [ -d "$OUT/guard" ] && [ ! -e "$OUT/guard/.disarmed" ]; then
+        guard disarm "$OUT/guard"; touch "$OUT/guard/.disarmed"
+    fi
+    if [ ! -e "$OUT/DONE" ]; then
+        echo "pips-campaign: NOT finished. Relaunch the same command to resume ($STAMP, progress.tsv)."
+        [ "$KIND" = ssd ] && [ "$ALIAS" = 1 ] && echo "               The holder keeps the drives; end without resuming: sync; sudo systemctl reboot -ff"
+    fi
     # a link left forced by a phase that never got to put it back
     [ "$KIND" = nic ] && [ ${#LINK_FOUND_S[@]} -gt 0 ] && link_restore_all
     kill "$SUDO_KEEP" 2>/dev/null
@@ -964,5 +1095,21 @@ echo "=============================================================="
 cat "$OUT/README.txt"
 if [ "$SWITCH_DEAD" = 1 ] || [ ${#NOTES[@]} -gt 0 ]; then
     banner "READ THE NOTES ABOVE: $( [ "$SWITCH_DEAD" = 1 ] && echo "the switch stopped answering; ")${#NOTES[@]} note(s)"
+fi
+date '+%F %T' > "$OUT/DONE"
+rm -f "$POINTER"
+say "campaign $STAMP DONE (marker $OUT/DONE)"
+if [ "$KIND" = ssd ] && [ "$ALIAS" = 1 ]; then
+    guard disarm "$OUT/guard"; touch "$OUT/guard/.disarmed"
+    if [ "$REBOOT" = 1 ]; then
+        banner "REBOOTING bigserver now: sync; systemctl reboot -ff" \
+               "(no process is stopped, so the holder never releases the drives; they come back on nvme)"
+        sync; sleep 2
+        sudo -n systemctl reboot -ff
+        sleep 60
+        echo "pips-campaign: still up 60 s after reboot -ff: reboot by hand (sync; sudo systemctl reboot -ff)"
+    else
+        banner "--no-reboot: the holder keeps the drives. End with: sync; sudo systemctl reboot -ff"
+    fi
 fi
 exit 0

@@ -64,8 +64,10 @@
  *                        b4 after a load: the freeze; HANDOFF §8). A command is
  *                        one line written to DIR/cmd (write DIR/cmd.tmp, then
  *                        rename): "load NAME MASK WS STRIDE ORDER WARM SECONDS
- *                        OUTDIR" (MASK bit i = the i-th --dev; outputs
- *                        OUTDIR/fio-ssd<i>-<queue>.json and _iops.1.log). The
+ *                        OUTDIR [READYFILE]" (MASK bit i = the i-th --dev;
+ *                        outputs OUTDIR/fio-ssd<i>-<queue>.json and _iops.1.log;
+ *                        READYFILE touched once every queue is loaded). A file
+ *                        DIR/stop ends the load under way (as SIGINT does). The
  *                        holder writes DIR/state, DIR/alive (each second: epoch
  *                        ms, pid, load|idle), DIR/done and DIR/done.<n> ("<n>
  *                        NAME ok|FAILED"). Between loads the queues stay and only
@@ -709,7 +711,7 @@ static void step_say(const char *what, const char *bdf)
 
 /* ------------------------------------------------------------ hold mode */
 static const char *g_hold;
-static volatile int g_dead;
+static volatile int g_dead, g_loading;   /* g_loading: a load from start to drained */
 
 /* DIR/name, written whole (tmp, fsync, rename): readers never see half a file */
 static void hold_write(const char *name, const char *text)
@@ -727,12 +729,20 @@ static void hold_write(const char *name, const char *text)
     rename(tmp, path);
 }
 
+/* DIR/stop exists: the load under way ends (the file is taken) */
+static int hold_stop(void)
+{
+    char path[700];
+    snprintf(path, sizeof(path), "%s/stop", g_hold);
+    return unlink(path) == 0;
+}
+
 static void hold_alive(void)
 {
     if (!g_hold || g_dead)
         return;
     char b[160];
-    snprintf(b, sizeof(b), "%" PRIu64 " %d %s\n", epoch_ms(), (int)getpid(), g_measure ? "load" : "idle");
+    snprintf(b, sizeof(b), "%" PRIu64 " %d %s\n", epoch_ms(), (int)getpid(), g_loading ? "load" : "idle");
     hold_write("alive", b);
 }
 
@@ -899,6 +909,7 @@ static int run_load(unsigned mask, char prefix[][512], double warm, double secs,
 {
     g_measure = 0;
     g_stopping = 0;
+    g_loading = 1;
     for (int i = 0; i < g_ndev; i++) {
         if (!(mask >> i & 1))
             continue;
@@ -950,6 +961,8 @@ static int run_load(unsigned mask, char prefix[][512], double warm, double secs,
             }
         if (each_second)
             each_second();
+        if (g_hold && hold_stop())
+            break;
         if (el >= next_hb) {
             printf("alias-nvme: t=%" PRIu64 "s %s", el, g_measure ? "measuring" : "warming");
             for (int i = 0; i < g_ndev; i++)
@@ -996,6 +1009,7 @@ static int run_load(unsigned mask, char prefix[][512], double warm, double secs,
     }
     g_stopping = 0;
     g_measure = 0;
+    g_loading = 0;
     return err;
 }
 
@@ -1060,12 +1074,12 @@ static void hold_loop(void)
         char taken[720];
         snprintf(taken, sizeof(taken), "%s/cmd.%u", g_hold, n);
         rename(path, taken);
-        char name[128], ord[32], outdir[600];
+        char name[128], ord[32], outdir[600], ready[600] = "";
         unsigned mask = 0;
         unsigned long long ws = 0, stride = 0;
         double warm = 0, secs = 0;
-        if (sscanf(line, "load %127s %u %llu %llu %31s %lf %lf %599s", name, &mask, &ws, &stride, ord,
-                   &warm, &secs, outdir) != 8 || !(mask & ((1u << g_ndev) - 1)) || !ws || !stride || secs <= 0) {
+        if (sscanf(line, "load %127s %u %llu %llu %31s %lf %lf %599s %599s", name, &mask, &ws, &stride, ord,
+                   &warm, &secs, outdir, ready) < 8 || !(mask & ((1u << g_ndev) - 1)) || !ws || !stride || secs <= 0) {
             line[strcspn(line, "\n")] = 0;
             printf("alias-nvme: hold: command %u not understood: '%s'\n", n, line);
             snprintf(b, sizeof(b), "%u bad-command\n", n);
@@ -1077,7 +1091,8 @@ static void hold_loop(void)
             char pre[MAXDEV][512];
             for (int i = 0; i < g_ndev; i++)
                 snprintf(pre[i], sizeof(pre[i]), "%s/fio-ssd%d", outdir, i);
-            int err = run_load(mask & ((1u << g_ndev) - 1), pre, warm, secs, NULL, hold_alive);
+            hold_stop();                  /* a stop left from before is not for this load */
+            int err = run_load(mask & ((1u << g_ndev) - 1), pre, warm, secs, ready[0] ? ready : NULL, hold_alive);
             snprintf(b, sizeof(b), "%u %s %s\n", n, name, err ? "FAILED" : "ok");
             printf("alias-nvme: hold: load %u '%s' %s; idle, drives held\n", n, name, err ? "FAILED" : "done");
         }
