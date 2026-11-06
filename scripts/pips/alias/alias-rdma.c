@@ -99,7 +99,7 @@ static void netdev_to_ibdev(const char *netdev, char *out, size_t n)
     out[0] = 0;
     while ((e = readdir(d)))
         if (e->d_name[0] != '.') {
-            snprintf(out, n, "%s", e->d_name);
+            snprintf(out, n, "%.63s", e->d_name);   /* names are short (mlx5_2) */
             break;
         }
     closedir(d);

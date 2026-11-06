@@ -248,6 +248,15 @@ preflight() {
     }
     echo "   remote repo: OK ($REPO)"
 
+    # Sync first, so the checks below see the client's updated copy.
+    # The remote copy must be new enough to understand --no_kill, or the second
+    # NIC's client group will wipe the first (and to have alias/ for --gen alias).
+    if [ "${sync_client:-0}" = "1" ]; then
+        echo "   syncing client repo..."
+        rsh "cd '$REPO' && git fetch origin && git checkout $CLIENT_BRANCH && git pull --ff-only" \
+            || { echo "ERROR: client repo sync failed." >&2; exit 1; }
+    fi
+
     if [ "$gen" = alias ]; then
         # Build on both hosts as the user (the runs use sudo); the binaries live
         # in build/<host>/ of each host's copy of the repo.
@@ -277,14 +286,6 @@ preflight() {
         exit 1
     }
     echo "   remote setup-server.sh: OK"
-
-    # The remote copy must be new enough to understand --no_kill, or the second
-    # NIC's client group will wipe the first.
-    if [ "${sync_client:-0}" = "1" ]; then
-        echo "   syncing client repo..."
-        rsh "cd '$REPO' && git fetch origin && git checkout $CLIENT_BRANCH && git pull --ff-only" \
-            || { echo "ERROR: client repo sync failed." >&2; exit 1; }
-    fi
 
     rsh_try "grep -q -- '--no_kill' '$exp_dir/run-netapp-tput.sh'" || {
         echo >&2
