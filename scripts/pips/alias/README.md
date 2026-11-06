@@ -155,5 +155,6 @@ runner writes each NIC's Gb/s over the windows to `iperf.bw.rpt` as
 | `alias-rdma.c` | RDMA READ generator: `--role client` (host under test), `--role server` (styx) |
 | `alias-run.sh` | builds for this host when needed, then runs (`--build`, `--path`) |
 | `alias-vfio.sh` | `bind`, `restore`, `status`: nvme ↔ vfio-pci |
+| `alias-hangtest.sh` | one drive load by hand with the kernel log, its heartbeat and a 1 Hz tick fsynced to the host's own disk, optional pcm-iio at a set second and `--panic` (lockup → pstore); `--show` after a reboot (the 11-05 bigserver hang bisect) |
 | `alias-postmortem.sh` | after a host died in a run: the previous boot's kernel log, panic and BMC records, the runner's output, the drives and the switch now (read only) |
 | `Makefile` | `make nvme`, `make rdma` → `build/<host>/` (git-ignored) |
