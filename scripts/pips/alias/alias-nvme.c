@@ -45,6 +45,8 @@
  *                        close). Default 0: all at exit. For the 11-05 bigserver
  *                        freeze at exit: the last line names the step.
  *   --exit-reverse       with --exit-steps and two drives: the second --dev first
+ *   --exit-reset         with --exit-steps: VFIO_DEVICE_RESET each drive (the
+ *                        open path's FLR) before closing it
  * Exit: 0 done, 2 usage/setup, 3 a read failed (the run is not valid).
  */
 #include "alias_common.h"
@@ -116,7 +118,7 @@ static uint64_t g_bs = 4096, g_cmd, g_backing, g_iova_base = 0x4000000000ull;
 static uint32_t g_qd = 32, g_k, g_nsid = 1;
 static int g_lba_rand = 1;
 static volatile int g_measure, g_stopping;
-static int g_exit_rev;
+static int g_exit_rev, g_exit_reset;
 
 /* ------------------------------------------------------------ registers */
 static uint32_t rd32(struct drive *d, uint32_t off)
@@ -674,6 +676,19 @@ static void exit_steps(double pause)
                 printf("alias-nvme: exit step: %s: config write failed: %s\n", d->bdf, strerror(errno));
         }
         step_say("bus master off done", d->bdf);
+        if (g_exit_reset) {
+            /* The open path's reset (pci_try_reset_function: save, command
+             * register cleared, FLR, restore), which works on both drives,
+             * before the release path's (FLR on an enabled device, then the
+             * config restore at once when the drive claims Immediate
+             * Readiness: b4, where the host froze on 11-05). */
+            step_pause(pause);
+            step_say("VFIO_DEVICE_RESET (FLR the way open does it) ...", d->bdf);
+            step_pause(1.0);
+            if (ioctl(d->dfd, VFIO_DEVICE_RESET))
+                printf("alias-nvme: exit step: %s: VFIO_DEVICE_RESET: %s\n", d->bdf, strerror(errno));
+            step_say("VFIO_DEVICE_RESET done", d->bdf);
+        }
         step_pause(pause);
         if (d->bar) {
             munmap((void *)d->bar, d->bar_size);
@@ -715,7 +730,7 @@ static void usage(void)
          "     [--cpus L[/L]] [--qd N] [--bs B] [--lba rand|seq] [--nsid N]\n"
          "     [--ws N] [--stride N] [--first N] [--order cyclic|shuffle|random] [--seed N]\n"
          "     [--page-list PATH] [--backing-pages N] [--iova-base A]\n"
-         "     [--warm S] [--seconds S] [--heartbeat S] [--ready-file PATH] [--exit-steps S] [--exit-reverse]\n"
+         "     [--warm S] [--seconds S] [--heartbeat S] [--ready-file PATH] [--exit-steps S] [--exit-reverse] [--exit-reset]\n"
          "(the comment at the top of alias-nvme.c says what each does)");
 }
 
@@ -731,6 +746,7 @@ int main(int argc, char **argv)
 #define ARG(s) (!strcmp(a, s) && v && ++i)
         if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(); return 0; }
         else if (!strcmp(a, "--exit-reverse")) g_exit_rev = 1;
+        else if (!strcmp(a, "--exit-reset")) g_exit_reset = 1;
         else if (ARG("--dev")) {
             if (g_ndev == MAXDEV)
                 die("at most %d drives", MAXDEV);
