@@ -2792,7 +2792,10 @@ misses. Both are aliasing, and they make the case for the batcher.
   shared: a bound drive vanishes from the kernel for the run (bind refuses
   if anyone has it open). (4) The IOMMU groups behind PIPS decide whether
   the idle drive must go to vfio-pci too (runner handles it; `alias-vfio.sh
-  status`). (5) NIC capacity points also count mlx5's MTT fetches (README
+  status`). Checked 11-05 on bigserver: separate groups, b3:00.0 (nvme0,
+  SSD 0) in group 236 with its PIPS downstream port b2:00.0, b4:00.0
+  (nvme1, SSD 1) in 237 with b2:01.0 (the switch's ports have ACS), so each
+  drive binds alone; the ports stay on pcieport. (5) NIC capacity points also count mlx5's MTT fetches (README
   caveats). Analysis: the page-order tools read the TLP logs as before.
   The miss curves come from the results JSONL (`IOTLB_misses` per I/O against
   ws and stride); no report generator yet.
