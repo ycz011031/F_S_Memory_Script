@@ -1108,10 +1108,11 @@ and `sweep_run` gets `</dev/null`. The 11-05 reanalysis found nothing in `~`
 Recovery, same stamp (its `progress.tsv` skips the 12 done sweeps; the
 analysis and the tarball then cover all of them; ~17 h left):
 `rm ~/pips-campaign-nic-c11060312/DONE; bash scripts/pips/pips-campaign.sh nic
---alias2 --stamp c11060312 --tmux`. A bigserver alias2 launch from
-`634b53777` may have the same fault (whatever in its runner reads stdin):
-its README's `sweeps:` line shows 6 names if so; resume it the same way
-(`rm .../DONE`, `--stamp <its stamp>`).
+--alias2 --stamp c11060312 --tmux`. bigserver's launch
+(`ssd-c11060312`, same stamp by chance) was not hit: all 58 sweeps are in ~
+(nothing in the drive runner reads stdin); tarball
+`~/pips-campaign-ssd-c11060312.tar.gz`, to copy back. Its 11-05
+reanalysis likely found nothing either (no c1105 files left in ~).
 
 ### Next
 
