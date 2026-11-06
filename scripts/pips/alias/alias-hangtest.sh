@@ -19,15 +19,24 @@
 #                     31), for --pcm-for s (default 20); default: no pcm-iio
 #   --panic           soft/hard lockup, RCU stall, NMI -> panic (pstore). Off:
 #                     a lockup that would recover stays a lockup
+#   --ftrace          trace the kernel functions of the VFIO open/release path
+#                     (reset: FLR, bus reset, ready wait; power state; config
+#                     restore; IOMMU domain attach/detach and unmap) and of the
+#                     restore to nvme, fsynced per line to ftrace.txt: the last
+#                     line before a freeze names the step (11-05: the host froze
+#                     within 0.8 s of alias-nvme's exit, nothing logged)
+#   --no-d3           vfio-pci's disable_idle_d3=Y for the test (no D3hot when
+#                     the drive is idle), put back at the end
 #
 # Into ~/alias-hangtest-<time>/: log.txt (this script), kmsg.txt (dmesg -w),
-# tick.txt (1 Hz: load, alive), nvme.txt (alias-nvme), pcm-iio.out, pcie.csv.
+# tick.txt (1 Hz: load, alive), nvme.txt (alias-nvme), pcm-iio.out, pcie.csv,
+# ftrace.txt (--ftrace).
 # --show prints the last lines of each and the pstore records.
 set -u
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../../.." && pwd)
-DRIVES=01 WS=32 STRIDE=4096 QUEUES=4 QD=32 BS=4k SECS=90 PCM_AT=0 PCM_FOR=20 PANIC=0 SHOW=""
+DRIVES=01 WS=32 STRIDE=4096 QUEUES=4 QD=32 BS=4k SECS=90 PCM_AT=0 PCM_FOR=20 PANIC=0 FTRACE=0 NOD3=0 SHOW=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --drives) DRIVES="$2"; shift 2 ;;
@@ -40,6 +49,8 @@ while [ $# -gt 0 ]; do
         --pcm-at) PCM_AT="$2"; shift 2 ;;
         --pcm-for) PCM_FOR="$2"; shift 2 ;;
         --panic) PANIC=1; shift ;;
+        --ftrace) FTRACE=1; shift ;;
+        --no-d3) NOD3=1; shift ;;
         --show) SHOW="${2:-latest}"; [ $# -ge 2 ] && shift; shift ;;
         -h|--help) awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; exit 0 ;;
         *) echo "alias-hangtest: unknown option $1 (--help)" >&2; exit 2 ;;
@@ -49,9 +60,10 @@ done
 if [ -n "$SHOW" ]; then
     [ "$SHOW" = latest ] && SHOW=$(ls -td "$HOME"/alias-hangtest-*/ 2>/dev/null | head -1)
     [ -d "$SHOW" ] || { echo "alias-hangtest: no test folder ($SHOW)" >&2; exit 1; }
-    for f in log.txt tick.txt nvme.txt kmsg.txt pcm-iio.out; do
+    for f in log.txt tick.txt nvme.txt kmsg.txt pcm-iio.out ftrace.txt; do
         [ -f "$SHOW/$f" ] || continue
-        echo "== $SHOW/$f (last 15)"; tail -n 15 "$SHOW/$f"
+        n=15; [ "$f" = ftrace.txt ] && n=60
+        echo "== $SHOW/$f (last $n)"; tail -n $n "$SHOW/$f"
     done
     echo "== pstore (records of a panic)"
     sudo ls -la /sys/fs/pstore /var/lib/systemd/pstore 2>&1
@@ -75,7 +87,7 @@ slog() {   # one line to the terminal and to log.txt, on disk before going on
 }
 
 sudo -v || exit 1
-slog "alias-hangtest: into $OUT; drives $DRIVES, ws $WS stride $STRIDE, $QUEUES queues x qd $QD, bs $BS, ${SECS}s; pcm-iio $( [ "$PCM_AT" -gt 0 ] && echo "at ${PCM_AT}s for ${PCM_FOR}s" || echo off); panic $PANIC"
+slog "alias-hangtest: into $OUT; drives $DRIVES, ws $WS stride $STRIDE, $QUEUES queues x qd $QD, bs $BS, ${SECS}s; pcm-iio $( [ "$PCM_AT" -gt 0 ] && echo "at ${PCM_AT}s for ${PCM_FOR}s" || echo off); panic $PANIC; ftrace $FTRACE; no-d3 $NOD3"
 slog "kernel $(uname -r); cmdline $(cat /proc/cmdline)"
 
 # The drives: serial -> BDF while they are still on nvme.
@@ -104,6 +116,16 @@ cleanup() {
     [ -n "${PCM_PID:-}" ] && sudo pkill -9 -f -- "-csv=$OUT/pcie.csv" 2>/dev/null
     if [ "$BOUND" = 1 ]; then
         sudo bash "$HERE/alias-vfio.sh" restore "${BDFS[@]}" 2>&1 | while IFS= read -r l; do slog "$l"; done
+    fi
+    if [ -n "${TR:-}" ]; then
+        sleep 1
+        sudo bash -c 'echo 0 > "$1/tracing_on"; echo nop > "$1/current_tracer"; : > "$1/set_ftrace_filter"' _ "$TR"
+        [ -s "$OUT/ftrace.pid" ] && { fp=$(cat "$OUT/ftrace.pid"); sudo pkill -P "$fp" 2>/dev/null; sudo kill "$fp" 2>/dev/null; }
+        slog "ftrace off: $(grep -c . "$OUT/ftrace.txt" 2>/dev/null || echo 0) lines in ftrace.txt"
+    fi
+    if [ -n "${D3_SAVED:-}" ]; then
+        echo "$D3_SAVED" | sudo tee /sys/module/vfio_pci/parameters/disable_idle_d3 >/dev/null 2>&1
+        slog "vfio-pci disable_idle_d3 back to $D3_SAVED"
     fi
     for kv in "${SYSCTL_SAVED[@]}"; do sudo sysctl -q -w "$kv" >/dev/null 2>&1; done
     [ ${#SYSCTL_SAVED[@]} -gt 0 ] && slog "sysctls back: ${SYSCTL_SAVED[*]}"
@@ -148,10 +170,50 @@ if [ "$PANIC" = 1 ]; then
         slog "WARNING: no pstore backend: a panic's backtrace stays only in kmsg.txt (as far as it got)"
 fi
 
-# 4. bind, load
+# 4. bind
+if [ "$NOD3" = 1 ]; then
+    sudo modprobe vfio-pci
+    D3P=/sys/module/vfio_pci/parameters/disable_idle_d3
+    if [ -w "$D3P" ] || sudo test -w "$D3P"; then
+        D3_SAVED=$(cat "$D3P")
+        echo Y | sudo tee "$D3P" >/dev/null && slog "vfio-pci disable_idle_d3: $D3_SAVED -> $(cat "$D3P")"
+    else
+        slog "WARNING: $D3P is not writable on this kernel: --no-d3 has no effect"
+    fi
+fi
 sudo bash "$HERE/alias-vfio.sh" bind "${BDFS[@]}" 2>&1 | while IFS= read -r l; do slog "$l"; done
 [ "${PIPESTATUS[0]}" = 0 ] || { slog "ERROR: bind failed"; exit 1; }
 BOUND=1
+for b in "${BDFS[@]}"; do
+    slog "$b now: power_state $(cat /sys/bus/pci/devices/$b/power_state 2>/dev/null), reset_method '$(cat /sys/bus/pci/devices/$b/reset_method 2>/dev/null)', bridge $(basename "$(dirname "$(readlink -f /sys/bus/pci/devices/$b)")") $(cat "$(dirname "$(readlink -f /sys/bus/pci/devices/$b)")/power_state" 2>/dev/null)"
+done
+
+# 5. the kernel functions of the release path, a line each, synced
+if [ "$FTRACE" = 1 ]; then
+    TR=/sys/kernel/tracing
+    sudo test -e "$TR/trace_pipe" || TR=/sys/kernel/debug/tracing
+    FUNCS="vfio_pci_core_enable vfio_pci_core_disable vfio_pci_core_close_device vfio_pci_release vfio_pci_open_device
+           vfio_pci_dev_set_try_reset pci_reset_bus __pci_reset_bus pci_bus_reset pci_slot_reset pci_bridge_secondary_bus_reset
+           pci_try_reset_function __pci_reset_function_locked pcie_flr pci_af_flr pci_pm_reset pci_dev_wait pcie_wait_for_link
+           pci_set_power_state vfio_pci_set_power_state pci_restore_state pci_load_and_free_saved_state pci_disable_device
+           vfio_unmap_unpin vfio_remove_dma vfio_iommu_type1_detach_group vfio_iommu_type1_release
+           __iommu_attach_group __iommu_detach_group intel_iommu_attach_device intel_iommu_detach_device
+           dmar_remove_one_dev_info domain_exit vfio_pci_remove vfio_pci_core_unregister_device
+           nvme_probe nvme_reset_work nvme_pci_enable pci_pm_runtime_suspend pci_pm_runtime_resume"
+    got=$(sudo bash -c '
+        T=$1; shift
+        echo 0 > "$T/tracing_on"; echo nop > "$T/current_tracer"; : > "$T/set_ftrace_filter"; : > "$T/trace"
+        for f in "$@"; do
+            grep -qE "^$f( |\$)" "$T/available_filter_functions" && echo "$f" >> "$T/set_ftrace_filter" 2>/dev/null && printf "%s " "$f"
+        done
+        echo function > "$T/current_tracer"; echo 1 > "$T/tracing_on"' _ "$TR" $FUNCS)
+    slog "ftrace on ($TR): $got"
+    sudo bash -c 'echo $$ > "$3"; cat "$1/trace_pipe" | while IFS= read -r l; do printf "%s %s\n" "$(date +%T.%6N)" "$l" >> "$2"; sync "$2" 2>/dev/null; done' \
+        alias-hangtest-ftrace "$TR" "$OUT/ftrace.txt" "$OUT/ftrace.pid" &
+    PIDS+=($!)
+fi
+
+# 6. load
 NVME=$(bash "$HERE/alias-run.sh" --build alias-nvme 2>&1 | tail -1)
 [ -x "$NVME" ] || { slog "ERROR: alias-nvme does not build: $NVME"; exit 1; }
 slog "alias-nvme start"
@@ -163,7 +225,7 @@ NVME_PIPE=$!
 for _ in $(seq 50); do NVME_PID=$(pgrep -x alias-nvme | head -1); [ -n "$NVME_PID" ] && break; sleep 0.2; done
 TS=$SECONDS
 
-# 5. pcm-iio at its second, as record-host-metrics.sh starts it
+# 7. pcm-iio at its second, as record-host-metrics.sh starts it
 if [ "$PCM_AT" -gt 0 ]; then
     while [ $((SECONDS - TS)) -lt "$PCM_AT" ] && kill -0 "$NVME_PIPE" 2>/dev/null; do sleep 0.5; done
     sudo modprobe msr
@@ -177,10 +239,14 @@ if [ "$PCM_AT" -gt 0 ]; then
     slog "pcm-iio stopped: $(grep -c . "$OUT/pcie.csv" 2>/dev/null || echo 0) csv lines"
 fi
 
-# 6. wait for the generator (it stops itself after warm-up + seconds)
+# 8. wait for the generator (it stops itself after warm-up + seconds)
+w=0
 while kill -0 "$NVME_PIPE" 2>/dev/null; do
-    sleep 10
-    slog "alive: $(tail -1 "$OUT/nvme.txt" 2>/dev/null | cut -c1-150)"
+    sleep 1; w=$((w + 1))
+    [ $((w % 10)) = 0 ] && slog "alive: $(tail -1 "$OUT/nvme.txt" 2>/dev/null | cut -c1-150)"
 done
 NVME_PID=""
 slog "alias-nvme ended: $(grep -E 'done:|FATAL|ERROR|die' "$OUT/nvme.txt" | tail -2 | tr '\n' ' ')"
+for b in "${BDFS[@]}"; do
+    slog "$b after release: power_state $(cat /sys/bus/pci/devices/$b/power_state 2>/dev/null), driver $(basename "$(readlink /sys/bus/pci/devices/$b/driver 2>/dev/null)")"
+done
