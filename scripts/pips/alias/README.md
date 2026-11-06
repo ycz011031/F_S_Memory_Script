@@ -141,8 +141,14 @@ runner writes each NIC's Gb/s over the windows to `iperf.bw.rpt` as
   CSTS.SHST), waits `--exit-settle S` (default 10 s), and then gives the
   drives back step by step with that reset first (`--exit-steps S`, default
   1 s between steps; ~30 s in all), also resetting first on an error exit;
-  `--exit-unsafe` is the old way. Not yet shown to be enough (HANDOFF §8
-  "Next"). The runner waits 120 s for it after SIGINT before it would KILL. Never
+  `--exit-unsafe` is the old way. Not enough: b4's reset froze the host
+  after the shutdown and settle too (5 of 6 resets after a load froze; 0 of
+  ~7 at open). Hence **hold mode** (`alias-nvme --hold DIR`): open the drives
+  once, run every load on command, never release them, and end with an
+  immediate reboot (`sync; systemctl reboot -ff`: no process is stopped, so
+  nothing is released). Never `kill` the holder: its exit is the release.
+  `alias-stability.sh` tests it. The runner waits 120 s for a one-shot
+  alias-nvme after SIGINT before it would KILL. Never
   `kill -9` alias-nvme by hand. `alias-hangtest.sh` is the tool for this.
 - **Interrupt remapping:** VFIO type1 refuses to attach a group on a host
   without interrupt remapping (EPERM at `VFIO_SET_IOMMU`) unless
@@ -172,6 +178,7 @@ runner writes each NIC's Gb/s over the windows to `iperf.bw.rpt` as
 | `alias-rdma.c` | RDMA READ generator: `--role client` (host under test), `--role server` (styx) |
 | `alias-run.sh` | builds for this host when needed, then runs (`--build`, `--path`) |
 | `alias-vfio.sh` | `bind`, `restore`, `status`: nvme ↔ vfio-pci |
+| `alias-stability.sh` | ~20 min test of the hold design on bigserver: one `alias-nvme --hold` keeps both drives for the whole test and runs 14 loads (patterns, one drive or both, PIPS batcher setting changed in the pauses, pcm-iio in half of them); BMC watchdog (hard reset when the host freezes or the holder's heartbeat is stale), panic-on-lockup with `kernel.panic=10`; ends with `sync; systemctl reboot -ff` (`--no-reboot`, `--no-wd`, `--dry-run`) |
 | `alias-hangtest.sh` | one drive load by hand with the kernel log, its heartbeat and a 1 Hz tick fsynced to the host's own disk, optional pcm-iio at a set second and `--panic` (lockup → pstore); `--show` after a reboot (the 11-05 bigserver hang bisect) |
 | `alias-postmortem.sh` | after a host died in a run: the previous boot's kernel log, panic and BMC records, the runner's output, the drives and the switch now (read only) |
 | `Makefile` | `make nvme`, `make rdma` → `build/<host>/` (git-ignored) |

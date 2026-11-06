@@ -59,6 +59,22 @@
  *                        (only to reproduce the freeze)
  *   --exit-reverse       two drives: release the second --dev first
  *   An error exit (die) also resets every open drive before closing it.
+ *   --hold DIR           hold mode: open and set up the drives once, then run
+ *                        loads on command and NEVER release them (no reset of
+ *                        b4 after a load: the freeze; HANDOFF §8). A command is
+ *                        one line written to DIR/cmd (write DIR/cmd.tmp, then
+ *                        rename): "load NAME MASK WS STRIDE ORDER WARM SECONDS
+ *                        OUTDIR" (MASK bit i = the i-th --dev; outputs
+ *                        OUTDIR/fio-ssd<i>-<queue>.json and _iops.1.log). The
+ *                        holder writes DIR/state, DIR/alive (each second: epoch
+ *                        ms, pid, load|idle), DIR/done and DIR/done.<n> ("<n>
+ *                        NAME ok|FAILED"). Between loads the queues stay and only
+ *                        the IOMMU region is remapped for a new pattern. SIGINT /
+ *                        SIGTERM stop a load, never the holder. On a fatal error
+ *                        it stops writing DIR/alive and waits for ever, drives
+ *                        held (a watchdog then resets the host). End: reboot
+ *                        with "sync; systemctl reboot -ff" (no process is
+ *                        stopped, so nothing is released).
  * Exit: 0 done, 2 usage/setup, 3 a read failed (the run is not valid).
  */
 #include "alias_common.h"
@@ -691,11 +707,50 @@ static void step_say(const char *what, const char *bdf)
         printf("alias-nvme: exit step: %s\n", what);
 }
 
+/* ------------------------------------------------------------ hold mode */
+static const char *g_hold;
+static volatile int g_dead;
+
+/* DIR/name, written whole (tmp, fsync, rename): readers never see half a file */
+static void hold_write(const char *name, const char *text)
+{
+    char path[700], tmp[720];
+    snprintf(path, sizeof(path), "%s/%s", g_hold, name);
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    FILE *f = fopen(tmp, "w");
+    if (!f)
+        return;
+    fputs(text, f);
+    fflush(f);
+    fsync(fileno(f));
+    fclose(f);
+    rename(tmp, path);
+}
+
+static void hold_alive(void)
+{
+    if (!g_hold || g_dead)
+        return;
+    char b[160];
+    snprintf(b, sizeof(b), "%" PRIu64 " %d %s\n", epoch_ms(), (int)getpid(), g_measure ? "load" : "idle");
+    hold_write("alive", b);
+}
+
 /* die() and any other exit() with drives still open: the open path's reset
  * first, then close, so the kernel's release never runs the bare FLR. */
 static volatile int g_released;
 static void release_on_exit(void)
 {
+    if (g_hold && !g_released) {
+        /* Never release in hold mode: hold the drives and go quiet, so the
+         * heartbeat goes stale and the watchdog resets the host. */
+        g_dead = 1;
+        hold_write("state", "dead: a fatal error; drives held, not released; reboot to end\n");
+        fprintf(stderr, "alias-nvme: hold: fatal error: NOT releasing the drives (a release resets b4, "
+                        "which froze bigserver); reboot to end\n");
+        for (;;)
+            pause();
+    }
     if (g_released || !g_exit_reset)
         return;
     g_released = 1;
@@ -832,6 +887,208 @@ static void exit_steps(double pause)
     step_say("all released; exiting", NULL);
 }
 
+/* ------------------------------------------------------------ one load */
+static struct alias_backing g_bk;
+static int g_hb = 5;
+
+/* The drives in mask (bit i = --dev i): fresh outputs at prefix[i]-<queue>, a
+ * warm-up, secs measured (0: until a stop signal), every queue drained. The
+ * queues, the controller and the region stay as they are. */
+static int run_load(unsigned mask, char prefix[][512], double warm, double secs, const char *ready,
+                    void (*each_second)(void))
+{
+    g_measure = 0;
+    g_stopping = 0;
+    for (int i = 0; i < g_ndev; i++) {
+        if (!(mask >> i & 1))
+            continue;
+        for (int k = 0; k < g_dev[i].nq; k++) {
+            struct ioq *q = &g_dev[i].q[k];
+            char pre[600], name[64];
+            if (q->inflight)
+                fprintf(stderr, "WARNING: %s queue %d: %" PRIu64 " read(s) of the last load never completed\n",
+                        g_dev[i].bdf, q->qid, q->inflight);
+            memset(&q->st, 0, sizeof(q->st));
+            memset(q->left, 0, g_qd * sizeof(*q->left));
+            q->err = 0;
+            q->live = 0;
+            q->inflight = 0;
+            snprintf(pre, sizeof(pre), "%s-%d", prefix[i], k);
+            snprintf(name, sizeof(name), "alias_%d_%d", i, k);
+            out_open(&q->out, pre, name);
+            q->cpu = g_dev[i].cpus[0] ? cpu_of(g_dev[i].cpus, k) : -1;
+            if (pthread_create(&q->th, NULL, io_thread, q))
+                die("pthread_create");
+        }
+    }
+    uint64_t t0 = now_ns();
+    for (int i = 0; i < g_ndev; i++)
+        for (int k = 0; (mask >> i & 1) && k < g_dev[i].nq; k++)
+            while (!g_dev[i].q[k].live) {
+                if (now_ns() - t0 > 10000000000ull)
+                    die("queue threads did not start in 10 s");
+                usleep(1000);
+            }
+    touch(ready);
+    printf("alias-nvme: READY, every queue loaded\n");
+
+    int err = 0;
+    uint64_t t_start = now_ns(), next_hb = (uint64_t)g_hb;
+    for (uint64_t el = 1;; el++) {
+        sleep_until(t_start + el * 1000000000ull);
+        if (!g_measure && (double)(now_ns() - t_start) / 1e9 >= warm) {
+            for (int i = 0; i < g_ndev; i++)
+                for (int k = 0; (mask >> i & 1) && k < g_dev[i].nq; k++)
+                    out_start(&g_dev[i].q[k].out, &g_dev[i].q[k].st);
+            g_measure = 1;
+        }
+        double sum[MAXDEV] = { 0 };
+        for (int i = 0; i < g_ndev; i++)
+            for (int k = 0; (mask >> i & 1) && k < g_dev[i].nq; k++) {
+                sum[i] += out_sample(&g_dev[i].q[k].out, &g_dev[i].q[k].st, g_bs);
+                err |= g_dev[i].q[k].err;
+            }
+        if (each_second)
+            each_second();
+        if (el >= next_hb) {
+            printf("alias-nvme: t=%" PRIu64 "s %s", el, g_measure ? "measuring" : "warming");
+            for (int i = 0; i < g_ndev; i++)
+                if (mask >> i & 1)
+                    printf(" | %s %.1f kIOPS %.2f GB/s", g_dev[i].bdf, sum[i] / 1e3, sum[i] * (double)g_bs / 1e9);
+            printf("\n");
+            next_hb += (uint64_t)g_hb;
+        }
+        if (g_stop || err || (secs > 0 && (double)(now_ns() - t_start) / 1e9 >= warm + secs))
+            break;
+    }
+    g_stopping = 1;
+    for (int i = 0; i < g_ndev; i++)
+        for (int k = 0; (mask >> i & 1) && k < g_dev[i].nq; k++) {
+            pthread_join(g_dev[i].q[k].th, NULL);
+            err |= g_dev[i].q[k].err;
+        }
+    for (int i = 0; i < g_ndev; i++) {
+        struct drive *d = &g_dev[i];
+        if (!(mask >> i & 1))
+            continue;
+        double iops = 0, lat = 0, n = 0;
+        for (int k = 0; k < d->nq; k++) {
+            struct ioq *q = &d->q[k];
+            char extra[1200];
+            snprintf(extra, sizeof(extra),
+                     "\"tool\": \"alias-nvme\", \"bdf\": \"%s\", \"serial\": \"%s\", \"model\": \"%s\", "
+                     "\"queue\": %d, \"cpu\": %d, \"qd\": %u, \"bs\": %" PRIu64 ", \"cmd_bytes\": %" PRIu64
+                     ", \"lba\": \"%s\", \"ws\": %" PRIu64 ", \"stride\": %" PRIu64 ", \"first\": %" PRIu64
+                     ", \"order\": \"%s\", \"span_pages\": %" PRIu64 ", \"backing_pages\": %" PRIu64
+                     ", \"iova_base\": \"0x%" PRIx64 "\", \"group\": %d, \"page_list\": \"%s\", \"hold\": %d",
+                     d->bdf, d->serial, d->model, q->qid, q->cpu, g_qd, g_bs, g_cmd,
+                     g_lba_rand ? "rand" : "seq", g_pat.ws, g_pat.stride, g_pat.first,
+                     order_name(g_pat.order), g_pat.span, g_bk.pages, d->data_iova, d->group,
+                     g_pat.list_path ? g_pat.list_path : "", g_hold ? 1 : 0);
+            out_close(&q->out, &q->st, extra, q->err);
+            double sec = q->out.started ? (double)(now_ns() - q->out.start_ns) / 1e9 : 0;
+            iops += sec ? (double)(q->st.ios - q->out.ios0) / sec : 0;
+            lat += (double)q->st.lat_sum_ns;
+            n += (double)q->st.lat_n;
+        }
+        printf("alias-nvme: %s done: %.1f kIOPS, %.2f GB/s, mean %.1f us%s\n", d->bdf, iops / 1e3,
+               iops * (double)g_bs / 1e9, n ? lat / n / 1e3 : 0, err ? " (FAILED)" : "");
+    }
+    g_stopping = 0;
+    g_measure = 0;
+    return err;
+}
+
+/* A new pattern between loads: unmap the region in every domain, a new
+ * backing, map the new region. The device is not touched. */
+static void pattern_switch(uint64_t ws, uint64_t stride, const char *order)
+{
+    for (int i = 0; i < g_ndev; i++) {
+        struct drive *d = &g_dev[i];
+        int dup = 0;
+        for (int j = 0; j < i; j++)
+            if (g_dev[j].ct == d->ct && g_dev[j].data_iova == d->data_iova)
+                dup = 1;
+        if (dup)
+            continue;
+        struct vfio_iommu_type1_dma_unmap u;
+        memset(&u, 0, sizeof(u));
+        u.argsz = sizeof(u);
+        u.iova = d->data_iova;
+        u.size = g_pat.span * ALIAS_PAGE;
+        if (ioctl(d->ct->fd, VFIO_IOMMU_UNMAP_DMA, &u))
+            die("%s: VFIO unmap of the region: %s", d->bdf, strerror(errno));
+    }
+    munmap(g_bk.va, g_bk.pages * ALIAS_PAGE);
+    close(g_bk.fd);
+    free(g_pat.page);
+    g_pat.page = NULL;
+    g_pat.list_path = NULL;
+    g_pat.ws = ws;
+    g_pat.stride = stride;
+    g_pat.order = parse_order(order);
+    pattern_build(&g_pat);
+    pattern_print(&g_pat, stdout, "alias-nvme");
+    backing_create(&g_bk, g_backing ? g_backing : backing_default(g_pat.span));
+    for (int i = 0; i < g_ndev; i++) {
+        if (g_dev[i].data_iova != g_iova_base && g_pat.span * ALIAS_PAGE > (1ull << 40))
+            die("two drives in one IOMMU group need spans under 1 TiB");
+        map_data(&g_dev[i], &g_bk);
+    }
+}
+
+static void hold_loop(void)
+{
+    char b[300];
+    snprintf(b, sizeof(b), "ready %d\n", (int)getpid());
+    hold_write("state", b);
+    printf("alias-nvme: HOLD %s: drives open, waiting for commands in %s/cmd; SIGINT/SIGTERM stop a load, "
+           "never the holder; end with: sync; systemctl reboot -ff\n", g_hold, g_hold);
+    for (unsigned n = 1;;) {
+        hold_alive();
+        g_stop = 0;
+        char path[700], line[1200];
+        snprintf(path, sizeof(path), "%s/cmd", g_hold);
+        FILE *f = fopen(path, "r");
+        if (!f) {
+            step_pause(0.25);
+            continue;
+        }
+        if (!fgets(line, sizeof(line), f))
+            line[0] = 0;
+        fclose(f);
+        char taken[720];
+        snprintf(taken, sizeof(taken), "%s/cmd.%u", g_hold, n);
+        rename(path, taken);
+        char name[128], ord[32], outdir[600];
+        unsigned mask = 0;
+        unsigned long long ws = 0, stride = 0;
+        double warm = 0, secs = 0;
+        if (sscanf(line, "load %127s %u %llu %llu %31s %lf %lf %599s", name, &mask, &ws, &stride, ord,
+                   &warm, &secs, outdir) != 8 || !(mask & ((1u << g_ndev) - 1)) || !ws || !stride || secs <= 0) {
+            line[strcspn(line, "\n")] = 0;
+            printf("alias-nvme: hold: command %u not understood: '%s'\n", n, line);
+            snprintf(b, sizeof(b), "%u bad-command\n", n);
+        } else {
+            printf("alias-nvme: hold: load %u '%s': drives 0x%x, ws %llu stride %llu %s, warm %.0f s, %.0f s, into %s\n",
+                   n, name, mask, ws, stride, ord, warm, secs, outdir);
+            if (ws != g_pat.ws || stride != g_pat.stride || parse_order(ord) != g_pat.order)
+                pattern_switch(ws, stride, ord);
+            char pre[MAXDEV][512];
+            for (int i = 0; i < g_ndev; i++)
+                snprintf(pre[i], sizeof(pre[i]), "%s/fio-ssd%d", outdir, i);
+            int err = run_load(mask & ((1u << g_ndev) - 1), pre, warm, secs, NULL, hold_alive);
+            snprintf(b, sizeof(b), "%u %s %s\n", n, name, err ? "FAILED" : "ok");
+            printf("alias-nvme: hold: load %u '%s' %s; idle, drives held\n", n, name, err ? "FAILED" : "done");
+        }
+        char dn[32];
+        snprintf(dn, sizeof(dn), "done.%u", n);
+        hold_write(dn, b);
+        hold_write("done", b);
+        n++;
+    }
+}
+
 static void usage(void)
 {
     puts("sudo alias-nvme --dev BDF=PREFIX [--dev BDF=PREFIX] [--serial S[,S]] [--queues N[,N]]\n"
@@ -839,6 +1096,7 @@ static void usage(void)
          "     [--ws N] [--stride N] [--first N] [--order cyclic|shuffle|random] [--seed N]\n"
          "     [--page-list PATH] [--backing-pages N] [--iova-base A]\n"
          "     [--warm S] [--seconds S] [--heartbeat S] [--ready-file PATH] [--exit-steps S] [--exit-settle S] [--exit-d3] [--exit-reverse] [--exit-unsafe]\n"
+         "     [--hold DIR]\n"
          "(the comment at the top of alias-nvme.c says what each does)");
 }
 
@@ -893,6 +1151,7 @@ int main(int argc, char **argv)
         else if (ARG("--heartbeat")) hb = (int)parse_u64(a, v);
         else if (ARG("--ready-file")) ready = v;
         else if (ARG("--exit-steps")) exit_pause = atof(v);
+        else if (ARG("--hold")) g_hold = v;
         else { usage(); die("unknown or incomplete option '%s'", a); }
 #undef ARG
     }
@@ -903,6 +1162,7 @@ int main(int argc, char **argv)
     if (g_iova_base % (1ull << 30))
         die("--iova-base must be 1 GiB aligned");
     if (hb < 1) hb = 1;
+    g_hb = hb;
     {   /* per-drive lists: "a,b" or "a/b" style */
         char qb[128], cb[1024], sb[256];
         snprintf(qb, sizeof(qb), "%s", queues);
@@ -927,10 +1187,13 @@ int main(int argc, char **argv)
         }
     }
     stop_on_signals();
+    if (g_hold) {                         /* a closed ssh session must not end the holder */
+        signal(SIGHUP, SIG_IGN);
+        signal(SIGQUIT, SIG_IGN);
+    }
     pattern_build(&g_pat);
     pattern_print(&g_pat, stdout, "alias-nvme");
-    struct alias_backing bk;
-    backing_create(&bk, g_backing ? g_backing : backing_default(g_pat.span));
+    backing_create(&g_bk, g_backing ? g_backing : backing_default(g_pat.span));
 
     atexit(release_on_exit);
     for (int i = 0; i < g_ndev; i++) {
@@ -957,92 +1220,19 @@ int main(int argc, char **argv)
                 d->data_iova = g_dev[j].data_iova + (1ull << 40);
         if (d->data_iova != g_iova_base && g_pat.span * ALIAS_PAGE > (1ull << 40))
             die("two drives in one IOMMU group need spans under 1 TiB");
-        map_data(d, &bk);
+        map_data(d, &g_bk);
         queues_create(d);
     }
     printf("alias-nvme: %d drive(s), bs %" PRIu64 " = %u command(s) of %" PRIu64 " KiB, qd %u, lba %s, "
            "backing %" PRIu64 " pages\n", g_ndev, g_bs, g_k, g_cmd >> 10, g_qd,
-           g_lba_rand ? "rand" : "seq", bk.pages);
+           g_lba_rand ? "rand" : "seq", g_bk.pages);
 
+    if (g_hold)
+        hold_loop();                      /* never returns */
+    char pre[MAXDEV][512];
     for (int i = 0; i < g_ndev; i++)
-        for (int k = 0; k < g_dev[i].nq; k++) {
-            struct ioq *q = &g_dev[i].q[k];
-            char pre[600], name[64];
-            snprintf(pre, sizeof(pre), "%s-%d", g_dev[i].prefix, k);
-            snprintf(name, sizeof(name), "alias_%d_%d", i, k);
-            out_open(&q->out, pre, name);
-            q->cpu = g_dev[i].cpus[0] ? cpu_of(g_dev[i].cpus, k) : -1;
-            if (pthread_create(&q->th, NULL, io_thread, q))
-                die("pthread_create");
-        }
-    uint64_t t0 = now_ns();
-    for (int i = 0; i < g_ndev; i++)
-        for (int k = 0; k < g_dev[i].nq; k++)
-            while (!g_dev[i].q[k].live) {
-                if (now_ns() - t0 > 10000000000ull)
-                    die("queue threads did not start in 10 s");
-                usleep(1000);
-            }
-    touch(ready);
-    printf("alias-nvme: READY, every queue loaded\n");
-
-    int err = 0;
-    uint64_t t_start = now_ns(), next_hb = (uint64_t)hb;
-    for (uint64_t el = 1;; el++) {
-        sleep_until(t_start + el * 1000000000ull);
-        if (!g_measure && (double)(now_ns() - t_start) / 1e9 >= warm) {
-            for (int i = 0; i < g_ndev; i++)
-                for (int k = 0; k < g_dev[i].nq; k++)
-                    out_start(&g_dev[i].q[k].out, &g_dev[i].q[k].st);
-            g_measure = 1;
-        }
-        double sum[MAXDEV] = { 0 };
-        for (int i = 0; i < g_ndev; i++)
-            for (int k = 0; k < g_dev[i].nq; k++) {
-                sum[i] += out_sample(&g_dev[i].q[k].out, &g_dev[i].q[k].st, g_bs);
-                err |= g_dev[i].q[k].err;
-            }
-        if (el >= next_hb) {
-            printf("alias-nvme: t=%" PRIu64 "s %s", el, g_measure ? "measuring" : "warming");
-            for (int i = 0; i < g_ndev; i++)
-                printf(" | %s %.1f kIOPS %.2f GB/s", g_dev[i].bdf, sum[i] / 1e3, sum[i] * (double)g_bs / 1e9);
-            printf("\n");
-            next_hb += (uint64_t)hb;
-        }
-        if (g_stop || err || (secs > 0 && (double)(now_ns() - t_start) / 1e9 >= warm + secs))
-            break;
-    }
-    g_stopping = 1;
-    for (int i = 0; i < g_ndev; i++)
-        for (int k = 0; k < g_dev[i].nq; k++) {
-            pthread_join(g_dev[i].q[k].th, NULL);
-            err |= g_dev[i].q[k].err;
-        }
-    for (int i = 0; i < g_ndev; i++) {
-        struct drive *d = &g_dev[i];
-        double iops = 0, lat = 0, n = 0;
-        for (int k = 0; k < d->nq; k++) {
-            struct ioq *q = &d->q[k];
-            char extra[1200];
-            snprintf(extra, sizeof(extra),
-                     "\"tool\": \"alias-nvme\", \"bdf\": \"%s\", \"serial\": \"%s\", \"model\": \"%s\", "
-                     "\"queue\": %d, \"cpu\": %d, \"qd\": %u, \"bs\": %" PRIu64 ", \"cmd_bytes\": %" PRIu64
-                     ", \"lba\": \"%s\", \"ws\": %" PRIu64 ", \"stride\": %" PRIu64 ", \"first\": %" PRIu64
-                     ", \"order\": \"%s\", \"span_pages\": %" PRIu64 ", \"backing_pages\": %" PRIu64
-                     ", \"iova_base\": \"0x%" PRIx64 "\", \"group\": %d, \"page_list\": \"%s\"",
-                     d->bdf, d->serial, d->model, q->qid, q->cpu, g_qd, g_bs, g_cmd,
-                     g_lba_rand ? "rand" : "seq", g_pat.ws, g_pat.stride, g_pat.first,
-                     order_name(g_pat.order), g_pat.span, bk.pages, d->data_iova, d->group,
-                     g_pat.list_path ? g_pat.list_path : "");
-            out_close(&q->out, &q->st, extra, q->err);
-            double sec = q->out.started ? (double)(now_ns() - q->out.start_ns) / 1e9 : 0;
-            iops += sec ? (double)(q->st.ios - q->out.ios0) / sec : 0;
-            lat += (double)q->st.lat_sum_ns;
-            n += (double)q->st.lat_n;
-        }
-        printf("alias-nvme: %s done: %.1f kIOPS, %.2f GB/s, mean %.1f us%s\n", d->bdf, iops / 1e3,
-               iops * (double)g_bs / 1e9, n ? lat / n / 1e3 : 0, err ? " (FAILED)" : "");
-    }
+        snprintf(pre[i], sizeof(pre[i]), "%s", g_dev[i].prefix);
+    int err = run_load((1u << g_ndev) - 1, pre, warm, secs, ready, NULL);
     for (int i = 0; i < g_ndev; i++)
         nvme_teardown(&g_dev[i]);
     printf("alias-nvme: controllers disabled; rebind with alias-vfio.sh restore\n");
