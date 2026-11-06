@@ -50,7 +50,10 @@
 #   nic  <logs>/<sweep>-<set>-uncapped-<point>-RUN-*/pips-log*.bin*
 # A 4 KiB point whose run was dropped for missing pcm-iio rows still has its
 # log, and is used. Sweeps with "-strict-" in the name get --strict (a page's
-# new visit always misses in the IOTLB simulation).
+# new visit always misses in the IOTLB simulation). PIPS_SEQ_STRICT=0|1
+# overrides that (0 for the alias campaigns: their pages are mapped once and
+# never invalidated), and PIPS_SEQ_IOTLB the simulated geometries (SETSxWAYS,
+# default 1x64,16x4,64x1; e.g. icx 32x8,64x4,128x2, bigserver 1x96,1x64,1x128).
 #
 # Calibration (with a model, v2 logs): pips-page-seq.py --calibrate on every
 # log first (a few seconds each): each log's output as logged lacks the stalls
@@ -149,6 +152,8 @@ mkdir -p "$OUT"
 
 STRICT=""
 case "$SWEEP" in *-strict-*) STRICT="--strict" ;; esac
+case "${PIPS_SEQ_STRICT:-}" in 0) STRICT="" ;; 1) STRICT="--strict" ;; esac
+IOTLB=${PIPS_SEQ_IOTLB:-1x64,16x4,64x1}
 PY=${PYTHON:-python3}
 SEQ="$HERE/pips-page-seq.py"
 MODEL_ARG=""
@@ -179,7 +184,7 @@ jobs_file="$OUT/.jobs"
     echo "sweep $SWEEP  sets: $SETS"
     [ -n "$MANIFEST" ] && echo "manifest $MANIFEST  sweep_id $SWEEP_ID"
     echo "points: $POINTS"
-    echo "pips-page-seq.py --kind $KIND --iotlb 1x64,16x4,64x1 $STRICT $MODEL_ARG --show $SHOW --from 100000 --port out,arr"
+    echo "pips-page-seq.py --kind $KIND --iotlb $IOTLB $STRICT $MODEL_ARG --show $SHOW --from 100000 --port out,arr"
     echo
 } > "$OUT/manifest.txt"
 missing=0
@@ -248,7 +253,7 @@ fi
 one() {
     local set=$1 point=$2 log=$3
     local base="$set-$point" t0=$SECONDS st
-    if $PY "$SEQ" "$log" --kind "$KIND" --iotlb 1x64,16x4,64x1 $STRICT $MODEL_ARG --json "$OUT/.$base.json" \
+    if $PY "$SEQ" "$log" --kind "$KIND" --iotlb "$IOTLB" $STRICT $MODEL_ARG --json "$OUT/.$base.json" \
            --show "$SHOW" --from 100000 --port out,arr --progress > "$OUT/seq-$base.txt" 2> "$OUT/.$base.err"; then
         st="done"
     else

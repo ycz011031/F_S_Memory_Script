@@ -34,6 +34,14 @@
  *   --lba rand|seq       where on the namespace (default rand, aligned to bs)
  *   --nsid N             namespace (default 1)
  *   --ws --stride --first --order --seed --page-list --backing-pages: the pattern
+ *   --ws1 --stride1 --first1 --order1 --page-list1: the second --dev's own
+ *                        pattern (default: the first's); each drive maps its own
+ *                        region in its own domain
+ *   --cursor queue|shared  queue (default): each queue walks the pattern from its
+ *                        own place (started 1/nq of the way apart; the phases
+ *                        drift); shared: every queue of a drive takes the next
+ *                        page from one cursor, so the drive visits its pages in
+ *                        strict pattern order (random order: per queue anyway)
  *   --iova-base A        IOVA of region page 0 (default 0x4000000000)
  *   --warm S --seconds S warm-up, then measure (0 = until SIGINT/TERM)
  *   --heartbeat S --ready-file PATH (touched when every queue is loaded)
@@ -64,7 +72,11 @@
  *                        b4 after a load: the freeze; HANDOFF §8). A command is
  *                        one line written to DIR/cmd (write DIR/cmd.tmp, then
  *                        rename): "load NAME MASK WS STRIDE ORDER WARM SECONDS
- *                        OUTDIR [READYFILE]" (MASK bit i = the i-th --dev;
+ *                        OUTDIR [READYFILE] [KEY=VALUE ...]" (MASK bit i = the i-th --dev;
+ *                        keys: first= list= (drive 0, and drive 1 unless its
+ *                        own is given), ws1= stride1= order1= first1= list1=
+ *                        (drive 1), cursor=queue|shared, seed=; a drive whose
+ *                        pattern changes gets its region remapped;
  *                        outputs OUTDIR/fio-ssd<i>-<queue>.json and _iops.1.log;
  *                        READYFILE touched once every queue is loaded). A file
  *                        DIR/stop ends the load under way (as SIGINT does). The
@@ -137,9 +149,14 @@ struct drive {
     uint8_t *idbuf;
     uint64_t idbuf_io;
     struct ioq *q;
+    struct alias_pattern pat;          /* this drive's pages (its own region, its own domain) */
+    struct alias_backing bk;
+    uint64_t spos;                     /* --cursor shared: the drive's one cursor */
+    char list[600];                    /* pat.list_path's storage */
 };
 
-static struct alias_pattern g_pat;
+static struct alias_pattern g_pat, g_pat1;  /* the command line's patterns: drive 0, drive 1 */
+static int g_have1, g_cursor_shared;
 static struct drive g_dev[MAXDEV];
 static int g_ndev;
 static struct ctr g_ctr[MAXDEV];
@@ -519,16 +536,38 @@ static void nvme_teardown(struct drive *d)
 
 /* The region: the pattern's span at data_iova, repeating the backing. Chunks
  * of the backing's size when that is few mappings, else the pattern's pages. */
+static int cmp_u64(const void *a, const void *b)
+{
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+static uint64_t distinct_pages(const struct alias_pattern *p, uint64_t **out)
+{
+    uint64_t *pg = malloc(p->ws * sizeof(*pg)), n = 0;
+    if (!pg)
+        die("out of memory");
+    memcpy(pg, p->page, p->ws * sizeof(*pg));
+    qsort(pg, p->ws, sizeof(*pg), cmp_u64);
+    for (uint64_t i = 0; i < p->ws; i++)
+        if (!i || pg[i] != pg[i - 1])
+            pg[n++] = pg[i];
+    *out = pg;
+    return n;
+}
+
+/* Sparse patterns (a page list, or a span over 64 times the pages it uses)
+ * map only their own pages, one VFIO mapping each: the IOMMU walks the same
+ * path to a page either way, and a 64 GiB span is then 64 mappings, not
+ * 16 M pinned pages. */
 static void map_data(struct drive *d, const struct alias_backing *b)
 {
-    uint64_t span = g_pat.span, chunks = (span + b->pages - 1) / b->pages;
-    int same = 0;
-    for (int i = 0; i < d->idx; i++)
-        if (g_dev[i].ct == d->ct && g_dev[i].data_iova == d->data_iova)
-            same = 1;
-    if (same)
-        return;                           /* the other drive mapped it in this domain */
-    if (chunks <= ALIAS_MAX_CHUNKS / MAXDEV) {
+    const struct alias_pattern *P = &d->pat;
+    uint64_t span = P->span, chunks = (span + b->pages - 1) / b->pages;
+    uint64_t *pg = NULL, n = distinct_pages(P, &pg);
+    int sparse = (P->list_path || span > 64 * n) && n <= ALIAS_MAX_CHUNKS / MAXDEV;
+    if (!sparse && chunks <= ALIAS_MAX_CHUNKS / MAXDEV) {
+        free(pg);
         for (uint64_t c = 0; c < chunks; c++) {
             uint64_t n = span - c * b->pages < b->pages ? span - c * b->pages : b->pages;
             dma_map(d->ct, b->va, d->data_iova + c * b->pages * ALIAS_PAGE, n * ALIAS_PAGE);
@@ -537,17 +576,6 @@ static void map_data(struct drive *d, const struct alias_backing *b)
                PRIu64 " backing pages\n", d->bdf, d->data_iova, d->data_iova + span * ALIAS_PAGE, chunks, b->pages);
         return;
     }
-    uint64_t *pg = malloc(g_pat.ws * sizeof(*pg)), n = 0;
-    if (!pg)
-        die("out of memory");
-    memcpy(pg, g_pat.page, g_pat.ws * sizeof(*pg));
-    for (uint64_t i = 1; i < g_pat.ws; i++)            /* insertion sort is fine at these sizes */
-        for (uint64_t j = i; j > 0 && pg[j - 1] > pg[j]; j--) {
-            uint64_t t = pg[j]; pg[j] = pg[j - 1]; pg[j - 1] = t;
-        }
-    for (uint64_t i = 0; i < g_pat.ws; i++)
-        if (!i || pg[i] != pg[i - 1])
-            pg[n++] = pg[i];
     if (n > ALIAS_MAX_CHUNKS / MAXDEV)
         die("%" PRIu64 " distinct pages over a span of %" PRIu64 ": too many VFIO mappings; "
             "raise --backing-pages or shrink the pattern", n, span);
@@ -559,6 +587,14 @@ static void map_data(struct drive *d, const struct alias_backing *b)
 }
 
 /* ------------------------------------------------------------ I/O */
+static inline uint64_t next_page(struct ioq *q)
+{
+    struct drive *d = q->d;
+    if (g_cursor_shared && d->pat.order != ORDER_RANDOM)
+        return d->pat.page[__atomic_fetch_add(&d->spos, 1, __ATOMIC_RELAXED) % d->pat.ws];
+    return pattern_next(&d->pat, &q->cur);
+}
+
 static void io_submit(struct ioq *q, uint32_t io)
 {
     struct drive *d = q->d;
@@ -578,13 +614,13 @@ static void io_submit(struct ioq *q, uint32_t io)
         memset(&e, 0, sizeof(e));
         e.dw[0] = 0x02 | (cid << 16);
         e.dw[1] = d->nsid;
-        uint64_t p0 = d->data_iova + pattern_next(&g_pat, &q->cur) * ALIAS_PAGE, p1 = 0;
+        uint64_t p0 = d->data_iova + next_page(q) * ALIAS_PAGE, p1 = 0;
         if (np == 2) {
-            p1 = d->data_iova + pattern_next(&g_pat, &q->cur) * ALIAS_PAGE;
+            p1 = d->data_iova + next_page(q) * ALIAS_PAGE;
         } else if (np > 2) {
             uint64_t *l = q->prp_va + (uint64_t)cid * (ALIAS_PAGE / 8);
             for (uint32_t j = 1; j < np; j++)
-                l[j - 1] = d->data_iova + pattern_next(&g_pat, &q->cur) * ALIAS_PAGE;
+                l[j - 1] = d->data_iova + next_page(q) * ALIAS_PAGE;
             p1 = q->prp_io + (uint64_t)cid * ALIAS_PAGE;
         }
         e.dw[6] = (uint32_t)p0; e.dw[7] = (uint32_t)(p0 >> 32);
@@ -606,7 +642,7 @@ static void *io_thread(void *arg)
     struct ioq *q = arg;
     struct drive *d = q->d;
     pin_cpu(q->cpu);
-    cursor_init(&g_pat, &q->cur, (uint64_t)q->idx, (uint64_t)d->nq);
+    cursor_init(&d->pat, &q->cur, (uint64_t)q->idx, (uint64_t)d->nq);
     q->cur.rng ^= (uint64_t)(d->idx + 1) * 0x94D049BB133111EBull;
     q->rng = (uint64_t)(d->idx + 1) * 0x9E3779B97F4A7C15ull ^ (uint64_t)(q->idx + 1) * 0xBF58476D1CE4E5B9ull;
     q->seqlba = (d->nsze / (uint64_t)d->nq) * (uint64_t)q->idx / (g_bs / d->lba) * (g_bs / d->lba);
@@ -898,7 +934,6 @@ static void exit_steps(double pause)
 }
 
 /* ------------------------------------------------------------ one load */
-static struct alias_backing g_bk;
 static int g_hb = 5;
 
 /* The drives in mask (bit i = --dev i): fresh outputs at prefix[i]-<queue>, a
@@ -993,11 +1028,13 @@ static int run_load(unsigned mask, char prefix[][512], double warm, double secs,
                      "\"queue\": %d, \"cpu\": %d, \"qd\": %u, \"bs\": %" PRIu64 ", \"cmd_bytes\": %" PRIu64
                      ", \"lba\": \"%s\", \"ws\": %" PRIu64 ", \"stride\": %" PRIu64 ", \"first\": %" PRIu64
                      ", \"order\": \"%s\", \"span_pages\": %" PRIu64 ", \"backing_pages\": %" PRIu64
-                     ", \"iova_base\": \"0x%" PRIx64 "\", \"group\": %d, \"page_list\": \"%s\", \"hold\": %d",
+                     ", \"iova_base\": \"0x%" PRIx64 "\", \"group\": %d, \"page_list\": \"%s\", \"hold\": %d, "
+                     "\"cursor\": \"%s\"",
                      d->bdf, d->serial, d->model, q->qid, q->cpu, g_qd, g_bs, g_cmd,
-                     g_lba_rand ? "rand" : "seq", g_pat.ws, g_pat.stride, g_pat.first,
-                     order_name(g_pat.order), g_pat.span, g_bk.pages, d->data_iova, d->group,
-                     g_pat.list_path ? g_pat.list_path : "", g_hold ? 1 : 0);
+                     g_lba_rand ? "rand" : "seq", d->pat.ws, d->pat.stride, d->pat.first,
+                     order_name(d->pat.order), d->pat.span, d->bk.pages, d->data_iova, d->group,
+                     d->pat.list_path ? d->pat.list_path : "", g_hold ? 1 : 0,
+                     g_cursor_shared ? "shared" : "queue");
             out_close(&q->out, &q->st, extra, q->err);
             double sec = q->out.started ? (double)(now_ns() - q->out.start_ns) / 1e9 : 0;
             iops += sec ? (double)(q->st.ios - q->out.ios0) / sec : 0;
@@ -1013,48 +1050,58 @@ static int run_load(unsigned mask, char prefix[][512], double warm, double secs,
     return err;
 }
 
-/* A new pattern between loads: unmap the region in every domain, a new
- * backing, map the new region. The device is not touched. */
-static void pattern_switch(uint64_t ws, uint64_t stride, const char *order)
+/* A drive's pattern (t, unbuilt) built, its backing made and its region
+ * mapped in its domain. */
+static void drive_pattern(struct drive *d, const struct alias_pattern *t)
 {
-    for (int i = 0; i < g_ndev; i++) {
-        struct drive *d = &g_dev[i];
-        int dup = 0;
-        for (int j = 0; j < i; j++)
-            if (g_dev[j].ct == d->ct && g_dev[j].data_iova == d->data_iova)
-                dup = 1;
-        if (dup)
-            continue;
-        struct vfio_iommu_type1_dma_unmap u;
-        memset(&u, 0, sizeof(u));
-        u.argsz = sizeof(u);
-        u.iova = d->data_iova;
-        u.size = g_pat.span * ALIAS_PAGE;
-        if (ioctl(d->ct->fd, VFIO_IOMMU_UNMAP_DMA, &u))
-            die("%s: VFIO unmap of the region: %s", d->bdf, strerror(errno));
+    d->pat = *t;
+    d->pat.page = NULL;
+    if (t->list_path) {
+        snprintf(d->list, sizeof(d->list), "%s", t->list_path);
+        d->pat.list_path = d->list;
     }
-    munmap(g_bk.va, g_bk.pages * ALIAS_PAGE);
-    close(g_bk.fd);
-    free(g_pat.page);
-    g_pat.page = NULL;
-    g_pat.list_path = NULL;
-    g_pat.ws = ws;
-    g_pat.stride = stride;
-    g_pat.order = parse_order(order);
-    pattern_build(&g_pat);
-    pattern_print(&g_pat, stdout, "alias-nvme");
-    backing_create(&g_bk, g_backing ? g_backing : backing_default(g_pat.span));
-    for (int i = 0; i < g_ndev; i++) {
-        if (g_dev[i].data_iova != g_iova_base && g_pat.span * ALIAS_PAGE > (1ull << 40))
-            die("two drives in one IOMMU group need spans under 1 TiB");
-        map_data(&g_dev[i], &g_bk);
-    }
+    pattern_build(&d->pat);
+    char who[64];
+    snprintf(who, sizeof(who), "alias-nvme %s", d->bdf);
+    pattern_print(&d->pat, stdout, who);
+    backing_create(&d->bk, g_backing ? g_backing : backing_default(d->pat.span));
+    if (d->data_iova != g_iova_base && d->pat.span * ALIAS_PAGE > (1ull << 40))
+        die("two drives in one IOMMU group need spans under 1 TiB");
+    map_data(d, &d->bk);
+    d->spos = 0;
+}
+
+static int same_pattern(const struct alias_pattern *a, const struct alias_pattern *b)
+{
+    if (!!a->list_path != !!b->list_path)
+        return 0;
+    if (a->list_path)
+        return !strcmp(a->list_path, b->list_path) && a->order == b->order && a->seed == b->seed;
+    return a->ws == b->ws && a->stride == b->stride && a->first == b->first && a->order == b->order &&
+           a->seed == b->seed;
+}
+
+/* A new pattern for one drive between loads: unmap its region, a new
+ * backing, map the new region. The device is not touched. */
+static void pattern_switch(struct drive *d, const struct alias_pattern *t)
+{
+    struct vfio_iommu_type1_dma_unmap u;
+    memset(&u, 0, sizeof(u));
+    u.argsz = sizeof(u);
+    u.iova = d->data_iova;
+    u.size = d->pat.span * ALIAS_PAGE;
+    if (ioctl(d->ct->fd, VFIO_IOMMU_UNMAP_DMA, &u))
+        die("%s: VFIO unmap of the region: %s", d->bdf, strerror(errno));
+    munmap(d->bk.va, d->bk.pages * ALIAS_PAGE);
+    close(d->bk.fd);
+    free(d->pat.page);
+    drive_pattern(d, t);
 }
 
 static void hold_loop(void)
 {
     char b[300];
-    snprintf(b, sizeof(b), "ready %d\n", (int)getpid());
+    snprintf(b, sizeof(b), "ready %d v2\n", (int)getpid());   /* v2: per-drive patterns, load extras, --cursor (11-06) */
     hold_write("state", b);
     printf("alias-nvme: HOLD %s: drives open, waiting for commands in %s/cmd; SIGINT/SIGTERM stop a load, "
            "never the holder; end with: sync; systemctl reboot -ff\n", g_hold, g_hold);
@@ -1074,20 +1121,77 @@ static void hold_loop(void)
         char taken[720];
         snprintf(taken, sizeof(taken), "%s/cmd.%u", g_hold, n);
         rename(path, taken);
-        char name[128], ord[32], outdir[600], ready[600] = "";
+        char name[128], ord[32], outdir[600], ready[600] = "", why[200] = "";
         unsigned mask = 0;
         unsigned long long ws = 0, stride = 0;
         double warm = 0, secs = 0;
-        if (sscanf(line, "load %127s %u %llu %llu %31s %lf %lf %599s %599s", name, &mask, &ws, &stride, ord,
-                   &warm, &secs, outdir, ready) < 8 || !(mask & ((1u << g_ndev) - 1)) || !ws || !stride || secs <= 0) {
+        struct alias_pattern t[MAXDEV];
+        int bad = sscanf(line, "load %127s %u %llu %llu %31s %lf %lf %599s", name, &mask, &ws, &stride, ord,
+                         &warm, &secs, outdir) < 8 || !(mask & ((1u << g_ndev) - 1)) || !ws || !stride || secs <= 0 ||
+                  (strcmp(ord, "cyclic") && strcmp(ord, "shuffle") && strcmp(ord, "random"));
+        int cursor = 0;
+        if (!bad) {   /* the optional READYFILE, then KEY=VALUE extras */
+            char tmp[1200], *sv = NULL, *tok;
+            int k = 0;
+            unsigned long long ws1 = 0, stride1 = 0, first = 0, first1 = 0, seed = 1;
+            int have_first1 = 0, have_list1 = 0;
+            char ord1[32] = "", list[600] = "", list1[600] = "";
+            snprintf(tmp, sizeof(tmp), "%s", line);
+            tmp[strcspn(tmp, "\n")] = 0;
+            for (tok = strtok_r(tmp, " \t", &sv); tok; tok = strtok_r(NULL, " \t", &sv), k++) {
+                if (k < 9)
+                    continue;               /* load NAME MASK WS STRIDE ORDER WARM SECONDS OUTDIR */
+                char *eq = strchr(tok, '=');
+                if (!eq) {
+                    if (k == 9) snprintf(ready, sizeof(ready), "%s", tok);
+                    else { snprintf(why, sizeof(why), "stray word '%.60s'", tok); bad = 1; }
+                    continue;
+                }
+                *eq = 0;
+                const char *key = tok, *val = eq + 1;
+                if (!strcmp(key, "ws1")) ws1 = strtoull(val, NULL, 0);
+                else if (!strcmp(key, "stride1")) stride1 = strtoull(val, NULL, 0);
+                else if (!strcmp(key, "first")) first = strtoull(val, NULL, 0);
+                else if (!strcmp(key, "first1")) { first1 = strtoull(val, NULL, 0); have_first1 = 1; }
+                else if (!strcmp(key, "seed")) seed = strtoull(val, NULL, 0);
+                else if (!strcmp(key, "order1")) snprintf(ord1, sizeof(ord1), "%s", val);
+                else if (!strcmp(key, "list")) snprintf(list, sizeof(list), "%s", val);
+                else if (!strcmp(key, "list1")) { snprintf(list1, sizeof(list1), "%s", val); have_list1 = 1; }
+                else if (!strcmp(key, "cursor")) {
+                    if (!strcmp(val, "shared")) cursor = 1;
+                    else if (strcmp(val, "queue")) { snprintf(why, sizeof(why), "cursor=%.20s", val); bad = 1; }
+                }
+                else { snprintf(why, sizeof(why), "unknown key '%.40s'", key); bad = 1; }
+            }
+            if (ord1[0] && strcmp(ord1, "cyclic") && strcmp(ord1, "shuffle") && strcmp(ord1, "random")) {
+                snprintf(why, sizeof(why), "order1=%.20s", ord1);
+                bad = 1;
+            }
+            for (int i = 0; i < MAXDEV && !bad; i++) {
+                pattern_defaults(&t[i]);
+                t[i].seed = seed + (uint64_t)i;
+                t[i].ws = i && ws1 ? ws1 : ws;
+                t[i].stride = i && stride1 ? stride1 : stride;
+                t[i].first = i && have_first1 ? first1 : first;
+                t[i].order = parse_order(i && ord1[0] ? ord1 : ord);
+                const char *lp = i && have_list1 ? list1 : list;
+                if (lp[0]) {
+                    if (access(lp, R_OK)) { snprintf(why, sizeof(why), "list %.80s: %s", lp, strerror(errno)); bad = 1; }
+                    t[i].list_path = i && have_list1 ? strdup(list1) : strdup(list);
+                }
+            }
+        }
+        if (bad) {
             line[strcspn(line, "\n")] = 0;
-            printf("alias-nvme: hold: command %u not understood: '%s'\n", n, line);
+            printf("alias-nvme: hold: command %u not understood%s%s: '%s'\n", n, why[0] ? ": " : "", why, line);
             snprintf(b, sizeof(b), "%u bad-command\n", n);
         } else {
-            printf("alias-nvme: hold: load %u '%s': drives 0x%x, ws %llu stride %llu %s, warm %.0f s, %.0f s, into %s\n",
-                   n, name, mask, ws, stride, ord, warm, secs, outdir);
-            if (ws != g_pat.ws || stride != g_pat.stride || parse_order(ord) != g_pat.order)
-                pattern_switch(ws, stride, ord);
+            printf("alias-nvme: hold: load %u '%s': drives 0x%x, ws %llu stride %llu %s, cursor %s, warm %.0f s, %.0f s, into %s\n",
+                   n, name, mask, ws, stride, ord, cursor ? "shared" : "queue", warm, secs, outdir);
+            g_cursor_shared = cursor;
+            for (int i = 0; i < g_ndev; i++)
+                if ((mask >> i & 1) && !same_pattern(&g_dev[i].pat, &t[i]))
+                    pattern_switch(&g_dev[i], &t[i]);
             char pre[MAXDEV][512];
             for (int i = 0; i < g_ndev; i++)
                 snprintf(pre[i], sizeof(pre[i]), "%s/fio-ssd%d", outdir, i);
@@ -1109,7 +1213,8 @@ static void usage(void)
     puts("sudo alias-nvme --dev BDF=PREFIX [--dev BDF=PREFIX] [--serial S[,S]] [--queues N[,N]]\n"
          "     [--cpus L[/L]] [--qd N] [--bs B] [--lba rand|seq] [--nsid N]\n"
          "     [--ws N] [--stride N] [--first N] [--order cyclic|shuffle|random] [--seed N]\n"
-         "     [--page-list PATH] [--backing-pages N] [--iova-base A]\n"
+         "     [--page-list PATH] [--backing-pages N] [--iova-base A] [--cursor queue|shared]\n"
+         "     [--ws1 N] [--stride1 N] [--first1 N] [--order1 O] [--page-list1 PATH]\n"
          "     [--warm S] [--seconds S] [--heartbeat S] [--ready-file PATH] [--exit-steps S] [--exit-settle S] [--exit-d3] [--exit-reverse] [--exit-unsafe]\n"
          "     [--hold DIR]\n"
          "(the comment at the top of alias-nvme.c says what each does)");
@@ -1121,6 +1226,10 @@ int main(int argc, char **argv)
     double warm = 0, secs = 0, exit_pause = 1;
     int hb = 5;
     pattern_defaults(&g_pat);
+    pattern_defaults(&g_pat1);
+    uint64_t o1_ws = 0, o1_stride = 0, o1_first = 0;
+    int o1_has_first = 0, o1_order = -1;
+    const char *o1_list = NULL;
     setvbuf(stdout, NULL, _IOLBF, 0);
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
@@ -1159,6 +1268,16 @@ int main(int argc, char **argv)
         else if (ARG("--order")) g_pat.order = parse_order(v);
         else if (ARG("--seed")) g_pat.seed = parse_u64(a, v);
         else if (ARG("--page-list")) g_pat.list_path = v;
+        else if (ARG("--ws1")) { o1_ws = parse_u64(a, v); g_have1 = 1; }
+        else if (ARG("--stride1")) { o1_stride = parse_u64(a, v); g_have1 = 1; }
+        else if (ARG("--first1")) { o1_first = parse_u64(a, v); o1_has_first = 1; g_have1 = 1; }
+        else if (ARG("--order1")) { o1_order = (int)parse_order(v); g_have1 = 1; }
+        else if (ARG("--page-list1")) { o1_list = v; g_have1 = 1; }
+        else if (ARG("--cursor")) {
+            if (!strcmp(v, "shared")) g_cursor_shared = 1;
+            else if (!strcmp(v, "queue")) g_cursor_shared = 0;
+            else die("--cursor queue or shared");
+        }
         else if (ARG("--backing-pages")) g_backing = parse_u64(a, v);
         else if (ARG("--iova-base")) g_iova_base = parse_u64(a, v);
         else if (ARG("--warm")) warm = atof(v);
@@ -1206,9 +1325,13 @@ int main(int argc, char **argv)
         signal(SIGHUP, SIG_IGN);
         signal(SIGQUIT, SIG_IGN);
     }
-    pattern_build(&g_pat);
-    pattern_print(&g_pat, stdout, "alias-nvme");
-    backing_create(&g_bk, g_backing ? g_backing : backing_default(g_pat.span));
+    g_pat1 = g_pat;                       /* drive 1: drive 0's pattern unless given its own */
+    if (o1_ws) g_pat1.ws = o1_ws;
+    if (o1_stride) g_pat1.stride = o1_stride;
+    if (o1_has_first) g_pat1.first = o1_first;
+    if (o1_order >= 0) g_pat1.order = (enum alias_order)o1_order;
+    if (o1_list) g_pat1.list_path = o1_list;
+    g_pat1.seed = g_pat.seed + 1;
 
     atexit(release_on_exit);
     for (int i = 0; i < g_ndev; i++) {
@@ -1233,14 +1356,12 @@ int main(int argc, char **argv)
         for (int j = 0; j < i; j++)
             if (g_dev[j].ct == d->ct)
                 d->data_iova = g_dev[j].data_iova + (1ull << 40);
-        if (d->data_iova != g_iova_base && g_pat.span * ALIAS_PAGE > (1ull << 40))
-            die("two drives in one IOMMU group need spans under 1 TiB");
-        map_data(d, &g_bk);
+        drive_pattern(d, i ? &g_pat1 : &g_pat);
         queues_create(d);
     }
     printf("alias-nvme: %d drive(s), bs %" PRIu64 " = %u command(s) of %" PRIu64 " KiB, qd %u, lba %s, "
            "backing %" PRIu64 " pages\n", g_ndev, g_bs, g_k, g_cmd >> 10, g_qd,
-           g_lba_rand ? "rand" : "seq", g_bk.pages);
+           g_lba_rand ? "rand" : "seq", g_dev[0].bk.pages);
 
     if (g_hold)
         hold_loop();                      /* never returns */

@@ -28,6 +28,15 @@
  *                             one entry in one page, else whole pages, each from
  *                             the pattern (split into several READs past the
  *                             device's scatter limit; one completion per READ group)
+ *   --sge-bytes B             bytes per scatter entry, each entry in the next
+ *                             pattern page (at its offset 0): a 4096-byte READ
+ *                             with --sge-bytes 512 writes 512 B into each of 8
+ *                             pages (small writes, scattered, at the READ rate of
+ *                             4 KiB READs). Default: 4096, or --bs below 4096.
+ *   --mtu BYTES               cap the RoCE path MTU (256, 512, 1024, 2048, 4096;
+ *                             default: the ports' active MTU). A smaller MTU cuts
+ *                             a page into more response packets, which the NIC
+ *                             interleaves across QPs.
  *   --ws --stride --first --order --seed --page-list --backing-pages: the pattern
  *   --warm S --seconds S      warm-up, then measure S seconds (0 = until SIGINT/TERM)
  *   --out PREFIX              PREFIX.json and PREFIX_iops.1.log (fio's format)
@@ -321,6 +330,7 @@ struct client {
     struct dev *d;
     struct alias_pattern pat;
     uint32_t nqps, depth, bs, pages, sge, wrs;    /* pages per logical READ, scatter per READ, READs */
+    uint32_t unit, mtu_cap;                        /* bytes per scatter entry (one page each); MTU cap, bytes */
     struct ibv_qp *qp[MAXQ];
     struct ibv_cq *cq;
     struct ibv_mr *mr;
@@ -338,7 +348,7 @@ static int post_io(struct client *c, uint32_t q, uint32_t slot)
 {
     struct ibv_send_wr wr[MAXWR], *bad = NULL;
     struct ibv_sge sg[MAXWR][MAXSGE];
-    uint32_t left = c->pages ? c->pages : 1;
+    uint32_t left = c->pages;
     uint64_t roff = c->rnext;
     c->rnext += c->bs;
     if (c->rnext + c->bs > c->rlen)
@@ -348,7 +358,7 @@ static int post_io(struct client *c, uint32_t q, uint32_t slot)
         for (uint32_t k = 0; k < n; k++) {
             uint64_t pg = pattern_next(&c->pat, &c->cur);
             sg[w][k].addr = (uint64_t)(uintptr_t)(c->region + pg * ALIAS_PAGE);
-            sg[w][k].length = c->pages ? (uint32_t)ALIAS_PAGE : c->bs;
+            sg[w][k].length = c->unit;
             sg[w][k].lkey = c->mr->lkey;
         }
         memset(&wr[w], 0, sizeof(wr[w]));
@@ -360,7 +370,7 @@ static int post_io(struct client *c, uint32_t q, uint32_t slot)
         wr[w].wr.rdma.remote_addr = c->raddr + roff;
         wr[w].wr.rdma.rkey = c->rkey;
         wr[w].next = w == c->wrs - 1 ? NULL : &wr[w + 1];
-        roff += (uint64_t)n * (c->pages ? ALIAS_PAGE : c->bs);
+        roff += (uint64_t)n * c->unit;
         left -= n;
     }
     c->t0[(uint64_t)q * c->depth + slot] = now_ns();
@@ -441,20 +451,24 @@ static int run_client(struct client *c, const char *ip, int port, double warm, d
     pattern_build(&c->pat);
     pattern_print(&c->pat, stdout, who);
 
-    /* scatter: whole pages from the pattern, at most the device's per-READ limit */
-    if (c->bs < ALIAS_PAGE) {
-        c->pages = 0; c->sge = 1; c->wrs = 1;
-    } else {
-        if (c->bs % ALIAS_PAGE)
-            die("--bs %u: below 4096 or a multiple of it", c->bs);
-        c->pages = c->bs / (uint32_t)ALIAS_PAGE;
+    /* scatter: one entry per pattern page, c->unit bytes at the page's start
+     * (default a whole page, or --bs below 4096), at most the device's
+     * per-READ limit; past it one logical READ is several READs */
+    if (!c->unit)
+        c->unit = c->bs < ALIAS_PAGE ? c->bs : (uint32_t)ALIAS_PAGE;
+    if (c->bs >= ALIAS_PAGE && c->unit == ALIAS_PAGE && c->bs % ALIAS_PAGE)
+        die("--bs %u: below 4096 or a multiple of it", c->bs);
+    if (c->unit > ALIAS_PAGE || c->bs % c->unit)
+        die("--sge-bytes %u: at most 4096 and a divisor of --bs %u", c->unit, c->bs);
+    c->pages = c->bs / c->unit;
+    {
         int lim = d->attr.max_sge_rd > 0 ? d->attr.max_sge_rd : d->attr.max_sge;
         c->sge = (uint32_t)(lim < MAXSGE ? lim : MAXSGE);
         if (c->sge > c->pages)
             c->sge = c->pages;
         c->wrs = (c->pages + c->sge - 1) / c->sge;
         if (c->wrs > MAXWR)
-            die("--bs %u needs %u READs of %u pages (at most %d)", c->bs, c->wrs, c->sge, MAXWR);
+            die("--bs %u needs %u READs of %u entries (at most %d)", c->bs, c->wrs, c->sge, MAXWR);
     }
 
     struct alias_backing bk;
@@ -464,8 +478,8 @@ static int run_client(struct client *c, const char *ip, int port, double warm, d
     if (!c->mr)
         die("ibv_reg_mr of %" PRIu64 " pages: %s (sudo, or ulimit -l unlimited)", c->pat.span, strerror(errno));
     printf("%s: MR %p, %" PRIu64 " pages over %" PRIu64 " backing pages, lkey 0x%x; "
-           "%u page(s) per logical READ in %u READ(s) of <= %u entries\n",
-           who, (void *)c->region, c->pat.span, bk.pages, c->mr->lkey, c->pages ? c->pages : 1, c->wrs, c->sge);
+           "%u page(s) per logical READ, %u B into each, in %u READ(s) of <= %u entries\n",
+           who, (void *)c->region, c->pat.span, bk.pages, c->mr->lkey, c->pages, c->unit, c->wrs, c->sge);
 
     c->cq = ibv_create_cq(d->ctx, (int)(c->nqps * c->depth + 64), NULL, NULL, 0);
     if (!c->cq)
@@ -473,6 +487,12 @@ static int run_client(struct client *c, const char *ip, int port, double warm, d
     struct hello h, sv;
     memset(&h, 0, sizeof(h));
     h.magic = MAGIC; h.version = VERSION; h.nqps = c->nqps; h.mtu = d->pattr.active_mtu;
+    if (c->mtu_cap) {                  /* the server takes the smaller of the two */
+        uint32_t e = c->mtu_cap >= 4096 ? IBV_MTU_4096 : c->mtu_cap >= 2048 ? IBV_MTU_2048 :
+                     c->mtu_cap >= 1024 ? IBV_MTU_1024 : c->mtu_cap >= 512 ? IBV_MTU_512 : IBV_MTU_256;
+        if (e < h.mtu)
+            h.mtu = e;
+    }
     h.rd_atom = (uint32_t)d->attr.max_qp_init_rd_atom;
     h.len = (uint64_t)c->bs * 64;
     memcpy(h.gid, d->gid.raw, 16);
@@ -572,10 +592,10 @@ static int run_client(struct client *c, const char *ip, int port, double warm, d
     char extra[1024];
     snprintf(extra, sizeof(extra),
              "\"tool\": \"alias-rdma\", \"device\": \"%s\", \"server\": \"%s:%d\", \"qps\": %u, "
-             "\"depth\": %u, \"bs\": %u, \"wire_rd\": %u, \"mtu\": %d, \"ws\": %" PRIu64
+             "\"depth\": %u, \"bs\": %u, \"sge_bytes\": %u, \"mtu_cap\": %u, \"wire_rd\": %u, \"mtu\": %d, \"ws\": %" PRIu64
              ", \"stride\": %" PRIu64 ", \"first\": %" PRIu64 ", \"order\": \"%s\", \"span_pages\": %" PRIu64
              ", \"backing_pages\": %" PRIu64 ", \"page_list\": \"%s\"",
-             d->name, ip, port, c->nqps, c->depth, c->bs, rd, 128 << mtu, c->pat.ws, c->pat.stride,
+             d->name, ip, port, c->nqps, c->depth, c->bs, c->unit, c->mtu_cap, rd, 128 << mtu, c->pat.ws, c->pat.stride,
              c->pat.first, order_name(c->pat.order), c->pat.span, bk.pages,
              c->pat.list_path ? c->pat.list_path : "");
     out_close(&o, &c->st, extra, err);
@@ -598,6 +618,7 @@ static void usage(void)
 {
     puts("alias-rdma --role server --netdev IF [--port N]\n"
          "alias-rdma --role client --netdev IF --server-ip A [--port N] [--qps N] [--depth N] [--bs B]\n"
+         "           [--sge-bytes B] [--mtu B]\n"
          "           [--ws N] [--stride N] [--first N] [--order cyclic|shuffle|random] [--seed N]\n"
          "           [--page-list PATH] [--backing-pages N] [--warm S] [--seconds S] [--out PREFIX]\n"
          "           [--name NAME] [--cpu C] [--heartbeat S] [--ready-file PATH]\n"
@@ -630,6 +651,8 @@ int main(int argc, char **argv)
         else if (ARG("--qps")) c.nqps = (uint32_t)parse_u64(a, v);
         else if (ARG("--depth")) c.depth = (uint32_t)parse_u64(a, v);
         else if (ARG("--bs")) c.bs = (uint32_t)parse_u64(a, v);
+        else if (ARG("--sge-bytes")) c.unit = (uint32_t)parse_u64(a, v);
+        else if (ARG("--mtu")) c.mtu_cap = (uint32_t)parse_u64(a, v);
         else if (ARG("--ws")) c.pat.ws = parse_u64(a, v);
         else if (ARG("--stride")) c.pat.stride = parse_u64(a, v);
         else if (ARG("--first")) c.pat.first = parse_u64(a, v);
@@ -661,5 +684,7 @@ int main(int argc, char **argv)
         die("--server-ip is required for the client");
     if (!c.nqps || c.nqps > MAXQ || !c.depth || !c.bs)
         die("--qps 1-%d, --depth and --bs at least 1", MAXQ);
+    if (c.mtu_cap && c.mtu_cap != 256 && c.mtu_cap != 512 && c.mtu_cap != 1024 && c.mtu_cap != 2048 && c.mtu_cap != 4096)
+        die("--mtu 256, 512, 1024, 2048 or 4096");
     return run_client(&c, ip, port, warm, secs, out, name, hb, ready);
 }

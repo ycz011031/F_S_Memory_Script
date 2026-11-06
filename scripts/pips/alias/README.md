@@ -90,6 +90,27 @@ The runners read them with `dualssd-results.py fio-sum` unchanged. The NIC
 runner writes each NIC's Gb/s over the windows to `iperf.bw.rpt` as
 `Avg_iperf_tput`.
 
+## Options added 11-06 (alias campaign 2)
+
+- `alias-rdma --sge-bytes B`: each scatter entry writes B bytes at the start of
+  the next pattern page, so a 4 KiB READ with `--sge-bytes 512` touches 8 pages
+  (small, scattered writes at the READ rate of 4 KiB READs). `--mtu B` caps the
+  RoCE path MTU (256-4096): a page then arrives in more packets, which the NIC
+  interleaves across QPs. Runner: `--sge-bytes`, `--rdma-mtu`.
+- Per device patterns: `alias-nvme --ws1 --stride1 --first1 --order1
+  --page-list1` (drive 1; each drive maps its own region in its own domain);
+  the NIC runner's `--ws1 ...` the same for NIC 1 (each NIC has its own MR).
+  Drive 1 and NIC 1 get seed + 1 (their shuffle order differs).
+- `alias-nvme --cursor shared`: one cursor per drive, so the drive visits its
+  pages in strict pattern order. The default (`queue`) gives each queue its own
+  cursor, started 1/nq of the way apart; their phases drift, so a page comes
+  back after a spread of visits (bigserver's soft knee on 11-05).
+- Sparse patterns (a page list, or a span over 64 times the pages used) are
+  mapped page by page: only the pattern's pages exist in the domain.
+- Hold mode: the load command takes `KEY=VALUE` extras after the ready file:
+  `first= list= ws1= stride1= order1= first1= list1= cursor=queue|shared
+  seed=`; state reads `ready <pid> v2`.
+
 ## Safety
 
 - **Read-only drives.** `alias-nvme` builds only Identify, Set Features

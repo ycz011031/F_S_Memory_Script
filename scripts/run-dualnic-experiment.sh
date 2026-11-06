@@ -58,6 +58,12 @@
 #   --rdma-bs BYTES     bytes per READ (default 4096: one page)
 #   --ws N --stride N   pages first + i*stride, i < ws (default 64, 1)
 #   --first N --order cyclic|shuffle|random --page-list PATH --backing-pages N
+#   --ws1 N --stride1 N --first1 N --order1 O --page-list1 PATH
+#                       NIC 1's own pattern (default NIC 0's); each NIC has its own MR
+#   --sge-bytes B       bytes per scatter entry, each in the next pattern page
+#                       (default 4096, or --rdma-bs below it): --rdma-bs 4096
+#                       --sge-bytes 512 writes 512 B into each of 8 pages per READ
+#   --rdma-mtu B        cap the RoCE path MTU (256-4096; default the ports')
 # Line rate only (-b uncapped, no --client-hw-rate). Per NIC the generator
 # writes fio's files (logs/<run>/fio-nic<i>.json, _iops.1.log); the Gb/s over
 # the measurement windows goes to reports/<run>-nic<i>/iperf.bw.rpt as
@@ -91,6 +97,7 @@ hw_rate=""             # client-side hardware pacing per port (--client-hw-rate)
 iommu_ops=0            # 1: count IOMMU map/unmap and VT-d invalidations (utils/iommu-ops.sh)
 gen=iperf              # iperf, or alias: scripts/pips/alias/alias-rdma (RDMA READ)
 a_ws=64; a_stride=1; a_first=0; a_order=cyclic; a_list=""; a_backing=0; a_depth=16; a_bs=4096
+a_ws1=""; a_stride1=""; a_first1=""; a_order1=""; a_list1=""; a_sge=0; a_mtu=0   # NIC 1's own pattern (empty: NIC 0's)
 CLIENT_BRANCH="$(git -C "$HERE/.." rev-parse --abbrev-ref HEAD 2>/dev/null || echo icx-dualnic)"
 
 while [ $# -gt 0 ]; do
@@ -123,6 +130,13 @@ while [ $# -gt 0 ]; do
         --backing-pages) a_backing="$2"; shift 2 ;;
         --depth)         a_depth="$2"; shift 2 ;;
         --rdma-bs)       a_bs="$2"; shift 2 ;;
+        --ws1)           a_ws1="$2"; shift 2 ;;
+        --stride1)       a_stride1="$2"; shift 2 ;;
+        --first1)        a_first1="$2"; shift 2 ;;
+        --order1)        a_order1="$2"; shift 2 ;;
+        --page-list1)    a_list1="$2"; shift 2 ;;
+        --sge-bytes)     a_sge="$2"; shift 2 ;;
+        --rdma-mtu)      a_mtu="$2"; shift 2 ;;
         -h|--help)
             awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; exit 0 ;;
         *) echo "unknown option: $1"; exit 2 ;;
@@ -134,9 +148,25 @@ case "$flows1" in ''|[1-9]|[1-9][0-9]) ;; *) echo "ERROR: --flows-nic1 takes 1-9
 case "$hw_rate" in ''|[1-9]*[gG]) ;; *) echo "ERROR: --client-hw-rate takes e.g. 50g" >&2; exit 2 ;; esac
 case "$gen" in iperf|alias) ;; *) echo "ERROR: --gen must be iperf or alias" >&2; exit 2 ;; esac
 case "$a_order" in cyclic|shuffle|random) ;; *) echo "ERROR: --order cyclic, shuffle or random" >&2; exit 2 ;; esac
-for v in "$a_ws" "$a_stride" "$a_first" "$a_backing" "$a_depth" "$a_bs"; do
-    case "$v" in ''|*[!0-9]*) echo "ERROR: --ws/--stride/--first/--backing-pages/--depth/--rdma-bs take integers" >&2; exit 2 ;; esac
+for v in "$a_ws" "$a_stride" "$a_first" "$a_backing" "$a_depth" "$a_bs" "$a_sge" "$a_mtu"; do
+    case "$v" in ''|*[!0-9]*) echo "ERROR: --ws/--stride/--first/--backing-pages/--depth/--rdma-bs/--sge-bytes/--rdma-mtu take integers" >&2; exit 2 ;; esac
 done
+for v in "$a_ws1" "$a_stride1" "$a_first1"; do
+    case "$v" in *[!0-9]*) echo "ERROR: --ws1/--stride1/--first1 take integers" >&2; exit 2 ;; esac
+done
+case "$a_order1" in ''|cyclic|shuffle|random) ;; *) echo "ERROR: --order1 cyclic, shuffle or random" >&2; exit 2 ;; esac
+case "$a_mtu" in 0|256|512|1024|2048|4096) ;; *) echo "ERROR: --rdma-mtu 256, 512, 1024, 2048 or 4096" >&2; exit 2 ;; esac
+[ -z "$a_list1" ] || [ -f "$a_list1" ] || { echo "ERROR: --page-list1 $a_list1: no such file" >&2; exit 2; }
+# alias-rdma's pattern options for NIC <i>: NIC 1 takes its own where given.
+nic_pattern() {
+    local i=$1 ws=$a_ws st=$a_stride fi=$a_first or=$a_order li=$a_list
+    if [ "$i" = 1 ]; then
+        ws=${a_ws1:-$ws}; st=${a_stride1:-$st}; fi=${a_first1:-$fi}; or=${a_order1:-$or}; li=${a_list1:-$li}
+    fi
+    echo "--ws $ws --stride $st --first $fi --order $or --seed $(( i + 1 ))$( [ -n "$li" ] && echo " --page-list $li")"
+    [ "$a_sge" -gt 0 ] && echo "--sge-bytes $a_sge"
+    [ "$a_mtu" -gt 0 ] && echo "--mtu $a_mtu"
+}
 if [ "$gen" = alias ]; then
     [ -z "$hw_rate" ] || { echo "ERROR: --gen alias runs at line rate: no --client-hw-rate" >&2; exit 2; }
     case "$bandwidth" in 0|uncapped|unlimited|none|line|linerate) ;;
@@ -520,6 +550,9 @@ echo "  NICs       : $nics  (indices: ${ACTIVE[*]})"
 echo "  per NIC    : $num_servers flows${flows1:+ (NIC 1: $flows1)}, $( [ "$(per_flow_bw "$bandwidth" "$num_clients")" = 0 ] && echo "UNCAPPED (line rate)" || echo "$bandwidth aggregate ($(per_flow_bw "$bandwidth" "$num_clients") bps/flow)" ), cca=$cca${hw_rate:+, client NIC paced to $hw_rate per port in hardware}"
 echo "  mtu $mtu  ring $ring_buffer  sockbuf ${buf}MB  dur ${dur}s"
 [ "$gen" = alias ] && echo "  generator  : alias-rdma READs, -S = QPs per NIC, depth $a_depth, bs $a_bs; pattern $( [ -n "$a_list" ] && echo "page list $a_list" || echo "ws $a_ws stride $a_stride first $a_first") order $a_order"
+[ "$gen" = alias ] && echo "  scatter    : $( [ "$a_sge" -gt 0 ] && echo "$a_sge B per entry, one page each" || echo "default (one page per entry)"); RoCE MTU $( [ "$a_mtu" -gt 0 ] && echo "capped at $a_mtu" || echo "the ports'")"
+[ "$gen" = alias ] && [ -n "$a_ws1$a_stride1$a_first1$a_order1$a_list1" ] &&
+    echo "  NIC 1      : $(nic_pattern 1 | head -1)"
 echo "  IOMMU      : $iommu_mode   (kernel $(uname -r))"
 echo "=============================================================="
 
@@ -601,13 +634,12 @@ for ((j = 0; j < num_runs; j++)); do
         rm -f "$L/alias-ready-nic$i"
         sudo "$ALIAS_RDMA" --role client --netdev "${SERVER_INTFS[$i]}" --server-ip "${CLIENT_NIC_IPS[$i]}" \
             --port $(( BASE_PORTS[i] + ALIAS_PORT_OFF )) --qps "$(nflows "$i")" --depth "$a_depth" --bs "$a_bs" \
-            --ws "$a_ws" --stride "$a_stride" --first "$a_first" --order "$a_order" \
-            $( [ -n "$a_list" ] && echo "--page-list $a_list") $( [ "$a_backing" -gt 0 ] && echo "--backing-pages $a_backing") \
+            $(nic_pattern "$i") $( [ "$a_backing" -gt 0 ] && echo "--backing-pages $a_backing") \
             --warm 10 --seconds "$a_secs" --heartbeat 10 --cpu "${SERVER_CORES[$i]%%,*}" \
             --name "alias_nic$i" --out "$L/fio-nic$i" --ready-file "$L/alias-ready-nic$i" \
             > "$L/alias-rdma-nic$i.log" 2>&1 9>&- &
     done
-    for _ in $(seq 150); do
+    for _ in $(seq 450); do      # 90 s: a large MR (n2walk: 8 GiB of IOVA) takes a while to register
         n=0; for i in "${ACTIVE[@]}"; do [ -e "$L/alias-ready-nic$i" ] && n=$((n + 1)); done
         [ "$n" -eq "${#ACTIVE[@]}" ] && break
         sleep 0.2
@@ -880,7 +912,9 @@ python3 "$HERE/dualnic-results.py" dump \
     --meta mtu="$mtu" --meta ring_buffer="$ring_buffer" --meta sockbuf_mb="$buf" \
     --meta gen="$gen" \
     $( [ "$gen" = alias ] && printf -- '--meta %s ' alias_ws="$a_ws" alias_stride="$a_stride" alias_first="$a_first" \
-        alias_order="$a_order" alias_backing="$a_backing" alias_depth="$a_depth" alias_bs="$a_bs" alias_list="${a_list:-none}") \
+        alias_order="$a_order" alias_backing="$a_backing" alias_depth="$a_depth" alias_bs="$a_bs" alias_list="${a_list:-none}" \
+        alias_sge_bytes="$a_sge" alias_rdma_mtu="$a_mtu" alias_ws1="${a_ws1:-$a_ws}" alias_stride1="${a_stride1:-$a_stride}" \
+        alias_first1="${a_first1:-$a_first}" alias_order1="${a_order1:-$a_order}" alias_list1="${a_list1:-${a_list:-none}}") \
     --meta dur_s="$dur" --meta cca="$cca" --meta cpu_util_cores="$active_cores" \
     ${PIPS_META[@]+"${PIPS_META[@]}"} \
     || echo "WARNING: could not write $results_file; the .rpt files are intact." >&2

@@ -85,6 +85,42 @@
 #                     kernel's panic on lockup (alias-guard.sh). The campaign
 #                     ENDS WITH A REBOOT (sync; systemctl reboot -ff: nothing
 #                     released; --no-reboot to leave it to you)
+#   --alias2          the second aliasing campaign (11-06, HANDOFF §8 "Alias
+#                     campaign 2"): everything --alias does (holder, guard,
+#                     reboot at the end on bigserver) with the phases below.
+#                     --runs (default 2) repeats the comparison points.
+#                     icx:  n2ways  ways: NIC0 alone and both, stride 4096 (one
+#                                   set), ws 1-16
+#                           n2sets  sets: NIC0 alone, ws 5 and 9, stride 8-256
+#                           n2rot   rotation: ws 64 at stride 4096, QPs 2/8/32 x
+#                                   RoCE MTU 2048/1024/512/256, d1 and d16, pb 0/1
+#                                   (a page's TLPs spread over more open pages
+#                                   than the set has ways); + a no-conflict control
+#                           n2small READ size 4096-256 B (one page each) x ws
+#                                   64/4096, 4 and 16 QPs
+#                           n2sge   4 KiB READs scattered 2048-256 B per page
+#                           n2place both NICs in the same sets, NIC 1 shifted by
+#                                   --first1 into other sets
+#                           n2share NIC0 ws 128 with NIC1 ws 32-512
+#                           n2walk  ws 32, pages 128 KiB to 256 MiB apart
+#                           n2cap   capacity 192-320 pages; shuffle/random order
+#                           n2lat   1 QP x 1 READ: hit, capacity, conflict, deep walk
+#                           n2quant grant quantum 4095 vs 0 on thrashing pairs
+#                           n2rep   d1/d16 x pb 0/1 at 3 patterns, 3 runs
+#                     bigserver (shared cursor: strict pattern order):
+#                           s2cap   capacity 32-160 pages per drive, step 8
+#                           s2probe drive 0 (ws 8) rate-capped (rcap0 64-1) while
+#                                   drive 1 thrashes (ws 65536) or idles (ws 16):
+#                                   misses a page takes between its own writes
+#                           s2place random page placement (16 GiB span) and
+#                                   random high bits (pages 512 MiB apart)
+#                           s2order random and shuffled order at 48-160 pages
+#                           s2walk  ws 32, pages 2 MiB to 2 GiB apart; ws
+#                                   128-2048 at 2 MiB apart
+#                           s2rep   d1/d16 x pb 0/1 at 2 patterns, 3 runs
+#                     The analysis simulates the fitted IOTLBs, not strict
+#                     (PIPS_SEQ_STRICT=0, PIPS_SEQ_IOTLB), and also reanalyses
+#                     the 11-05 alias sweeps so (analyze-1105/)
 #   --leg M           with --paper: the leg expected (strict, lazy, pt, off);
 #                     refused when the devices are not so (a reboot missed).
 #                     With --dry-run: plan that leg whatever this host is
@@ -166,7 +202,7 @@ case "$KIND" in
 esac
 PASS=("$KIND"); IN_TMUX=0
 for a in "$@"; do if [ "$a" = --tmux ]; then IN_TMUX=1; else PASS+=("$a"); fi; done
-DRY=0; ONLY=""; SKIP=""; ANALYSIS=1; PENDING=""; WIRE=1; HW=1; JOBS=""; STAMP=""; RETIRE=""; MINIMAL=0; PAPER=0; LEG_WANT=""; RUNS=""; ALIAS=0; FRESH=0; REBOOT=1
+DRY=0; ONLY=""; SKIP=""; ANALYSIS=1; PENDING=""; WIRE=1; HW=1; JOBS=""; STAMP=""; RETIRE=""; MINIMAL=0; PAPER=0; LEG_WANT=""; RUNS=""; ALIAS=0; ALIAS2=0; FRESH=0; REBOOT=1
 while [ $# -gt 0 ]; do
     case "$1" in
         --tmux) shift ;;
@@ -180,6 +216,7 @@ while [ $# -gt 0 ]; do
         --minimal) MINIMAL=1; shift ;;
         --paper) PAPER=1; shift ;;
         --alias) ALIAS=1; shift ;;
+        --alias2) ALIAS=1; ALIAS2=1; shift ;;
         --leg) LEG_WANT="$2"; shift 2 ;;
         --runs) RUNS="$2"; shift 2 ;;
         --no-wire) WIRE=0; shift ;;
@@ -220,7 +257,15 @@ STAMP=${STAMP:-c$(date +%m%d%H%M)}
 [ $(( MINIMAL + PAPER + ALIAS )) -gt 1 ] && { echo "pips-campaign: one of --minimal, --paper, --alias" >&2; exit 2; }
 # --minimal, --paper and --alias leave the pending 0x0A04/0x0A05 analysis out unless --pending.
 [ -n "$PENDING" ] || { if [ "$MINIMAL" = 1 ] || [ "$PAPER" = 1 ] || [ "$ALIAS" = 1 ]; then PENDING=0; else PENDING=1; fi; }
-[ -n "$RUNS" ] || { if [ "$ALIAS" = 1 ]; then RUNS=1; else RUNS=3; fi; }
+[ -n "$RUNS" ] || { if [ "$ALIAS2" = 1 ]; then RUNS=2; elif [ "$ALIAS" = 1 ]; then RUNS=1; else RUNS=3; fi; }
+# The alias campaigns map their pages once: the page-order analysis simulates
+# the fitted IOTLBs (HANDOFF §8 "Alias campaign results"), never strict mode's
+# "every new visit misses".
+if [ "$ALIAS" = 1 ]; then
+    export PIPS_SEQ_STRICT="${PIPS_SEQ_STRICT-0}"
+    if [ "$KIND" = nic ]; then export PIPS_SEQ_IOTLB="${PIPS_SEQ_IOTLB-32x8,64x4,128x2,1x256}"
+    else export PIPS_SEQ_IOTLB="${PIPS_SEQ_IOTLB-1x96,1x64,1x128,1x256}"; fi
+fi
 export PIPS_PB_MODEL="${PIPS_PB_MODEL-self,sweepc1,sweepc1f512}"
 case "$STAMP" in [A-Za-z]*) ;; *) echo "--stamp: must start with a letter" >&2; exit 2 ;; esac
 case "$STAMP" in *[!A-Za-z0-9]*) echo "--stamp: letters and digits only" >&2; exit 2 ;; esac
@@ -280,7 +325,7 @@ if [ "$ALIAS" = 1 ]; then
     esac
 fi
 # Resume: a half-done campaign of this kind and mode is picked up.
-if [ "$ALIAS" = 1 ]; then MODE_KEY=alias; elif [ "$PAPER" = 1 ]; then MODE_KEY=paper-$LEG
+if [ "$ALIAS2" = 1 ]; then MODE_KEY=alias2; elif [ "$ALIAS" = 1 ]; then MODE_KEY=alias; elif [ "$PAPER" = 1 ]; then MODE_KEY=paper-$LEG
 elif [ "$MINIMAL" = 1 ]; then MODE_KEY=minimal; else MODE_KEY=full; fi
 POINTER="$HOME/.pips-campaign-$KIND-$MODE_KEY.current"
 RESUME=0
@@ -369,7 +414,12 @@ alias_extra() {   # <ws:stride> -> the runner options of that point
 }
 alias_npts() { set -- $1; echo $#; }
 
-if [ "$ALIAS" = 1 ]; then
+if [ "$ALIAS2" = 1 ]; then
+    if [ "$KIND" = nic ]; then PHASES=(n2ways n2sets n2rot n2small n2sge n2place n2share n2walk n2cap n2lat n2quant n2rep)
+    else PHASES=(s2cap s2probe s2place s2order s2walk s2rep); fi
+    [ "$KIND" = nic ] && MIN_PER_PT=1.6
+    [ "$KIND" = ssd ] && MIN_PER_PT=1.1
+elif [ "$ALIAS" = 1 ]; then
     PHASES=(ageom acap aconf)
     [ "$KIND" = nic ] && MIN_PER_PT=1.6        # no iperf3 stats wait
     [ "$KIND" = ssd ] && MIN_PER_PT=1.1        # one holder for the campaign: no bind or release per run
@@ -402,6 +452,7 @@ est_points() {
         nic:e8)     echo $(( 4 * RUNS + 1 )) ;;
         nic:rcap0)  echo $(( 3 * (1 + 1) )) ;;
         nic:ops)    echo $(( 2 + 1 )) ;;
+        ssd:s2*|nic:n2*) a2_est "$1" ;;
         ssd:ageom|nic:ageom) echo $(( ($(alias_npts "$ALIAS_GEOM_CAP") + $(alias_npts "$ALIAS_GEOM_CONF")) * (2 * RUNS + 1) )) ;;
         ssd:acap|nic:acap)   echo $(( $(alias_npts "$ALIAS_CAP") * (4 * RUNS + 1) )) ;;
         ssd:aconf|nic:aconf) echo $(( $(alias_npts "$ALIAS_CONF") * (4 * RUNS + 1) )) ;;
@@ -436,6 +487,7 @@ describe() {
         nic:e8)     echo "E8, IOMMU $LEG: NIC0 alone, 5/10/15/30 flows, d1t0c1, $RUNS runs" ;;
         nic:rcap0)  echo "E11: both NICs, 5 flows, d1t0, rate cap on NIC0's input only: rcap0 $NIC_RCAP0 (~47/37/28G)" ;;
         nic:ops)    echo "E7, IOMMU $LEG: map/unmap and VT-d invalidations per packet (--iommu-ops 1), d1t0c1, both NICs, 5 and 30 flows" ;;
+        ssd:s2*|nic:n2*) a2_describe "$1" ;;
         ssd:ageom|nic:ageom) echo "alias, IOTLB geometry, d1t0c1: capacity curve (stride 1, ws $(echo "$ALIAS_GEOM_CAP" | sed 's/:1//g')) and conflict curve (ws 32, stride $(echo "$ALIAS_GEOM_CONF" | sed 's/32://g')); $( [ "$KIND" = ssd ] && echo "drive 0 alone and both" || echo "NIC0 alone and both")" ;;
         ssd:acap|nic:acap)   echo "alias, capacity misses, both: stride 1, ws $(echo "$ALIAS_CAP" | sed 's/:1//g'); d1t0c1 pb0 vs d${ALIAS_ON%%:*}t${ALIAS_ON#*:}c1 pb 0/1" ;;
         ssd:aconf|nic:aconf) echo "alias, conflict misses, both: stride 4096, ws $(echo "$ALIAS_CONF" | sed 's/:4096//g'); d1t0c1 pb0 vs d${ALIAS_ON%%:*}t${ALIAS_ON#*:}c1 pb 0/1" ;;
@@ -734,6 +786,7 @@ phase_run() {
                    sweep_run g --cfgs "$PAPER_ON" --caps 1 --pbs "0 1" --set "$THR" "${NIC_G[@]}" ;;
         nic:e8)    sweep_run e8 --cfgs "1:0" --caps 1 --pbs 0 --set "$THR" "${NIC_E8[@]}" ;;
         ssd:ageom|nic:ageom|ssd:acap|nic:acap|ssd:aconf|nic:aconf) alias_phase "$p" ;;
+        ssd:s2*|nic:n2*) a2_phase "$p" ;;
         nic:rcap0) for q in $NIC_RCAP0; do
                        sweep_run "r0c$q" --cfgs "1:0" --caps 0 --pbs 0 --set "$THR rcap0=$q rcap1=0" "${NIC_E11[@]}"
                    done ;;
@@ -763,6 +816,166 @@ alias_phase() {
                done ;;
     esac
     RUNNER_EXTRA=""
+}
+
+# ------------------------------------------------------------------ --alias2
+# One sweep per spec line: "label|runner options|cfgs|pbs|--set extra|grid|runs per setting".
+# Grids: the sweep's trailing arguments (modes, flows/instances, runs); runs per
+# setting = modes x flows x runs, for the estimate. Every sweep adds its datapath run.
+a2_grid() {   # <name> -> A2G=( sweep args )
+    case "$1" in
+        ngeo)   A2G=( --modes "nic0only both" "4" "uncapped" 1 ) ;;
+        ngeo0)  A2G=( --modes nic0only "4" "uncapped" 1 ) ;;
+        ngeo1)  A2G=( --modes nic0only "1" "uncapped" 1 ) ;;
+        ngeo2)  A2G=( --modes "nic0only both" "1 4" "uncapped" 1 ) ;;
+        nsmall) A2G=( --modes "nic0only both" "4 16" "uncapped" 1 ) ;;
+        nrot)   A2G=( --modes "nic0only both" "2 8 32" "uncapped" "$RUNS" ) ;;
+        nrotc)  A2G=( --modes both "8 32" "uncapped" 1 ) ;;
+        nboth)  A2G=( "4" "uncapped" "$RUNS" ) ;;
+        nrep)   A2G=( "4" "uncapped" 3 ) ;;
+        nlat)   A2G=( --modes nic0only "1" "uncapped" 3 ) ;;
+        sgeo)   A2G=( --single --no-asy "4k" "4" 1 ) ;;
+        sprobe) A2G=( --single-ssd 1 --no-asy "4k" "4" "$RUNS" ) ;;
+        sprobeq) A2G=( --single --no-asy "4k" "4" "$RUNS" ) ;;
+        srep)   A2G=( --no-asy "4k" "4" 3 ) ;;
+    esac
+}
+a2_specs() {   # <phase>: its spec lines
+    local w s m q b f
+    case "$1" in
+        n2ways) # one set (stride 4096): the first ws that misses is ways + 1; both NICs
+                # (own MRs, same set) miss once 2 ws > ways. 1 QP = strictly cyclic order.
+                for w in 1 2 3 4 5 6 7 8 9 10 12 16; do
+                    echo "nwyw${w}|--ws $w --stride 4096|1:0|0||ngeo2|4"; done
+                # the same in two other sets (a ring or MTT page could sit in set 0)
+                for f in 7 13; do for w in 3 4 5 6 8 9 10; do
+                    echo "nwyf${f}w${w}|--ws $w --stride 4096 --first $f|1:0|0||ngeo1|1"; done; done
+                # another stride that is one set for any set count up to 16384
+                for w in 4 5 8 9; do
+                    echo "nwykw${w}|--ws $w --stride 16384|1:0|0||ngeo1|1"; done
+                # replacement: at ws = ways + 1 cyclic misses every visit under LRU;
+                # random and shuffled order tell LRU, pseudo-LRU and random apart
+                for o in random shuffle; do for w in 4 5 6 8 9 10 12 16; do
+                    echo "nwy${o:0:1}w${w}|--ws $w --stride 4096 --order $o|1:0|0||ngeo0|1"; done; done ;;
+        n2sets) # ws = ways + 1 misses only once every page is in one set: the smallest
+                # such stride is the set count (4 ways: ws 5 from stride 64 on; 8 ways:
+                # ws 5 never, ws 9 from 32). Odd multiples of 32 (96, 192, 320) test
+                # that the index is the plain low bits: one set if 32 sets, two if 64
+                # (then ws 5 fits at 96 although it misses at 64).
+                for w in 5 9; do for s in 2 4 8 16 32 64 128 256 512 1024 96 192 320; do
+                    echo "nstw${w}s${s}|--ws $w --stride $s|1:0|0||ngeo0|1"; done; done
+                for w in 3 17; do for s in 32 64 128 256; do
+                    echo "nstw${w}s${s}|--ws $w --stride $s|1:0|0||ngeo0|1"; done; done ;;
+        n2rot)  for m in 2048 1024 512 256; do
+                    echo "nrtm${m}|--ws 64 --stride 4096 --rdma-mtu $m|1:0 16:218|0 1||nrot|$(( 6 * RUNS ))"; done
+                echo "nrtcm512|--ws 64 --stride 1 --rdma-mtu 512|1:0|0||nrotc|2" ;;
+        n2small) for b in 4096 2048 1024 512 256; do for w in 64 4096; do
+                    echo "nsmb${b}w${w}|--ws $w --stride 1 --rdma-bs $b|1:0|0||nsmall|4"; done; done ;;
+        n2sge)  for b in 2048 1024 512 256; do for w in 64 4096; do
+                    echo "nsgb${b}w${w}|--ws $w --stride 1 --rdma-bs 4096 --sge-bytes $b|1:0|0||nsmall|4"; done; done ;;
+        n2place) for f in 0 1 2 4; do echo "nplw32s8f${f}|--ws 32 --stride 8 --first1 $f|1:0|0||nboth|$RUNS"; done
+                 for w in 4 8; do for f in 0 1; do
+                    echo "nplw${w}s4096f${f}|--ws $w --stride 4096 --first1 $f|1:0|0||nboth|$RUNS"; done; done ;;
+        n2share) for w in 32 64 128 192 256 512; do
+                    echo "nshw128x${w}|--ws 128 --stride 1 --ws1 $w --stride1 1|1:0|0||nboth|$RUNS"; done ;;
+        n2walk) for s in 32 128 512 1024 2048 4096 16384 65536; do
+                    echo "nwkw32s${s}|--ws 32 --stride $s|1:0|0||ngeo0|1"; done ;;
+        n2cap)  for w in 192 208 224 240 256 272 288 304 320; do
+                    echo "ncpw${w}|--ws $w --stride 1|1:0|0||ngeo0|1"; done
+                for o in shuffle random; do for w in 128 256 384; do
+                    echo "nco${o:0:1}w${w}|--ws $w --stride 1 --order $o|1:0|0||ngeo0|1"; done; done ;;
+        n2lat)  echo "nltw64s1|--ws 64 --stride 1 --depth 1|1:0|0||nlat|3"
+                echo "nltw4096s1|--ws 4096 --stride 1 --depth 1|1:0|0||nlat|3"
+                echo "nltw32s4096|--ws 32 --stride 4096 --depth 1|1:0|0||nlat|3"
+                echo "nltw32s65536|--ws 32 --stride 65536 --depth 1|1:0|0||nlat|3" ;;
+        n2quant) for q in 0 4095; do
+                    echo "nqq${q}w256s1|--ws 256 --stride 1|16:218|0|quantum=$q|nboth|$RUNS"
+                    echo "nqq${q}w32s8|--ws 32 --stride 8|16:218|0|quantum=$q|nboth|$RUNS"; done ;;
+        n2rep)  echo "nrpw256s1|--ws 256 --stride 1|1:0 16:218|0 1||nrep|3"
+                echo "nrpw32s4096|--ws 32 --stride 4096|1:0 16:218|0 1||nrep|3"
+                echo "nrpw64s4096|--ws 64 --stride 4096|1:0 16:218|0 1||nrep|3" ;;
+        s2cap)  for w in 32 40 48 56 64 72 80 88 96 104 112 120 128 136 144 152 160; do
+                    echo "scpw${w}|--ws $w --stride 1 --cursor shared|1:0|0||sgeo|2"; done ;;
+        s2probe) for q in 0 64 16 8 4 2 1; do
+                    echo "sprr${q}|--ws 8 --stride 1 --ws1 65536 --stride1 1 --cursor shared|1:0|0|rcap0=$q|sprobe|$(( 2 * RUNS ))"; done
+                 for q in 0 4 1; do
+                    echo "sprqr${q}|--ws 8 --stride 1 --ws1 16 --stride1 1 --cursor shared|1:0|0|rcap0=$q|sprobeq|$(( 2 * RUNS ))"; done ;;
+        s2place) for w in 32 48 64 80 96 112 128 160; do
+                    echo "splrw${w}|--page-list $OUT/lists/rand-w${w}-d0.txt --page-list1 $OUT/lists/rand-w${w}-d1.txt --cursor shared|1:0|0||sgeo|2"; done
+                 for w in 64 96 128; do
+                    echo "splhw${w}|--page-list $OUT/lists/hi17-w${w}-d0.txt --page-list1 $OUT/lists/hi17-w${w}-d1.txt --cursor shared|1:0|0||sgeo|2"; done ;;
+        s2order) for w in 48 64 80 96 112 128 160; do
+                    echo "sorrw${w}|--ws $w --stride 1 --order random --cursor shared|1:0|0||sgeo|2"; done
+                 for w in 96 128; do
+                    echo "sorsw${w}|--ws $w --stride 1 --order shuffle --cursor shared|1:0|0||sgeo|2"; done ;;
+        s2walk) for s in 512 2048 8192 32768 131072 524288; do
+                    echo "swkw32s${s}|--ws 32 --stride $s --cursor shared|1:0|0||sgeo|2"; done
+                for w in 128 512 2048; do
+                    echo "swkw${w}s512|--ws $w --stride 512 --cursor shared|1:0|0||sgeo|2"; done ;;
+        s2rep)  echo "srpw256s1|--ws 256 --stride 1|1:0 16:218|0 1||srep|3"
+                echo "srpw64s4096|--ws 64 --stride 4096|1:0 16:218|0 1||srep|3" ;;
+    esac
+}
+a2_est() {
+    local n=0 lab ex cfgs pbs st g pps c b
+    while IFS='|' read -r lab ex cfgs pbs st g pps; do
+        set -- $cfgs; c=$#; set -- $pbs; b=$#
+        n=$(( n + c * b * pps + 1 ))
+    done < <(a2_specs "$1")
+    echo "$n"
+}
+a2_describe() {
+    case "$KIND:$1" in
+        nic:n2ways)  echo "alias2: ways: one set (stride 4096), ws 1-16, NIC0 alone and both, 1 and 4 QPs; again in sets 7 and 13, at stride 16384, and in random/shuffled order" ;;
+        nic:n2sets)  echo "alias2: sets: NIC0 alone, ws 5 and 9 at strides 2-1024 and 96/192/320, ws 3 and 17 at 32-256 (the smallest stride that misses at ws = ways + 1 is the set count)" ;;
+        nic:n2rot)   echo "alias2: rotation: ws 64 in one set, QPs 2/8/32 x RoCE MTU 2048/1024/512/256, d1t0c1 and d16t218c1 x pb 0/1, NIC0 alone and both, $RUNS runs; control ws 64 stride 1" ;;
+        nic:n2small) echo "alias2: READ size 4096-256 B, one page per READ, ws 64 (hits) and 4096 (misses), 4 and 16 QPs" ;;
+        nic:n2sge)   echo "alias2: 4 KiB READs scattered 2048-256 B per page (--sge-bytes), ws 64 and 4096" ;;
+        nic:n2place) echo "alias2: placement: both NICs at the same sets (ws 32 stride 8; ws 4/8 stride 4096), NIC 1 shifted by --first1 0/1/2/4" ;;
+        nic:n2share) echo "alias2: sharing: NIC0 ws 128 (fits alone), NIC1 ws 32-512" ;;
+        nic:n2walk)  echo "alias2: walk depth: NIC0 alone, ws 32, stride 32-65536 (pages 128 KiB to 256 MiB apart)" ;;
+        nic:n2cap)   echo "alias2: capacity 192-320 pages, NIC0 alone; shuffle and random order at 128/256/384" ;;
+        nic:n2lat)   echo "alias2: READ latency, 1 QP x 1 READ, NIC0 alone: hit, capacity, conflict, deep walk, 3 runs" ;;
+        nic:n2quant) echo "alias2: grant quantum 0 vs 4095 beats at d16t218c1, both NICs thrashing (ws 256 stride 1; ws 32 stride 8)" ;;
+        nic:n2rep)   echo "alias2: repeats: d1t0c1/d16t218c1 x pb 0/1 at ws 256 s1, ws 32 and 64 at s4096, 3 runs" ;;
+        ssd:s2cap)   echo "alias2: capacity 32-160 pages per drive, step 8, shared cursor (strict order), drive 0 alone and both" ;;
+        ssd:s2probe) echo "alias2: eviction probe: drive 0 ws 8 capped rcap0 0/64/16/8/4/2/1 while drive 1 thrashes (ws 65536; drive 1 alone too) or idles (ws 16; drive 0 alone too)" ;;
+        ssd:s2place) echo "alias2: placement: random pages in a 16 GiB span, and random pages 512 MiB apart (bits below 17 equal), per drive its own list" ;;
+        ssd:s2order) echo "alias2: random and shuffled visit order at 48-160 pages, shared cursor" ;;
+        ssd:s2walk)  echo "alias2: walk depth: ws 32, pages 2 MiB to 2 GiB apart; ws 128/512/2048 at 2 MiB apart" ;;
+        ssd:s2rep)   echo "alias2: repeats: d1t0c1/d16t218c1 x pb 0/1 at ws 256 s1 and ws 64 s4096, 3 runs" ;;
+    esac
+}
+a2_phase() {
+    local lab ex cfgs pbs st g pps
+    while IFS='|' read -r lab ex cfgs pbs st g pps; do
+        a2_grid "$g"
+        if [ "$KIND" = ssd ]; then RUNNER_EXTRA="--gen alias $ex --order cyclic"
+        else RUNNER_EXTRA="--gen alias --order cyclic --depth 16 --rdma-bs 4096 $ex"; fi
+        # a later --order/--depth/--rdma-bs in $ex wins (the runners take the last)
+        [ "$KIND" = ssd ] && case "$ex" in *--order*) RUNNER_EXTRA="--gen alias $ex" ;; esac
+        sweep_run "$lab" --cfgs "$cfgs" --caps 1 --pbs "$pbs" --set "$THR${st:+ $st}" "${A2G[@]}"
+    done < <(a2_specs "$1")
+    RUNNER_EXTRA=""
+}
+# s2place's page lists: per drive its own (seed differs), distinct pages.
+#   rand-w<W>-d<i>: W pages at random in [0, 2^22) (16 GiB of IOVA)
+#   hi17-w<W>-d<i>: W random multiples of 2^17 pages in [0, 2^26): equal low 17 bits
+a2_lists() {
+    if [ "$DRY" = 1 ]; then echo "    page lists into <campaign>/lists (python3, seeded)"; return 0; fi
+    mkdir -p "$OUT/lists"
+    python3 - "$OUT/lists" <<'PYEOF'
+import os, random, sys
+d = sys.argv[1]
+for w in (32, 48, 64, 80, 96, 112, 128, 160):
+    for i in (0, 1):
+        r = random.Random(1106 + 10 * w + i)
+        open(os.path.join(d, f"rand-w{w}-d{i}.txt"), "w").write("\n".join(map(str, r.sample(range(1 << 22), w))) + "\n")
+for w in (64, 96, 128):
+    for i in (0, 1):
+        r = random.Random(2106 + 10 * w + i)
+        open(os.path.join(d, f"hi17-w{w}-d{i}.txt"), "w").write("\n".join(str(x << 17) for x in r.sample(range(1 << 9), w)) + "\n")
+PYEOF
 }
 
 # ------------------------------------------------------------------ --paper
@@ -947,6 +1160,7 @@ if [ "$KIND" = ssd ] && [ "$ALIAS" = 1 ]; then
     hold_up || exit 1
     guard arm "$OUT/guard" "$HOLD_DIR" 120 || { echo "ERROR: the hang guard did not arm (above); the holder keeps the drives: reboot to end" >&2; exit 1; }
     export ALIAS_HOLD=$HOLD_DIR
+    [ "$ALIAS2" = 1 ] && { a2_lists && say "alias2: page lists for s2place in $OUT/lists ($(ls "$OUT/lists" | wc -l) files)" || exit 1; }
 elif [ "$KIND" = ssd ]; then
     # Both drives completing on one CPU livelocks it in strict mode (10-25).
     # The layout is per boot: after a reboot for another leg it may differ.
@@ -1046,6 +1260,20 @@ if [ "$ANALYSIS" = 1 ] && [ "${#MANIFESTS[@]}" -gt 0 ]; then
         note "analysis of the new sweeps exited $? (analyze-new/analyze.log)"
     rm -f "$OUT/analyze-new.tar.gz"
 fi
+if [ "$ANALYSIS" = 1 ] && [ "$ALIAS2" = 1 ]; then
+    shopt -s nullglob
+    old=( "$RESULTS"/dual"$KIND"-pips-strict-c1105[0-9][0-9][0-9][0-9]a[gcf]w*s*.manifest.tsv )
+    shopt -u nullglob
+    if [ "${#old[@]}" -gt 0 ]; then
+        margs=(); for m in "${old[@]}"; do margs+=(--manifest "$m"); done
+        say "analysis 1b: the 11-05 alias campaign's ${#old[@]} sweep(s) again, IOTLB simulated as ${PIPS_SEQ_IOTLB} (not strict)"
+        HEARTBEAT=120 bash "$HERE/pips-analyze.sh" "$KIND" --sweeps "" "${margs[@]}" -j "$JOBS" -o "$OUT/analyze-1105" ||
+            note "reanalysis of the 11-05 sweeps exited $? (analyze-1105/analyze.log)"
+        rm -f "$OUT/analyze-1105.tar.gz"
+    else
+        note "no 11-05 alias manifests in $RESULTS: no reanalysis"
+    fi
+fi
 if [ "$ANALYSIS" = 1 ] && [ "$PENDING" = 1 ]; then
     say "analysis 2/2: pending, the 0x0A04/0x0A05 sweeps with the fixed model (HANDOFF §8 Next item 0)"
     pend=(); [ "$KIND" = ssd ] && pend=(--no-lengths)
@@ -1069,7 +1297,8 @@ for m in ${MANIFESTS[@]+"${MANIFESTS[@]}"}; do
         ( cd "$REPO" && find "$ld" -maxdepth 1 -type f \( -name 'pips-cfg.txt' -o -name 'pips-status*.txt' \
               -o -name 'pips-log-summary.*' -o -name 'sweep-id.txt' -o -name 'nstat-client.txt' \
               -o -name 'pips-log-record.txt' -o -name 'windows.txt' -o -name 'pips-bp.tsv' \
-              -o -name 'iommu-ops.txt' \) -print0 2>/dev/null |
+              -o -name 'iommu-ops.txt' -o -name 'fio-nic*.json' -o -name 'fio-ssd*.json' \
+              -o -name 'alias-rdma-nic*.log' -o -name 'alias-nvme.out' \) -print0 2>/dev/null |
           xargs -0 -r cp --parents -t "$OUT/runs/" )
         ( cd "$REPO" && [ -d "$rd" ] && find "$rd"* -maxdepth 1 -type f -name '*.rpt' -size -1M -print0 2>/dev/null |
           xargs -0 -r cp --parents -t "$OUT/runs/" )

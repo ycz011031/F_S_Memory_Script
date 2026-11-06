@@ -81,6 +81,14 @@ def one_run(reports, exp, j, nics):
         t = read_kv(os.path.join(f'{base}-nic{i}', 'iperf.bw.rpt')).get('Avg_iperf_tput')
         r[f'tput_nic{i}_gbps'] = t
         total = None if (t is None or total is None) else total + t
+        # --gen alias: alias-rdma's own numbers over the window (fio-sum's fio.rpt):
+        # READ groups per s and their completion latency (mean, p99 of the worst QP).
+        fio = read_kv(os.path.join(f'{base}-nic{i}', 'fio.rpt'))
+        if fio:
+            r[f'iops_nic{i}'] = fio.get('IOPS')
+            r[f'lat_us_nic{i}'] = fio.get('lat_mean_us')
+            r[f'p99_us_nic{i}'] = fio.get('clat_p99_us_max')
+            r[f'window_covered_nic{i}'] = fio.get('window_covered')
     r['tput_total_gbps'] = total
 
     pcie = read_kv(os.path.join(base, 'pcie.rpt'))

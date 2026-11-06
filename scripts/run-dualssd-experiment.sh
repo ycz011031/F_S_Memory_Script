@@ -76,6 +76,10 @@
 #   --ws N --stride N   pages first + i*stride, i < ws (default 64, 1)
 #   --first N --order cyclic|shuffle|random --page-list PATH --backing-pages N
 #   --lba rand|seq      where on the namespace (default rand)
+#   --ws1 N --stride1 N --first1 N --order1 O --page-list1 PATH
+#                       drive 1's own pattern (default drive 0's), its own region
+#   --cursor queue|shared  one cursor per queue (default; their phases drift) or
+#                       one per drive (strict pattern order)
 # Read-only as fio: the generator builds no command but Identify, queue
 # setup and Read. Its per-queue output is fio's (fio-ssd<i>-<k>.json and
 # _iops.1.log), so fio-sum and the results are the same; the results add
@@ -120,6 +124,7 @@ pips_log=0             # 1: record the PIPS switch's TLP log in every run
 iommu_ops=0            # 1: count IOMMU map/unmap and VT-d invalidations (utils/iommu-ops.sh)
 gen=fio                # fio, or alias: scripts/pips/alias/alias-nvme through VFIO
 a_ws=64; a_stride=1; a_first=0; a_order=cyclic; a_list=""; a_backing=0; a_lba=rand
+a_ws1=""; a_stride1=""; a_first1=""; a_order1=""; a_list1=""; a_cursor=queue   # drive 1's own pattern (empty: drive 0's)
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -146,6 +151,12 @@ while [ $# -gt 0 ]; do
         --page-list)    a_list="$2"; shift 2 ;;
         --backing-pages) a_backing="$2"; shift 2 ;;
         --lba)          a_lba="$2"; shift 2 ;;
+        --ws1)          a_ws1="$2"; shift 2 ;;
+        --stride1)      a_stride1="$2"; shift 2 ;;
+        --first1)       a_first1="$2"; shift 2 ;;
+        --order1)       a_order1="$2"; shift 2 ;;
+        --page-list1)   a_list1="$2"; shift 2 ;;
+        --cursor)       a_cursor="$2"; shift 2 ;;
         -h|--help)
             sed -n '2,85p' "$SELF"; exit 0 ;;
         *) echo "unknown option: $1"; exit 2 ;;
@@ -166,7 +177,33 @@ case "$a_lba" in rand|seq) ;; *) echo "ERROR: --lba rand or seq" >&2; exit 2 ;; 
 for v in "$a_ws" "$a_stride" "$a_first" "$a_backing"; do
     case "$v" in ''|*[!0-9]*) echo "ERROR: --ws/--stride/--first/--backing-pages take integers" >&2; exit 2 ;; esac
 done
+for v in "$a_ws1" "$a_stride1" "$a_first1"; do
+    case "$v" in *[!0-9]*) echo "ERROR: --ws1/--stride1/--first1 take integers" >&2; exit 2 ;; esac
+done
+case "$a_order1" in ''|cyclic|shuffle|random) ;; *) echo "ERROR: --order1 cyclic, shuffle or random" >&2; exit 2 ;; esac
+case "$a_cursor" in queue|shared) ;; *) echo "ERROR: --cursor queue or shared" >&2; exit 2 ;; esac
 [ -z "$a_list" ] || [ -f "$a_list" ] || { echo "ERROR: --page-list $a_list: no such file" >&2; exit 2; }
+[ -z "$a_list1" ] || [ -f "$a_list1" ] || { echo "ERROR: --page-list1 $a_list1: no such file" >&2; exit 2; }
+# The holder's load extras (KEY=VALUE) and alias-nvme's options for drive 1's pattern and the cursor.
+hold_extra() {
+    local e="cursor=$a_cursor"
+    [ "$a_first" != 0 ] && e+=" first=$a_first"
+    [ -n "$a_list" ] && e+=" list=$(readlink -f "$a_list")"
+    [ -n "$a_ws1" ] && e+=" ws1=$a_ws1"
+    [ -n "$a_stride1" ] && e+=" stride1=$a_stride1"
+    [ -n "$a_first1" ] && e+=" first1=$a_first1"
+    [ -n "$a_order1" ] && e+=" order1=$a_order1"
+    [ -n "$a_list1" ] && e+=" list1=$(readlink -f "$a_list1")"
+    echo "$e"
+}
+nvme_extra() {
+    echo "--cursor $a_cursor"
+    [ -n "$a_ws1" ] && echo "--ws1 $a_ws1"
+    [ -n "$a_stride1" ] && echo "--stride1 $a_stride1"
+    [ -n "$a_first1" ] && echo "--first1 $a_first1"
+    [ -n "$a_order1" ] && echo "--order1 $a_order1"
+    [ -n "$a_list1" ] && echo "--page-list1 $a_list1"
+}
 # JOBS[i]: instances on drive i. -J n0,n1 sets them separately (co-run only).
 IFS=',' read -r -a JOBS <<< "$jobs"
 case "${#JOBS[@]}" in
@@ -373,8 +410,11 @@ preflight() {
         done
         [ "$iodepth" = "$hd" ] || PROBLEMS+=("--iodepth $iodepth, but the holder runs qd $hd")
         [ "$bsb" = "$hbs" ] || PROBLEMS+=("--bs $bs, but the holder runs bs $hbs")
-        [ "$a_first" = 0 ] && [ -z "$a_list" ] && [ "${a_backing:-0}" = 0 ] && [ "$a_lba" = rand ] ||
-            PROBLEMS+=("under a holder only --ws, --stride and --order change per run (not --first, --page-list, --backing-pages, --lba)")
+        [ "${a_backing:-0}" = 0 ] && [ "$a_lba" = rand ] ||
+            PROBLEMS+=("under a holder --backing-pages and --lba can't change per run")
+        [ "$a_cursor" = queue ] && [ -z "$a_ws1$a_stride1$a_first1$a_order1$a_list1$a_list" ] && [ "$a_first" = 0 ] ||
+            grep -q ' v2' "$HOLD/state" 2>/dev/null ||
+            PROBLEMS+=("the holder predates per-drive patterns, --first/--page-list and --cursor (state without v2, 11-06): start a new campaign")
         a=$(cat "$HOLD/alive" 2>/dev/null)
         [ -n "$a" ] && [ $(( $(date +%s%3N) - ${a%% *} )) -lt 10000 ] || PROBLEMS+=("the holder's heartbeat is stale: $HOLD/alive '$a'")
     elif [ "$gen" = alias ]; then
@@ -542,7 +582,9 @@ echo "  SSDs       : $ssds  (indices: ${ACTIVE[*]})"
 for i in "${ACTIVE[@]}"; do echo "               $i: ${DEVS[$i]}  ${JOBS[$i]} instance(s) on cores ${CORES[$i]}"; done
 if [ "$gen" = alias ]; then
 echo "  generator  : alias-nvme (VFIO, polled), per queue: iodepth $iodepth, bs=$bs, lba $a_lba, read-only"
-echo "  pattern    : $( [ -n "$a_list" ] && echo "page list $a_list" || echo "ws $a_ws stride $a_stride first $a_first") order $a_order, backing ${a_backing:-0} (0 = default)"
+echo "  pattern    : $( [ -n "$a_list" ] && echo "page list $a_list" || echo "ws $a_ws stride $a_stride first $a_first") order $a_order, backing ${a_backing:-0} (0 = default), cursor $a_cursor"
+[ -n "$a_ws1$a_stride1$a_first1$a_order1$a_list1" ] &&
+echo "  drive 1    : $( [ -n "$a_list1" ] && echo "page list $a_list1" || echo "ws ${a_ws1:-$a_ws} stride ${a_stride1:-$a_stride} first ${a_first1:-$a_first}") order ${a_order1:-$a_order}"
 else
 echo "  per instance: iodepth $iodepth, $rw bs=$bs, $ioengine, O_DIRECT, read-only"
 fi
@@ -593,17 +635,17 @@ for ((j = 0; j < num_runs; j++)); do
         # The campaign's holder runs the load: one command, ready when loaded.
         mask=0; for i in "${ACTIVE[@]}"; do mask=$(( mask | (1 << i) )); done
         rm -f "$L/alias-ready"
-        echo "load $RUN $mask $a_ws $a_stride $a_order $warm $fio_runtime $L $L/alias-ready" > "$HOLD/cmd.tmp" &&
+        echo "load $RUN $mask $a_ws $a_stride $a_order $warm $fio_runtime $L $L/alias-ready $(hold_extra)" > "$HOLD/cmd.tmp" &&
             mv "$HOLD/cmd.tmp" "$HOLD/cmd"
-        for _ in $(seq 300); do [ -e "$L/alias-ready" ] && break; sleep 0.2; done
+        for _ in $(seq 600); do [ -e "$L/alias-ready" ] && break; sleep 0.2; done
         if [ ! -e "$L/alias-ready" ]; then
-            echo "ERROR: the holder did not load the drives in 60 s. Its log:" >&2
+            echo "ERROR: the holder did not load the drives in 120 s. Its log:" >&2
             tail -15 "$HOLD/holder.txt" | sed 's/^/    /' >&2
             stop_fio
             exit 3
         fi
         want=1
-        echo "   holder: load $RUN on drives mask $mask, ws $a_ws stride $a_stride $a_order"
+        echo "   holder: load $RUN on drives mask $mask, ws $a_ws stride $a_stride $a_order; $(hold_extra)"
     elif [ "$gen" = alias ]; then
         # One generator for every active drive: one VFIO process per group.
         aargs=(); acpus=(); aq=(); aser=()
@@ -616,7 +658,7 @@ for ((j = 0; j < num_runs; j++)); do
         sudo "$ALIAS_NVME" "${aargs[@]}" --serial "$(IFS=,; echo "${aser[*]}")" \
             --queues "$(IFS=,; echo "${aq[*]}")" --cpus "$(IFS=/; echo "${acpus[*]}")" \
             --qd "$iodepth" --bs "$bs" --lba "$a_lba" \
-            --ws "$a_ws" --stride "$a_stride" --first "$a_first" --order "$a_order" \
+            --ws "$a_ws" --stride "$a_stride" --first "$a_first" --order "$a_order" $(nvme_extra) \
             $( [ "$a_backing" -gt 0 ] && echo "--backing-pages $a_backing") \
             --warm "$warm" --seconds "$fio_runtime" --heartbeat 10 \
             --ready-file "$L/alias-ready" > "$L/alias-nvme.out" 2>&1 9>&- &
@@ -863,7 +905,9 @@ python3 "$HERE/dualssd-results.py" dump \
     --meta rw="$rw" --meta ioengine="$( [ "$gen" = alias ] && echo vfio-alias || echo "$ioengine")" \
     --meta gen="$gen" \
     $( [ "$gen" = alias ] && printf -- '--meta %s ' alias_ws="$a_ws" alias_stride="$a_stride" alias_first="$a_first" \
-        alias_order="$a_order" alias_backing="$a_backing" alias_lba="$a_lba" alias_list="${a_list:-none}") \
+        alias_order="$a_order" alias_backing="$a_backing" alias_lba="$a_lba" alias_list="${a_list:-none}" \
+        alias_cursor="$a_cursor" alias_ws1="${a_ws1:-$a_ws}" alias_stride1="${a_stride1:-$a_stride}" \
+        alias_first1="${a_first1:-$a_first}" alias_order1="${a_order1:-$a_order}" alias_list1="${a_list1:-${a_list:-none}}") \
     --meta devices="$(for i in "${ACTIVE[@]}"; do printf '%s ' "${DEVS[$i]}"; done | xargs | tr ' ' ',')" \
     --meta serials="$(for i in "${ACTIVE[@]}"; do printf '%s ' "${SSD_SERIALS[$i]}"; done | xargs | tr ' ' ',')" \
     --meta dur_s="$dur" --meta warm_s="$warm" --meta cpu_util_cores="$active_cores" \
