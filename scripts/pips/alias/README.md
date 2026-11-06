@@ -155,4 +155,5 @@ runner writes each NIC's Gb/s over the windows to `iperf.bw.rpt` as
 | `alias-rdma.c` | RDMA READ generator: `--role client` (host under test), `--role server` (styx) |
 | `alias-run.sh` | builds for this host when needed, then runs (`--build`, `--path`) |
 | `alias-vfio.sh` | `bind`, `restore`, `status`: nvme ↔ vfio-pci |
+| `alias-postmortem.sh` | after a host died in a run: the previous boot's kernel log, panic and BMC records, the runner's output, the drives and the switch now (read only) |
 | `Makefile` | `make nvme`, `make rdma` → `build/<host>/` (git-ignored) |
