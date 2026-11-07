@@ -17,7 +17,13 @@ an option is added).
   which sweep and design, which report generator reads what, the published
   pages). On the Windows analysis machine `claude.md` (git-ignored) adds its
   local paths, tools and editing gotchas.
-- **Last updated:** 2026-11-07: **0x0A08 becomes the assumption-test build**
+- **Last updated:** 2026-11-07 (later): **0x0A08 is built** (FPGA repo `5fe3bda`, P1-P3, not
+  yet run on hardware) and **its live-test tools are written, not yet run**:
+  `scripts/pips/pips-rid-live.sh` (T0-T12), `pips bg` (pips.c, `PIPS_BG_*` merged into
+  `pips_regs.h`), the holder's `map` command (alias-nvme: fresh page tags without I/O),
+  `ridcheck/pips_bg_pages.c` (F3). Checked here: C syntax (MinGW, stub headers), the
+  script's syntax, dry run and its Python on synthetic data. No engine model in pips_sim.
+- **2026-11-07:** **0x0A08 becomes the assumption-test build**
   ([docs/PIPS-0A08-ASSUMPTION-TEST.md](docs/PIPS-0A08-ASSUMPTION-TEST.md)): the engine core
   plus requester-ID slots, tag window and clash detector (fallback F2), leak monitor, tag
   census, straddle / flow-control / head-of-line counters, completion capture; live tests
@@ -1129,6 +1135,7 @@ reanalysis likely found nothing either (no c1105 files left in ~).
 
 ### Next
 
+Status 11-07 (later): **0x0A08 built (FPGA `5fe3bda`), live tests written.** Once the bitstream is on bigserver: `git pull`, then `bash scripts/pips/pips-rid-live.sh --start-holder --fallbacks` after a reboot (drives on nvme), or without `--start-holder` while a holder runs; ~1 h; ends with the drives held (reboot: `sync; sudo systemctl reboot -ff`). Copy back `~/pips-rid-live-*.tar.gz`. icx: `--load-cmd '<a NIC load>'`. `pips-campaign.sh` still refuses 0x0A08 (it asks for 0x0a06/0x0a07).
 Status 11-07: **run `pips-rid-check.sh` on both hosts** (bigserver with `--module --pt --vfio-drive0`, icx with `--module --pt`; read-only apart from drive 0's short VFIO bind) and copy back `~/pips-rid-check-*.tar.gz`. Then the hardware agent builds `0x0A08` ([docs/PIPS-0A08-ASSUMPTION-TEST.md](docs/PIPS-0A08-ASSUMPTION-TEST.md)), and its live tests T0-T12 decide F0/F1/F2/F3/F4.
 Status 11-06 (night): **background read engine designed, not built** ([docs/PIPS-BG-READ-ENGINE.md](docs/PIPS-BG-READ-ENGINE.md)): next is the hardware agent's build of `0x0A08` (its §9, testbench §9.1, open questions §13), then host software S1-S8 (§10) and the bring-up X0 on bigserver (§12). The one assumption to test first: a PIPS downstream port's own requester ID translates through its device's IOMMU domain.
 Status 11-06 (later): **alias campaign 2 set up, not run** (section above): `pips-campaign.sh nic --alias2 --tmux` (icx, ~19 h 30), `pips-campaign.sh ssd --alias2 --tmux` (bigserver, ~5 h + reboot). Committed and pushed 11-06.

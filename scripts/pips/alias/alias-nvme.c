@@ -78,7 +78,12 @@
  *                        (drive 1), cursor=queue|shared, seed=; a drive whose
  *                        pattern changes gets its region remapped;
  *                        outputs OUTDIR/fio-ssd<i>-<queue>.json and _iops.1.log;
- *                        READYFILE touched once every queue is loaded). A file
+ *                        READYFILE touched once every queue is loaded);
+ *                        "map NAME MASK WS STRIDE ORDER [KEY=VALUE ...]" maps
+ *                        those patterns again on fresh backings (every page
+ *                        tagged anew), no I/O: for the switch's read engine
+ *                        (pips-rid-live.sh), since a load's reads overwrite
+ *                        the tags; state says "v2 map" when it has it. A file
  *                        DIR/stop ends the load under way (as SIGINT does). The
  *                        holder writes DIR/state, DIR/alive (each second: epoch
  *                        ms, pid, load|idle), DIR/done and DIR/done.<n> ("<n>
@@ -1101,7 +1106,7 @@ static void pattern_switch(struct drive *d, const struct alias_pattern *t)
 static void hold_loop(void)
 {
     char b[300];
-    snprintf(b, sizeof(b), "ready %d v2\n", (int)getpid());   /* v2: per-drive patterns, load extras, --cursor (11-06) */
+    snprintf(b, sizeof(b), "ready %d v2 map\n", (int)getpid());   /* v2: per-drive patterns, load extras, --cursor (11-06); map (11-07) */
     hold_write("state", b);
     printf("alias-nvme: HOLD %s: drives open, waiting for commands in %s/cmd; SIGINT/SIGTERM stop a load, "
            "never the holder; end with: sync; systemctl reboot -ff\n", g_hold, g_hold);
@@ -1126,6 +1131,22 @@ static void hold_loop(void)
         unsigned long long ws = 0, stride = 0;
         double warm = 0, secs = 0;
         struct alias_pattern t[MAXDEV];
+        /* map NAME MASK WS STRIDE ORDER [KEY=VALUE ...]: a load's patterns, each
+         * masked drive's region mapped again on a fresh backing (every page
+         * tagged with its backing index again), no I/O. For reads by the
+         * switch's background read engine: a load's reads overwrite the tags. */
+        int is_map = 0;
+        if (!strncmp(line, "map ", 4)) {
+            char nm[128], o[32], rest[1000];
+            unsigned mk;
+            unsigned long long w, st;
+            int used = 0;
+            if (sscanf(line, "map %127s %u %llu %llu %31s%n", nm, &mk, &w, &st, o, &used) == 5) {
+                snprintf(rest, sizeof(rest), "%s", line + used);
+                snprintf(line, sizeof(line), "load %s %u %llu %llu %s 0 1 - %s", nm, mk, w, st, o, rest);
+                is_map = 1;
+            }
+        }
         int bad = sscanf(line, "load %127s %u %llu %llu %31s %lf %lf %599s", name, &mask, &ws, &stride, ord,
                          &warm, &secs, outdir) < 8 || !(mask & ((1u << g_ndev) - 1)) || !ws || !stride || secs <= 0 ||
                   (strcmp(ord, "cyclic") && strcmp(ord, "shuffle") && strcmp(ord, "random"));
@@ -1185,6 +1206,15 @@ static void hold_loop(void)
             line[strcspn(line, "\n")] = 0;
             printf("alias-nvme: hold: command %u not understood%s%s: '%s'\n", n, why[0] ? ": " : "", why, line);
             snprintf(b, sizeof(b), "%u bad-command\n", n);
+        } else if (is_map) {
+            for (int i = 0; i < g_ndev; i++)
+                if (mask >> i & 1) {
+                    pattern_switch(&g_dev[i], &t[i]);
+                    printf("alias-nvme: hold: map %u '%s': %s region at IOVA 0x%" PRIx64 ", %" PRIu64
+                           " pages, backing %" PRIu64 " pages, fresh tags (page k holds k mod backing)\n",
+                           n, name, g_dev[i].bdf, g_dev[i].data_iova, g_dev[i].pat.span, g_dev[i].bk.pages);
+                }
+            snprintf(b, sizeof(b), "%u %s ok\n", n, name);
         } else {
             printf("alias-nvme: hold: load %u '%s': drives 0x%x, ws %llu stride %llu %s, cursor %s, warm %.0f s, %.0f s, into %s\n",
                    n, name, mask, ws, stride, ord, cursor ? "shared" : "queue", warm, secs, outdir);

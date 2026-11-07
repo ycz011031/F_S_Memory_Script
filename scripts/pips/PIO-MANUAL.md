@@ -311,6 +311,7 @@ the longest any read waited at an input (a device's completion timeout is
 | `0x0A05` | `64193c6`, 10-17 | batching FIFO 512 rows (was 128) |
 | `0x0A06` | `9673e37` + `d44fdd0`, 10-23/24 | page batcher: reg2/reg3, status `0x24`-`0x2C` |
 | `0x0A07` | `28ff5b6`, 10-27 | rate caps (reg4 `0x10`), refused / held cycle counters `0x30`-`0x3C`, read flush no longer preempts |
+| `0x0A08` | `5fe3bda`, 11-06 | background read engine, assumption-test build (`BG_ID` "RIDP"): AXI segment `0xA402_0000` (`pips bg`; `pips_regs.h` `PIPS_BG_*`; FPGA repo `sw_handoff/README.md` §12). The batcher as 0x0A07, plus an RQ mux after it and a completion sink before the router. Specs: [docs/PIPS-BG-READ-ENGINE.md](../../docs/PIPS-BG-READ-ENGINE.md), [docs/PIPS-0A08-ASSUMPTION-TEST.md](../../docs/PIPS-0A08-ASSUMPTION-TEST.md); live tests `pips-rid-live.sh` |
 
 Every artifact the tools write carries the design ID: in the name for raw logs
 (`pips-log-id0a04.bin.gz`) and sweeps (`<NAME>-id0a04-<setting>`), inside for

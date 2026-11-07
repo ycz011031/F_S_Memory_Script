@@ -1,6 +1,7 @@
 # PIPS background read engine (`pips_bg_rd`): design and plan
 
-Status: **proposal, 2026-11-06. Nothing built.** The engine core (issuer,
+Status: **proposal, 2026-11-06; the core is built in `0x0A08`** (FPGA repo
+`5fe3bda`, 11-06; not yet run on hardware; host tools: the test doc §5.2). The engine core (issuer,
 sink, mux, tags, latency, counters, table) is built first in design `0x0A08`
 together with the tests of its assumptions and fallbacks:
 [PIPS-0A08-ASSUMPTION-TEST.md](PIPS-0A08-ASSUMPTION-TEST.md). What this file

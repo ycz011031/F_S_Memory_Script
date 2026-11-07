@@ -1,6 +1,9 @@
-# Out-of-tree build of pips_iommu_peek.ko for the running kernel. pips-rid-check.sh
-# copies this folder into its output folder and builds there (nothing is written here).
-obj-m := pips_iommu_peek.o
+# Out-of-tree build of the ridcheck modules for the running kernel. The scripts
+# copy this folder into their output folder and build there (nothing is written
+# here). MODS picks the modules: pips_iommu_peek (pips-rid-check.sh --module),
+# pips_bg_pages (pips-rid-live.sh T11, fallback F3).
+MODS ?= pips_iommu_peek
+obj-m := $(addsuffix .o,$(MODS))
 KDIR ?= /lib/modules/$(shell uname -r)/build
 
 all:

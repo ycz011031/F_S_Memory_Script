@@ -219,6 +219,167 @@
 #define PIPS_LOG_PORT_IN1       1u            /* requests from downstream port zero (10ee:b148) */
 #define PIPS_LOG_PORT_OUT       2u            /* older format only: batched stream sent to the host */
 
+/* ------------------------------------------------------------------ background read engine
+ * pips_bg_rd_0 at PIPS_AXI_BG (design ID >= 0x0A08; on older builds the segment is unmapped and
+ * window reads fail with WIN_STATUS set). 64 KB, 32-bit registers, 32-bit writes only (wstrb is
+ * ignored), unused offsets read 0, nothing returns DECERR. Same addresses from XSCT.
+ * Specs: Fast-and-Safe-IO-Memory-Protection docs/PIPS-BG-READ-ENGINE.md and
+ * PIPS-0A08-ASSUMPTION-TEST.md; deviations: FPGA repo 0A08_UPGRADE_PLAN.md section 2 (H1-H16).
+ * 64-bit counters 0x100-0x184 read the SNAPSHOT (write CTRL.SNAPSHOT first); the test extension
+ * counters at 0x220/0x244/0x24C/0x2EC/0x2F4 read LIVE: read LO first, it latches HI for the read of
+ * HI that follows. Timing unit: one cycle = 4 ns (250 MHz). */
+#define PIPS_AXI_BG                 0xA4020000ull
+#define PIPS_DESIGN_ID_BG           0x0A08u             /* first build with the engine (test build) */
+
+#define PIPS_BG_ID                  0x000u   /* RO "RIDP" on 0x0A08, "BGRD" on the engine-only build */
+#define PIPS_BG_ID_TEST             0x52494450u
+#define PIPS_BG_ID_ENGINE           0x42475244u
+#define PIPS_BG_VERSION             0x004u   /* RO [31:16] major, [15:0] minor; 0x00010000 */
+#define PIPS_BG_CAPS                0x008u   /* RO [9:0] tags 256, [19:16] log2 table 13, [23:20] log2 trace 12,
+                                              *    [29:24] log2 histogram bins 6, [30] NP gating, [31] log tap */
+#define PIPS_BG_BUS                 0x00Cu   /* RO [7:0] primary, [15:8] secondary, [23:16] subordinate */
+#define PIPS_BG_CTRL                0x010u   /* RW, reset 0x404 */
+#define PIPS_BG_STATUS              0x014u   /* RO */
+#define PIPS_BG_RID                 0x018u   /* RW [15:0] slot 0 RID; RO [31:16] RID_LATCHED */
+#define PIPS_BG_BASE_LO             0x01Cu   /* RW IOVA [31:12] ([11:0] read 0) */
+#define PIPS_BG_BASE_HI             0x020u   /* RW IOVA [63:32] */
+#define PIPS_BG_FIRST               0x024u   /* RW first page index (pattern) */
+#define PIPS_BG_STRIDE              0x028u   /* RW pages between pattern pages, reset 1 */
+#define PIPS_BG_WS                  0x02Cu   /* RW pattern pages / table entries used, reset 1 */
+#define PIPS_BG_SEED                0x030u   /* RW LFSR seed, reset 1 */
+#define PIPS_BG_OFFSET              0x034u   /* RW byte offset in the page [11:2] */
+#define PIPS_BG_READ_DW             0x038u   /* RW DWs per read 1-16, reset 1 */
+#define PIPS_BG_INTERVAL            0x03Cu   /* RW live, min cycles between issues [15:0] */
+#define PIPS_BG_MAX_OUT             0x040u   /* RW live, outstanding reads 1-256, reset 1 */
+#define PIPS_BG_NPH_RESERVE         0x044u   /* RW live, issue only while nph_av > this, reset 2 */
+#define PIPS_BG_COUNT_LO            0x048u   /* RW reads to issue then DRAIN, 0 = no limit */
+#define PIPS_BG_COUNT_HI            0x04Cu
+#define PIPS_BG_TIMEOUT             0x050u   /* RW cycles, reset 0x10000 (262 us); below 256 means 256 */
+#define PIPS_BG_BACKING             0x054u   /* RW data check backing pages, power of two, 0 = no compare */
+#define PIPS_BG_HIST_SHIFT          0x058u   /* RW bin = min(latency >> shift, 63), reset 3 */
+#define PIPS_BG_TRACE_SKIP          0x05Cu   /* RW trace holds sequence numbers SKIP .. SKIP+4095 */
+
+/* CTRL bits. Start = write RUN 1 while it reads 0 (IDLE); stop = write RUN 0 while it reads 1.
+ * RUN reads back the request and drops to 0 when the engine is IDLE again, so a read-modify-write
+ * of CTRL (e.g. to change ARB live) never starts a run by accident. */
+#define PIPS_BG_CTRL_RUN            (1u << 0)
+#define PIPS_BG_CTRL_CLEAR          (1u << 1)    /* self-clearing; see README section 12 for what it clears */
+#define PIPS_BG_CTRL_STOP_ON_ERR    (1u << 2)    /* reset 1 */
+#define PIPS_BG_CTRL_SNAPSHOT       (1u << 3)    /* self-clearing: latch 0x100-0x18C at once */
+#define PIPS_BG_CTRL_ARB_SHIFT      4            /* [5:4] live: 0 idle-fill, 1 round robin, 2 engine first */
+#define PIPS_BG_CTRL_ARB_MASK       (3u << 4)
+#define PIPS_BG_CTRL_SRC_TABLE      (1u << 6)
+#define PIPS_BG_CTRL_ORDER_RANDOM   (1u << 7)
+#define PIPS_BG_CTRL_DATA_CHECK     (1u << 8)
+#define PIPS_BG_CTRL_CLEAR_ON_START (1u << 10)   /* reset 1; adds the 4096-cycle trace sweep (~16 us) to START */
+#define PIPS_BG_CTRL_TRACE_EN       (1u << 11)
+#define PIPS_BG_CTRL_FC_GATE_OFF    (1u << 12)   /* live: ignore nph_av */
+#define PIPS_BG_CTRL_SINK_RIDTAG    (1u << 13)   /* required with a device-ID slot (F2) */
+
+/* STATUS fields */
+#define PIPS_BG_STATE(v)            ((uint32_t)(v) & 3u)          /* 0 IDLE, 1 RUN, 2 DRAIN, 3 START */
+#define PIPS_BG_ST_IDLE             0u
+#define PIPS_BG_ST_RUN              1u
+#define PIPS_BG_ST_DRAIN            2u
+#define PIPS_BG_ST_START            3u
+#define PIPS_BG_STS_ERR_STOP        (1u << 8)
+#define PIPS_BG_STS_TIMEOUT         (1u << 9)
+#define PIPS_BG_STS_UNEXPECTED      (1u << 10)
+#define PIPS_BG_STS_CFG_ERR         (1u << 11)
+#define PIPS_BG_CFG_CODE(v)         (((uint32_t)(v) >> 12) & 0xFu)
+#define PIPS_BG_STS_CLEARING        (1u << 16)
+#define PIPS_BG_STS_MISMATCH        (1u << 17)
+#define PIPS_BG_STS_COUNT_DONE      (1u << 18)
+#define PIPS_BG_STS_TABLE_WR_RUN    (1u << 19)
+#define PIPS_BG_STS_CLEAR_REFUSED   (1u << 20)
+#define PIPS_BG_STS_SINK_ARMED      (1u << 21)   /* RID_LATCHED != 0: the sink takes those completions */
+#define PIPS_BG_STS_LEAK            (1u << 22)   /* LEAK_CPL went non-zero: stop and investigate */
+#define PIPS_BG_STS_CLASH           (1u << 23)
+#define PIPS_BG_QUARANTINED(v)      ((uint32_t)(v) >> 24)         /* saturating at 255 */
+
+/* Config error codes (STATUS[15:12]) */
+#define PIPS_BG_CFG_RID             1u    /* RID not allowed (slot used by the run) */
+#define PIPS_BG_CFG_ZERO            2u    /* WS or STRIDE 0 */
+#define PIPS_BG_CFG_WS_POW2         3u    /* random order, WS not a power of two */
+#define PIPS_BG_CFG_TABLE_WS        4u    /* table mode, WS > 8192 */
+#define PIPS_BG_CFG_READ_DW         5u    /* READ_DW 0 or > 16, or OFFSET + 4*READ_DW crosses 64 bytes */
+#define PIPS_BG_CFG_MAX_OUT         6u    /* MAX_OUT 0 / > 256 / > tag window */
+#define PIPS_BG_CFG_SEED            7u    /* SEED 0 with random order */
+#define PIPS_BG_CFG_BACKING         8u    /* data check: BACKING not a power of two, or OFFSET != 0 */
+#define PIPS_BG_CFG_RANGE           9u    /* FIRST + (WS-1)*STRIDE >= 2^40 */
+#define PIPS_BG_CFG_NOT_IDLE        10u   /* start while not IDLE (ignored) */
+#define PIPS_BG_CFG_TABLE_SLOT      11u   /* a table entry in 0..WS-1 names a slot whose RID is 0 */
+#define PIPS_BG_CFG_QUAR_RID        12u   /* tags quarantined and a latched RID would change */
+
+/* Counters (snapshot; 64-bit pairs LO at off, HI at off + 4) */
+#define PIPS_BG_CYCLES              0x100u
+#define PIPS_BG_RUN_CYCLES          0x108u
+#define PIPS_BG_ISSUED              0x110u
+#define PIPS_BG_CPL_SC              0x118u
+#define PIPS_BG_CPL_UR              0x120u
+#define PIPS_BG_CPL_CA              0x128u
+#define PIPS_BG_CPL_OTHER           0x130u
+#define PIPS_BG_CPL_POISONED        0x138u
+#define PIPS_BG_CPL_MALFORMED       0x140u
+#define PIPS_BG_CPL_UNEXPECTED      0x148u
+#define PIPS_BG_TIMEOUTS            0x150u
+#define PIPS_BG_LAT_SUM             0x158u
+#define PIPS_BG_LAT_MIN             0x160u   /* 32-bit, 0xFFFFFFFF until the first completion */
+#define PIPS_BG_LAT_MAX             0x164u   /* 32-bit */
+#define PIPS_BG_STALL_ARB           0x168u
+#define PIPS_BG_STALL_TAGS          0x170u
+#define PIPS_BG_STALL_FC            0x178u
+#define PIPS_BG_DATA_MISMATCH       0x180u
+#define PIPS_BG_OUTSTANDING         0x188u   /* live */
+#define PIPS_BG_OUT_MAX             0x18Cu   /* snapshot */
+#define PIPS_BG_LAST_CPL            0x190u   /* live [7:0] tag, [10:8] status, [11] poisoned, [15:12] error code, [28:16] byte count */
+#define PIPS_BG_LAST_DATA           0x194u   /* live first DW of the last SC completion */
+#define PIPS_BG_LAST_ERR_PAGE       0x198u   /* live */
+#define PIPS_BG_LAST_ERR_SEQ        0x19Cu   /* live */
+
+/* Test extensions (0x0A08) */
+#define PIPS_BG_RID_SLOT(n)         (0x200u + 4u * (unsigned)(n))   /* n = 1..3: [15:0] RID, [31:16] latched */
+#define PIPS_BG_TAG_WIN             0x210u   /* [7:0] lo, [15:8] hi (inclusive), [16] enable */
+#define PIPS_BG_UNSAFE_KEY          0x214u   /* write PIPS_BG_UNSAFE_MAGIC; reads [0] unlocked */
+#define PIPS_BG_UNSAFE_MAGIC        0x53504F46u   /* "SPOF"; cleared when the engine returns to IDLE, by CLEAR, reset */
+#define PIPS_BG_CLASH               0x218u   /* [15:0] count, [23:16] last tag, [24] input (0 = in0) */
+#define PIPS_BG_LEAK_CPL            0x220u   /* live 64-bit, must stay 0 */
+#define PIPS_BG_LEAK_LAST           0x228u   /* [15:0] RID, [23:16] tag, [24] path (0 = dsp0) */
+#define PIPS_BG_CENSUS_CTRL         0x240u   /* write [0] 1 = clear census, [1] freeze */
+#define PIPS_BG_IN0_MRD             0x244u   /* live 64-bit */
+#define PIPS_BG_IN1_MRD             0x24Cu   /* live 64-bit */
+#define PIPS_BG_IN_TAG_MAX          0x254u   /* [7:0] in0, [15:8] in1 */
+#define PIPS_BG_WIN_HITS            0x258u   /* device MRds with a tag in TAG_WIN lo..hi (enable bit ignored) */
+#define PIPS_BG_IN0_TAGS            0x260u   /* 8 words, bit t of the 256-bit map = tag t seen */
+#define PIPS_BG_IN1_TAGS            0x280u
+#define PIPS_BG_CPL0_TAGS           0x2A0u   /* completions down router path dsp0 */
+#define PIPS_BG_CPL1_TAGS           0x2C0u
+#define PIPS_BG_RC_STRADDLE         0x2E0u   /* must stay 0 */
+#define PIPS_BG_RQ_STRADDLE         0x2E4u   /* must stay 0 */
+#define PIPS_BG_TFC                 0x2E8u   /* [3:0] nph_av, [7:4] npd_av, [11:8] min nph_av since FC_CLEAR, [31] present */
+#define PIPS_BG_HOL_ENGINE          0x2ECu   /* live 64-bit */
+#define PIPS_BG_HOL_DEVICE          0x2F4u   /* live 64-bit */
+#define PIPS_BG_FC_CLEAR            0x2FCu   /* write 1: clear 0x2E0-0x2F8 */
+
+/* Memories */
+#define PIPS_BG_HIST                0x0400u  /* 64 x u32 bins, saturating */
+#define PIPS_BG_CAP_WPTR            0x0FF0u  /* [5:0] next index, [31:8] entries ever written */
+#define PIPS_BG_CAP                 0x1000u  /* 64 entries x 32 B: DW0-2 descriptor, DW3-4 payload, latency, seq, [1:0] slot [8] late */
+#define PIPS_BG_TRACE               0x4000u  /* 4096 x u32 = one 16 KB window page */
+#define PIPS_BG_TABLE               0x8000u  /* 8192 x u32 = two window pages; writes only in IDLE */
+#define PIPS_BG_TRACE_LAT(v)        ((uint32_t)(v) & 0xFFFFu)        /* 0xFFFF = saturated or timed out */
+#define PIPS_BG_TRACE_STATUS(v)     (((uint32_t)(v) >> 16) & 7u)
+#define PIPS_BG_TRACE_POISONED      (1u << 19)
+#define PIPS_BG_TRACE_TIMED_OUT     (1u << 20)
+#define PIPS_BG_TRACE_MISMATCH      (1u << 21)
+#define PIPS_BG_TRACE_VALID         (1u << 31)
+#define PIPS_BG_TABLE_ENTRY(page, slot) (((uint32_t)(page) & 0x3FFFFFFFu) | ((uint32_t)(slot) << 30))
+
+/* Requester IDs the engine accepts (bus numbers from PIPS_BG_BUS) */
+#define PIPS_BG_RID_DSP1(sec)       ((uint16_t)(((sec) & 0xFFu) << 8))               /* sec:00.0, above in0 */
+#define PIPS_BG_RID_DSP0(sec)       ((uint16_t)((((sec) & 0xFFu) << 8) | (1u << 3)))  /* sec:01.0, above in1 */
+#define PIPS_BG_RID_USP(pri)        ((uint16_t)(((pri) & 0xFFu) << 8))               /* pri:00.0, negative control */
+
 /* ------------------------------------------------------------------ access helpers
  * bar = base of the mmap()ed BAR0 (UC mapping of sysfs resource0).
  * Every access is a single naturally aligned 32-bit volatile load or store. */

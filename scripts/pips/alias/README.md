@@ -174,7 +174,11 @@ runner writes each NIC's Gb/s over the windows to `iperf.bw.rpt` as
   uses it: `pips-campaign.sh ssd --alias` starts one holder, the runner sends
   each run's load to it (`ALIAS_HOLD=<dir>`: no bind, no restore, no block
   device; -J 4, qd 32, bs 4k fixed), the guard reboots a hung host, and the
-  campaign ends with the reboot. The runner waits 120 s for a one-shot
+  campaign ends with the reboot. A holder command `map NAME MASK WS STRIDE
+  ORDER [KEY=VALUE ...]` (11-07, state `v2 map`) maps a load's patterns again
+  on fresh backings without I/O, so every page holds its tag again: the
+  switch's read engine checks data against it (`pips-rid-live.sh`); a
+  load's reads overwrite the tags. The runner waits 120 s for a one-shot
   alias-nvme after SIGINT before it would KILL. Never
   `kill -9` alias-nvme by hand. `alias-hangtest.sh` is the tool for this.
 - **Interrupt remapping:** VFIO type1 refuses to attach a group on a host

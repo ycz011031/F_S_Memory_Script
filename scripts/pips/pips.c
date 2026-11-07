@@ -41,11 +41,18 @@
  *                              failing step. Steps, in order: regs bram
  *                              regfile dma ddr err split log (default: all)
  *   soak [N]                   N random 4/8-byte BRAM write/read pairs (1e6)
+ *   bg ...                     the background read engine (design >= 0x0a08,
+ *                              pips_bg_rd_0 at 0xA4020000): info, set K=V,
+ *                              start, stop, wait, run, counters, clear, hist,
+ *                              trace, capture, census, facts, table (pips bg
+ *                              help). Whatever starts a run stops it on exit
+ *                              (bg run: also on SIGINT/TERM/HUP, leak, clash)
  *
  *   -s BDF   upstream port (default $PIPS_BDF, else the only 10ee:b048)
  *   -f       skip the ID/VERSION check (rd and wr never check)
  *
- * Exit status: 0 ok, 1 failure, 2 usage, 3 timeout (log-stop, log-wait).
+ * Exit status: 0 ok, 1 failure, 2 usage, 3 timeout (log-stop, log-wait, bg
+ * stop/wait); bg run: 4 an error stopped the run, 5 a leak or clash.
  * Output lines of the form key=value are for scripts; lines starting with #
  * are notes. Register map: pips_regs.h. Access rules (single aligned 4/8-byte
  * accesses, never memcpy on the mapping): README.md in this folder.
@@ -55,6 +62,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -274,6 +282,7 @@ static void open_bar(void)
 /* WIN_BASE is shared state: one pips at a time. The file is opened without
  * O_CREAT when it exists: with fs.protected_regular, even root may not
  * O_CREAT-open another user's file in /tmp. */
+static int g_lock_fd = -1;
 static void take_lock(void)
 {
     int fd = open(LOCK_FILE, O_RDONLY);
@@ -287,6 +296,7 @@ static void take_lock(void)
             die("another pips has held %s for 5 s", LOCK_FILE);
         sleep_ms(100);
     }
+    g_lock_fd = fd;
 }
 
 static void check_id(void)
@@ -1667,6 +1677,850 @@ static int cmd_soak(uint64_t n)
     return bad || st ? 1 : 0;
 }
 
+/* ------------------------------------------------------------ background read engine
+ * pips_bg_rd_0 at PIPS_AXI_BG (design >= 0x0A08). Register map: pips_regs.h
+ * PIPS_BG_*; rules: the FPGA repo's sw_handoff/README.md section 12. Every
+ * command that starts the engine stops it on every exit path (bg_owned). */
+#define BG_CYCLE_NS 4.0
+static int g_bg_owned;                   /* this process started a run: stop it at exit */
+static volatile sig_atomic_t g_bg_sig;
+
+static uint32_t bg_rd(uint32_t off) { return axi_rd_ok(PIPS_AXI_BG + off, "engine register read"); }
+static void bg_wr(uint32_t off, uint32_t v) { axi_wr_ok(PIPS_AXI_BG + off, v, "engine register write"); }
+
+/* Snapshot counters: LO and HI from the same snapshot. Live 64-bit ones: LO
+ * first, it latches HI. */
+static uint64_t bg_rd64(uint32_t off)
+{
+    uint32_t lo = bg_rd(off);
+    return lo | (uint64_t)bg_rd(off + 4) << 32;
+}
+
+static unsigned bg_state(uint32_t st) { return PIPS_BG_STATE(st); }
+static const char *bg_state_name(unsigned s)
+{
+    static const char *n[] = { "idle", "run", "drain", "start" };
+    return n[s & 3];
+}
+
+/* Every CTRL write is a start (RUN 1 while idle) or a stop (RUN 0 while
+ * running). Writes that are neither (SNAPSHOT, CLEAR, a live ARB/FC_GATE_OFF
+ * change) go through here: RUN 0 when idle, RUN 1 while in RUN; in START or
+ * DRAIN wait (up to 1 s) for RUN or IDLE first. Should the run have ended in
+ * between and the write started a new one (START right after), it is stopped. */
+static void bg_ctrl_keep(uint32_t bits)
+{
+    double t0 = now_s();
+    unsigned s;
+
+    bits &= ~PIPS_BG_CTRL_RUN;
+    while ((s = bg_state(bg_rd(PIPS_BG_STATUS))) == PIPS_BG_ST_START || s == PIPS_BG_ST_DRAIN) {
+        if (now_s() - t0 > 1.0)
+            die("engine in %s for 1 s: cannot write CTRL without starting or stopping it", bg_state_name(s));
+        sleep_ms(1);
+    }
+    if (s == PIPS_BG_ST_IDLE) {
+        bg_wr(PIPS_BG_CTRL, bits);
+        return;
+    }
+    bg_wr(PIPS_BG_CTRL, bits | PIPS_BG_CTRL_RUN);
+    if (bg_state(bg_rd(PIPS_BG_STATUS)) == PIPS_BG_ST_START) {
+        bg_wr(PIPS_BG_CTRL, bits);
+        fprintf(stderr, "pips: the run ended just as CTRL was written, which started a new one: stopped it\n");
+        sleep_ms(2);
+    }
+}
+
+static int u32_cmp(const void *a, const void *b)
+{
+    uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+static const char *bg_cfg_name(unsigned c)
+{
+    static const char *n[] = { "none", "rid not allowed", "ws or stride 0", "random order needs ws a power of two",
+                               "table ws > 8192", "read_dw 0/>16 or offset+4*dw crosses 64 B",
+                               "max_out 0/>256/> tag window", "seed 0 with random order",
+                               "backing not a power of two, or offset != 0 with data check",
+                               "first+(ws-1)*stride >= 2^40", "start while not idle",
+                               "a table entry names a slot whose rid is 0",
+                               "tags quarantined and a latched rid would change" };
+    return c < sizeof n / sizeof n[0] ? n[c] : "?";
+}
+
+/* The build has the engine: design ID and BG_ID. */
+static void bg_check(void)
+{
+    int id;
+    uint32_t bid;
+
+    win_start();
+    id = design_id();
+    if (id < (int)PIPS_DESIGN_ID_BG)
+        die("design 0x%04x has no background read engine (needs >= 0x%04x)", id < 0 ? 0 : id, PIPS_DESIGN_ID_BG);
+    bid = bg_rd(PIPS_BG_ID);
+    if (bid != PIPS_BG_ID_TEST && bid != PIPS_BG_ID_ENGINE)
+        die("BG_ID reads 0x%08x, expected 0x%08x (RIDP) or 0x%08x (BGRD)", bid, PIPS_BG_ID_TEST, PIPS_BG_ID_ENGINE);
+}
+
+static void bg_bus(unsigned *pri, unsigned *sec, unsigned *sub)
+{
+    uint32_t b = bg_rd(PIPS_BG_BUS);
+
+    *pri = b & 0xFF;
+    *sec = (b >> 8) & 0xFF;
+    *sub = (b >> 16) & 0xFF;
+}
+
+/* A requester ID: in0 / port0 (sec:00.0, above in0), in1 / port1 (sec:01.0),
+ * usp (pri:00.0), dev0 / dev1 (function 0 of the device below in0 / in1:
+ * bus sec+1 / sec+2), BB:DD.F, or a number. 0 or none disarms a slot. */
+static uint16_t bg_parse_rid(const char *s)
+{
+    unsigned pri, sec, sub, b, d, f;
+
+    if (!strcmp(s, "none") || !strcmp(s, "off"))
+        return 0;
+    bg_bus(&pri, &sec, &sub);
+    if (!strcmp(s, "in0") || !strcmp(s, "port0"))
+        return PIPS_BG_RID_DSP1(sec);
+    if (!strcmp(s, "in1") || !strcmp(s, "port1"))
+        return PIPS_BG_RID_DSP0(sec);
+    if (!strcmp(s, "usp"))
+        return PIPS_BG_RID_USP(pri);
+    if (!strcmp(s, "dev0") || !strcmp(s, "dev1"))
+        return (uint16_t)(((sec + (s[3] == '0' ? 1u : 2u)) & 0xFF) << 8);
+    if (sscanf(s, "%x:%x.%x", &b, &d, &f) == 3 && strchr(s, ':') && b < 256 && d < 32 && f < 8)
+        return (uint16_t)(b << 8 | d << 3 | f);
+    {
+        uint64_t v = parse_num(s, "rid");
+        if (v > 0xFFFF)
+            die("rid '%s': 16 bits", s);
+        return (uint16_t)v;
+    }
+}
+
+/* What a requester ID is, for printing. */
+static const char *bg_rid_name(uint16_t rid, unsigned pri, unsigned sec, unsigned sub)
+{
+    static char b[4][48];
+    static int k;
+    char *o = b[k++ & 3];
+    unsigned bus = rid >> 8, dev = (rid >> 3) & 31, fn = rid & 7;
+    const char *what = "?";
+
+    if (!rid)
+        return "none";
+    if (rid == PIPS_BG_RID_DSP1(sec)) what = "in0 port";
+    else if (rid == PIPS_BG_RID_DSP0(sec)) what = "in1 port";
+    else if (rid == PIPS_BG_RID_USP(pri)) what = "usp";
+    else if (bus == sec + 1) what = "in0 device";
+    else if (bus == sec + 2) what = "in1 device";
+    else if (bus > sec && bus <= sub) what = "device";
+    snprintf(o, 48, "%02x:%02x.%u(%s)", bus, dev, fn, what);
+    return o;
+}
+
+static void bg_print_status(uint32_t st)
+{
+    printf("bg_status=0x%08x bg_state=%s err_stop=%u timeout_seen=%u unexpected_seen=%u cfg_err=%u cfg_code=%u "
+           "clearing=%u mismatch_seen=%u count_done=%u table_wr_run=%u clear_refused=%u sink_armed=%u "
+           "leak_seen=%u clash_seen=%u quarantined=%u\n", st, bg_state_name(bg_state(st)),
+           !!(st & PIPS_BG_STS_ERR_STOP), !!(st & PIPS_BG_STS_TIMEOUT), !!(st & PIPS_BG_STS_UNEXPECTED),
+           !!(st & PIPS_BG_STS_CFG_ERR), PIPS_BG_CFG_CODE(st), !!(st & PIPS_BG_STS_CLEARING),
+           !!(st & PIPS_BG_STS_MISMATCH), !!(st & PIPS_BG_STS_COUNT_DONE), !!(st & PIPS_BG_STS_TABLE_WR_RUN),
+           !!(st & PIPS_BG_STS_CLEAR_REFUSED), !!(st & PIPS_BG_STS_SINK_ARMED), !!(st & PIPS_BG_STS_LEAK),
+           !!(st & PIPS_BG_STS_CLASH), PIPS_BG_QUARANTINED(st));
+    if (st & PIPS_BG_STS_CFG_ERR)
+        printf("# config error %u: %s\n", PIPS_BG_CFG_CODE(st), bg_cfg_name(PIPS_BG_CFG_CODE(st)));
+    if (st & PIPS_BG_STS_LEAK)
+        printf("# LEAK: a completion for the engine reached a device path. Stop, do not restart, report\n");
+    if (st & PIPS_BG_STS_CLASH)
+        printf("# CLASH: a device used a tag the engine held (device-ID slot)\n");
+}
+
+static int cmd_bg_info(void)
+{
+    unsigned pri, sec, sub;
+    uint32_t caps = bg_rd(PIPS_BG_CAPS), ctrl = bg_rd(PIPS_BG_CTRL), win = bg_rd(PIPS_BG_TAG_WIN);
+    uint32_t rid0 = bg_rd(PIPS_BG_RID);
+
+    bg_bus(&pri, &sec, &sub);
+    printf("bg_id=0x%08x bg_kind=%s bg_version=0x%08x\n", bg_rd(PIPS_BG_ID),
+           bg_rd(PIPS_BG_ID) == PIPS_BG_ID_TEST ? "test" : "engine", bg_rd(PIPS_BG_VERSION));
+    printf("bg_caps=0x%08x tags=%u table=%u trace=%u hist_bins=%u np_gating=%u\n", caps, caps & 0x3FF,
+           1u << ((caps >> 16) & 15), 1u << ((caps >> 20) & 15), 1u << ((caps >> 24) & 63), !!(caps & (1u << 30)));
+    printf("bus_primary=0x%02x bus_secondary=0x%02x bus_subordinate=0x%02x\n", pri, sec, sub);
+    printf("rid_in0=0x%04x rid_in1=0x%04x rid_usp=0x%04x rid_dev0=0x%04x rid_dev1=0x%04x\n",
+           PIPS_BG_RID_DSP1(sec), PIPS_BG_RID_DSP0(sec), PIPS_BG_RID_USP(pri), (sec + 1) << 8, (sec + 2) << 8);
+    bg_print_status(bg_rd(PIPS_BG_STATUS));
+    printf("ctrl=0x%08x run=%u stop_on_err=%u arb=%u src=%s order=%s data_check=%u clear_on_start=%u trace=%u "
+           "fc_gate_off=%u sink_ridtag=%u\n", ctrl, ctrl & 1, !!(ctrl & PIPS_BG_CTRL_STOP_ON_ERR),
+           (ctrl & PIPS_BG_CTRL_ARB_MASK) >> PIPS_BG_CTRL_ARB_SHIFT, ctrl & PIPS_BG_CTRL_SRC_TABLE ? "table" : "pattern",
+           ctrl & PIPS_BG_CTRL_ORDER_RANDOM ? "random" : "cyclic", !!(ctrl & PIPS_BG_CTRL_DATA_CHECK),
+           !!(ctrl & PIPS_BG_CTRL_CLEAR_ON_START), !!(ctrl & PIPS_BG_CTRL_TRACE_EN), !!(ctrl & PIPS_BG_CTRL_FC_GATE_OFF),
+           !!(ctrl & PIPS_BG_CTRL_SINK_RIDTAG));
+    printf("rid0=0x%04x rid0_latched=0x%04x # %s\n", rid0 & 0xFFFF, rid0 >> 16, bg_rid_name(rid0 & 0xFFFF, pri, sec, sub));
+    for (unsigned n = 1; n <= 3; n++) {
+        uint32_t r = bg_rd(PIPS_BG_RID_SLOT(n));
+        printf("rid%u=0x%04x rid%u_latched=0x%04x # %s\n", n, r & 0xFFFF, n, r >> 16, bg_rid_name(r & 0xFFFF, pri, sec, sub));
+    }
+    printf("base=0x%" PRIx64 " first=%u stride=%u ws=%u seed=0x%x offset=%u read_dw=%u\n",
+           (uint64_t)bg_rd(PIPS_BG_BASE_HI) << 32 | bg_rd(PIPS_BG_BASE_LO), bg_rd(PIPS_BG_FIRST), bg_rd(PIPS_BG_STRIDE),
+           bg_rd(PIPS_BG_WS), bg_rd(PIPS_BG_SEED), bg_rd(PIPS_BG_OFFSET), bg_rd(PIPS_BG_READ_DW));
+    printf("interval=%u max_out=%u nph_reserve=%u count=%" PRIu64 " timeout=%u backing=%u hist_shift=%u trace_skip=%u\n",
+           bg_rd(PIPS_BG_INTERVAL), bg_rd(PIPS_BG_MAX_OUT), bg_rd(PIPS_BG_NPH_RESERVE),
+           (uint64_t)bg_rd(PIPS_BG_COUNT_HI) << 32 | bg_rd(PIPS_BG_COUNT_LO), bg_rd(PIPS_BG_TIMEOUT),
+           bg_rd(PIPS_BG_BACKING), bg_rd(PIPS_BG_HIST_SHIFT), bg_rd(PIPS_BG_TRACE_SKIP));
+    printf("tag_win=0x%08x tag_win_lo=%u tag_win_hi=%u tag_win_en=%u unsafe=%u\n", win, win & 0xFF, (win >> 8) & 0xFF,
+           !!(win & (1u << 16)), bg_rd(PIPS_BG_UNSAFE_KEY) & 1);
+    return 0;
+}
+
+static int bg_flag(const char *k, const char *v)
+{
+    if (!strcmp(v, "1") || !strcmp(v, "on") || !strcmp(v, "yes"))
+        return 1;
+    if (!strcmp(v, "0") || !strcmp(v, "off") || !strcmp(v, "no"))
+        return 0;
+    die("%s=%s: 0 or 1", k, v);
+}
+
+/* bg set K=V...: registers in the order given, CTRL once at the end. The
+ * latched ones only while IDLE (the engine reads them at start); interval=,
+ * maxout=, nphres=, arb= and fcoff= are live. Returns the keys it took. */
+static int bg_set(int argc, char **argv, int quiet)
+{
+    static const char *live[] = { "interval", "maxout", "nphres", "arb", "fcoff", NULL };
+    uint32_t st = bg_rd(PIPS_BG_STATUS), ctrl, ctrl0;
+    int idle = bg_state(st) == PIPS_BG_ST_IDLE, n = 0;
+
+    ctrl0 = ctrl = bg_rd(PIPS_BG_CTRL) & ~(PIPS_BG_CTRL_CLEAR | PIPS_BG_CTRL_SNAPSHOT);
+    for (int i = 0; i < argc; i++) {
+        char k[32], *eq = strchr(argv[i], '=');
+        const char *v;
+        int is_live = 0;
+
+        if (!eq || eq == argv[i] || (size_t)(eq - argv[i]) >= sizeof k)
+            die("bg set: '%s' is not KEY=VALUE", argv[i]);
+        snprintf(k, sizeof k, "%.*s", (int)(eq - argv[i]), argv[i]);
+        v = eq + 1;
+        for (int j = 0; live[j]; j++)
+            is_live |= !strcmp(k, live[j]);
+        if (!idle && !is_live)
+            die("bg set %s: the engine is %s; only interval= maxout= nphres= arb= fcoff= change while it runs",
+                k, bg_state_name(bg_state(st)));
+        n++;
+        if (!strcmp(k, "rid") || !strcmp(k, "rid0"))
+            bg_wr(PIPS_BG_RID, bg_parse_rid(v));
+        else if (!strcmp(k, "rid1") || !strcmp(k, "rid2") || !strcmp(k, "rid3"))
+            bg_wr(PIPS_BG_RID_SLOT(k[3] - '0'), bg_parse_rid(v));
+        else if (!strcmp(k, "base")) {
+            uint64_t a = parse_num(v, "base");
+            if (a & 0xFFF)
+                die("base=0x%" PRIx64 ": page aligned", a);
+            bg_wr(PIPS_BG_BASE_LO, (uint32_t)a);
+            bg_wr(PIPS_BG_BASE_HI, (uint32_t)(a >> 32));
+        } else if (!strcmp(k, "first")) bg_wr(PIPS_BG_FIRST, (uint32_t)parse_num(v, k));
+        else if (!strcmp(k, "stride")) bg_wr(PIPS_BG_STRIDE, (uint32_t)parse_num(v, k));
+        else if (!strcmp(k, "ws")) bg_wr(PIPS_BG_WS, (uint32_t)parse_num(v, k));
+        else if (!strcmp(k, "seed")) bg_wr(PIPS_BG_SEED, (uint32_t)parse_num(v, k));
+        else if (!strcmp(k, "offset")) {
+            uint64_t o = parse_num(v, k);
+            if (o > 4092 || o % 4)
+                die("offset=%s: bytes, a multiple of 4 below 4096", v);
+            bg_wr(PIPS_BG_OFFSET, (uint32_t)o);
+        } else if (!strcmp(k, "dw")) bg_wr(PIPS_BG_READ_DW, (uint32_t)parse_num(v, k));
+        else if (!strcmp(k, "interval")) {
+            uint64_t x = parse_num(v, k);
+            if (x > 0xFFFF)
+                die("interval=%s: at most 65535 cycles", v);
+            bg_wr(PIPS_BG_INTERVAL, (uint32_t)x);
+        } else if (!strcmp(k, "maxout")) bg_wr(PIPS_BG_MAX_OUT, (uint32_t)parse_num(v, k));
+        else if (!strcmp(k, "nphres")) bg_wr(PIPS_BG_NPH_RESERVE, (uint32_t)parse_num(v, k));
+        else if (!strcmp(k, "count")) {
+            uint64_t c = parse_num(v, k);
+            bg_wr(PIPS_BG_COUNT_LO, (uint32_t)c);
+            bg_wr(PIPS_BG_COUNT_HI, (uint32_t)(c >> 32));
+        } else if (!strcmp(k, "timeout")) bg_wr(PIPS_BG_TIMEOUT, (uint32_t)parse_num(v, k));
+        else if (!strcmp(k, "timeout_us")) bg_wr(PIPS_BG_TIMEOUT, (uint32_t)(parse_num(v, k) * 250));
+        else if (!strcmp(k, "backing")) bg_wr(PIPS_BG_BACKING, (uint32_t)parse_num(v, k));
+        else if (!strcmp(k, "hshift")) bg_wr(PIPS_BG_HIST_SHIFT, (uint32_t)parse_num(v, k));
+        else if (!strcmp(k, "tskip")) bg_wr(PIPS_BG_TRACE_SKIP, (uint32_t)parse_num(v, k));
+        else if (!strcmp(k, "tagwin")) {
+            unsigned lo, hi;
+            if (!strcmp(v, "off") || !strcmp(v, "0"))
+                bg_wr(PIPS_BG_TAG_WIN, 0);
+            else if (sscanf(v, "%u-%u", &lo, &hi) == 2 && lo <= hi && hi < 256)
+                bg_wr(PIPS_BG_TAG_WIN, lo | hi << 8 | 1u << 16);
+            else
+                die("tagwin=%s: LO-HI (0-255, inclusive) or off", v);
+        } else if (!strcmp(k, "unsafe")) {
+            if (bg_flag(k, v))
+                bg_wr(PIPS_BG_UNSAFE_KEY, PIPS_BG_UNSAFE_MAGIC);
+        } else if (!strcmp(k, "arb")) {
+            unsigned a = !strcmp(v, "idle") ? 0 : !strcmp(v, "rr") ? 1 : !strcmp(v, "engine") ? 2 : (unsigned)parse_num(v, k);
+            if (a > 2)
+                die("arb=%s: idle (0), rr (1) or engine (2)", v);
+            ctrl = (ctrl & ~PIPS_BG_CTRL_ARB_MASK) | a << PIPS_BG_CTRL_ARB_SHIFT;
+        } else {
+            uint32_t bit = 0;
+            int on;
+            if (!strcmp(k, "src")) {
+                if (strcmp(v, "table") && strcmp(v, "pattern"))
+                    die("src=%s: pattern or table", v);
+                bit = PIPS_BG_CTRL_SRC_TABLE; on = !strcmp(v, "table");
+            } else if (!strcmp(k, "order")) {
+                if (strcmp(v, "random") && strcmp(v, "cyclic"))
+                    die("order=%s: cyclic or random", v);
+                bit = PIPS_BG_CTRL_ORDER_RANDOM; on = !strcmp(v, "random");
+            } else {
+                static const struct { const char *k; uint32_t b; } fl[] = {
+                    { "dcheck", PIPS_BG_CTRL_DATA_CHECK }, { "trace", PIPS_BG_CTRL_TRACE_EN },
+                    { "fcoff", PIPS_BG_CTRL_FC_GATE_OFF }, { "ridtag", PIPS_BG_CTRL_SINK_RIDTAG },
+                    { "stoponerr", PIPS_BG_CTRL_STOP_ON_ERR }, { "clronstart", PIPS_BG_CTRL_CLEAR_ON_START } };
+                for (size_t j = 0; j < sizeof fl / sizeof fl[0]; j++)
+                    if (!strcmp(k, fl[j].k))
+                        bit = fl[j].b;
+                if (!bit)
+                    die("bg set: unknown key '%s' (pips bg help)", k);
+                on = bg_flag(k, v);
+            }
+            ctrl = on ? ctrl | bit : ctrl & ~bit;
+        }
+    }
+    if (ctrl != ctrl0)
+        bg_ctrl_keep(ctrl);
+    if (!quiet)
+        printf("# bg set: %d key(s)%s\n", n, ctrl != ctrl0 ? ", CTRL written" : "");
+    return n;
+}
+
+/* Stop: RUN 0, then wait for IDLE. 0 = idle, -1 = still not idle after ms. */
+static int bg_stop(unsigned ms)
+{
+    double t0 = now_s();
+    uint32_t c = bg_rd(PIPS_BG_CTRL) & ~(PIPS_BG_CTRL_CLEAR | PIPS_BG_CTRL_SNAPSHOT | PIPS_BG_CTRL_RUN);
+
+    bg_wr(PIPS_BG_CTRL, c);
+    while (bg_state(bg_rd(PIPS_BG_STATUS)) != PIPS_BG_ST_IDLE) {
+        if ((now_s() - t0) * 1e3 > ms)
+            return -1;
+        sleep_ms(1);
+    }
+    g_bg_owned = 0;
+    return 0;
+}
+
+static void bg_atexit(void)
+{
+    static int busy;
+
+    if (!g_bg_owned || busy)
+        return;
+    busy = 1;
+    fprintf(stderr, "pips: stopping the background read engine on exit\n");
+    if (bg_stop(3000))
+        fprintf(stderr, "pips: the engine is not idle 3 s after stop: pips bg stop; pips bg info\n");
+}
+
+static void bg_on_signal(int s) { g_bg_sig = s; }
+
+/* Start: RUN 1 while IDLE, wait out START. Returns the state after it, or -1
+ * when the start was refused (config error printed). */
+static int bg_start(void)
+{
+    uint32_t st = bg_rd(PIPS_BG_STATUS), c;
+    double t0;
+
+    if (bg_state(st) != PIPS_BG_ST_IDLE)
+        die("bg start: the engine is %s (pips bg stop first)", bg_state_name(bg_state(st)));
+    c = bg_rd(PIPS_BG_CTRL) & ~(PIPS_BG_CTRL_CLEAR | PIPS_BG_CTRL_SNAPSHOT);
+    atexit(bg_atexit);
+    g_bg_owned = 1;
+    bg_wr(PIPS_BG_CTRL, c | PIPS_BG_CTRL_RUN);
+    t0 = now_s();
+    while (bg_state(st = bg_rd(PIPS_BG_STATUS)) == PIPS_BG_ST_START) {
+        if (now_s() - t0 > 0.5)
+            die("bg start: still in START after 500 ms (STATUS 0x%08x)", st);
+    }
+    if (bg_state(st) == PIPS_BG_ST_IDLE && (st & PIPS_BG_STS_CFG_ERR)) {
+        g_bg_owned = 0;
+        bg_print_status(st);
+        fprintf(stderr, "pips: bg start refused: config error %u (%s)\n", PIPS_BG_CFG_CODE(st),
+                bg_cfg_name(PIPS_BG_CFG_CODE(st)));
+        return -1;
+    }
+    if (bg_state(st) == PIPS_BG_ST_IDLE)
+        g_bg_owned = 0;                 /* already done (a short COUNT) */
+    return (int)bg_state(st);
+}
+
+/* The BAR0 lock, given up while a long run waits so other pips calls get in. */
+static void lock_drop(void)
+{
+    if (g_lock_fd >= 0)
+        flock(g_lock_fd, LOCK_UN);
+}
+static void lock_back(void)
+{
+    if (g_lock_fd < 0)
+        return;
+    for (int i = 0; flock(g_lock_fd, LOCK_EX | LOCK_NB); i++) {
+        if (i == 300)
+            die("another pips has held %s for 30 s while a bg run waited", LOCK_FILE);
+        sleep_ms(100);
+    }
+    g_page = UINT64_MAX;                /* WIN_BASE may have moved meanwhile */
+}
+
+static void bg_print_counters(void)
+{
+    uint32_t c = bg_rd(PIPS_BG_CTRL) & ~(PIPS_BG_CTRL_CLEAR | PIPS_BG_CTRL_SNAPSHOT);
+    static const struct { const char *n; uint32_t off; } k64[] = {
+        { "cycles", PIPS_BG_CYCLES }, { "run_cycles", PIPS_BG_RUN_CYCLES }, { "issued", PIPS_BG_ISSUED },
+        { "cpl_sc", PIPS_BG_CPL_SC }, { "cpl_ur", PIPS_BG_CPL_UR }, { "cpl_ca", PIPS_BG_CPL_CA },
+        { "cpl_other", PIPS_BG_CPL_OTHER }, { "cpl_poisoned", PIPS_BG_CPL_POISONED },
+        { "cpl_malformed", PIPS_BG_CPL_MALFORMED }, { "cpl_unexpected", PIPS_BG_CPL_UNEXPECTED },
+        { "timeouts", PIPS_BG_TIMEOUTS }, { "lat_sum", PIPS_BG_LAT_SUM }, { "stall_arb", PIPS_BG_STALL_ARB },
+        { "stall_tags", PIPS_BG_STALL_TAGS }, { "stall_fc", PIPS_BG_STALL_FC },
+        { "data_mismatch", PIPS_BG_DATA_MISMATCH } };
+    uint64_t v[sizeof k64 / sizeof k64[0]];
+    uint32_t lmin, lmax, lc, st, cl, ll, tfc, itm;
+
+    bg_ctrl_keep(c | PIPS_BG_CTRL_SNAPSHOT);
+    for (size_t i = 0; i < sizeof k64 / sizeof k64[0]; i++) {
+        v[i] = bg_rd64(k64[i].off);
+        printf("%s=%" PRIu64 "\n", k64[i].n, v[i]);
+    }
+    lmin = bg_rd(PIPS_BG_LAT_MIN);
+    lmax = bg_rd(PIPS_BG_LAT_MAX);
+    printf("lat_min=%u\nlat_max=%u\noutstanding=%u\nout_max=%u\n", lmin, lmax, bg_rd(PIPS_BG_OUTSTANDING),
+           bg_rd(PIPS_BG_OUT_MAX));
+    {
+        uint64_t ncpl = v[3] + v[4] + v[5] + v[6];
+        double run_s = v[1] * BG_CYCLE_NS * 1e-9;
+        printf("lat_mean_ns=%.1f\nlat_min_ns=%.1f\nlat_max_ns=%.1f\nrun_s=%.6f\nissue_rate_mrd_s=%.0f\n",
+               ncpl ? (double)v[11] / ncpl * BG_CYCLE_NS : 0.0, lmin == 0xFFFFFFFFu ? 0.0 : lmin * BG_CYCLE_NS,
+               lmax * BG_CYCLE_NS, run_s, run_s > 0 ? v[2] / run_s : 0.0);
+    }
+    lc = bg_rd(PIPS_BG_LAST_CPL);
+    printf("last_cpl=0x%08x\nlast_cpl_tag=%u\nlast_cpl_status=%u\nlast_cpl_poisoned=%u\nlast_cpl_err=%u\nlast_cpl_bytes=%u\n",
+           lc, lc & 0xFF, (lc >> 8) & 7, !!(lc & (1u << 11)), (lc >> 12) & 15, (lc >> 16) & 0x1FFF);
+    printf("last_data=0x%08x\nlast_err_page=%u\nlast_err_seq=%u\n", bg_rd(PIPS_BG_LAST_DATA),
+           bg_rd(PIPS_BG_LAST_ERR_PAGE), bg_rd(PIPS_BG_LAST_ERR_SEQ));
+    /* test extensions, live */
+    printf("leak_cpl=%" PRIu64 "\n", bg_rd64(PIPS_BG_LEAK_CPL));
+    ll = bg_rd(PIPS_BG_LEAK_LAST);
+    printf("leak_last=0x%08x\nleak_last_rid=0x%04x\nleak_last_tag=%u\nleak_last_path=dsp%u\n", ll, ll & 0xFFFF,
+           (ll >> 16) & 0xFF, (ll >> 24) & 1);
+    cl = bg_rd(PIPS_BG_CLASH);
+    printf("clash=%u\nclash_last_tag=%u\nclash_last_input=in%u\n", cl & 0xFFFF, (cl >> 16) & 0xFF, (cl >> 24) & 1);
+    printf("rc_straddle=%u\nrq_straddle=%u\n", bg_rd(PIPS_BG_RC_STRADDLE), bg_rd(PIPS_BG_RQ_STRADDLE));
+    tfc = bg_rd(PIPS_BG_TFC);
+    printf("tfc=0x%08x\ntfc_present=%u\ntfc_nph_av=%u\ntfc_npd_av=%u\ntfc_nph_min=%u\n", tfc, tfc >> 31, tfc & 15,
+           (tfc >> 4) & 15, (tfc >> 8) & 15);
+    printf("hol_engine=%" PRIu64 "\nhol_device=%" PRIu64 "\n", bg_rd64(PIPS_BG_HOL_ENGINE), bg_rd64(PIPS_BG_HOL_DEVICE));
+    printf("in0_mrd=%" PRIu64 "\nin1_mrd=%" PRIu64 "\n", bg_rd64(PIPS_BG_IN0_MRD), bg_rd64(PIPS_BG_IN1_MRD));
+    itm = bg_rd(PIPS_BG_IN_TAG_MAX);
+    printf("in0_tag_max=%u\nin1_tag_max=%u\nwin_hits=%u\n", itm & 0xFF, (itm >> 8) & 0xFF, bg_rd(PIPS_BG_WIN_HITS));
+    st = bg_rd(PIPS_BG_STATUS);
+    bg_print_status(st);
+}
+
+/* A 256-bit tag map: the tags as ranges, how many, the largest unused range. */
+static void bg_tagmap(const char *name, uint32_t off)
+{
+    uint32_t w[8];
+    char r[1100] = "";
+    int n = 0, best_lo = -1, best_n = 0, run_lo = -1;
+
+    for (int i = 0; i < 8; i++)
+        w[i] = bg_rd(off + 4u * i);
+    for (int t = 0; t <= 256; t++) {
+        int set = t < 256 && (w[t >> 5] >> (t & 31) & 1);
+        n += set;
+        if (set && (t == 0 || !(w[(t - 1) >> 5] >> ((t - 1) & 31) & 1)))
+            run_lo = t;
+        if (!set && run_lo >= 0) {
+            snprintf(r + strlen(r), sizeof r - strlen(r), "%s%d", r[0] ? "," : "", run_lo);
+            if (t - 1 > run_lo)
+                snprintf(r + strlen(r), sizeof r - strlen(r), "-%d", t - 1);
+            run_lo = -1;
+        }
+    }
+    for (int t = 0, lo = -1; t <= 256; t++) {
+        int set = t == 256 || (w[t >> 5] >> (t & 31) & 1);
+        if (!set && lo < 0)
+            lo = t;
+        if (set && lo >= 0) {
+            if (t - lo > best_n) { best_n = t - lo; best_lo = lo; }
+            lo = -1;
+        }
+    }
+    printf("%s_tags=%s\n%s_tags_n=%d\n", name, r[0] ? r : "none", name, n);
+    if (best_n)
+        printf("%s_free_max=%d-%d\n%s_free_max_n=%d\n", name, best_lo, best_lo + best_n - 1, name, best_n);
+    else
+        printf("%s_free_max=none\n%s_free_max_n=0\n", name, name);
+    printf("%s_map=", name);
+    for (int i = 7; i >= 0; i--)
+        printf("%08x", w[i]);
+    putchar('\n');
+}
+
+static int cmd_bg_census(int argc, char **argv)
+{
+    if (argc == 1 && !strcmp(argv[0], "clear")) {
+        bg_wr(PIPS_BG_CENSUS_CTRL, 1);
+        printf("# census cleared\n");
+        return 0;
+    }
+    if (argc == 1 && (!strcmp(argv[0], "freeze") || !strcmp(argv[0], "thaw"))) {
+        bg_wr(PIPS_BG_CENSUS_CTRL, !strcmp(argv[0], "freeze") ? 2 : 0);
+        printf("# census %s\n", argv[0][0] == 'f' ? "frozen" : "counting");
+        return 0;
+    }
+    if (argc)
+        die("usage: pips bg census [clear|freeze|thaw]");
+    {
+        uint32_t itm = bg_rd(PIPS_BG_IN_TAG_MAX);
+        printf("in0_mrd=%" PRIu64 "\nin1_mrd=%" PRIu64 "\n", bg_rd64(PIPS_BG_IN0_MRD), bg_rd64(PIPS_BG_IN1_MRD));
+        printf("in0_tag_max=%u\nin1_tag_max=%u\nwin_hits=%u\n", itm & 0xFF, (itm >> 8) & 0xFF, bg_rd(PIPS_BG_WIN_HITS));
+    }
+    bg_tagmap("in0", PIPS_BG_IN0_TAGS);
+    bg_tagmap("in1", PIPS_BG_IN1_TAGS);
+    bg_tagmap("cpl0", PIPS_BG_CPL0_TAGS);
+    bg_tagmap("cpl1", PIPS_BG_CPL1_TAGS);
+    return 0;
+}
+
+static int cmd_bg_facts(int argc, char **argv)
+{
+    uint32_t tfc;
+
+    if (argc == 1 && !strcmp(argv[0], "clear")) {
+        bg_wr(PIPS_BG_FC_CLEAR, 1);
+        printf("# straddle, TFC minimum and head-of-line counters cleared\n");
+        return 0;
+    }
+    if (argc)
+        die("usage: pips bg facts [clear]");
+    tfc = bg_rd(PIPS_BG_TFC);
+    printf("rc_straddle=%u\nrq_straddle=%u\n", bg_rd(PIPS_BG_RC_STRADDLE), bg_rd(PIPS_BG_RQ_STRADDLE));
+    printf("tfc=0x%08x\ntfc_present=%u\ntfc_nph_av=%u\ntfc_npd_av=%u\ntfc_nph_min=%u\n", tfc, tfc >> 31, tfc & 15,
+           (tfc >> 4) & 15, (tfc >> 8) & 15);
+    printf("hol_engine=%" PRIu64 "\nhol_device=%" PRIu64 "\n", bg_rd64(PIPS_BG_HOL_ENGINE), bg_rd64(PIPS_BG_HOL_DEVICE));
+    {
+        uint64_t lk = bg_rd64(PIPS_BG_LEAK_CPL);
+        uint32_t ll = bg_rd(PIPS_BG_LEAK_LAST), cl = bg_rd(PIPS_BG_CLASH);
+        printf("leak_cpl=%" PRIu64 "\nleak_last_rid=0x%04x\nleak_last_tag=%u\nleak_last_path=dsp%u\n", lk, ll & 0xFFFF,
+               (ll >> 16) & 0xFF, (ll >> 24) & 1);
+        printf("clash=%u\nclash_last_tag=%u\nclash_last_input=in%u\n", cl & 0xFFFF, (cl >> 16) & 0xFF, (cl >> 24) & 1);
+    }
+    return 0;
+}
+
+static int cmd_bg_hist(void)
+{
+    uint32_t sh = bg_rd(PIPS_BG_HIST_SHIFT) & 15;
+    uint64_t tot = 0;
+
+    printf("hist_shift=%u\n# bin lo_ns hi_ns count (bin = latency_cycles >> shift, the last bin open-ended)\n", sh);
+    for (unsigned i = 0; i < 64; i++) {
+        uint32_t c = bg_rd(PIPS_BG_HIST + 4u * i);
+        tot += c;
+        if (c)
+            printf("hist %u %.0f %s%.0f %u\n", i, (double)((uint64_t)i << sh) * BG_CYCLE_NS, i == 63 ? ">" : "",
+                   (double)(((uint64_t)(i + 1) << sh)) * BG_CYCLE_NS, c);
+    }
+    printf("hist_total=%" PRIu64 "\n", tot);
+    return 0;
+}
+
+/* The latency trace as CSV, and a summary. */
+static int cmd_bg_trace(int argc, char **argv)
+{
+    uint64_t n = argc > 1 ? parse_num(argv[1], "N") : 4096;
+    uint32_t skip = bg_rd(PIPS_BG_TRACE_SKIP), *lat;
+    uint64_t valid = 0, nlat = 0, tmo = 0, mism = 0, nsc = 0;
+    FILE *f;
+
+    if (argc < 1 || argc > 2)
+        die("usage: pips bg trace FILE [N]");
+    if (n > 4096)
+        n = 4096;
+    if (!(f = fopen(argv[0], "w")))
+        die("%s: %s", argv[0], strerror(errno));
+    if (!(lat = malloc(n * sizeof *lat)))
+        die("out of memory");
+    fprintf(f, "idx,seq,lat_cycles,lat_ns,status,poisoned,timed_out,mismatch\n");
+    for (uint64_t i = 0; i < n; i++) {
+        uint32_t v = bg_rd(PIPS_BG_TRACE + 4u * (uint32_t)i);
+        if (!(v & PIPS_BG_TRACE_VALID))
+            continue;
+        valid++;
+        tmo += !!(v & PIPS_BG_TRACE_TIMED_OUT);
+        mism += !!(v & PIPS_BG_TRACE_MISMATCH);
+        nsc += PIPS_BG_TRACE_STATUS(v) == 0 && !(v & PIPS_BG_TRACE_TIMED_OUT);
+        if (PIPS_BG_TRACE_LAT(v) != 0xFFFF)
+            lat[nlat++] = PIPS_BG_TRACE_LAT(v);
+        fprintf(f, "%" PRIu64 ",%" PRIu64 ",%u,%.0f,%u,%u,%u,%u\n", i, (uint64_t)skip + i, PIPS_BG_TRACE_LAT(v),
+                PIPS_BG_TRACE_LAT(v) * BG_CYCLE_NS, PIPS_BG_TRACE_STATUS(v), !!(v & PIPS_BG_TRACE_POISONED),
+                !!(v & PIPS_BG_TRACE_TIMED_OUT), !!(v & PIPS_BG_TRACE_MISMATCH));
+    }
+    fclose(f);
+    printf("trace_file=%s\ntrace_valid=%" PRIu64 "\ntrace_sc=%" PRIu64 "\ntrace_timed_out=%" PRIu64
+           "\ntrace_mismatch=%" PRIu64 "\n", argv[0], valid, nsc, tmo, mism);
+    if (nlat) {
+        qsort(lat, nlat, sizeof *lat, u32_cmp);
+        printf("trace_lat_ns_min=%.0f\ntrace_lat_ns_p50=%.0f\ntrace_lat_ns_p90=%.0f\ntrace_lat_ns_p99=%.0f\n"
+               "trace_lat_ns_max=%.0f\n", lat[0] * BG_CYCLE_NS, lat[nlat / 2] * BG_CYCLE_NS,
+               lat[nlat * 9 / 10] * BG_CYCLE_NS, lat[nlat * 99 / 100] * BG_CYCLE_NS, lat[nlat - 1] * BG_CYCLE_NS);
+    }
+    free(lat);
+    return 0;
+}
+
+/* The completion capture ring, oldest first. RC descriptor: DW0 [11:0] lower
+ * address, [15:12] error code, [28:16] byte count, [30] request completed;
+ * DW1 [10:0] dword count, [13:11] status, [14] poisoned, [31:16] requester ID;
+ * DW2 [7:0] tag, [23:8] completer ID. */
+static int cmd_bg_capture(int argc, char **argv)
+{
+    uint32_t wp = bg_rd(PIPS_BG_CAP_WPTR), total = wp >> 8, n = argc ? (uint32_t)parse_num(argv[0], "N") : 64;
+    unsigned pri, sec, sub;
+
+    if (n > 64)
+        n = 64;
+    if (n > total)
+        n = total;
+    bg_bus(&pri, &sec, &sub);
+    printf("cap_written=%u\ncap_shown=%u\n", total, n);
+    for (uint32_t k = 0; k < n; k++) {
+        uint32_t i = ((wp & 63) + 64 - n + k) & 63, w[8];
+        for (int j = 0; j < 8; j++)
+            w[j] = bg_rd(PIPS_BG_CAP + 32u * i + 4u * (uint32_t)j);
+        printf("cap i=%u seq=%u slot=%u late=%u lat_ns=%.0f rid=0x%04x(%s) tag=%u status=%u poisoned=%u err=%u "
+               "bytes=%u dwords=%u lower_addr=0x%03x completer=0x%04x dw0=0x%08x dw1=0x%08x desc=0x%08x,0x%08x,0x%08x\n",
+               i, w[6], w[7] & 3, !!(w[7] & 0x100), w[5] * BG_CYCLE_NS, w[1] >> 16,
+               bg_rid_name((uint16_t)(w[1] >> 16), pri, sec, sub), w[2] & 0xFF, (w[1] >> 11) & 7, !!(w[1] & (1u << 14)),
+               (w[0] >> 12) & 15, (w[0] >> 16) & 0x1FFF, w[1] & 0x7FF, w[0] & 0xFFF, (w[2] >> 8) & 0xFFFF, w[3], w[4],
+               w[0], w[1], w[2]);
+    }
+    return 0;
+}
+
+/* bg table load FILE: lines "page" or "page:slot" (# comments), entries 0..n-1.
+ * bg table show [N]. */
+static int cmd_bg_table(int argc, char **argv)
+{
+    if (argc >= 1 && !strcmp(argv[0], "show")) {
+        uint64_t n = argc > 1 ? parse_num(argv[1], "N") : 16;
+        for (uint64_t i = 0; i < n && i < 8192; i++) {
+            uint32_t v = bg_rd(PIPS_BG_TABLE + 4u * (uint32_t)i);
+            printf("table %" PRIu64 " page=%u slot=%u\n", i, v & 0x3FFFFFFFu, v >> 30);
+        }
+        return 0;
+    }
+    if (argc == 2 && !strcmp(argv[0], "load")) {
+        char line[256];
+        uint32_t n = 0, slots = 0;
+        FILE *f = fopen(argv[1], "r");
+
+        if (!f)
+            die("%s: %s", argv[1], strerror(errno));
+        if (bg_state(bg_rd(PIPS_BG_STATUS)) != PIPS_BG_ST_IDLE)
+            die("bg table load: the engine is not idle (table writes are ignored outside IDLE)");
+        while (fgets(line, sizeof line, f)) {
+            char *p = line, *c, *end;
+            unsigned long long pg, sl = 0;
+            line[strcspn(line, "#\r\n")] = 0;
+            while (*p == ' ' || *p == '\t')
+                p++;
+            if (!*p)
+                continue;
+            if (n == 8192)
+                die("%s: more than 8192 entries", argv[1]);
+            errno = 0;
+            pg = strtoull(p, &end, 0);
+            if (errno || end == p || pg > 0x3FFFFFFFull)
+                die("%s: bad page '%s'", argv[1], p);
+            if ((c = strchr(p, ':'))) {
+                sl = strtoull(c + 1, &end, 0);
+                if (sl > 3)
+                    die("%s: slot %llu (0-3)", argv[1], sl);
+            }
+            slots |= 1u << sl;
+            bg_wr(PIPS_BG_TABLE + 4u * n, PIPS_BG_TABLE_ENTRY(pg, sl));
+            n++;
+        }
+        fclose(f);
+        if (bg_rd(PIPS_BG_STATUS) & PIPS_BG_STS_TABLE_WR_RUN)
+            die("bg table load: STATUS says a table write came outside IDLE");
+        printf("table_entries=%u\ntable_slots=0x%x\n", n, slots);
+        return 0;
+    }
+    die("usage: pips bg table load FILE | pips bg table show [N]");
+}
+
+/* bg run [K=V...] [secs=S] [ms=MS]: set, start, wait for the run to end (COUNT
+ * reached) or S seconds (then stop), print the counters. SIGINT/SIGTERM stop
+ * it; any exit stops it. A leak (STATUS[22]) stops it at once.
+ * Exit 0 ended normally, 4 an error ended it (ERR_STOP), 5 leak or clash,
+ * 1 refused, 3 not idle after stop. */
+static int cmd_bg_run(int argc, char **argv)
+{
+    char *setv[64];
+    int ns = 0, s, leak = 0, beat = 5;
+    double secs = 0, ms = 0, t0, last = 0;
+    uint32_t st;
+    struct sigaction sa;
+
+    for (int i = 0; i < argc; i++) {
+        if (!strncmp(argv[i], "secs=", 5)) secs = atof(argv[i] + 5);
+        else if (!strncmp(argv[i], "ms=", 3)) ms = atof(argv[i] + 3);
+        else if (!strncmp(argv[i], "beat=", 5)) beat = atoi(argv[i] + 5);
+        else if (ns < 64) setv[ns++] = argv[i];
+        else die("bg run: too many settings");
+    }
+    if (ns)
+        bg_set(ns, setv, 1);
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = bg_on_signal;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGHUP, &sa, NULL);
+    t0 = now_s();
+    s = bg_start();
+    if (s < 0)
+        return 1;
+    if (secs > 0)
+        printf("# bg run: started (%s), stops after %.1f s\n", bg_state_name((unsigned)s), secs);
+    else
+        printf("# bg run: started (%s), until COUNT%s\n", bg_state_name((unsigned)s), ms > 0 ? " or ms=" : "");
+    while (g_bg_owned) {
+        double t = now_s() - t0;
+        st = bg_rd(PIPS_BG_STATUS);
+        if (bg_state(st) == PIPS_BG_ST_IDLE) {
+            g_bg_owned = 0;
+            break;
+        }
+        if (st & (PIPS_BG_STS_LEAK | PIPS_BG_STS_CLASH)) {
+            leak = 1;
+            printf("# bg run: %s seen at %.1f s: stopping now\n", st & PIPS_BG_STS_LEAK ? "LEAK" : "CLASH", t);
+            break;
+        }
+        if (g_bg_sig) {
+            printf("# bg run: signal %d at %.1f s: stopping\n", (int)g_bg_sig, t);
+            break;
+        }
+        if ((secs > 0 && t >= secs) || (ms > 0 && t * 1e3 >= ms))
+            break;
+        if (beat > 0 && t - last >= beat) {
+            last = t;
+            printf("# bg run: %.0f s, %s, outstanding %u, quarantined %u\n", t, bg_state_name(bg_state(st)),
+                   bg_rd(PIPS_BG_OUTSTANDING), PIPS_BG_QUARANTINED(st));
+        }
+        if (t > 0.2) {                  /* long runs: let other pips calls in between polls */
+            lock_drop();
+            sleep_ms(100);
+            lock_back();
+        }
+    }
+    if (g_bg_owned && bg_stop(3000)) {
+        bg_print_status(bg_rd(PIPS_BG_STATUS));
+        fprintf(stderr, "pips: bg run: the engine is not idle 3 s after stop\n");
+        return 3;
+    }
+    printf("bg_run_s=%.3f\n", now_s() - t0);
+    bg_print_counters();
+    st = bg_rd(PIPS_BG_STATUS);
+    if (leak || (st & (PIPS_BG_STS_LEAK | PIPS_BG_STS_CLASH)))
+        return 5;
+    return st & PIPS_BG_STS_ERR_STOP ? 4 : 0;
+}
+
+static int cmd_bg_wait(unsigned ms)
+{
+    double t0 = now_s(), last = 0;
+    uint32_t st;
+
+    while (bg_state(st = bg_rd(PIPS_BG_STATUS)) != PIPS_BG_ST_IDLE) {
+        double t = now_s() - t0;
+        if (ms && t * 1e3 > ms) {
+            bg_print_status(st);
+            return 3;
+        }
+        if (t - last >= 5) {
+            last = t;
+            printf("# bg wait: %.0f s, %s, outstanding %u\n", t, bg_state_name(bg_state(st)), bg_rd(PIPS_BG_OUTSTANDING));
+        }
+        lock_drop();
+        sleep_ms(20);
+        lock_back();
+    }
+    bg_print_status(st);
+    return 0;
+}
+
+static int cmd_bg(int argc, char **argv)
+{
+    const char *c;
+
+    if (argc < 1 || !strcmp(argv[0], "help")) {
+        fputs("pips bg info | set K=V... | start | stop [MS] | wait [MS] | run [K=V...] [secs=S] [ms=MS] [beat=S]\n"
+              "        counters | clear [twice] | hist | trace FILE [N] | capture [N] | census [clear|freeze|thaw]\n"
+              "        facts [clear] | table load FILE | table show [N]\n"
+              "keys: rid= rid1= rid2= rid3= (in0 in1 usp dev0 dev1 BB:DD.F 0xNNNN none) base= first= stride= ws=\n"
+              "      seed= offset= dw= interval= maxout= nphres= count= timeout= timeout_us= backing= hshift= tskip=\n"
+              "      tagwin=LO-HI|off unsafe=1 arb=idle|rr|engine src=pattern|table order=cyclic|random\n"
+              "      dcheck= trace= fcoff= ridtag= stoponerr= clronstart= (0|1)\n"
+              "in0 = the port above input 0 (sec:00.0), in1 = sec:01.0; dev0/dev1 = the device below each\n", stderr);
+        return argc < 1 ? 2 : 0;
+    }
+    bg_check();
+    c = argv[0];
+    argc--;
+    argv++;
+    if (!strcmp(c, "info") && !argc) return cmd_bg_info();
+    if (!strcmp(c, "set") && argc) { bg_set(argc, argv, 0); return 0; }
+    if (!strcmp(c, "start") && !argc) {
+        int s = bg_start();
+        if (s < 0)
+            return 1;
+        g_bg_owned = 0;                 /* a bare start leaves it running: the caller owns it */
+        bg_print_status(bg_rd(PIPS_BG_STATUS));
+        return 0;
+    }
+    if (!strcmp(c, "stop") && argc <= 1) {
+        int r = bg_stop(argc ? (unsigned)parse_num(argv[0], "MS") : 2000);
+        bg_print_status(bg_rd(PIPS_BG_STATUS));
+        return r ? 3 : 0;
+    }
+    if (!strcmp(c, "wait") && argc <= 1) return cmd_bg_wait(argc ? (unsigned)parse_num(argv[0], "MS") : 0);
+    if (!strcmp(c, "run")) return cmd_bg_run(argc, argv);
+    if (!strcmp(c, "counters") && !argc) { bg_print_counters(); return 0; }
+    if (!strcmp(c, "clear") && argc <= 1) {
+        uint32_t ctl = bg_rd(PIPS_BG_CTRL) & ~(PIPS_BG_CTRL_SNAPSHOT | PIPS_BG_CTRL_CLEAR);
+        int times = argc && !strcmp(argv[0], "twice") ? 2 : 1;
+        for (int i = 0; i < times; i++) {
+            bg_ctrl_keep(ctl | PIPS_BG_CTRL_CLEAR);
+            sleep_ms(1);
+        }
+        bg_print_status(bg_rd(PIPS_BG_STATUS));
+        return 0;
+    }
+    if (!strcmp(c, "hist") && !argc) return cmd_bg_hist();
+    if (!strcmp(c, "trace")) return cmd_bg_trace(argc, argv);
+    if (!strcmp(c, "capture") && argc <= 1) return cmd_bg_capture(argc, argv);
+    if (!strcmp(c, "census")) return cmd_bg_census(argc, argv);
+    if (!strcmp(c, "facts")) return cmd_bg_facts(argc, argv);
+    if (!strcmp(c, "table")) return cmd_bg_table(argc, argv);
+    die("bg %s: unknown or wrong arguments (pips bg help)", c);
+}
+
 /* ------------------------------------------------------------ main */
 static void usage(void)
 {
@@ -1682,6 +2536,8 @@ static void usage(void)
           "  ddr-dump ADDR BYTES FILE\n"
           "  hwtest [--ddr-addr ADDR] [regs bram regfile dma ddr err split log]\n"
           "  soak [N]\n"
+          "  bg help | info | set K=V... | start | stop | wait | run [K=V...] [secs=S] | counters | clear\n"
+          "     | hist | trace FILE | capture | census [clear] | facts [clear] | table load FILE   (>= 0x0a08)\n"
           "Header of pips.c has the details.\n", stderr);
     exit(2);
 }
@@ -1781,5 +2637,7 @@ int main(int argc, char **argv)
         return cmd_hwtest(argc, argv);
     if (!strcmp(cmd, "soak") && argc <= 1)
         return cmd_soak(argc ? parse_num(argv[0], "N") : 1000000);
+    if (!strcmp(cmd, "bg"))
+        return cmd_bg(argc, argv);
     usage();
 }

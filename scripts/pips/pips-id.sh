@@ -72,6 +72,7 @@ design_note() {
         0x0a05) echo "64193c6, 10-17: batching FIFO 512 rows" ;;
         0x0a06) echo "9673e37 + d44fdd0, 10-23/24: page batcher" ;;
         0x0a07) echo "28ff5b6, 10-27: rate caps, refused-cycle counters" ;;
+        0x0a08) echo "5fe3bda, 11-06: background read engine, assumption-test build (pips bg)" ;;
         *)      echo "not in this script's table: see PIO-MANUAL.md, \"Design ID\", and pips.tcl" ;;
     esac
 }

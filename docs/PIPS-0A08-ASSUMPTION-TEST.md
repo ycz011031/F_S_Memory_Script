@@ -1,6 +1,10 @@
 # PIPS design 0x0A08: the assumption-test build
 
-Status: **proposal, 2026-11-06. Nothing built.**
+Status: **built** (FPGA repo `5fe3bda`, 2026-11-06: P1-P3, everything in §3;
+the FPGA side's decisions H1-H16, e.g. a START state and config errors 11/12,
+in that repo's `0A08_UPGRADE_PLAN.md` §2 and `sw_handoff/README.md` §12).
+Not yet run on hardware. Host tools for the live tests written 2026-11-07
+(§5.2): `pips bg`, `scripts/pips/pips-rid-live.sh`, `pips_bg_pages.ko`.
 
 The background read engine ([PIPS-BG-READ-ENGINE.md](PIPS-BG-READ-ENGINE.md),
 "the engine doc") rests on assumptions the host alone can't prove. The main
@@ -333,7 +337,34 @@ What it does:
 
 Verdict in `summary.txt`: HOLDS / FAILS / NOT DECIDED.
 
-### 5.2 With the bitstream
+### 5.2 With the bitstream (written, 2026-11-07)
+
+As written (the plan that follows below it is kept for the record):
+
+- **`pips bg`** (`pips.c`, registers `PIPS_BG_*` in `pips_regs.h`, copied
+  from the FPGA repo's `sw_handoff/pips_regs.h`): `info`, `set K=V...`,
+  `start`, `stop`, `wait`, `run [K=V...] [secs=S]`, `counters`, `clear
+  [twice]`, `hist`, `trace FILE`, `capture [N]`, `census [clear|freeze|thaw]`,
+  `facts [clear]`, `table load FILE | show`. RIDs by name (`in0`, `in1`,
+  `usp`, `dev0`, `dev1`) from `BG_BUS`. `bg run` stops the engine on every
+  exit path (signals, leak, clash, errors); every CTRL write that is not a
+  start or stop keeps RUN as it is and undoes a start it caused by a race.
+  `pips bg help` lists the keys.
+- **`scripts/pips/pips-rid-live.sh`:** T0-T9, T10/T11 with `--fallbacks`
+  (or `--t10`, `--t11`), T12 with `--t12`; `--help`. bigserver through the
+  alias-nvme holder (a running one, or `--start-holder`), whose new `map`
+  command re-tags the regions before each data check; icx with
+  `--load-cmd` and pages from a TLP log. `summary.txt` per test: pass
+  condition, numbers, DMAR lines per BDF, AER deltas, verdict; then the
+  decision of the tree above.
+- **`scripts/pips/ridcheck/pips_bg_pages.c`** (§5.3): written; T11 builds
+  it (`make MODS=pips_bg_pages`).
+- **Not done:** `pips_sim.c` has no model of the engine (no `make check`
+  coverage of `pips bg`). Nothing has run on hardware; the C was only
+  syntax-checked on Windows and the script's Python parts on synthetic
+  data.
+
+The plan, as written before the build:
 
 - **`pips bg` (`pips.c`):** the engine doc's §10 S2, plus:
   - `rid1= rid2= rid3=`;
@@ -354,7 +385,7 @@ Verdict in `summary.txt`: HOLDS / FAILS / NOT DECIDED.
   IOVA base from a short TLP log, the engine doc's S8). Heartbeat lines
   throughout.
 
-### 5.3 Only if T2 fails: `pips_bg_pages.ko` (F3 helper)
+### 5.3 Only if T2 fails: `pips_bg_pages.ko` (F3 helper; written 11-07)
 
 A small kernel module:
 - **Mapping:** allocates N pages (default 4096), writes each page's index
