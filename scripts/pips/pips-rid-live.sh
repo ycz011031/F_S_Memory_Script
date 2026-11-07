@@ -662,12 +662,13 @@ PYEOF
         [ "$ENG_WIN" = off ] || [ "${WH:-1}" = 0 ] || bad="$bad win_hits=${WH:-?}"
         if [ -z "$bad" ]; then end PASS "no leak, every read SC, the load clean, over $ncombo trains"
         else end FAIL "trains that failed:$bad"; decide_stop "T4: leak or errors under load"; fi
+        T4D=$TD   # T6 reads T4's iops.tsv (begin moves TD)
         # T5
         begin T5 "straddle under load (A5)" "RC_STRADDLE = 0 and RQ_STRADDLE = 0 over every T4 train"
         if [ "$RCS" = 0 ] && [ "$RQS" = 0 ]; then end PASS "none"; else end FAIL "rc $RCS, rq $RQS: the sink and the router need straddle handling"; decide_stop "T5: straddle"; fi
         # T6
         begin T6 "flow control and head-of-line (A6)" "idle-fill trains cost the devices no throughput (within 3% of the engine-free windows)"
-        verdict=$(python3 - "$TD" <<'PYEOF'
+        verdict=$(python3 - "$T4D" <<'PYEOF'
 import sys
 d = sys.argv[1]
 try:
@@ -770,7 +771,7 @@ if [ -z "$STOPPED" ] && [ "$F0" = 1 ] && want T8; then
         "from a flushed IOTLB, fresh pages: 'once' sets the capacity C (P misses >= 0.5); 'cross' misses at N >= C as 'once' -> shared, else partitioned; 'twice' vs 'once' at N >= C -> reuse protection"
     [ -n "$HIT_THR" ] || sum "   no hit/miss threshold from T7: the miss fractions are not computed"
     [ "$KIND" = nic ] && sum "   icx: no IOTLB flush between runs (the NICs' mappings): pages are fresh within a run only"
-    printf 'n\tcase\tprobes\tprobe_miss\tfill_miss\tprobe_p50_ns\tfirst_p50_ns\n' > "$TD/t8.tsv"
+    printf 'n\tcase\tprobes\tprobe_miss\tfill_miss\tprobe_p50_ns\tfirst_p50_ns\tprobe_by_round\n' > "$TD/t8.tsv"
     for N in 32 64 96 128 192 256 384 512; do
         R=$(( 4096 / (N + 3) )); [ "$R" -gt 16 ] && R=16
         for case in once cross twice; do
@@ -817,9 +818,10 @@ for r in range(R):
     fill += [v for v in (ns(s) for s in range(b + k, b + k + N)) if v is not None]
 med = lambda a: sorted(a)[len(a) // 2] if a else float("nan")
 miss = lambda a: (sum(1 for x in a if x > thr) / len(a)) if a and thr > 0 else float("nan")
-print(f"{N}\t{case}\t{len(probe)}\t{miss(probe):.2f}\t{miss(fill):.2f}\t{med(probe):.0f}\t{med(first):.0f}")
+rounds = "".join("-" if ns(r * S + S - 1) is None else "." if thr > 0 and ns(r * S + S - 1) > thr else "h" for r in range(R))
+print(f"{N}\t{case}\t{len(probe)}\t{miss(probe):.2f}\t{miss(fill):.2f}\t{med(probe):.0f}\t{med(first):.0f}\t{rounds}")
 PYEOF
-            say "    $case-$N: $(tail -1 "$TD/t8.tsv" | cut -f3-7 | tr '\t' ' ') (probes probe_miss fill_miss probe_p50 first_p50)"
+            say "    $case-$N: $(tail -1 "$TD/t8.tsv" | cut -f3-8 | tr '\t' ' ') (probes probe_miss fill_miss probe_p50 first_p50 probe_by_round)"
         done
     done
     tab "$TD/t8.tsv" | sed 's/^/   /' | tee -a "$SUM" > /dev/null
@@ -851,7 +853,7 @@ else:
 if w:
     wm = sum(w) / len(w)
     line.append(f"NOTE reuse: P read twice misses {wm:.2f} from N {C} vs {om:.2f} read once: " +
-                ("a reused entry is protected (not plain LRU): an evictor must reuse its pages to displace a device's hot entries" if wm < 0.5 * om else "no protection seen"))
+                ("a reused entry is protected (not plain LRU): an evictor must reuse its pages to displace a device's hot entries" if wm < 0.5 * om else "two back-to-back reads earn no protection"))
 line.append("NOTE once by N: " + ", ".join(f"{n} {once[n]:.2f}" for n in sorted(once)))
 print("\n".join(line))
 PYEOF

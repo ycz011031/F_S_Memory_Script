@@ -9,7 +9,10 @@ bigserver 2026-11-07 (§4, "First run"): T2/T3 pass, so F0 holds; T4 found
 that the engine's tags must stay out of the devices' tags (A11). Second
 run (01:37, engine tags 128-255): T0-T5 and T9 pass, 32 M reads clean under
 load; T7 separable at 2.6% error; T8 inconclusive, and the IOTLB looks
-reuse-protected (§4 "Second run"); T8 rewritten.**
+reuse-protected (§4 "Second run"); T8 rewritten. Third run (15:00): every
+test passes, T0-T9: F0 holds, one IOTLB for both domains (A7), engine-first
+free up to ~2.5 M reads/s; one-shot reads evict only entries not yet reused
+(§4 "Third run").**
 
 The background read engine ([PIPS-BG-READ-ENGINE.md](PIPS-BG-READ-ENGINE.md),
 "the engine doc") rests on assumptions the host alone can't prove. The main
@@ -407,6 +410,70 @@ below; a pass under the revised rule), T8 no conclusion, T9 PASS. 6 min.
 - **T9 PASS:** over 2 min of load, drive 0 used tags 0-127, drive 1 0-63.
 - **Next:** the same command again, a fresh holder (`--start-holder
   --reboot --tmux`), ~25 min: T4 with 20 s trains (T6's IOPS), T8 v2.
+
+### Third run: bigserver, 2026-11-07 15:00 (`dualssd/1106/rid-live/pips-rid-live-bigserver-1107-150019/`)
+
+**Every test passes: T0-T9** (T6 after re-analysis: the script looked for
+T4's IOPS file in T6's folder and said "no data"; fixed). 16 min. F0 holds,
+no fallback is needed, and the engine's tags must stay in the census's free
+range (A11).
+
+- **T2/T3 PASS** a third time.
+- **T4 PASS: 32 trains of 20 s, 5.27 G engine reads under both drives' load,
+  every one SC**: no malformed completion, no timeout, no leak, `WIN_HITS` 0.
+  **T5 PASS** (no straddle).
+- **T6 PASS: the cost to the drives by engine rate** (`T4/iops.tsv` against
+  baselines 866/785 kIOPS; INTERVAL is in 4 ns clocks):
+
+  | engine trains | reads/s | drive 0 | drive 1 |
+  |---|---|---|---|
+  | idle-fill, any setting | 0.20-0.66 M | -0.7..+0.7% | -0.1..+1.1% |
+  | engine-first, MAX_OUT 1 | 0.25-1.0 M | within 1% | within 1% |
+  | engine-first, INTERVAL 100 | 2.5 M | -0.9% | -1.1% |
+  | engine-first, MAX_OUT 8 | 7.9-8.0 M | -4% | -2.6% |
+  | engine-first, INTERVAL 10, MAX_OUT 64/128 | 24.7 M | -13% | -8% |
+  | engine-first, INTERVAL 1, MAX_OUT 64 | 61.6 M | -29% | -24% |
+  | engine-first, INTERVAL 1, MAX_OUT 128 | 118 M | -59% | -57% |
+
+  Idle-fill costs nothing but tops out at 0.66 M reads/s (the drives leave
+  few idle cycles). Engine-first is free up to ~2.5 M reads/s and costs about
+  0.5% per M reads/s beyond. The NP header credits reached 0 only in the two
+  INTERVAL 1, MAX_OUT 128 trains (`nph_min`).
+- **T7 PASS:** hit p50 684 ns, miss 1064 ns, 3.03% misclassified at 840 ns.
+- **T8 PASS: one IOTLB for both domains (A7).** From a flushed IOTLB with
+  fresh pages, drive 1's pages (through in1's port) evict P exactly as
+  drive 0's do, round by round at every N (`T8/t8.tsv`):
+
+  | N fresh pages | P read once: probe by round (h hit) | cross | twice |
+  |---|---|---|---|
+  | 32 | `hhhh............` | same | same |
+  | 64, 96 | `hh..............` | same | same |
+  | 128-512 | all miss | same | same |
+
+- **The IOTLB's replacement (with run 2 and alias campaign 2):**
+  - After the flush the first ~130 fresh pages land in free entries (P
+    survives while the cumulative inserts are below ~130-190), so the
+    IOTLB holds well over 96 entries in all.
+  - Once it is full, **P read once is evicted by at most 32 fresh pages, and
+    P read twice (4 us apart) the same**: two back-to-back reads earn no
+    protection.
+  - Run 2: pages read once per round over 16 rounds (33 pages apart)
+    stayed through the ~4000 fresh pages of the later runs; alias campaign
+    2: another drive's ~10 misses evict a page its own drive revisits
+    rarely, and a drive alone keeps 56-64 cyclic pages.
+  - Reading: new entries churn a small part of the IOTLB; entries with
+    repeated use, spread over time, hold the rest. What earns that hold (how
+    many uses, how far apart) and the size of the churned part (< 32) are
+    open.
+  - **For the engine:** one-shot reads evict only entries not yet held:
+    other one-shot entries and a device's newest pages. Whether a drive's
+    page under write is held by the time of its next write decides whether
+    the engine can evict it between two writes. A replacement probe (T8b:
+    after a flush, insert K pages and re-read which survive; read P k times
+    at spacing s, then fresh pages; warm cache, N = 1-32) would settle it.
+- **T9 PASS:** drive 0 tags 0-127, drive 1 0-63 (free 128-255 / 64-255).
+- **Script fixes after this run:** T6 reads `T4/iops.tsv` (it read T6's
+  folder); `t8.tsv` gains `probe_by_round`; the "twice" note reworded.
 
 ## 5. Software for the tests
 

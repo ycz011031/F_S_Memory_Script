@@ -17,7 +17,16 @@ an option is added).
   which sweep and design, which report generator reads what, the published
   pages). On the Windows analysis machine `claude.md` (git-ignored) adds its
   local paths, tools and editing gotchas.
-- **Last updated:** 2026-11-07 (second run, 01:37): with the engine's tags in 128-255 **T0-T5
+- **Last updated:** 2026-11-07 (third run, 15:00): **every 0x0A08 assumption test passes
+  (T0-T9)**: F0 holds (no fallback needed), 5.27 G engine reads under both drives' load all
+  SC, **one IOTLB for both domains** (T8: drive 1's pages evict drive 0's entry exactly as
+  drive 0's do). Cost to the drives: idle-fill none (max 0.66 M reads/s), engine-first none
+  up to ~2.5 M reads/s, -4% at 8 M, -13% at 25 M, -59% at 118 M. IOTLB replacement: after
+  a flush ~130 fresh pages fit; once full, a page read once or twice (4 us apart) is evicted
+  by <= 32 fresh pages, while pages reused over time survive thousands: one-shot engine
+  reads evict only entries not yet reused. Open: what earns that hold (T8b proposed). T6
+  analysis bug fixed. Test doc §4 "Third run".
+- **2026-11-07 (second run, 01:37):** with the engine's tags in 128-255 **T0-T5
   and T9 pass**: 32 M engine reads under both drives' load, all SC, no leak, no straddle, no
   device tag in the window. T7: hit 688 / miss 1076 ns median, 2.6% misclassified per read
   (now a pass). T8 inconclusive: a page read twice survived thousands of later misses, so
@@ -1249,6 +1258,7 @@ bigserver (Skylake, drives, alias-nvme 4 queues x qd 32, 18 lookups per page):
 
 ### Next
 
+Status 11-07 (third run, 15:00): **T0-T9 all PASS.** F0, A7 (one shared IOTLB), engine-first free to ~2.5 M reads/s, the IOTLB keeps reused entries against one-shot reads (test doc §4 "Third run"). Next: the replacement probe (T8b) if the evictor design needs it; 0x0A09 = the engine's extras, tag window default 128-255.
 Status 11-07 (first results, 01:04 run): **T2/T3 PASS: F0 holds** (port IDs read their drives' pages, isolated). **T4 FAIL**: in every train one completion came back SC with byte count or "request completed" wrong, then timed out; the failing tags were all in drive 0's 0-127: the core tracks requests by tag alone and the devices' tags pass through to it (new assumption A11). Fixed in the script: the engine's tags = the largest range unused in T0's census (128-255), MAX_OUT capped to it, T4 checks `CPL_MALFORMED` and `WIN_HITS`, captures saved on errors (`req_done=` in `pips bg capture`). Next: a fresh run, as a campaign (the 01:04 run's holder is gone): on bigserver `git pull`, then `bash scripts/pips/pips-rid-live.sh --start-holder --reboot --tmux` (new `--tmux`; ~1 h; reboots at the end; tarball `~/pips-rid-live-bigserver-*.tar.gz` written before the reboot). Its captures say which field the core sets. Test doc §4 "First run".
 Status 11-07 (first attempt): bigserver's first `pips-rid-live.sh` run (01:01) stopped at the engine check although the bitstream is right (design 0x0a08, `bg_id=0x52494450`, `bg_caps=0x46cd0100` = RTL `BG_CAPS_VAL`, buses b1/b2/b4): the script's `kv` read only one key per line, and `pips bg info` prints several to a line. Fixed (`kv` reads KEY=value tokens; this also lets `leak_seen`/`clash_seen` from the status line through, which never matched before). Rerun the same command.
 Status 11-07 (later): **0x0A08 built (FPGA `5fe3bda`), live tests written.** Once the bitstream is on bigserver: `git pull`, then `bash scripts/pips/pips-rid-live.sh --start-holder --fallbacks` after a reboot (drives on nvme), or without `--start-holder` while a holder runs; ~1 h; ends with the drives held (reboot: `sync; sudo systemctl reboot -ff`). Copy back `~/pips-rid-live-*.tar.gz`. icx: `--load-cmd '<a NIC load>'`. `pips-campaign.sh` still refuses 0x0A08 (it asks for 0x0a06/0x0a07).
