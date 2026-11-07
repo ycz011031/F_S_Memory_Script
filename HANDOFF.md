@@ -77,7 +77,8 @@ an option is added).
   Next campaign proposed on the page (not set up).
 - **Earlier entries** (11-05 back to 09-29): [docs/archive/handoff-log.md](docs/archive/handoff-log.md).
 - **Where the study stands (11-06):**
-  - **Build:** design `0x0A07` (§8 "Switch designs") is the only one in use.
+  - **Build:** design `0x0A07` (§8 "Switch designs") for the campaigns;
+    `0x0A08` (0x0A07 + the background read engine) on bigserver since 11-07.
     0x0A02-0x0A06 are retired; their results are in the archive (below) and
     on their report pages (§8).
   - **Batcher study: done** (§8 "Verdict", 10-30), judged on page order
@@ -98,6 +99,12 @@ an option is added).
     256 B pieces cost 15-22% Gb/s at 4 QPs. bigserver: not LRU (another
     drive's ~10 misses evict a page; fits ~40 entries, random replacement).
     §8 "Alias campaign 2 results".
+  - **0x0A08 background read engine: works (11-07)** (§8 "0x0A08: the
+    background read engine"): every assumption test passes on bigserver. A
+    downstream port's ID reads in its drive's domain (F0), one IOTLB serves
+    both domains, engine tags 128-255; engine-first is free up to ~2.5 M
+    reads/s; one-shot reads evict only entries not yet reused. Next: what
+    earns an entry the hold (T8b), then X3.
 - **Headline across both testbeds:** IOMMU strict costs throughput only
   where every I/O is mapped and unmapped and the I/O is small: drives at 4k
   (strict ~30-40% of off). Everywhere else (NICs at any flow count, drives
@@ -895,6 +902,7 @@ Two changes since the 10-13 sweeps matter to the experiments:
 | `0x0A05` | `64193c6`, 10-17 | **batching FIFOs of 512 beats** (`FIFO_DEPTH`, was 128; FIFO 2 too): an input stops at 493 beats and asks for a drain above 477, so a batch reaches 95 drive or 53 NIC TLPs (18 / 10 before). Nothing else changed. The depth sweep ran on it |
 | `0x0A06` | `9673e37` + timing fix `d44fdd0`, 10-23/24 | **page batcher** (`axi4_mwr_batch_pp`): per device, packets batch **by page** (8 segments of 128 rows, a 512-row overflow, a completion lane that fences: a device's older data leaves before its completion), weighted round robin by open pages, a read flushes its own device first. reg2 = completion size per input (0 = 16 DW), reg3 = `page_batch_en` (power-on 0: one in-order FIFO per input, 1536 rows, 0x0A05's triggers; but the build ties `wrr_en` = 1 (`pips_batch_ctrl.v:121`), so the arbiter stays open-page weighted, completions-first and read-flush-first even at 0: not 0x0A05's plain round robin, see result 9), `ctrl_push_off`, `grant_quantum`; status at `0x24`-`0x2C` (spills, stuck watchdog, longest MRd wait; `0x24` read clears). `batch_mrd` tied off. Depth/time/cap keep their meaning. PIO-MANUAL §6 |
 | `0x0A07` | `28ff5b6`, 10-27 (AXI4-switch `aa823c9` + `1803d4a`) | As 0x0A06 plus: **rate caps** (reg4 `0x10`: in0, in1, out one byte each, n beats per 256 cycles = n x 0.5 Gb/s of 64-byte beats, 0 = uncapped = power-on; token bucket, held only between TLPs, reads and completions held too; input caps ahead of the `pkt_wait` stamp, the out cap inside it), **refused-cycle counters** (`0x30`/`0x34` in0/in1, any reason; `0x38`/`0x3C` the cap's part; free-running 32 bit, wrap after 17.2 s counted). **Read flush changed:** a read waiting at its barrier no longer preempts the other input's drain episode (0x0A06's did, and with reads waiting on both drives the two went out interleaved packet by packet); its input takes the next episode and drains to the barrier in one run, drain cap ignored. Worst-case read wait now includes the other input's episode (`axi4_page_batch_ch.v` header: ~30-77 us cap off, ~18-46 us cap on). `wrr_en` still tied 1. PIO-MANUAL §6 |
+| `0x0A08` | `5fe3bda`, 11-07 | As 0x0A07 plus the **background read engine** `pips_bg_rd` with its test extensions (`BG_ID` "RIDP"): MRds under a switch port's ID, completions swallowed before the router. §8 "0x0A08: the background read engine" |
 
 **Every artifact carries the design ID from now on**: raw logs in the name
 (`pips-log-id0a04.bin.gz`), sweeps in the name (`<NAME>-id0a04-d8t22c1`), text
@@ -1255,6 +1263,99 @@ bigserver (Skylake, drives, alias-nvme 4 queues x qd 32, 18 lookups per page):
     0.81 at ws 128, 0.97 at 512, 0.99 at 2048.
 12. Batcher settings (s2rep, d1t0c1/d16t218c1 x pb0/pb1): misses unchanged
     (0.84 at ws 256 stride 1, 0.23 at ws 64 stride 4096).
+
+### 0x0A08: the background read engine (built and tested 11-07)
+
+What it is: design `0x0A08` = `0x0A07` + `pips_bg_rd`, a requester inside the
+switch that issues memory reads (MRd) to host IOVAs under a switch port's
+requester ID, interleaves them into the upstream request stream behind the
+batcher, and swallows their completions before the router, so no device
+ever sees one. Its purpose: evict a drive's IOTLB entries between two of its
+own writes, so that page order turns into misses (X3 in the engine doc).
+FPGA repo `5fe3bda` (decisions H1-H16 in its untracked `0A08_UPGRADE_PLAN.md`).
+Design: [docs/PIPS-BG-READ-ENGINE.md](docs/PIPS-BG-READ-ENGINE.md) (register
+map §7, experiments X0-X5 §12). Assumptions, tests and every run's results:
+[docs/PIPS-0A08-ASSUMPTION-TEST.md](docs/PIPS-0A08-ASSUMPTION-TEST.md) (§1
+A1-A11, §3 the test extensions, §4 the runs). **This build is the test build:
+`BG_ID` reads `0x52494450` "RIDP"** (the engine-only `0x0A09` will read
+"BGRD").
+
+**Capabilities** (AXI segment `0xA402_0000`, 64 KiB; `BG_CAPS` `0x46cd0100`:
+256 tags, table 8192 entries, trace 4096 reads, 64 histogram bins, NP-credit
+gating present):
+
+| Area | What it can do | Registers / `pips bg` keys |
+|---|---|---|
+| Addresses | pattern: `base + (first + i*stride)*4 KiB + offset`, cyclic or random order, `ws` pages; or table mode: up to 8192 entries, each a page index + one of 4 requester-ID slots, read in order | `base= first= stride= ws= order=cyclic\|random seed= offset= src=pattern\|table`, `pips bg table load FILE` (`page:slot` per line) |
+| Requester | 4 RID slots; allowed: the two downstream ports (`in0` = `b2:00.0`, `in1` = `b2:01.0`) and the upstream port (`usp`); device IDs only with `unsafe=1` + a tag window + RID+tag sink (fallback F2, not needed) | `rid= rid1= rid2= rid3=` (`in0 in1 usp dev0 dev1 BB:DD.F none`) |
+| Read size | 1-16 DW inside one 64-byte block (default 1 DW) | `dw=` |
+| Rate | `INTERVAL` minimum clocks between issues (4 ns clocks: 1000 = 0.25 M/s, 1 = every clock), `MAX_OUT` outstanding reads, `COUNT` reads (0 = until stopped), NP header credit reserve | `interval= maxout= count= nphres= secs=` |
+| Mux | idle-fill (only into cycles the devices leave free), round robin, engine-first | `arb=idle\|rr\|engine` |
+| Tags | **tag window** `TAG_WIN` `[7:0]` lo, `[15:8]` hi, `[16]` enable; `MAX_OUT` must be <= its size (config error 6) | `tagwin=LO-HI\|off` |
+| Measures | issued, completions by status (SC/UR/CA/other/poisoned/malformed/unexpected), timeouts, latency sum/min/max, 64-bin histogram, a per-read latency trace (4096 reads from `TRACE_SKIP`), stalls (arb/tags/credits), data check against the holder's page tags | `pips bg counters / hist / trace FILE / run trace=1 dcheck=1 backing=N` |
+| Test extensions | leak monitor (completions for the engine that reached the router's outputs: must be 0), **tag census** (every tag each device used, `WIN_HITS`), straddle counters, NP credits and head-of-line cycles (`TFC`, `HOL_ENGINE/DEVICE`), capture of the last 64 completions (descriptor, `req_done`), clash detector (F2) | `pips bg census [clear] / facts [clear] / capture [N]` |
+
+**Tools** (all on the host, bigserver tested; icx not yet):
+- `pips bg ...` (pips.c): `info`, `set`, `start/stop/wait`, `run K=V... [secs=S]`
+  (start, heartbeat, stop, print every counter as `key=value`), and the
+  commands in the table. `pips bg help` lists the keys.
+- `scripts/pips/pips-rid-live.sh`: the live tests T0-T12 (T10-T12 the
+  fallbacks, only with `--fallbacks`). On bigserver it starts the alias-nvme
+  holder (`--start-holder`), whose `map` command maps a region of tagged
+  pages at IOVA `0x4000000000` in each drive's domain (and, as a side effect,
+  flushes those IOTLB entries: T8 uses that). Run:
+  `bash scripts/pips/pips-rid-live.sh --start-holder --reboot --tmux --no-ridcheck`
+  (~16-25 min, reboots at the end: the holder can't release the drives).
+  Output `~/pips-rid-live-<host>-<MMDD-HHMMSS>/` + `.tar.gz`: `summary.txt`,
+  `results.tsv`, `T*/`.
+- `pips-campaign.sh` refuses 0x0A08 (it accepts 0x0A06/0x0A07 only); the
+  batcher and rate caps are 0x0A07's, so the campaigns would run, but
+  nothing records the engine's state yet.
+
+**Results on bigserver (3 runs, 11-07; the third: every test passes):**
+
+| Test | Assumption | Result |
+|---|---|---|
+| T1 | the core sends the engine's RQ beat | PASS (UR from the upstream port's ID, as expected) |
+| T2, T3 | **F0: a downstream port's ID reads in its drive's domain, isolated** | PASS in all 3 runs: in0 reads drive 0's page tags, in1 drive 1's; a page mapped only for drive 0 is UR through in1 |
+| T4 | no leak under load | PASS: 5.27 G reads in 32 x 20 s trains under both drives' load, all SC, leak 0 |
+| T5 | no straddled beats | PASS |
+| T6 | the engine doesn't cost the drives | PASS for idle-fill; engine-first costs above ~2.5 M reads/s (table below) |
+| T7 | latency tells hit from miss | PASS: hit 684 ns, miss 1064 ns (p50), 3% misclassified per read at 840 ns; 2 MB stride 1364-1436 ns, 1 GB 1568-1592 ns (each walk level ~0.2-0.4 us) |
+| T8 | one IOTLB for both domains | PASS: drive 1's pages evict drive 0's entry exactly as drive 0's do |
+| T9 | tag census | drive 0 tags 0-127, drive 1 0-63 under load: **128-255 free** |
+| (A11, found in run 1) | engine tags must not overlap device tags | the core tracks requests by tag alone and device tags pass through unchanged; overlapping tags gave malformed completions and timeouts. The script now takes the census's free range |
+
+Rate and cost (T4/T6, drives at 866/785 kIOPS without the engine):
+
+| Engine | Reads/s | Drive 0 | Drive 1 |
+|---|---|---|---|
+| idle-fill, any INTERVAL/MAX_OUT | 0.20-0.66 M (its ceiling) | +-1% | +-1% |
+| engine-first, up to INTERVAL 100 | <= 2.5 M | -1% | -1% |
+| engine-first, MAX_OUT 8 | 8 M | -4% | -3% |
+| engine-first, INTERVAL 10, MAX_OUT 64+ | 25 M | -13% | -8% |
+| engine-first, INTERVAL 1, MAX_OUT 64 | 62 M | -29% | -24% |
+| engine-first, INTERVAL 1, MAX_OUT 128 | 118 M (MAX_OUT / ~1 us) | -59% | -57% (NP header credits hit 0) |
+
+**Rules learned (keep them in any engine use):**
+- Engine tags in the census's free range: **128-255 on bigserver**, so
+  `MAX_OUT` <= 128. Redo the census at the experiment's load (`pips bg census`):
+  the set can grow with queue depth.
+- `count=0` for timed runs (a count ends the run early).
+- Idle-fill gives at most ~0.66 M reads/s under the drives' load, about 0.7
+  reads per 1.024 us window, not the ~170 per window X3's plan assumed.
+  X3 needs engine-first, whose cost is in the table.
+- **The IOTLB keeps reused entries against one-shot reads** (T8 v2 with run 2
+  and alias campaign 2): after a flush ~130 fresh pages fit; once full, a page
+  read once, or twice 4 us apart, is evicted by <= 32 fresh pages, while pages
+  reused over time survive thousands. One-shot engine reads evict only
+  entries not yet reused. Whether a drive's page is still evictable between
+  two of its writes is open: the replacement probe (T8b, proposed in the
+  test doc §4 "Third run", not written) would settle what earns the hold.
+
+**State:** bigserver runs 0x0A08; its holder from the third run still holds
+the drives (reboot before the next run). icx: not run. Results in
+`dualssd/1106/rid-live/` (FILE-MAP §7).
 
 ### Next
 
