@@ -475,6 +475,37 @@ range (A11).
 - **Script fixes after this run:** T6 reads `T4/iops.tsv` (it read T6's
   folder); `t8.tsv` gains `probe_by_round`; the "twice" note reworded.
 
+### First icx run: 2026-11-07 17:47 (`dualnic/1106/rid-live/pips-rid-live-icx-1107-174708/`)
+
+IOMMU strict, kernel 6.12.43. T0-T3, T7, T8 PASS; **T4-T6 and T9 skipped:
+the NIC load never started**. 5 min.
+
+- **The load:** both alias-rdma clients timed out connecting to styx on TCP
+  3760 / 4760 (SYNs unanswered: styx lets only the campaign's ports through;
+  3700/4700 work). Fixed: the built-in load uses BASE_PORTS + 700 as
+  run-dualnic-experiment.sh, kills stale servers on those ports first, checks
+  styx listens, gives up as soon as a client exits, prints the clients'
+  ERROR lines (the message was empty: `tail -2` on two files) and copies the
+  servers' logs back. With no load, T0's engine window falls back to the
+  idle census's free range (this run used all 256 tags; no malformed
+  completion, the NICs were idle).
+- **T2 PASS: F0 holds on icx too.** `pips_bg_region.ko` put both NICs'
+  regions at the same IOVA, `0xc0000000`. in0's port read DW1 = 1 (its own
+  NIC's region), in1's port DW1 = 2; 64 + 16 reads all SC, tags right,
+  mean 758 / 740 ns.
+- **T3 PASS:** page 32 of in0's NIC's region read through in1's port returned
+  in1's NIC's page at that IOVA (DW0 32, DW1 2): each port translates in its
+  own NIC's domain. The DW1 tag is what makes this visible when the IOVAs
+  coincide.
+- **T7 PASS:** hit p50 520 ns, miss 752 ns (vs bigserver 684 / 1064), 4.0%
+  misclassified at 624 ns. A 2 MiB stride costs no more than a miss (748 ns):
+  icx's walk caches hold the upper levels.
+- **T8 PASS: one IOTLB for both NICs' domains.** P survives up to N 192
+  fresh pages (miss <= 0.19) and is evicted from N 256 (0.73-1.00), as
+  cross: 32 sets x 8 ways (alias campaign 2), where P's set gets N/32 of
+  the fresh pages. Reading P twice protects nothing (LRU family). At N 512
+  a few probes hit (0.71): noise of 7 probes, or a pseudo-LRU.
+
 ## 5. Software for the tests
 
 ### 5.1 Now: `scripts/pips/pips-rid-check.sh` (written, 2026-11-06)

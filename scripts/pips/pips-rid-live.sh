@@ -362,7 +362,8 @@ hold_load_end() {   # stop the load (if still running), wait for its done line; 
 # ------------------------------------------------------------------ icx: the NIC load and the pages
 # The built-in load: per NIC an alias-rdma server on styx (ssh, screen) and a client here that READs from it,
 # its NIC writing the responses into a 64-page MR (4 QPs x depth 16, 4 KiB), until stopped. Ports
-# BASE_PORTS[i] + 760 (run-dualnic-experiment.sh uses + 700). NI0/NI1: the config index of each NIC.
+# BASE_PORTS[i] + 700, as run-dualnic-experiment.sh (styx answered nothing on + 760, 11-07: a firewall lets
+# only the campaign's ports through). NI0/NI1: the config index of each NIC.
 rsh_try() {
     if [ -n "${CLIENT_PWD:-}" ]; then
         sshpass -p "$CLIENT_PWD" ssh -n -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "$CLIENT_USERNAME@$CLIENT_SSH_IP" "$@"
@@ -371,7 +372,7 @@ rsh_try() {
     fi
 }
 NI0=0; NI1=1; ALIAS_RDMA=""; R_ALIAS_RDMA=""
-nic_port() { echo $(( ${BASE_PORTS[$1]:-$((3000 + 1000 * $1))} + 760 )); }
+nic_port() { echo $(( ${BASE_PORTS[$1]:-$((3000 + 1000 * $1))} + 700 )); }
 nic_index() {   # <bdf>: the index of its netdev in SERVER_INTFS, or the default given
     local nd i
     nd=$(ls "/sys/bus/pci/devices/$1/net" 2>/dev/null | head -1)
@@ -423,11 +424,18 @@ nic_load_start() {   # <secs> <dir>: secs is ignored (runs until nic_load_end)
     fi
     [ "$NIC_OK" = 1 ] || return 1
     NIC_LOAD=1
+    rsh_try "sudo pkill -INT -f 'alias-rdm[a] --role server .*--port ($(nic_port "$NI0")|$(nic_port "$NI1"))( |\$)' > /dev/null 2>&1; screen -wipe > /dev/null 2>&1; true"
+    sleep 1
     for i in "$NI0" "$NI1"; do
         port=$(nic_port "$i")
         rsh_try "screen -dmS ridlive_srv$i bash -c \"sudo $R_ALIAS_RDMA --role server --netdev ${CLIENT_INTFS[$i]} --port $port --heartbeat 30 > /tmp/ridlive-srv$i.log 2>&1\""
     done
     sleep 2
+    for i in "$NI0" "$NI1"; do   # the servers listen on styx?
+        port=$(nic_port "$i")
+        rsh_try "ss -ltn 2>/dev/null | grep -q ':$port '" ||
+            say "  WARNING: styx: no listener on TCP $port: $(rsh_try "tail -n 3 /tmp/ridlive-srv$i.log" 2>&1 | tr '\n' ' ' | cut -c1-250)"
+    done
     for i in "$NI0" "$NI1"; do
         port=$(nic_port "$i"); rm -f "$d/ready-nic$i"
         sudo -n setsid "$ALIAS_RDMA" --role client --netdev "${SERVER_INTFS[$i]}" --server-ip "${CLIENT_NIC_IPS[$i]}" --port "$port" \
@@ -438,8 +446,14 @@ nic_load_start() {   # <secs> <dir>: secs is ignored (runs until nic_load_end)
     n=0
     until [ -e "$d/ready-nic$NI0" ] && [ -e "$d/ready-nic$NI1" ]; do
         sleep 1; n=$((n + 1)); [ $((n % 10)) = 0 ] && say "  ... waiting for the NIC load to start (${n} s)"
-        if [ "$n" -ge 90 ]; then
-            say "  the NIC load did not start: $(tail -2 "$d"/alias-rdma-nic*.log | xargs | cut -c1-300)"
+        # give up at 90 s, or as soon as a client has exited without getting ready
+        dead=0
+        for i in "$NI0" "$NI1"; do
+            [ -e "$d/ready-nic$i" ] || pgrep -f "alias-rdm[a] --role client .*--name ridlive_nic$i( |\$)" > /dev/null || dead=1
+        done
+        if [ "$n" -ge 90 ] || { [ "$n" -ge 5 ] && [ "$dead" = 1 ]; }; then
+            say "  the NIC load did not start: $(grep -h -E '^ERROR' "$d"/alias-rdma-nic*.log | tr '\n' ' ' | cut -c1-400)"
+            for i in "$NI0" "$NI1"; do rsh_try "cat /tmp/ridlive-srv$i.log" > "$d/server-nic$i.log" 2>&1; done
             nic_alias_stop; return 1
         fi
     done
@@ -556,8 +570,10 @@ case "${TAGWIN:-}" in
     ?*)  ENG_WIN=$TAGWIN; WIN_N=$(( ${TAGWIN#*-} - ${TAGWIN%-*} + 1 )); sum "   engine tags: $ENG_WIN (--tagwin; the census left $FW free)" ;;
     *)   if [ "$T0_LOAD" = 1 ] && [ "${FWN:-0}" -ge 16 ]; then ENG_WIN=$FW; WIN_N=$FWN
              sum "   engine tags: $ENG_WIN ($WIN_N), the largest range no device used under load$( [ "$FWN" -lt 64 ] && echo "; MAX_OUT is capped at $WIN_N")"
+         elif [ "${FWN:-0}" -ge 16 ]; then ENG_WIN=$FW; WIN_N=$FWN   # no load: the idle census is still better than all 256
+             sum "   WARNING: engine tags: $ENG_WIN ($WIN_N), from an idle census (no load ran): a loaded device may use more tags"
          else ENG_WIN=off; WIN_N=256
-             sum "   WARNING: engine tags: all 256 (census under load: $( [ "$T0_LOAD" = 1 ] && echo "free range $FW ($FWN) < 16" || echo "no load ran")): reads may collide with the devices' tags (malformed + timeout)"
+             sum "   WARNING: engine tags: all 256 (census: $( [ "$T0_LOAD" = 1 ] && echo "free range $FW ($FWN) < 16" || echo "no load ran, free range $FW ($FWN)")): reads may collide with the devices' tags (malformed + timeout)"
          fi ;;
 esac
 ENG_DEF=${ENG_DEF/tagwin=off/tagwin=$ENG_WIN}
@@ -633,8 +649,8 @@ if [ -z "$STOPPED" ] && want T2; then
             erun "$p-id" rid=$p base="$pb" first=9 ws=1 count=1 dw=2
             pipsc bg capture 1 > "$TD/$p-id-capture.txt" 2>&1
             d1=$(grep -o 'dw1=0x[0-9a-f]*' "$TD/$p-id-capture.txt" | head -1 | cut -d= -f2)
-            sum "   $p: a 2-DW read: sc $(kv cpl_sc "$TD/$p-id.txt") DW0 $(grep -o 'dw0=0x[0-9a-f]*' "$TD/$p-id-capture.txt" | head -1 | cut -d= -f2) DW1 ${d1:-?} (NIC $want_n's region)"
-            [ "$(kv cpl_sc "$TD/$p-id.txt")" = 1 ] && [ $(( ${d1:-0} )) = "$want_n" ] || { ok=0; why="$why $p(region of NIC $(( ${d1:-0} )))"; T2_KIND=${T2_KIND:-fault}; }
+            sum "   $p: a 2-DW read: sc $(kv cpl_sc "$TD/$p-id.txt") DW0 $(grep -o 'dw0=0x[0-9a-f]*' "$TD/$p-id-capture.txt" | head -1 | cut -d= -f2) DW1 ${d1:-?} (want $want_n: $p's own NIC)"
+            [ "$(kv cpl_sc "$TD/$p-id.txt")" = 1 ] && [ $(( ${d1:-0} )) = "$want_n" ] || { ok=0; why="$why $p(DW1 $(( ${d1:-0} )), not its own NIC's region)"; T2_KIND=${T2_KIND:-fault}; }
         done
     fi
     if [ "$T2_KIND" != skip ]; then
@@ -664,7 +680,7 @@ if [ -z "$STOPPED" ] && [ "$F0" = 1 ] && want T3; then
     sum "   in0 port: sc $(kv cpl_sc "$a") data $(kv last_data "$a"); in1 port: sc $(kv cpl_sc "$b") ur $(kv cpl_ur "$b") ca $(kv cpl_ca "$b") data $(kv last_data "$b") DW1 ${d1:-?}; DMAR naming in1's port: $f1"
     iso=""
     if [ "$(kv cpl_sc "$b")" = 0 ] && [ "$(cpl_total "$b")" = 1 ]; then iso="UR/CA through in1's port"
-    elif [ "$KIND" = nic ] && [ "$(kv cpl_sc "$b")" = 1 ] && [ $(( ${d1:-1} )) != 1 ]; then iso="in1's port reached another mapping at that IOVA (DW1 ${d1}: $( [ $(( d1 )) = 2 ] && echo "NIC 1's region" || echo "not a region page"))"; fi
+    elif [ "$KIND" = nic ] && [ "$(kv cpl_sc "$b")" = 1 ] && [ $(( ${d1:-1} )) != 1 ]; then iso="in1's port reached another mapping at that IOVA (DW1 ${d1}: $( [ $(( d1 )) = 2 ] && echo "in1's own NIC's region" || echo "not a region page"))"; fi
     if [ "$(kv cpl_sc "$a")" = 1 ] && [ $(( $(kv last_data "$a") )) = 32 ] && [ -n "$iso" ]; then
         end PASS "each port translates in its own device's domain: $iso$( [ "$f1" = 0 ] && [ "$(kv cpl_sc "$b")" = 0 ] && echo " (no DMAR line naming in1's port: rate-limited or not logged)")"
     else
@@ -919,9 +935,9 @@ line = []
 if x:
     xm = sum(x) / len(x)
     if xm >= 0.5 * om:
-        line.append(f"PASS shared: from N {C} (P misses {om:.2f} after drive 0's pages) P misses {xm:.2f} after drive 1's pages: traffic in one domain evicts another's entries (A7)")
+        line.append(f"PASS shared: from N {C} (P misses {om:.2f} after device 0's pages) P misses {xm:.2f} after device 1's pages: traffic in one domain evicts another's entries (A7)")
     else:
-        line.append(f"FAIL partitioned: from N {C} P misses {om:.2f} after drive 0's pages but {xm:.2f} after drive 1's: entries are kept per domain (A7 fails: F1/F3 can't evict drive 0's entries; F0 is unaffected, it reads in drive 0's own domain)")
+        line.append(f"FAIL partitioned: from N {C} P misses {om:.2f} after device 0's pages but {xm:.2f} after device 1's: entries are kept per domain (A7 fails: F1/F3 can't evict device 0's entries; F0 is unaffected, it reads in device 0's own domain)")
 else:
     line.append(f"INFO capacity C ~ {C} (once misses {om:.2f}); no cross runs")
 if w:
