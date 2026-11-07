@@ -121,6 +121,40 @@
 #                     The analysis simulates the fitted IOTLBs, not strict
 #                     (PIPS_SEQ_STRICT=0, PIPS_SEQ_IOTLB), and also reanalyses
 #                     the 11-05 alias sweeps so (analyze-1105/)
+#   --bg              ssd: the 0x0A08 stress campaign (11-07, HANDOFF §8
+#                     "0x0A08 stress campaign"): the switch's background read
+#                     engine as a cheap IOMMU stressor (a 1-DW read is one
+#                     translation; its completion is swallowed in the switch)
+#                     against the drives' misses per I/O and throughput, by
+#                     batcher setting. Design 0x0A08, IOMMU strict. Two halves,
+#                     native first (VFIO can't be undone without a reboot):
+#                     nprep   drives on nvme: ridcheck/pips_bg_region.ko maps a
+#                             256 MiB region in each drive's DMA domain; 64-read
+#                             data check through in0/in1; tag census under fio
+#                     nalone  the engine alone: reads/s and latency against
+#                             MAX_OUT and rate (pcm-iio), capacity knee by latency
+#                     nstress fio 4k-1m x 4, drive 0 alone and both, d1t0c1/
+#                             d16t218c1 x pb 0/1; one sweep per engine level:
+#                             off, hits (h16 h50 hx), one-shot misses (m1 m4 m16
+#                             m50 mx), 96 / 256 reused pages (c16 v16), 2 MiB
+#                             apart (d16)
+#                     nheavy  fio 16 per drive; ncross the engine in drive 1's
+#                             domain; nend the module unloaded
+#                     vprep   one alias-nvme --hold (as --alias, BMC guard), the
+#                             engine's own region (holder "bgmap"), census
+#                     valone  capacity knee, T8b replacement probe, reads/s
+#                             and latency down to pages 1 GiB apart
+#                     vstress alias 4k x 4 queues at ws 32 / 48 shared / 65536,
+#                             the same levels and settings; vcross drive 1's domain
+#                     --runs (default 2). No page-order analysis (--analysis
+#                     after the fact by hand). A problem with the engine stops
+#                     it for the rest of that half; soft lockups end the native
+#                     half (the vfio half still runs). Ends with a reboot once
+#                     the vfio half has started (--no-reboot leaves it to you)
+#   --smoke           with --bg: every step once, small (~1 h 30 with the reboot):
+#                     levels off/m16/mx, 1 run, 4k, d1t0c1 and d16t218c1 pb 0,
+#                     knee ws 32/128, 6 T8b tables, vfio ws 32 only; its own
+#                     resume pointer
 #   --leg M           with --paper: the leg expected (strict, lazy, pt, off);
 #                     refused when the devices are not so (a reboot missed).
 #                     With --dry-run: plan that leg whatever this host is
@@ -192,6 +226,7 @@ HERE=$(dirname "$SELF")
 REPO=$(cd "$HERE/../.." && pwd)
 . "$REPO/utils/ssd-lib.sh"            # relaunch_in_tmux
 . "$HERE/pips-lib.sh"
+. "$HERE/pips-bg-lib.sh"             # --bg (0x0A08's read engine)
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF"; }
 
 KIND=${1:-}
@@ -203,6 +238,7 @@ esac
 PASS=("$KIND"); IN_TMUX=0
 for a in "$@"; do if [ "$a" = --tmux ]; then IN_TMUX=1; else PASS+=("$a"); fi; done
 DRY=0; ONLY=""; SKIP=""; ANALYSIS=1; PENDING=""; WIRE=1; HW=1; JOBS=""; STAMP=""; RETIRE=""; MINIMAL=0; PAPER=0; LEG_WANT=""; RUNS=""; ALIAS=0; ALIAS2=0; FRESH=0; REBOOT=1
+BG=0; LOCKUP_SOFT=0; SMOKE=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --tmux) shift ;;
@@ -217,6 +253,8 @@ while [ $# -gt 0 ]; do
         --paper) PAPER=1; shift ;;
         --alias) ALIAS=1; shift ;;
         --alias2) ALIAS=1; ALIAS2=1; shift ;;
+        --bg) BG=1; shift ;;
+        --smoke) SMOKE=1; shift ;;
         --leg) LEG_WANT="$2"; shift 2 ;;
         --runs) RUNS="$2"; shift 2 ;;
         --no-wire) WIRE=0; shift ;;
@@ -254,10 +292,14 @@ if [ -n "$RETIRE" ]; then
 fi
 STAMP_GIVEN=$STAMP
 STAMP=${STAMP:-c$(date +%m%d%H%M)}
-[ $(( MINIMAL + PAPER + ALIAS )) -gt 1 ] && { echo "pips-campaign: one of --minimal, --paper, --alias" >&2; exit 2; }
+[ $(( MINIMAL + PAPER + ALIAS + BG )) -gt 1 ] && { echo "pips-campaign: one of --minimal, --paper, --alias, --bg" >&2; exit 2; }
+[ "$BG" = 1 ] && [ "$KIND" = nic ] && { echo "pips-campaign: --bg is written for the drives (ssd) so far" >&2; exit 2; }
+[ "$BG" = 1 ] && ANALYSIS=0      # misses per I/O and throughput: no page-order analysis
+[ "$SMOKE" = 1 ] && [ "$BG" = 0 ] && { echo "pips-campaign: --smoke goes with --bg" >&2; exit 2; }
+[ "$SMOKE" = 1 ] && bg_smoke
 # --minimal, --paper and --alias leave the pending 0x0A04/0x0A05 analysis out unless --pending.
-[ -n "$PENDING" ] || { if [ "$MINIMAL" = 1 ] || [ "$PAPER" = 1 ] || [ "$ALIAS" = 1 ]; then PENDING=0; else PENDING=1; fi; }
-[ -n "$RUNS" ] || { if [ "$ALIAS2" = 1 ]; then RUNS=2; elif [ "$ALIAS" = 1 ]; then RUNS=1; else RUNS=3; fi; }
+[ -n "$PENDING" ] || { if [ "$MINIMAL" = 1 ] || [ "$PAPER" = 1 ] || [ "$ALIAS" = 1 ] || [ "$BG" = 1 ]; then PENDING=0; else PENDING=1; fi; }
+[ -n "$RUNS" ] || { if [ "$ALIAS2" = 1 ] || [ "$BG" = 1 ]; then RUNS=2; elif [ "$ALIAS" = 1 ]; then RUNS=1; else RUNS=3; fi; }
 # The alias campaigns map their pages once: the page-order analysis simulates
 # the fitted IOTLBs (HANDOFF §8 "Alias campaign results"), never strict mode's
 # "every new visit misses".
@@ -324,8 +366,16 @@ if [ "$ALIAS" = 1 ]; then
            fi ;;
     esac
 fi
+# --bg: the native half is about strict mode's invalidations (user, 11-07: strict).
+if [ "$BG" = 1 ]; then
+    BMODE=$(iommu_detect)
+    if [ "$BMODE" != strict ]; then
+        if [ "$DRY" = 1 ]; then echo "pips-campaign: (dry run) IOMMU here: $BMODE; --bg wants strict" >&2
+        else echo "ERROR: --bg: the devices behind the switch are '$BMODE', not strict (boot strict first)" >&2; exit 1; fi
+    fi
+fi
 # Resume: a half-done campaign of this kind and mode is picked up.
-if [ "$ALIAS2" = 1 ]; then MODE_KEY=alias2; elif [ "$ALIAS" = 1 ]; then MODE_KEY=alias; elif [ "$PAPER" = 1 ]; then MODE_KEY=paper-$LEG
+if [ "$BG" = 1 ]; then MODE_KEY=bg$( [ "$SMOKE" = 1 ] && echo -smoke); elif [ "$ALIAS2" = 1 ]; then MODE_KEY=alias2; elif [ "$ALIAS" = 1 ]; then MODE_KEY=alias; elif [ "$PAPER" = 1 ]; then MODE_KEY=paper-$LEG
 elif [ "$MINIMAL" = 1 ]; then MODE_KEY=minimal; else MODE_KEY=full; fi
 POINTER="$HOME/.pips-campaign-$KIND-$MODE_KEY.current"
 RESUME=0
@@ -414,7 +464,11 @@ alias_extra() {   # <ws:stride> -> the runner options of that point
 }
 alias_npts() { set -- $1; echo $#; }
 
-if [ "$ALIAS2" = 1 ]; then
+if [ "$BG" = 1 ]; then
+    read -r -a PHASES <<< "$(bg_phases)"
+    [ "$DRY" = 1 ] && bg_dry_init
+    MIN_PER_PT=1.08
+elif [ "$ALIAS2" = 1 ]; then
     if [ "$KIND" = nic ]; then PHASES=(n2ways n2sets n2rot n2small n2sge n2place n2share n2walk n2cap n2lat n2quant n2rep)
     else PHASES=(s2cap s2probe s2place s2order s2walk s2rep); fi
     [ "$KIND" = nic ] && MIN_PER_PT=1.6
@@ -437,6 +491,7 @@ else
 fi
 # est_points <phase>: runs it takes (each sweep adds its datapath check)
 est_points() {
+    [ "$BG" = 1 ] && { bg_nsweeps "$1"; return; }
     case "$KIND:$1" in
         ssd:main)   echo $(( 16 * 40 + 1 )) ;;
         ssd:cap0)   echo $(( 6 * 12 + 1 )) ;;
@@ -472,6 +527,7 @@ est_points() {
     esac
 }
 describe() {
+    [ "$BG" = 1 ] && { bg_describe "$1"; return; }
     case "$KIND:$1" in
         ssd:main)   echo "page_batch_en 0/1 x the 8 depths, cap on, w31; bs 4k-1m x 1-16 per drive + 2/4/8+16" ;;
         ssd:cap0)   echo "cap off at d1/d8/d64, page_batch_en 0/1; knob grid" ;;
@@ -537,7 +593,7 @@ clock_in() { date -d "+$1 min" '+%a %H:%M' 2>/dev/null || echo "+$(fmt_min "$1")
 
 plan() {
     local p n m tot=0
-    echo "pips-campaign $KIND$( [ "$MINIMAL" = 1 ] && echo " (minimal)")$( [ "$ALIAS" = 1 ] && echo " (alias: in-house generators, IOMMU ${AMODE:-?})")$( [ "$PAPER" = 1 ] && echo " (paper, IOMMU leg $LEG)"), stamp $STAMP, $(hostname), $(date '+%F %T'), repo $(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)"
+    echo "pips-campaign $KIND$( [ "$BG" = 1 ] && echo " (bg: 0x0A08 read engine as IOMMU stressor, IOMMU ${BMODE:-?})")$( [ "$MINIMAL" = 1 ] && echo " (minimal)")$( [ "$ALIAS" = 1 ] && echo " (alias: in-house generators, IOMMU ${AMODE:-?})")$( [ "$PAPER" = 1 ] && echo " (paper, IOMMU leg $LEG)"), stamp $STAMP, $(hostname), $(date '+%F %T'), repo $(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)"
     echo "sweeps named dual$KIND-pips-<iommu>-$STAMP<phase>; ${MIN_PER_PT} min per run (estimate)"
     printf '  %-7s %5s %8s  %s\n' phase runs time what
     for p in "${RUN_PHASES[@]}"; do
@@ -570,7 +626,8 @@ switch_ok() {
     out=$(timeout 20 sudo -n "$PIPS" cfg 2>&1) || { LAST_SWITCH="$out"; return 1; }
     LAST_SWITCH="$out"
     d=$(design_of <(printf '%s\n' "$out"))
-    case "$d" in 0x0a06|0x0a07) ;; *) return 1 ;; esac
+    if [ "$BG" = 1 ]; then [ "$d" = 0x0a08 ] || return 1
+    else case "$d" in 0x0a06|0x0a07) ;; *) return 1 ;; esac; fi
     [ -z "$CAMPAIGN_DESIGN" ] || [ "$d" = "$CAMPAIGN_DESIGN" ]
 }
 switch_dead() {   # <where>
@@ -631,7 +688,11 @@ sweep_run() {
     else
         note "sweep $label left no manifest (exit $rc): it did not start; see campaign.log"
     fi
-    if [ -e "$OUT/.lockup-stop" ]; then
+    if [ -e "$OUT/.lockup-stop" ] && [ "$LOCKUP_SOFT" = 1 ]; then
+        BN_STOP=1
+        note "sweep $label STOPPED by the soft-lockup guard ($(cat "$OUT/.lockup-stop")): the native half ends here, the vfio half still runs (journalctl -k)"
+        rm -f "$OUT/.lockup-stop"
+    elif [ -e "$OUT/.lockup-stop" ]; then
         STOPPED=1
         note "sweep $label STOPPED by the soft-lockup guard ($(cat "$OUT/.lockup-stop")): see journalctl -k"
         banner "KERNEL SOFT LOCKUPS: the campaign stopped its sweeps (soft-lockup guard)." \
@@ -746,6 +807,7 @@ fi
 phase_run() {
     local p=$1 q
     CUR_PHASE=$p
+    [ "$BG" = 1 ] && { bg_phase "$p"; return; }
     case "$KIND:$p" in
         ssd:main)  sweep_run main --cfgs "$DEPTHS" --caps 1 --pbs "0 1" --set "$THR" "${SSD_MAIN[@]}" ;;
         ssd:cap0)  sweep_run cap0 --cfgs "1:0 8:106 64:255" --caps 0 --pbs "0 1" --set "$THR" "${SSD_KNOB[@]}" ;;
@@ -1101,6 +1163,10 @@ guard() { bash "$HERE/alias/alias-guard.sh" "$@" 2>&1 | while IFS= read -r l; do
 # ------------------------------------------------------------------ dry run
 if [ "$DRY" = 1 ]; then
     [ "$RESUME" = 1 ] && echo "(dry run) a launch now RESUMES campaign $STAMP ($(grep -c '^done' "$OUT/progress.tsv" 2>/dev/null || echo 0) sweep(s) done); --fresh starts a new one"
+    if [ "$BG" = 1 ]; then
+        echo "(dry run) --bg: the native half first (drives on nvme, module region), then the vfio half (holder, BMC guard; reboot at the end once it started)"
+        echo "(dry run) engine levels:"; bg_levels_line
+    fi
     if [ "$KIND" = ssd ] && [ "$ALIAS" = 1 ]; then
         echo "(dry run) before the sweeps: bind both drives, alias-nvme --hold $HOLD_DIR, alias-guard.sh arm (BMC watchdog 120 s, panic on lockup);"
         echo "          every run: ALIAS_HOLD=$HOLD_DIR (load command, no bind/restore); at the end: $( [ "$REBOOT" = 1 ] && echo "sync; systemctl reboot -ff" || echo "drives left held (--no-reboot)")"
@@ -1129,7 +1195,7 @@ sudo -n true 2>/dev/null || { echo "ERROR: sudo needs a password: run with --tmu
 plan | tee "$OUT/plan.txt"
 echo
 pips_build || { echo "ERROR: cannot build $PIPS" >&2; exit 1; }
-switch_ok || { echo "ERROR: the switch does not answer as design 0x0a06 or 0x0a07:" >&2; printf '%s\n' "$LAST_SWITCH" | tail -5 >&2; exit 1; }
+switch_ok || { echo "ERROR: the switch does not answer as design $( [ "$BG" = 1 ] && echo 0x0a08 || echo "0x0a06 or 0x0a07"):" >&2; printf '%s\n' "$LAST_SWITCH" | tail -5 >&2; exit 1; }
 CAMPAIGN_DESIGN=$(design_of <(printf '%s\n' "$LAST_SWITCH"))
 say "switch: $(printf '%s\n' "$LAST_SWITCH" | grep -E '^(cfg|drain|pb|thr|rcap|design_id)=' | xargs)"
 [ "$MINIMAL" = 1 ] && [ "$CAMPAIGN_DESIGN" != 0x0a07 ] &&
@@ -1149,7 +1215,7 @@ if [ "$PAPER" = 1 ]; then
         fi
     fi
 fi
-if [ "$CAMPAIGN_DESIGN" = 0x0a07 ]; then
+if [ "$CAMPAIGN_DESIGN" = 0x0a07 ] || [ "$CAMPAIGN_DESIGN" = 0x0a08 ]; then
     sudo -n "$PIPS" counters > "$OUT/counters-at-start.txt" 2>&1 &&
         say "refused-cycle counters answer: $(grep -E '^bp_cycles' "$OUT/counters-at-start.txt")"
 fi
@@ -1164,6 +1230,10 @@ if [ "$KIND" = ssd ] && [ "$ALIAS" = 1 ]; then
     guard arm "$OUT/guard" "$HOLD_DIR" 120 || { echo "ERROR: the hang guard did not arm (above); the holder keeps the drives: reboot to end" >&2; exit 1; }
     export ALIAS_HOLD=$HOLD_DIR
     [ "$ALIAS2" = 1 ] && { a2_lists && say "alias2: page lists for s2place in $OUT/lists ($(ls "$OUT/lists" | wc -l) files)" || exit 1; }
+elif [ "$KIND" = ssd ] && [ "$BG" = 1 ] && { bg_init; [ "$BG_HELD" = 1 ]; }; then
+    say "bg: the drives are held by this campaign's alias-nvme from before: the native half is over; vfio half resumed"
+    export ALIAS_HOLD=$HOLD_DIR
+    hold_fresh || { echo "ERROR: the drives are not on nvme but no fresh holder of this campaign runs: reboot (sync; sudo systemctl reboot -ff), then relaunch to resume" >&2; exit 1; }
 elif [ "$KIND" = ssd ]; then
     # Both drives completing on one CPU livelocks it in strict mode (10-25).
     # The layout is per boot: after a reboot for another leg it may differ.
@@ -1175,6 +1245,13 @@ elif [ "$KIND" = ssd ]; then
             echo "ERROR: the drives' fio cores are unsafe for this boot's interrupt layout (above)." >&2; exit 1
         fi
     fi
+fi
+if [ "$BG" = 1 ]; then
+    sudo -n "$PIPS" bg info > "$OUT/bg/bg-info.txt" 2>&1
+    grep -q 'bg_id=0x' "$OUT/bg/bg-info.txt" || { echo "ERROR: --bg: pips bg info does not answer (design 0x0A08's engine): $OUT/bg/bg-info.txt" >&2; exit 1; }
+    sudo -n "$PIPS" bg stop 3000 >> "$OUT/bg/bg-info.txt" 2>&1
+    sudo -n "$PIPS" bg clear twice >> "$OUT/bg/bg-info.txt" 2>&1
+    say "read engine: $(grep -E '^(bg_id|bg_caps)' "$OUT/bg/bg-info.txt" | xargs)$( [ "$BG_DEAD" = 1 ] && echo "; STOPPED FOR GOOD before (bg/DEAD)")"
 fi
 if [ "$KIND" = nic ]; then
     say "client: syncing styx's repo (git pull --ff-only), as run-dualnic-experiment.sh --sync-client"
@@ -1216,12 +1293,13 @@ heartbeat() {
 heartbeat & HB=$!
 on_exit() {
     kill "$HB" 2>/dev/null
-    if [ "$KIND" = ssd ] && [ "$ALIAS" = 1 ] && [ -d "$OUT/guard" ] && [ ! -e "$OUT/guard/.disarmed" ]; then
+    [ "$BG" = 1 ] && sudo -n "$PIPS" bg stop 3000 > /dev/null 2>&1
+    if [ "$KIND" = ssd ] && { [ "$ALIAS" = 1 ] || [ "$BG" = 1 ]; } && [ -d "$OUT/guard" ] && [ ! -e "$OUT/guard/.disarmed" ]; then
         guard disarm "$OUT/guard"; touch "$OUT/guard/.disarmed"
     fi
     if [ ! -e "$OUT/DONE" ]; then
         echo "pips-campaign: NOT finished. Relaunch the same command to resume ($STAMP, progress.tsv)."
-        [ "$KIND" = ssd ] && [ "$ALIAS" = 1 ] && echo "               The holder keeps the drives; end without resuming: sync; sudo systemctl reboot -ff"
+        [ "$KIND" = ssd ] && { [ "$ALIAS" = 1 ] || [ "${BG_HELD:-0}" = 1 ]; } && echo "               The holder keeps the drives; end without resuming: sync; sudo systemctl reboot -ff"
     fi
     # a link left forced by a phase that never got to put it back
     [ "$KIND" = nic ] && [ ${#LINK_FOUND_S[@]} -gt 0 ] && link_restore_all
@@ -1322,7 +1400,8 @@ for m in ${MANIFESTS[@]+"${MANIFESTS[@]}"}; do
               -o -name 'pips-log-summary.*' -o -name 'sweep-id.txt' -o -name 'nstat-client.txt' \
               -o -name 'pips-log-record.txt' -o -name 'windows.txt' -o -name 'pips-bp.tsv' \
               -o -name 'iommu-ops.txt' -o -name 'fio-nic*.json' -o -name 'fio-ssd*.json' \
-              -o -name 'alias-rdma-nic*.log' -o -name 'alias-nvme.out' \) -print0 2>/dev/null |
+              -o -name 'alias-rdma-nic*.log' -o -name 'alias-nvme.out' -o -name 'bg-run.txt' -o -name 'bg-hist.txt' \
+              -o -name 'bg-cmd.txt' \) -print0 2>/dev/null |
           xargs -0 -r cp --parents -t "$OUT/runs/" )
         ( cd "$REPO" && [ -d "$rd" ] && find "$rd"* -maxdepth 1 -type f -name '*.rpt' -size -1M -print0 2>/dev/null |
           xargs -0 -r cp --parents -t "$OUT/runs/" )
@@ -1352,8 +1431,9 @@ fi
 date '+%F %T' > "$OUT/DONE"
 rm -f "$POINTER"
 say "campaign $STAMP DONE (marker $OUT/DONE)"
-if [ "$KIND" = ssd ] && [ "$ALIAS" = 1 ]; then
-    guard disarm "$OUT/guard"; touch "$OUT/guard/.disarmed"
+[ "$BG" = 1 ] && [ "$BG_HELD" = 0 ] && bn_mod_unload
+if [ "$KIND" = ssd ] && { [ "$ALIAS" = 1 ] || [ "$BG_HELD" = 1 ]; }; then
+    [ -d "$OUT/guard" ] && guard disarm "$OUT/guard"; touch "$OUT/guard/.disarmed"
     if [ "$REBOOT" = 1 ]; then
         banner "REBOOTING bigserver now: sync; systemctl reboot -ff" \
                "(no process is stopped, so the holder never releases the drives; they come back on nvme)"

@@ -83,7 +83,17 @@
  *                        those patterns again on fresh backings (every page
  *                        tagged anew), no I/O: for the switch's read engine
  *                        (pips-rid-live.sh), since a load's reads overwrite
- *                        the tags; state says "v2 map" when it has it. A file
+ *                        the tags; state says "v2 map" when it has it;
+ *                        "bgmap NAME MASK WS STRIDE [base=A] [backing=N]" maps
+ *                        a SEPARATE region per masked drive for the read
+ *                        engine alone (pips-campaign.sh --bg): pages first 0 +
+ *                        i*STRIDE, i < WS, at IOVA A (default 0x2000000000; a
+ *                        drive sharing another's group: + 1 TiB, as its data
+ *                        region), page k holding k mod backing (default min(span,
+ *                        65536)); loads never touch it; a new bgmap replaces it
+ *                        (the unmap flushes its IOTLB entries). DIR/bg-<i>:
+ *                        "iova 0x... span N backing N ws N stride N"; state
+ *                        says "bgmap" when it has it. A file
  *                        DIR/stop ends the load under way (as SIGINT does). The
  *                        holder writes DIR/state, DIR/alive (each second: epoch
  *                        ms, pid, load|idle), DIR/done and DIR/done.<n> ("<n>
@@ -158,6 +168,10 @@ struct drive {
     struct alias_backing bk;
     uint64_t spos;                     /* --cursor shared: the drive's one cursor */
     char list[600];                    /* pat.list_path's storage */
+    struct alias_pattern bgpat;        /* hold "bgmap": the read engine's own region (no I/O) */
+    struct alias_backing bgbk;
+    uint64_t bg_iova;
+    int bg_mapped;
 };
 
 static struct alias_pattern g_pat, g_pat1;  /* the command line's patterns: drive 0, drive 1 */
@@ -565,30 +579,38 @@ static uint64_t distinct_pages(const struct alias_pattern *p, uint64_t **out)
  * map only their own pages, one VFIO mapping each: the IOMMU walks the same
  * path to a page either way, and a 64 GiB span is then 64 mappings, not
  * 16 M pinned pages. */
-static void map_data(struct drive *d, const struct alias_backing *b)
+/* The mapping budget per region: lim VFIO mappings (the data region gets
+ * ALIAS_MAX_CHUNKS / MAXDEV; the engine's region, hold "bgmap", BG_MAX_MAPS). */
+#define BG_MAX_MAPS 2048
+static void map_region(struct drive *d, const struct alias_pattern *P, const struct alias_backing *b, uint64_t iova,
+                       uint64_t lim, const char *what)
 {
-    const struct alias_pattern *P = &d->pat;
     uint64_t span = P->span, chunks = (span + b->pages - 1) / b->pages;
     uint64_t *pg = NULL, n = distinct_pages(P, &pg);
-    int sparse = (P->list_path || span > 64 * n) && n <= ALIAS_MAX_CHUNKS / MAXDEV;
-    if (!sparse && chunks <= ALIAS_MAX_CHUNKS / MAXDEV) {
+    int sparse = (P->list_path || span > 64 * n) && n <= lim;
+    if (!sparse && chunks <= lim) {
         free(pg);
         for (uint64_t c = 0; c < chunks; c++) {
             uint64_t n = span - c * b->pages < b->pages ? span - c * b->pages : b->pages;
-            dma_map(d->ct, b->va, d->data_iova + c * b->pages * ALIAS_PAGE, n * ALIAS_PAGE);
+            dma_map(d->ct, b->va, iova + c * b->pages * ALIAS_PAGE, n * ALIAS_PAGE);
         }
-        printf("alias-nvme: %s: region IOVA 0x%" PRIx64 "-0x%" PRIx64 " in %" PRIu64 " mapping(s) of %"
-               PRIu64 " backing pages\n", d->bdf, d->data_iova, d->data_iova + span * ALIAS_PAGE, chunks, b->pages);
+        printf("alias-nvme: %s: %s IOVA 0x%" PRIx64 "-0x%" PRIx64 " in %" PRIu64 " mapping(s) of %"
+               PRIu64 " backing pages\n", d->bdf, what, iova, iova + span * ALIAS_PAGE, chunks, b->pages);
         return;
     }
-    if (n > ALIAS_MAX_CHUNKS / MAXDEV)
+    if (n > lim)
         die("%" PRIu64 " distinct pages over a span of %" PRIu64 ": too many VFIO mappings; "
             "raise --backing-pages or shrink the pattern", n, span);
     for (uint64_t i = 0; i < n; i++)
-        dma_map(d->ct, b->va + (pg[i] % b->pages) * ALIAS_PAGE, d->data_iova + pg[i] * ALIAS_PAGE, ALIAS_PAGE);
-    printf("alias-nvme: %s: %" PRIu64 " pattern pages mapped one by one at IOVA base 0x%" PRIx64 "\n",
-           d->bdf, n, d->data_iova);
+        dma_map(d->ct, b->va + (pg[i] % b->pages) * ALIAS_PAGE, iova + pg[i] * ALIAS_PAGE, ALIAS_PAGE);
+    printf("alias-nvme: %s: %s: %" PRIu64 " pattern pages mapped one by one at IOVA base 0x%" PRIx64 "\n",
+           d->bdf, what, n, iova);
     free(pg);
+}
+
+static void map_data(struct drive *d, const struct alias_backing *b)
+{
+    map_region(d, &d->pat, b, d->data_iova, ALIAS_MAX_CHUNKS / MAXDEV, "region");
 }
 
 /* ------------------------------------------------------------ I/O */
@@ -1103,10 +1125,99 @@ static void pattern_switch(struct drive *d, const struct alias_pattern *t)
     drive_pattern(d, t);
 }
 
+/* hold "bgmap NAME MASK WS STRIDE [base=A] [backing=N]": the read engine's own
+ * region per masked drive, apart from the data region, kept across loads; a
+ * new one replaces it. Every check comes first: a die() here would end the
+ * holder's heartbeat and the BMC guard would reset the host. 0 ok, else the
+ * reason in why. */
+static int hold_bgmap(const char *line, char *why, size_t wn, char *name, size_t nn)
+{
+    char nm[128] = "", rest[1000] = "";
+    unsigned mk = 0;
+    unsigned long long w = 0, st = 0;
+    int used = 0;
+    uint64_t base = 0x2000000000ull, bkn = 0;
+    if (sscanf(line, "bgmap %127s %u %llu %llu%n", nm, &mk, &w, &st, &used) != 4) {
+        snprintf(why, wn, "bgmap NAME MASK WS STRIDE [base=A] [backing=N]");
+        return 1;
+    }
+    snprintf(name, nn, "%s", nm);
+    snprintf(rest, sizeof(rest), "%s", line + used);
+    rest[strcspn(rest, "\n")] = 0;
+    char *sv = NULL;
+    for (char *tok = strtok_r(rest, " \t", &sv); tok; tok = strtok_r(NULL, " \t", &sv)) {
+        if (!strncmp(tok, "base=", 5)) base = strtoull(tok + 5, NULL, 0);
+        else if (!strncmp(tok, "backing=", 8)) bkn = strtoull(tok + 8, NULL, 0);
+        else { snprintf(why, wn, "unknown word '%.40s'", tok); return 1; }
+    }
+    if (!(mk & ((1u << g_ndev) - 1)) || !w || !st || w > (1ull << 22)) {
+        snprintf(why, wn, "mask %u, ws %llu (1-4194304), stride %llu", mk, w, st);
+        return 1;
+    }
+    if (st > ((1ull << 30) - 1) / (w > 1 ? w - 1 : 1)) {
+        snprintf(why, wn, "ws %llu x stride %llu spans over 2^30 pages", w, st);
+        return 1;
+    }
+    uint64_t span = (w - 1) * st + 1, bk = bkn ? bkn : backing_default(span);
+    /* below every data region (drive 0's at --iova-base, a drive sharing its
+     * group 1 TiB up: its engine region moves up as much), above 4 GiB (the
+     * MSI window and the low reserved ranges) */
+    if ((base & 0xFFF) || base < (1ull << 32) || base + span * ALIAS_PAGE > g_iova_base) {
+        snprintf(why, wn, "base 0x%" PRIx64 " + %" PRIu64 " pages: page aligned, from 4 GiB, ending at or below 0x%" PRIx64,
+                 base, span, g_iova_base);
+        return 1;
+    }
+    if (!bk || bk > 65536 || bk > span) {
+        snprintf(why, wn, "backing %" PRIu64 " (1-65536, at most the span %" PRIu64 ")", bk, span);
+        return 1;
+    }
+    uint64_t chunks = (span + bk - 1) / bk;
+    if (chunks > BG_MAX_MAPS && w > BG_MAX_MAPS) {
+        snprintf(why, wn, "%" PRIu64 " mappings (span %" PRIu64 " / backing %" PRIu64 ", or %llu pages): at most %d",
+                 chunks, span, bk, w, BG_MAX_MAPS);
+        return 1;
+    }
+    for (int i = 0; i < g_ndev; i++) {
+        if (!(mk >> i & 1))
+            continue;
+        struct drive *d = &g_dev[i];
+        if (d->bg_mapped) {
+            struct vfio_iommu_type1_dma_unmap u;
+            memset(&u, 0, sizeof(u));
+            u.argsz = sizeof(u);
+            u.iova = d->bg_iova;
+            u.size = d->bgpat.span * ALIAS_PAGE;
+            if (ioctl(d->ct->fd, VFIO_IOMMU_UNMAP_DMA, &u))
+                die("%s: VFIO unmap of the engine region: %s", d->bdf, strerror(errno));
+            munmap(d->bgbk.va, d->bgbk.pages * ALIAS_PAGE);
+            close(d->bgbk.fd);
+            free(d->bgpat.page);
+            d->bg_mapped = 0;
+        }
+        pattern_defaults(&d->bgpat);
+        d->bgpat.ws = w;
+        d->bgpat.stride = st;
+        pattern_build(&d->bgpat);
+        backing_create(&d->bgbk, bk);
+        d->bg_iova = base + (d->data_iova - g_iova_base);
+        map_region(d, &d->bgpat, &d->bgbk, d->bg_iova, BG_MAX_MAPS, "engine region");
+        d->bg_mapped = 1;
+        char f[32], t[300];
+        snprintf(f, sizeof(f), "bg-%d", i);
+        snprintf(t, sizeof(t), "iova 0x%" PRIx64 " span %" PRIu64 " backing %" PRIu64 " ws %llu stride %llu\n",
+                 d->bg_iova, d->bgpat.span, d->bgbk.pages, w, st);
+        hold_write(f, t);
+        printf("alias-nvme: hold: bgmap '%s': %s engine region at IOVA 0x%" PRIx64 ", ws %llu stride %llu, span %"
+               PRIu64 " pages, backing %" PRIu64 " (page k holds k mod backing)\n",
+               nm, d->bdf, d->bg_iova, w, st, d->bgpat.span, d->bgbk.pages);
+    }
+    return 0;
+}
+
 static void hold_loop(void)
 {
     char b[300];
-    snprintf(b, sizeof(b), "ready %d v2 map\n", (int)getpid());   /* v2: per-drive patterns, load extras, --cursor (11-06); map (11-07) */
+    snprintf(b, sizeof(b), "ready %d v2 map bgmap\n", (int)getpid());   /* v2: per-drive patterns, load extras, --cursor (11-06); map (11-07); bgmap (11-07) */
     hold_write("state", b);
     printf("alias-nvme: HOLD %s: drives open, waiting for commands in %s/cmd; SIGINT/SIGTERM stop a load, "
            "never the holder; end with: sync; systemctl reboot -ff\n", g_hold, g_hold);
@@ -1126,6 +1237,21 @@ static void hold_loop(void)
         char taken[720];
         snprintf(taken, sizeof(taken), "%s/cmd.%u", g_hold, n);
         rename(path, taken);
+        if (!strncmp(line, "bgmap ", 6)) {
+            char why[300] = "", nm[128] = "-", dn[32];
+            int e = hold_bgmap(line, why, sizeof(why), nm, sizeof(nm));
+            if (e) {
+                printf("alias-nvme: hold: command %u not understood: %s\n", n, why);
+                snprintf(b, sizeof(b), "%u bad-command\n", n);
+            } else {
+                snprintf(b, sizeof(b), "%u %s ok\n", n, nm);
+            }
+            snprintf(dn, sizeof(dn), "done.%u", n);
+            hold_write(dn, b);
+            hold_write("done", b);
+            n++;
+            continue;
+        }
         char name[128], ord[32], outdir[600], ready[600] = "", why[200] = "";
         unsigned mask = 0;
         unsigned long long ws = 0, stride = 0;

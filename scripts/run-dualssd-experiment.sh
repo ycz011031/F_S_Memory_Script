@@ -92,6 +92,19 @@
 # (<dir>/config): -J, --iodepth and --bs must match. The IOMMU must be on (VFIO needs a group;
 # pt is fine and translates: VFIO's domain is its own).
 #
+# PIPS_BG="K=V ..." (set by pips-campaign.sh --bg; design 0x0A08): the
+# switch's background read engine runs through every run: `pips bg run
+# PIPS_BG stopwin=1` starts once the load is up (before the warm-up) and is
+# stopped after the measurement windows. Per run: logs/<run>/bg-run.txt (its
+# counters), bg-hist.txt (latency histogram), reports/<run>/bg.rpt; in the
+# results bg_spec, bg_label (PIPS_BG_LABEL), bg_rate_mrd_s, bg_lat_ns,
+# bg_errors (means over the runs). Any engine problem (a completion other than
+# SC, a timeout, a data mismatch, a leak, a device tag in the engine's tag
+# window, no reads at all) makes the run invalid (exit 3) and writes
+# PIPS_BG_STOPFILE (default ~/.pips-bg-stop) with the reason; while that file
+# exists every runner with PIPS_BG refuses to start (the campaign then stops
+# using the engine).
+#
 # Exit status 3: this configuration could not be measured (fio instances died,
 # stalled or missed the window, or pcm-iio logged nothing with the IOMMU on;
 # with it off or pt such a run is kept); sweeps log it and go on.
@@ -500,6 +513,16 @@ $(printf '%s\n' "$busy" | sed 's/^/      /')")
         done
     done
     pips_identify drive "${BDFS[@]}"
+    if [ -n "${PIPS_BG:-}" ]; then
+        if [ -e "$BG_STOPFILE" ]; then
+            PROBLEMS+=("PIPS_BG is set, but the read engine was stopped for good: $BG_STOPFILE says
+      $(head -3 "$BG_STOPFILE" 2>/dev/null)")
+        elif ! sudo -n "$PIPS" bg info 2>&1 | grep -q 'bg_id=0x'; then
+            PROBLEMS+=("PIPS_BG is set, but the switch has no background read engine (pips bg info: design 0x0A08)")
+        else
+            echo "   read engine (PIPS_BG): ${PIPS_BG_LABEL:+$PIPS_BG_LABEL: }$PIPS_BG"
+        fi
+    fi
     if [ "$ssds" -eq 2 ] && [ "$(printf '%s' "$iommu_units" | tr '+' '\n' | grep -c .)" -gt 1 ]; then
         echo "   NOTE: the drives are behind DIFFERENT IOMMU units ($iommu_units); a co-run"
         echo "         has no shared IOTLB to contend for."
@@ -519,9 +542,70 @@ $(printf '%s\n' "$busy" | sed 's/^/      /')")
     fi
 }
 
+# ------------------------------------------------------------ the read engine (PIPS_BG)
+BG_STOPFILE=${PIPS_BG_STOPFILE:-$HOME/.pips-bg-stop}
+BG_PID=""
+bg_begin() {   # <log dir>: start the engine for this run; 1 if it did not start
+    [ -n "${PIPS_BG:-}" ] || return 0
+    rm -f "$1/bg-run.txt"
+    echo "\$ pips bg run $PIPS_BG secs=$(( warm + span + 600 )) beat=10 stopwin=1" > "$1/bg-cmd.txt"
+    sudo -n "$PIPS" bg run $PIPS_BG secs=$(( warm + span + 600 )) beat=10 stopwin=1 > "$1/bg-run.txt" 2>&1 9>&- &
+    BG_PID=$!
+    for _ in $(seq 50); do
+        grep -q '^# bg run: started' "$1/bg-run.txt" 2>/dev/null && { echo "   read engine on: ${PIPS_BG_LABEL:-$PIPS_BG}"; return 0; }
+        kill -0 "$BG_PID" 2>/dev/null || break
+        sleep 0.1
+    done
+    echo "ERROR: the read engine did not start: $(tail -3 "$1/bg-run.txt" 2>/dev/null | tr '\n' ' ')" >&2
+    bg_end "$1" "" >/dev/null 2>&1
+    return 1
+}
+bg_end() {   # <log dir> <report dir or "">: stop it, keep its counters; 1 if the engine had a problem
+    [ -n "$BG_PID" ] || return 0
+    local rc k v errs=0 why="" f="$1/bg-run.txt"
+    sudo -n pkill -INT -f "^$PIPS bg run " >/dev/null 2>&1
+    for _ in $(seq 150); do kill -0 "$BG_PID" 2>/dev/null || break; sleep 0.1; done
+    if kill -0 "$BG_PID" 2>/dev/null; then
+        echo "WARNING: pips bg run did not end 15 s after SIGINT: killing it, then pips bg stop" >&2
+        sudo -n pkill -KILL -f "^$PIPS bg run " >/dev/null 2>&1
+    fi
+    wait "$BG_PID" 2>/dev/null; rc=$?
+    BG_PID=""
+    sudo -n "$PIPS" bg stop 3000 >> "$1/bg-cmd.txt" 2>&1
+    [ -n "$2" ] || return 0
+    sudo -n "$PIPS" bg hist > "$1/bg-hist.txt" 2>&1
+    bgv() { awk -v k="$1=" '{ for (i = 1; i <= NF; i++) if (index($i, k) == 1) v = substr($i, length(k) + 1) } END { print (v == "" ? 0 : v) }' "$f" 2>/dev/null; }
+    {
+        echo "bg_spec: ${PIPS_BG}"
+        echo "bg_label: ${PIPS_BG_LABEL:-}"
+        echo "bg_rc: $rc"
+        for k in bg_run_s run_s issued issue_rate_mrd_s lat_mean_ns lat_min_ns lat_max_ns cpl_sc cpl_ur cpl_ca cpl_other \
+                 cpl_poisoned cpl_malformed cpl_unexpected timeouts data_mismatch leak_cpl win_hits stall_arb stall_tags \
+                 stall_fc tfc_nph_min hol_engine hol_device out_max; do
+            echo "bg_${k#bg_}: $(bgv "$k")"
+        done
+    } > "$2/bg.rpt"
+    for k in cpl_ur cpl_ca cpl_other cpl_poisoned cpl_malformed cpl_unexpected timeouts data_mismatch leak_cpl; do
+        v=$(bgv "$k"); case "$v" in ''|*[!0-9]*) v=0 ;; esac
+        [ "$v" -gt 0 ] && { errs=$((errs + v)); why="$why $k=$v"; }
+    done
+    case "$rc" in 0) ;; 6) why="$why a device used a tag in the engine's window (WIN_HITS)" ;; 5) why="$why LEAK or CLASH" ;;
+                  *) why="$why pips bg run exit $rc" ;; esac
+    [ "$(bgv issued)" = 0 ] && why="$why no reads issued"
+    echo "   read engine: $(bgv issued) reads, $(awk -v r="$(bgv issue_rate_mrd_s)" 'BEGIN { printf "%.2f", r / 1e6 }') M/s," \
+         "latency mean $(bgv lat_mean_ns) ns, max $(bgv lat_max_ns) ns, errors $errs, exit $rc"
+    if [ -n "$why" ]; then
+        echo "ERROR: the read engine had a problem in $RUN:$why. The engine is stopped for good ($BG_STOPFILE)." >&2
+        printf '%s %s:%s\n(run logs %s)\n' "$(date '+%F %T')" "$RUN" "$why" "$1" >> "$BG_STOPFILE"
+        return 1
+    fi
+    return 0
+}
+
 aborted=0
 ALIAS_BOUND=0
 cleanup() {
+    [ -n "$BG_PID" ] && bg_end "${L:-/tmp}" ""
     stop_fio
     if [ "$ALIAS_BOUND" = 1 ]; then
         sudo -n bash "$ALIAS_DIR/alias-vfio.sh" restore "${ALIAS_BIND[@]}" ||
@@ -703,6 +787,13 @@ for ((j = 0; j < num_runs; j++)); do
     # (32 per drive, co-run) the last sudo + fio launch may lag the first; its
     # ramp would then end inside the window, and fio-sum rejects a late start.
     for _ in $(seq 100); do [ "$(fio_count)" -ge "$want" ] && break; sleep 0.2; done
+    # PIPS_BG: the read engine from here to the end of the windows (the warm-up
+    # takes the IOTLB to its loaded state with the engine already on).
+    if ! bg_begin "$L"; then
+        printf '%s %s: the engine did not start\n(run logs %s)\n' "$(date '+%F %T')" "$RUN" "$L" >> "$BG_STOPFILE"
+        stop_fio
+        exit 3
+    fi
     # The window then opens 1 s after the ramp, plus 1 s per 16 instances: on
     # oversubscribed cores some instances' ramps start late (0.5-0.7 s at 64).
     echo "warming up ${warm}s..."; sleep "$warm"; sleep $((1 + want / 16))
@@ -726,8 +817,10 @@ for ((j = 0; j < num_runs; j++)); do
         --iommu-ops "$iommu_ops" \
         --cores "$active_cores" --pattern "$SSD_PCIE_PATTERN" -o "$RUN" ) 9>&-
 
+    bg_bad=0
+    bg_end "$L" "$setup_dir/reports/$RUN" || bg_bad=1
     got=$(fio_count)
-    bad_run=0
+    bad_run=$bg_bad
     if [ "$got" -lt "$want" ]; then
         echo "ERROR: only $got of $want fio instances were still running at the end" >&2
         echo "       of the measurement; the drives were under-loaded for part of it." >&2
@@ -896,6 +989,17 @@ done
 # The PIPS build, setting and log status (pips_meta, pips-lib.sh).
 pips_meta
 per_drive+=( ${PIPS_META[@]+"${PIPS_META[@]}"} )
+# The read engine's spec and its mean rate, latency and errors over the runs.
+if [ -n "${PIPS_BG:-}" ]; then
+    bgmean() { for ((j = 0; j < num_runs; j++)); do rpt_val "$setup_dir/reports/$exp-RUN-$j/bg.rpt" "$1"; done | mean_sd | cut -d' ' -f1; }
+    per_drive+=( --meta "bg_spec=$PIPS_BG" --meta "bg_label=${PIPS_BG_LABEL:-}" --meta "bg_rate_mrd_s=$(bgmean bg_issue_rate_mrd_s)"
+                 --meta "bg_lat_ns=$(bgmean bg_lat_mean_ns)" --meta "bg_lat_max_ns=$(bgmean bg_lat_max_ns)"
+                 --meta "bg_errors=$(for ((j = 0; j < num_runs; j++)); do f=$setup_dir/reports/$exp-RUN-$j/bg.rpt
+                     echo $(( $(rpt_val "$f" bg_cpl_ur) + $(rpt_val "$f" bg_cpl_ca) + $(rpt_val "$f" bg_timeouts) + $(rpt_val "$f" bg_data_mismatch) + $(rpt_val "$f" bg_cpl_malformed) ))
+                     done | awk '{ s += $1 } END { print s + 0 }')" )
+else
+    per_drive+=( --meta bg_spec=off --meta bg_label=off )
+fi
 python3 "$HERE/dualssd-results.py" dump \
     --reports "$setup_dir/reports" --exp "$exp" --runs "$num_runs" \
     --ssds "$(IFS=,; echo "${ACTIVE[*]}")" --out "$results_file" \

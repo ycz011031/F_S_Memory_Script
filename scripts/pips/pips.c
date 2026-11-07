@@ -2366,23 +2366,26 @@ static int cmd_bg_table(int argc, char **argv)
     die("usage: pips bg table load FILE | pips bg table show [N]");
 }
 
-/* bg run [K=V...] [secs=S] [ms=MS]: set, start, wait for the run to end (COUNT
- * reached) or S seconds (then stop), print the counters. SIGINT/SIGTERM stop
- * it; any exit stops it. A leak (STATUS[22]) stops it at once.
+/* bg run [K=V...] [secs=S] [ms=MS] [stopwin=1]: set, start, wait for the run
+ * to end (COUNT reached) or S seconds (then stop), print the counters.
+ * SIGINT/SIGTERM stop it; any exit stops it. A leak (STATUS[22]) stops it at
+ * once; with stopwin=1 so does a device's read on a tag in the engine's tag
+ * window (WIN_HITS rising: the core tracks requests by tag alone, A11).
  * Exit 0 ended normally, 4 an error ended it (ERR_STOP), 5 leak or clash,
- * 1 refused, 3 not idle after stop. */
+ * 6 a device tag in the window (stopwin), 1 refused, 3 not idle after stop. */
 static int cmd_bg_run(int argc, char **argv)
 {
     char *setv[64];
-    int ns = 0, s, leak = 0, beat = 5;
+    int ns = 0, s, leak = 0, beat = 5, stopwin = 0, winhit = 0;
     double secs = 0, ms = 0, t0, last = 0;
-    uint32_t st;
+    uint32_t st, win0 = 0;
     struct sigaction sa;
 
     for (int i = 0; i < argc; i++) {
         if (!strncmp(argv[i], "secs=", 5)) secs = atof(argv[i] + 5);
         else if (!strncmp(argv[i], "ms=", 3)) ms = atof(argv[i] + 3);
         else if (!strncmp(argv[i], "beat=", 5)) beat = atoi(argv[i] + 5);
+        else if (!strncmp(argv[i], "stopwin=", 8)) stopwin = bg_flag("stopwin", argv[i] + 8);
         else if (ns < 64) setv[ns++] = argv[i];
         else die("bg run: too many settings");
     }
@@ -2397,6 +2400,7 @@ static int cmd_bg_run(int argc, char **argv)
     s = bg_start();
     if (s < 0)
         return 1;
+    win0 = bg_rd(PIPS_BG_WIN_HITS);     /* after the start: CLEAR_ON_START may have zeroed it */
     if (secs > 0)
         printf("# bg run: started (%s), stops after %.1f s\n", bg_state_name((unsigned)s), secs);
     else
@@ -2416,6 +2420,15 @@ static int cmd_bg_run(int argc, char **argv)
         if (g_bg_sig) {
             printf("# bg run: signal %d at %.1f s: stopping\n", (int)g_bg_sig, t);
             break;
+        }
+        if (stopwin) {
+            uint32_t w = bg_rd(PIPS_BG_WIN_HITS);
+            if (w > win0) {
+                winhit = 1;
+                printf("# bg run: WIN_HITS %u (was %u) at %.1f s: a device used a tag in the engine's window: stopping now\n",
+                       w, win0, t);
+                break;
+            }
         }
         if ((secs > 0 && t >= secs) || (ms > 0 && t * 1e3 >= ms))
             break;
@@ -2440,6 +2453,8 @@ static int cmd_bg_run(int argc, char **argv)
     st = bg_rd(PIPS_BG_STATUS);
     if (leak || (st & (PIPS_BG_STS_LEAK | PIPS_BG_STS_CLASH)))
         return 5;
+    if (winhit)
+        return 6;
     return st & PIPS_BG_STS_ERR_STOP ? 4 : 0;
 }
 
@@ -2471,7 +2486,7 @@ static int cmd_bg(int argc, char **argv)
     const char *c;
 
     if (argc < 1 || !strcmp(argv[0], "help")) {
-        fputs("pips bg info | set K=V... | start | stop [MS] | wait [MS] | run [K=V...] [secs=S] [ms=MS] [beat=S]\n"
+        fputs("pips bg info | set K=V... | start | stop [MS] | wait [MS] | run [K=V...] [secs=S] [ms=MS] [beat=S] [stopwin=1]\n"
               "        counters | clear [twice] | hist | trace FILE [N] | capture [N] | census [clear|freeze|thaw]\n"
               "        facts [clear] | table load FILE | table show [N]\n"
               "keys: rid= rid1= rid2= rid3= (in0 in1 usp dev0 dev1 BB:DD.F 0xNNNN none) base= first= stride= ws=\n"

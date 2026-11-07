@@ -17,7 +17,15 @@ an option is added).
   which sweep and design, which report generator reads what, the published
   pages). On the Windows analysis machine `claude.md` (git-ignored) adds its
   local paths, tools and editing gotchas.
-- **Last updated:** 2026-11-07 (third run, 15:00): **every 0x0A08 assumption test passes
+- **Last updated:** 2026-11-07 (evening): **the 0x0A08 stress campaign is written, not
+  run** (§8 "0x0A08 stress campaign"): `pips-campaign.sh ssd --bg` uses the engine as a cheap
+  IOMMU stressor, ~30 h on bigserver, IOMMU strict. Native half first (drives on nvme, the
+  engine reading a region a new module maps in each drive's DMA domain), then the vfio half
+  (holder, static pages, the holder's new `bgmap`). Measures the drives' misses per I/O and
+  throughput by engine level and batcher setting. Also the engine alone (rate and latency
+  against MAX_OUT, capacity knee, T8b replacement probe). `--smoke` (~1 h 30) runs every
+  step once. icx side not written yet.
+- **2026-11-07 (third run, 15:00):** **every 0x0A08 assumption test passes
   (T0-T9)**: F0 holds (no fallback needed), 5.27 G engine reads under both drives' load all
   SC, **one IOTLB for both domains** (T8: drive 1's pages evict drive 0's entry exactly as
   drive 0's do). Cost to the drives: idle-fill none (max 0.66 M reads/s), engine-first none
@@ -103,8 +111,8 @@ an option is added).
     background read engine"): every assumption test passes on bigserver. A
     downstream port's ID reads in its drive's domain (F0), one IOTLB serves
     both domains, engine tags 128-255; engine-first is free up to ~2.5 M
-    reads/s; one-shot reads evict only entries not yet reused. Next: what
-    earns an entry the hold (T8b), then X3.
+    reads/s; one-shot reads evict only entries not yet reused. **Stress
+    campaign written (11-07, `--bg`, not run):** §8 "0x0A08 stress campaign".
 - **Headline across both testbeds:** IOMMU strict costs throughput only
   where every I/O is mapped and unmapped and the I/O is small: drives at 4k
   (strict ~30-40% of off). Everywhere else (NICs at any flow count, drives
@@ -1357,8 +1365,83 @@ Rate and cost (T4/T6, drives at 866/785 kIOPS without the engine):
 the drives (reboot before the next run). icx: not run. Results in
 `dualssd/1106/rid-live/` (FILE-MAP §7).
 
+### 0x0A08 stress campaign (`pips-campaign.sh ssd --bg`, written 11-07, not run)
+
+Why (user, 11-07): the engine loads the IOMMU cheaply. A 1-DW read is one
+translation for ~24 B of uplink (a drive's 4 KiB read: ~18 lookups for 4 KiB),
+and its completion travels the near-idle downstream direction and is
+swallowed in the switch. So the engine can stress Skylake's IOMMU far beyond
+what the drives alone make (~30 M lookups/s, <= 1.7 M misses/s). Goal: the
+drives' **misses per I/O** (and throughput, latency) under that stress, by
+batcher setting, to connect with the page order measured on earlier designs.
+Server time is cheap: everything runs, ~30 h. Rules from the user: IOMMU
+strict; native nvme with invalidations AND a clean static-page (VFIO) run; no
+reboot except the final one; a launched campaign runs to completion;
+stability first.
+
+**Design.** Two halves in one campaign, native first (binding the drives to
+VFIO can't be undone without a reboot):
+
+| Phase | What |
+|---|---|
+| `nprep` | Drives on nvme. `ridcheck/pips_bg_region.ko` maps 65536 pages (256 MiB, on 4096 tagged backing pages) contiguously with one `dma_map_sg` in each drive's DMA domain (shared with the port above it: A1). 64-read data check through in0 and in1. Tag census under fio (16 x 4k, 4 x 1m, both drives) -> the engine's tag window (largest free range, 16 tags kept clear of the devices' when wide) and MAX_OUT (window size, <= 128) |
+| `nalone` | Drives idle. X2: reads/s and latency against MAX_OUT 1-128 (interval 1) and against INTERVAL 250-1 at MAX_OUT with pcm-iio (IOTLB counters of the engine alone), for hits (ws 8), one-shot misses (ws 65536 random), 2 MiB apart (ws 128 stride 512). X1: capacity knee by latency, ws 16-512 cyclic and random, one read at a time, last 4096 reads traced; module reloaded per point (the unmap flushes) |
+| `nstress` | fio 4k/16k/64k/1m x 4 per drive, drive 0 alone and both, d1t0c1 / d16t218c1 x pb 0/1, 2 runs; one sweep per engine level (below), light to heavy |
+| `nheavy` | fio 4k/64k x 16 per drive, both; levels off m16 v16 mx |
+| `ncross` | the engine in drive 1's domain (in1) with drive 0 alone and both; m16 v16 mx; 1 run |
+| `nend` | module unloaded |
+| `vprep` | hold_up (both drives to vfio-pci, one `alias-nvme --hold`, BMC guard), the holder's `bgmap` maps the engine's own region (2097152 pages = 8 GiB of IOVA at 0x2000000000, on 65536 backing pages) apart from the drives' load regions; data check; census under alias loads |
+| `valone` | drive regions flushed (`map`); X1 (region remapped per point: the unmap flushes); **T8b**: 155 tables (192 warm fresh pages; per round P read k times back to back or d fresh pages apart, N fresh pages, P probed; k 1-32, N 4-256, 0 or 10 us between reads; `t8b/roles.tsv` names each read); X2 down to 1 GiB apart |
+| `vstress` | alias 4k x 4 queues, ws 32 (fits) / ws 48 shared cursor (capacity edge) / ws 65536 (thrash), drive 0 alone and both, same settings and levels, 2 runs |
+| `vcross` | the engine in drive 1's domain while drive 0 runs; ws 32 and 48; m16 c16 v16 mx |
+
+Engine levels (arb=engine, data check on, tags in the window, MAX_OUT the
+window's): `off`; hits ws 8 at 15.6 / 50 M/s / max (`h16 h50 hx`: the link
+cost with no IOMMU work, the control); one-shot misses ws 65536 random at 1 /
+4 / 15.6 / 50 M/s / max (`m1 m4 m16 m50 mx`: walker load; T8 says these evict
+only entries not yet reused); 96 pages reused (`c16`, fits: capacity taken),
+256 reused (`v16`, over capacity: reused misses); misses 2 MiB apart (`d16`).
+
+**Reading it.** pcm-iio counts the engine's lookups and misses with the
+drives'. Drive misses = total - the engine's: the hit levels add none; for
+the others use the engine's latency histogram per run (`bg-hist.txt`, hit
+~0.7 us / miss ~1.1 us, T7) or its rate x its miss share from `nalone`/`valone`.
+Compare each level with its same-rate hit control: the difference is the
+IOMMU's share; the hit control alone is the link's.
+
+**Tools changed for it.**
+- `run-dualssd-experiment.sh`: `PIPS_BG="K=V ..."` runs `pips bg run ...
+  stopwin=1` through each run (started before the warm-up, stopped after the
+  windows): `logs/<run>/bg-run.txt`, `bg-hist.txt`, `reports/<run>/bg.rpt`,
+  results `bg_spec bg_label bg_rate_mrd_s bg_lat_ns bg_lat_max_ns bg_errors`
+  (`bg_spec=off` without). Any engine problem (non-SC, timeout, data
+  mismatch, leak, device tag in the window, no reads) fails the run and writes
+  `PIPS_BG_STOPFILE` (campaign: `<out>/bg/stop-<half>`): the rest of that half
+  runs no engine. A leak or clash stops it for the campaign (`bg/DEAD`).
+- `pips bg run stopwin=1`: stops at once when `WIN_HITS` rises (a device read
+  on a tag in the engine's window; exit 6).
+- `alias-nvme` holder: `bgmap NAME MASK WS STRIDE [base=A] [backing=N]` (state
+  "bgmap"; `hold/bg-<i>` gives the IOVA). Checked before anything that could
+  end the holder (a dead holder = BMC reset).
+- `ridcheck/pips_bg_region.c`: the native region (`/sys/kernel/debug/pips_bg_region/regions`).
+- `pips-bg-lib.sh`: the phases, sourced by `pips-campaign.sh`.
+- Soft lockups in the native half end the native half only (the vfio half
+  still runs). The campaign reboots at the end only if the vfio half started.
+
+**Run (bigserver, booted strict, drives on nvme, no holder):**
+`git pull`, then `bash scripts/pips/pips-campaign.sh ssd --bg --dry-run`, then
+`bash scripts/pips/pips-campaign.sh ssd --bg --smoke --only "nprep nalone nstress nheavy ncross nend" --tmux`
+(~45 min, native only, no reboot: checks the module, the census, the
+runner hook), then `bash scripts/pips/pips-campaign.sh ssd --bg --tmux` (~30 h,
+reboots at the end). Copy back `~/pips-campaign-ssd-<stamp>.tar.gz`; `bg/` in it
+holds the engine-alone data (x1/x2/t8b traces, pcm reports, census).
+
+**Not checked here** (no Linux): the module and the holder change are only
+syntax-checked (MinGW, stubs); the scripts by `bash -n` and the dry run.
+
 ### Next
 
+Status 11-07 (evening): **0x0A08 stress campaign written, not run** (section above): on bigserver `git pull`, the native smoke (~45 min, no reboot), then `pips-campaign.sh ssd --bg --tmux` (~30 h, reboot at the end). icx side next (needs the engine's bring-up on icx first: census of the NICs' tags, data check).
 Status 11-07 (third run, 15:00): **T0-T9 all PASS.** F0, A7 (one shared IOTLB), engine-first free to ~2.5 M reads/s, the IOTLB keeps reused entries against one-shot reads (test doc §4 "Third run"). Next: the replacement probe (T8b) if the evictor design needs it; 0x0A09 = the engine's extras, tag window default 128-255.
 Status 11-07 (first results, 01:04 run): **T2/T3 PASS: F0 holds** (port IDs read their drives' pages, isolated). **T4 FAIL**: in every train one completion came back SC with byte count or "request completed" wrong, then timed out; the failing tags were all in drive 0's 0-127: the core tracks requests by tag alone and the devices' tags pass through to it (new assumption A11). Fixed in the script: the engine's tags = the largest range unused in T0's census (128-255), MAX_OUT capped to it, T4 checks `CPL_MALFORMED` and `WIN_HITS`, captures saved on errors (`req_done=` in `pips bg capture`). Next: a fresh run, as a campaign (the 01:04 run's holder is gone): on bigserver `git pull`, then `bash scripts/pips/pips-rid-live.sh --start-holder --reboot --tmux` (new `--tmux`; ~1 h; reboots at the end; tarball `~/pips-rid-live-bigserver-*.tar.gz` written before the reboot). Its captures say which field the core sets. Test doc §4 "First run".
 Status 11-07 (first attempt): bigserver's first `pips-rid-live.sh` run (01:01) stopped at the engine check although the bitstream is right (design 0x0a08, `bg_id=0x52494450`, `bg_caps=0x46cd0100` = RTL `BG_CAPS_VAL`, buses b1/b2/b4): the script's `kv` read only one key per line, and `pips bg info` prints several to a line. Fixed (`kv` reads KEY=value tokens; this also lets `leak_seen`/`clash_seen` from the status line through, which never matched before). Rerun the same command.
