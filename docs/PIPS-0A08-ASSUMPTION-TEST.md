@@ -346,6 +346,7 @@ T0-T3 PASS, T4 FAIL, T5 PASS, T6 no data. Stopped after T4 (3 min).
 - **A11 (new):** the engine's tags must be disjoint from every device's tags
   even under port IDs (F0): the requester ID keeps the sink and the router
   right, but the core's own completion tracking is per tag.
+- **Next:** a fresh run, `pips-rid-live.sh --start-holder --reboot --tmux`.
 - **Fixed in the script (11-07):** every engine run from T1 on uses
   `tagwin=` = the largest range no device used in T0's census (here
   128-255), MAX_OUT capped at its size (T4's 256 becomes 128); T4 fails on

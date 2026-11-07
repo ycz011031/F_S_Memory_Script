@@ -49,11 +49,14 @@
 #   bash scripts/pips/pips-rid-live.sh --t12 --soak-min 30
 #   bash scripts/pips/pips-rid-live.sh --only T7,T8      # selected tests (T0 always)
 #   bash scripts/pips/pips-rid-live.sh --dry-run         # the plan only
+#   bash scripts/pips/pips-rid-live.sh --start-holder --reboot --tmux   # a fresh bigserver run, as a campaign
 # Options:
 #   --hold DIR          the holder's folder (default: the running holder's)
 #   --start-holder      start one (bigserver; the drives stay held until a reboot)
 #   --no-guard          with --start-holder: no BMC guard (not advised)
 #   --reboot            end with sync; systemctl reboot -ff (only with --start-holder)
+#   --tmux              run in a new tmux session (asks for the sudo password
+#                       there; survives a dropped ssh). Attach: tmux attach -t pips-rid-live-1
 #   --load-cmd CMD      icx: the NIC load to run in the background in load windows
 #   --quick             T4 grid INTERVAL {1000,1} x MAX_OUT {1,64}, shorter loads
 #   --keep-going        do not stop at a failing test
@@ -77,7 +80,8 @@ REPO=$(cd "$HERE/../.." && pwd)
 
 HOLD=""; START_HOLDER=0; GUARD=1; REBOOT=0; LOAD_CMD=""; QUICK=0; KEEP=0
 T10=0; T11=0; T12=0; FALLBACKS=0; TAGWIN=""; F3PORT=in0; SOAK_MIN=30; SOAK_IVL=100; SOAK_MO=64
-RIDCHECK=1; OUT=""; DRY=0; ONLY=""
+RIDCHECK=1; OUT=""; DRY=0; ONLY=""; IN_TMUX=0; PASS=()
+for a in "$@"; do if [ "$a" = --tmux ]; then IN_TMUX=1; else PASS+=("$a"); fi; done
 while [ $# -gt 0 ]; do
     case "$1" in
         --hold) HOLD=$2; shift 2 ;;
@@ -101,6 +105,7 @@ while [ $# -gt 0 ]; do
         --only) ONLY=",$2,"; shift 2 ;;
         --out) OUT=$2; shift 2 ;;
         --dry-run) DRY=1; shift ;;
+        --tmux) shift ;;
         -h|--help) awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; exit 0 ;;
         *) echo "pips-rid-live: unknown option $1 (--help)" >&2; exit 2 ;;
     esac
@@ -117,12 +122,16 @@ if [ "$DRY" = 1 ]; then
 pips-rid-live (dry run) on $HOSTN, output $OUT
   T0 baselines (pips-rid-check.sh $( [ "$RIDCHECK" = 1 ] && echo on || echo off ), census under load, straddle/TFC)
   T1 usp read; T2 in0/in1 port reads (SC, tag, no fault, no leak); T3 isolation (page 32)
-  T4-T6 engine trains under load: $( [ "$QUICK" = 1 ] && echo "INTERVAL {1000,1} x MAX_OUT {1,64}" || echo "INTERVAL {1000,100,10,1} x MAX_OUT {1,8,64,256}") x {idle-fill, engine-first}; engine tags ${TAGWIN:-the census's largest free range}, MAX_OUT capped to its size
+  T4-T6 engine trains under load: $( [ "$QUICK" = 1 ] && echo "INTERVAL {1000,1} x MAX_OUT {1,64}" || echo "INTERVAL {1000,100,10,1} x MAX_OUT {1,8,64,256}") x {idle-fill, engine-first}; engine tags ${TAGWIN:-the largest range free in the census}, MAX_OUT capped to its size
   T7 latency hit/miss + strides 512, 262144; T8 cross-domain prime/probe N = 32 64 96 128 256; T9 census under load
   T10 $( [ "$T10" = 1 ] && echo on || { [ "$FALLBACKS" = 1 ] && echo "if T2 fails" || echo off; }) T11 $( [ "$T11" = 1 ] && echo "on ($F3PORT)" || { [ "$FALLBACKS" = 1 ] && echo "if T2 faults" || echo off; }) T12 $( [ "$T12" = 1 ] && echo "${SOAK_MIN} min" || echo off)
   holder: $( [ "$START_HOLDER" = 1 ] && echo "started here (drives held until a reboot$( [ "$REBOOT" = 1 ] && echo "; reboot at the end"))" || echo "${HOLD:-the running one (pgrep)}")
 EOF
     exit 0
+fi
+if [ "$IN_TMUX" = 1 ]; then
+    . "$REPO/utils/ssd-lib.sh"   # relaunch_in_tmux: does not return
+    relaunch_in_tmux "$HERE/pips-rid-live.sh" "${PASS[@]}" --out "$OUT"
 fi
 mkdir -p "$OUT" || exit 2
 LOG="$OUT/log.txt"; SUM="$OUT/summary.txt"; RES="$OUT/results.tsv"
