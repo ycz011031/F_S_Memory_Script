@@ -397,6 +397,11 @@ PYEOF
 
 # ------------------------------------------------------------------ setup
 if [ "$KIND" = ssd ]; then
+    # a holder whose folder was deleted still holds the drives but can't be driven (cmd/state/alive live there);
+    # never kill it (drive b4 freezes the host when reset after a load): reboot
+    if hold_find && [ ! -d "$HOLD" ]; then
+        sum "an alias-nvme holder still runs and holds the drives, but its folder $HOLD is gone, so it can't be used or replaced. Reboot (sync; sudo systemctl reboot -ff), then --start-holder"; exit 2
+    fi
     if [ "$START_HOLDER" = 1 ]; then
         hold_find && { sum "a holder already runs ($HOLD): use it (drop --start-holder)"; exit 2; }
         hold_start || exit 2
