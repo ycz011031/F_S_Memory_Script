@@ -83,9 +83,12 @@ an option is added).
     icx's IOTLB has 256 entries, set-associative; bigserver's ~96, no set
     conflicts; a miss costs nothing measurable; the batcher doesn't move
     aliasing misses.
-  - **Alias campaign 2 in (11-07): both hosts complete** (drives 58 sweeps,
-    NICs 151 after a resume), in `dualssd/1106/`, `dualnic/1106/`; analysis
-    under way (§8 "Alias campaign 2", "Back").
+  - **Alias campaign 2 in (11-07):** icx's IOTLB is **32 sets x 8 ways**
+    (index = low 5 page bits), LRU-family replacement; rotation in one set
+    reaches 7-12 misses per page and the batcher cuts it 7.4 -> 2.0; scattered
+    256 B pieces cost 15-22% Gb/s at 4 QPs. bigserver: not LRU (another
+    drive's ~10 misses evict a page; fits ~40 entries, random replacement).
+    §8 "Alias campaign 2 results".
 - **Headline across both testbeds:** IOMMU strict costs throughput only
   where every I/O is mapped and unmapped and the I/O is small: drives at 4k
   (strict ~30-40% of off). Everywhere else (NICs at any flow count, drives
@@ -1163,6 +1166,86 @@ gives the manifests; run `pips-analyze.sh nic --sweeps ''
 PIPS_SEQ_IOTLB=32x8,64x4,128x2,1x256` (what `--alias2` exports). The
 counters (misses, lookups, Gb/s, latency) need no analysis: tables from
 `results/` and `runs/` locally.
+
+### Alias campaign 2 results (11-07)
+
+Tables: `py -3 dualssd/report-gen/c1106.py [ssd] [nic] [json]` ->
+`dualssd/1106/c1106-ssd.txt`, `dualnic/1106/c1106-nic.txt` (counters only:
+no page order yet, the NIC analysis is to be redone, "Back" above). Policy
+fits: `report-gen/repl1106.py` (icx), `probe1106.py` (bigserver). 1 run per
+point except n2rot (2), n2lat/n2rep (3); every sweep's datapath row repeats
+its first point and agrees within 0.04 misses/page.
+
+icx (Ice Lake, NICs, alias-rdma READs of 4 KiB = 9.1 lookups per page):
+1. **8 ways.** One set (stride 4096), NIC0 alone, 1 QP: ws 1-8 no misses,
+   ws 9 0.94 per page, ws 10-16 1.01. The same in sets 7 and 13 and at
+   stride 16384 (ws 8 0, ws 9 0.74). Both NICs, one set: ws 4 each (8) no
+   misses, ws 5 each (10) 0.83. Placement (n2place) agrees: both NICs ws 8
+   stride 4096 in one set 0.93, NIC 1 one set over (`--first1 1`) 0.
+2. **32 sets, plain low-bit index.** ws 9 misses from stride 32 on (0.31-0.34,
+   4 QPs), none at 2-16; strides 96, 192, 320 (odd multiples of 32) miss
+   like 32. ws 5 never misses at any stride (<= 8 ways); ws 17 always. So
+   32 x 8 = 256 entries; capacity (n2cap, cyclic stride 1): 240 no misses,
+   256 0.09, 272 0.65, 288+ 1.0. Sharing (n2share): NIC0 128 + NIC1 32/64 no
+   misses, + 128 0.15, + 192-512 ~0.66.
+3. **Replacement: LRU-family.** 1-QP cyclic ws 9 misses 0.94 per visit: LRU,
+   tree-PLRU, FIFO predict 1.0 (fit 0.09 over the cyclic rows), bit-PLRU 0.57
+   (0.83), random 0.22 (1.96). Not resolved between LRU, tree-PLRU, FIFO: a
+   list that re-touches a page (A..H, A, I) separates LRU from FIFO. Note:
+   alias's "shuffle" is one fixed permutation cycled, so in one set it is
+   cyclic (its 4-QP rows equal the 4-QP cyclic rows: 0.33 at ws 9 = the QPs'
+   reordering); i.i.d. random order gives 1 - 8/ws under any policy.
+4. **Rotation in one set makes several misses per page** (n2rot, ws 64 stride
+   4096): NIC0 alone at 32 QPs, d1t0c1: 7.1-7.5 per page (MTU 1024-2048),
+   11.6 at MTU 256; both NICs 8 QPs MTU 1024 3.6. **The batcher cuts it where
+   one NIC rotates:** NIC0 alone 32 QPs MTU 2048 7.4 -> 2.0 (d16t218c1), MTU
+   1024 7.1 -> 4.0, 8 QPs MTU 2048 1.5 -> 1.08; Gb/s 80-84 -> 92-96, but
+   d1t0c1 alone is slower at 2 QPs too (82 vs 92, no misses), so that Gb/s
+   gap is the setting, not the misses. With both NICs the cut is small (8
+   QPs MTU 1024 3.6 -> 3.1; 32 QPs 3.46 -> 3.41); pb1 adds little or
+   nothing (MTU 256 both: worse). Control ws 64 stride 1: no misses.
+5. **First bandwidth cost of misses: scattered pieces at low QP counts**
+   (n2sge, 4 KiB READ in 256-1024 B pieces, one page per piece): misses 1.02-
+   1.14 per page (16 per READ at 256 B); NIC0 alone 4 QPs 256 B 44.6 vs 57.2
+   Gb/s (fits, ws 64) = -22%, 512 B -22%, 1024 B -16%; both 4 QPs 256 B -15%;
+   at 16 QPs no cost. READ size alone (n2small): misses 1.03 per READ,
+   Gb/s ~unchanged except 1024 B at 4 QPs (-8 to -16%, 1 run).
+6. **Walk depth** (n2walk, n2lat): memory accesses per miss 3.0 for pages up
+   to 8 MiB apart (stride <= 2048), 6.0 from 16 MiB apart (stride >= 4096).
+   READ latency 1 QP x 1 READ: hit 3.4 us, capacity miss (3 accesses) 3.6,
+   deep miss (6) 3.8: ~0.2 us per miss level.
+7. Grant quantum 0 vs 4095 (n2quant): no change. Repeats (n2rep): misses 1.03-
+   1.08 per page in every setting, no batcher effect at 4 QPs stride 1/4096.
+
+bigserver (Skylake, drives, alias-nvme 4 queues x qd 32, 18 lookups per page):
+8. **Not LRU: another device's misses evict a page after ~10 insertions**
+   (s2probe). Drive 0 ws 8 capped by rcap0, drive 1 ws 65536 (1.01 misses per
+   page); drive 0's own misses (total minus drive 1 alone x its share):
+   uncapped 0.18 per page (8 foreign misses between two visits of a page),
+   rcap0 64 0.28 (12), 16 0.89 (56), <= 8 every visit (>= 117). LRU over
+   ~96 entries would need ~88 foreign misses; every 96-128 entry candidate
+   (fully associative or hashed sets, LRU or random) predicts at most half
+   the measured rate. Fully associative **~40 entries, random replacement**
+   fits (`probe1106.py`: 1x40 rnd error 0.20, 1x32 0.23, 1x48 0.27; 1x96 rnd
+   0.96). Time alone does not evict: drive 0 capped to rcap0 1 (a page
+   revisited every ~0.7 ms) with drive 1 on 16 pages that fit, or alone: no
+   misses (sprqr).
+9. **Capacity is soft** (s2cap, shared cursor): drive 0 alone no misses up to
+   56 pages, 64 0.07, 96 0.21, 128 0.27, 160 0.41 (noisy, 1 run: 136 0.52);
+   both drives ws 48 each no misses, 56 0.15, 64 0.31, 96 0.61, 160 0.82.
+   Alone misses more than both at the same total (alone 96: 0.21; both 48+48:
+   0): not one shared fully associative cache. Open, with item 8: the
+   capacity knee (~56-64 per drive) is larger than the ~40 the probe fits.
+   Random order (s2order) about as cyclic: completion order already scatters.
+10. **No low-bit set conflicts:** 64 pages with equal low 17 bits (splhw64)
+    0.09 per page = cyclic 64 (0.07). Random pages in 16 GiB (splrw) miss
+    earlier and add L3 walk misses (128: 0.69, L3 0.56); 512 MiB apart (splhw
+    96/128) add L2 walk misses (0.30-0.47 per page).
+11. **Walk caches** (s2walk): ws 32 never misses at any stride up to 2 GiB
+    apart (IOTLB holds them); at 2 MiB apart, L3 walk misses per IOTLB miss
+    0.81 at ws 128, 0.97 at 512, 0.99 at 2048.
+12. Batcher settings (s2rep, d1t0c1/d16t218c1 x pb0/pb1): misses unchanged
+    (0.84 at ws 256 stride 1, 0.23 at ws 64 stride 4096).
 
 ### Next
 
