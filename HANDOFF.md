@@ -17,7 +17,14 @@ an option is added).
   which sweep and design, which report generator reads what, the published
   pages). On the Windows analysis machine `claude.md` (git-ignored) adds its
   local paths, tools and editing gotchas.
-- **Last updated:** 2026-11-07 (first run): **0x0A08's main assumption holds (F0)**: on
+- **Last updated:** 2026-11-07 (second run, 01:37): with the engine's tags in 128-255 **T0-T5
+  and T9 pass**: 32 M engine reads under both drives' load, all SC, no leak, no straddle, no
+  device tag in the window. T7: hit 688 / miss 1076 ns median, 2.6% misclassified per read
+  (now a pass). T8 inconclusive: a page read twice survived thousands of later misses, so
+  the IOTLB looks reuse-protected; T8 rewritten (flushed IOTLB, fresh pages, once / cross /
+  twice). T4 trains now run 20 s (T6). Next: rerun, `--start-holder --reboot --tmux`.
+  Test doc §4 "Second run".
+- **2026-11-07 (first run):** **0x0A08's main assumption holds (F0)**: on
   bigserver a read under a downstream port's ID returns that drive's page, and only through
   its own port (T2, T3 PASS). T4 failed: the engine's tags collided with drive 0's tags
   (0-127) inside the PCIe core, giving a malformed completion and a timeout in every train.

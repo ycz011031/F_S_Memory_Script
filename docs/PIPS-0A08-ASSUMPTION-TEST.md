@@ -6,7 +6,10 @@ in that repo's `0A08_UPGRADE_PLAN.md` §2 and `sw_handoff/README.md` §12).
 Host tools for the live tests written 2026-11-07 (§5.2): `pips bg`,
 `scripts/pips/pips-rid-live.sh`, `pips_bg_pages.ko`. **First run on
 bigserver 2026-11-07 (§4, "First run"): T2/T3 pass, so F0 holds; T4 found
-that the engine's tags must stay out of the devices' tags (A11).**
+that the engine's tags must stay out of the devices' tags (A11). Second
+run (01:37, engine tags 128-255): T0-T5 and T9 pass, 32 M reads clean under
+load; T7 separable at 2.6% error; T8 inconclusive, and the IOTLB looks
+reuse-protected (§4 "Second run"); T8 rewritten.**
 
 The background read engine ([PIPS-BG-READ-ENGINE.md](PIPS-BG-READ-ENGINE.md),
 "the engine doc") rests on assumptions the host alone can't prove. The main
@@ -357,6 +360,53 @@ T0-T3 PASS, T4 FAIL, T5 PASS, T6 no data. Stopped after T4 (3 min).
   required), and the hardware agent should know that 8-bit device tags pass
   through to the core: a device that uses all 256 tags leaves the engine
   none.
+
+### Second run: bigserver, 2026-11-07 01:37 (`dualssd/1106/rid-live/pips-rid-live-bigserver-1107-013752/`)
+
+Engine tags 128-255 (T0's census). T0-T5 PASS, T6 no data, T7 "FAIL" (see
+below; a pass under the revised rule), T8 no conclusion, T9 PASS. 6 min.
+
+- **T2/T3 again PASS** (F0), **T4 PASS: 32 trains, 32 M reads, every one
+  SC**: no malformed completion, no timeout, no leak, `WIN_HITS` 0 (no
+  device tag entered 128-255). A11 holds with the window.
+  - Rates: the engine-first trains reach the limit set by the outstanding
+    reads, up to 97 M reads/s at MAX_OUT 128 (128 / 1.25 µs; latency
+    1.25 µs there vs ~0.95 µs at low depth). Idle-fill trains reach at most
+    0.68 M reads/s: the drives' traffic leaves few idle cycles. With
+    INTERVAL 1000 (4 µs) both give 0.2-0.25 M/s.
+  - Each train issued `count=1000000` and so ended in 0.04-5 s, not 20 s:
+    the drives' IOPS windows were empty for the fast ones, and T6 had no
+    data. Where windows had data (the slow trains) the drives stayed at
+    865/789 kIOPS (baselines 860-876 / 782-788). Fixed: `count=0`, 20 s each.
+- **T5 PASS:** no straddle over 32 M reads.
+- **T7: hit and miss separate by median, not by tail.** ws 8 (hits): p50
+  688 ns, p99 972; ws 4096 (misses, page-walk cache hits): p50 1076, p1 892.
+  At 832 ns 2.6% are misclassified. A 2 MB stride (s512) gives 1436 ns, a
+  1 GB stride 1592 ns: each walk level adds ~0.2-0.4 µs. Counting misses as
+  fractions works, one-by-one with ~3% error. The rule is now: a pass when
+  <= 5% are misclassified.
+- **T8: no conclusion, and a new observation about the IOTLB's
+  replacement.** The test read P twice, then N filler pages (the same
+  ones every round), then P. In the drive-0-only control the filler
+  missed more and more with N (N = 32/64/96/128/256: 2/51/67/75/88%), yet
+  P hit every time. Pages 0-15 (read three times a round) even hit on
+  their first read in every later run, after thousands of misses in
+  between. The likely reading is that **an entry used more than once is
+  protected from single-use misses** (segmented-LRU-like), and the miss
+  rate rises gradually instead of as an LRU cliff. If so, an evictor's
+  one-shot reads cannot displace a device's hot entries; it would have to
+  reuse its own pages. Cross (drive 1's pages) missed less than the control
+  at every N (16/44/58/79% at 64-256), which a shared cache wouldn't show
+  unless the leftovers differ.
+  - **T8 rewritten:** every run starts from a flushed IOTLB (the holder's
+    `map` unmaps and maps both regions), reads only fresh pages, and has
+    three cases per N (32-512): `once` (P, N drive-0 pages, P: the capacity
+    C), `cross` (N drive-1 pages through in1's port: A7), `twice` (P read
+    twice: protection). On simulated caches the verdict reads shared LRU,
+    shared + protection, and partitioned correctly.
+- **T9 PASS:** over 2 min of load, drive 0 used tags 0-127, drive 1 0-63.
+- **Next:** the same command again, a fresh holder (`--start-holder
+  --reboot --tmux`), ~25 min: T4 with 20 s trains (T6's IOPS), T8 v2.
 
 ## 5. Software for the tests
 

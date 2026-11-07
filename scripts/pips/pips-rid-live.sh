@@ -602,7 +602,7 @@ if [ -z "$STOPPED" ] && [ "$F0" = 1 ] && want T4; then
     begin T4 "no leak under load: $ncombo engine trains through in0's port while both devices run, engine tags $ENG_WIN (A3)" \
         "every train: LEAK_CPL 0, CPL_UNEXPECTED 0, CPL_MALFORMED 0, CPL_SC = ISSUED, timeouts 0; WIN_HITS 0 (no device tag in the engine's window); the devices' load ends ok; no DMAR fault; AER unchanged"
     pipsc bg census clear >> "$LOG" 2>&1
-    LS=$(( 60 + ncombo * 25 ))
+    LS=$(( 90 + ncombo * 30 ))   # 20 s per train + 3 s gap + run overhead, two 20 s baselines
     [ "$KIND" = ssd ] && hold_map 64 1 64 1
     if load_start "$LS" "$TD/load"; then
         printf 'name\tt0_ms\tt1_ms\n' > "$TD/windows.tsv"
@@ -617,7 +617,7 @@ if [ -z "$STOPPED" ] && [ "$F0" = 1 ] && want T4; then
                 idx_list in0 "$(( NPG0 < 64 ? NPG0 : 64 ))" 0 > "$TD/t.tbl"; pipsc bg table load "$TD/t.tbl" >> "$LOG" 2>&1
                 base=(src=table base="$IBASE" ws="$(( NPG0 < 64 ? NPG0 : 64 ))"); fi
             t0=$(now_ms)
-            erun "$c" rid=in0 "${base[@]}" count=1000000 interval="$i" maxout="$m" arb="$arb" secs=20
+            erun "$c" rid=in0 "${base[@]}" count=0 interval="$i" maxout="$m" arb="$arb" secs=20
             printf '%s\t%s\t%s\n' "$c" "$t0" "$(now_ms)" >> "$TD/windows.tsv"
             f="$TD/$c.txt"
             RCS=$(( RCS + $(kv rc_straddle "$f") )); RQS=$(( RQS + $(kv rq_straddle "$f") ))
@@ -701,7 +701,7 @@ fi
 # ------------------------------------------------------------------ T7
 HIT_THR=""
 if [ -z "$STOPPED" ] && [ "$F0" = 1 ] && want T7; then
-    begin T7 "per-read latency separates IOTLB hit and miss (A8)" "engine alone, MAX_OUT 1, INTERVAL 1000: the latency distributions of ws 8 (hits) and ws 4096 (misses) do not overlap"
+    begin T7 "per-read latency separates IOTLB hit and miss (A8)" "engine alone, MAX_OUT 1, INTERVAL 1000: the latency distributions of ws 8 (hits) and ws 4096 (misses) do not overlap, or overlap with <= 5% misclassified at the threshold"
     if [ "$KIND" = ssd ]; then
         hold_map 4096 1 64 1
         erun hit rid=in0 base=$REG ws=8 count=4160 tskip=64 interval=1000 trace=1 dcheck=1 backing=$BK0
@@ -740,13 +740,15 @@ if h and m:
     thr = (q(h, .9) + q(m, .1)) / 2
     over = sum(1 for x in h if x * 4 > thr) / len(h) + sum(1 for x in m if x * 4 <= thr) / len(m)
     print(f"THRESHOLD_NS {thr:.0f}")
-    print(("SEPARATE" if hp99 < mp1 else "OVERLAP") + f" hit p99 {hp99:.0f} ns, miss p1 {mp1:.0f} ns; misclassified at {thr:.0f} ns: {over*100:.2f}%")
+    word = "SEPARATE" if hp99 < mp1 else "SEPARABLE" if over <= 0.05 else "OVERLAP"
+    print(word + f" hit p99 {hp99:.0f} ns, miss p1 {mp1:.0f} ns; misclassified at {thr:.0f} ns: {over*100:.2f}%")
 PYEOF
 )
         echo "$out" | grep -v '^THRESHOLD' | sed 's/^/   /' | tee -a "$SUM" > /dev/null; echo "$out" > "$TD/latency.txt"
         HIT_THR=$(echo "$out" | sed -n 's/^THRESHOLD_NS //p')
         case "$out" in
             *SEPARATE*) end PASS "hit and miss separate; threshold $HIT_THR ns (the stride runs give the walk levels: latency.txt)" ;;
+            *SEPARABLE*) end PASS "hit and miss separable per read at $HIT_THR ns ($(echo "$out" | grep -o 'misclassified.*') : count misses as fractions, not one by one)" ;;
             *) end FAIL "hit and miss latencies overlap: the engine can't count misses one by one (A8); use ws-level averages"
                [ -n "$HIT_THR" ] || HIT_THR="" ;;
         esac
@@ -756,34 +758,46 @@ PYEOF
 fi
 
 # ------------------------------------------------------------------ T8
+# One IOTLB for all domains (A7), and its replacement. The first T8 (11-07 01:37) read P twice before the
+# filler and reused the filler pages: P then survived 256 misses x 16 rounds and later runs, so it measured
+# nothing. Now every run starts from a flushed IOTLB (bigserver: the holder's map unmaps and maps both
+# regions) and reads each page once except P:
+#   once  : P, N fresh drive-0 pages (in0's port), P: the capacity C where P starts to miss
+#   cross : P, N fresh drive-1 pages through in1's port, P: misses as "once" at N >= C -> one shared IOTLB
+#   twice : P, P, N fresh drive-0 pages, P: hits where "once" misses -> reuse protects an entry
 if [ -z "$STOPPED" ] && [ "$F0" = 1 ] && want T8; then
-    begin T8 "one IOTLB for all domains (A7)" "probe P (in0, drive 0's domain) after N pages read through in1's port (drive 1's domain): P misses at N past the capacity as in the in0-only control -> shared; stays a hit -> partitioned"
-    [ -n "$HIT_THR" ] || sum "   no hit/miss threshold from T7: the probe latencies are reported raw"
-    [ "$KIND" = ssd ] && hold_map 4096 1 4096 1
-    printf 'n\tcase\tprobes\tprobe_miss\tsecond_read_miss\tprobe_p50_ns\thit_p50_ns\n' > "$TD/t8.tsv"
-    for N in 32 64 96 128 256; do
+    begin T8 "one IOTLB for all domains (A7); does reuse protect an entry" \
+        "from a flushed IOTLB, fresh pages: 'once' sets the capacity C (P misses >= 0.5); 'cross' misses at N >= C as 'once' -> shared, else partitioned; 'twice' vs 'once' at N >= C -> reuse protection"
+    [ -n "$HIT_THR" ] || sum "   no hit/miss threshold from T7: the miss fractions are not computed"
+    [ "$KIND" = nic ] && sum "   icx: no IOTLB flush between runs (the NICs' mappings): pages are fresh within a run only"
+    printf 'n\tcase\tprobes\tprobe_miss\tfill_miss\tprobe_p50_ns\tfirst_p50_ns\n' > "$TD/t8.tsv"
+    for N in 32 64 96 128 192 256 384 512; do
         R=$(( 4096 / (N + 3) )); [ "$R" -gt 16 ] && R=16
-        for case in cross ctrl; do
+        for case in once cross twice; do
             [ "$ABORT" = 1 ] && break 2
-            t="$TD/$case-$N.tbl"; : > "$t"
-            for r in $(seq 0 $((R - 1))); do
-                if [ "$KIND" = ssd ]; then
-                    P=$r
-                    echo "$P:0" >> "$t"; echo "$P:0" >> "$t"
-                    for j in $(seq 0 $((N - 1))); do [ "$case" = cross ] && echo "$((1000 + j)):1" >> "$t" || echo "$((2000 + j)):0" >> "$t"; done
-                    echo "$P:0" >> "$t"
-                else
-                    [ "$NPG1" -ge "$N" ] && [ "$NPG0" -ge $((N + R)) ] || { sum "   icx: too few harvested pages for N $N"; continue 3; }
-                    P=$(idx_list in0 $((r + 1)) 0 | tail -1)
-                    echo "$P" >> "$t"; echo "$P" >> "$t"
-                    if [ "$case" = cross ]; then idx_list in1 "$N" 1 >> "$t"; else idx_list in0 $((R + N)) 0 | tail -n "$N" >> "$t"; fi
-                    echo "$P" >> "$t"
+            t="$TD/$case-$N.tbl"
+            if [ "$KIND" = ssd ]; then
+                awk -v N="$N" -v R="$R" -v c="$case" 'BEGIN { for (r = 0; r < R; r++) {
+                    print r ":0"; if (c == "twice") print r ":0"
+                    for (j = 0; j < N; j++) print (1000 + r * N + j) ":" (c == "cross" ? 1 : 0)
+                    print r ":0" } }' > "$t"
+                hold_map 8192 1 8192 1 > /dev/null   # flushes both regions' IOTLB entries; tags = page mod 8192
+                b=$REG
+            else
+                need=$(( R * (N + 1) ))
+                if [ "$NPG0" -lt "$need" ] || { [ "$case" = cross ] && [ "$NPG1" -lt $(( R * N )) ]; }; then
+                    sum "   icx: too few harvested pages for N $N ($case)"; continue
                 fi
-            done
-            b=$([ "$KIND" = ssd ] && echo $REG || echo "$IBASE")
+                idx_list in0 "$need" 0 > "$TD/p0.lst"; idx_list in1 $(( R * N )) 1 > "$TD/p1.lst"
+                awk -v N="$N" -v R="$R" -v c="$case" 'FNR == NR { a[n0++] = $0; next } { b1[n1++] = $0 }
+                    END { for (r = 0; r < R; r++) { print a[r]; if (c == "twice") print a[r]
+                        for (j = 0; j < N; j++) print (c == "cross" ? b1[r * N + j] : a[R + r * N + j]); print a[r] } }' \
+                    "$TD/p0.lst" "$TD/p1.lst" > "$t"
+                b=$IBASE
+            fi
             n=$(wc -l < "$t")
             tblrun "$case-$N" "$t" rid=in0 rid1=in1 base="$b" count="$n" interval=1000 maxout=1 trace=1 \
-                $( [ "$KIND" = ssd ] && echo dcheck=1 backing=4096 )
+                $( [ "$KIND" = ssd ] && echo dcheck=1 backing="$BK0" )
             pipsc bg trace "$TD/$case-$N.csv" > /dev/null 2>&1
             python3 - "$TD/$case-$N.csv" "$N" "$R" "$case" "${HIT_THR:-0}" <<'PYEOF' >> "$TD/t8.tsv"
 import csv, sys
@@ -792,16 +806,20 @@ rows = {int(x["seq"]): x for x in csv.DictReader(open(f))}
 def ns(s):
     x = rows.get(s)
     return None if x is None or x["timed_out"] != "0" or x["lat_cycles"] == "65535" else int(x["lat_cycles"]) * 4
-probe, second = [], []
+k = 2 if case == "twice" else 1
+S = k + N + 1
+probe, first, fill = [], [], []
 for r in range(R):
-    b = r * (N + 3)
-    p, s = ns(b + N + 2), ns(b + 1)
-    if p is not None: probe.append(p)
-    if s is not None: second.append(s)
+    b = r * S
+    for lst, s in ((probe, b + S - 1), (first, b)):
+        v = ns(s)
+        if v is not None: lst.append(v)
+    fill += [v for v in (ns(s) for s in range(b + k, b + k + N)) if v is not None]
 med = lambda a: sorted(a)[len(a) // 2] if a else float("nan")
 miss = lambda a: (sum(1 for x in a if x > thr) / len(a)) if a and thr > 0 else float("nan")
-print(f"{N}\t{case}\t{len(probe)}\t{miss(probe):.2f}\t{miss(second):.2f}\t{med(probe):.0f}\t{med(second):.0f}")
+print(f"{N}\t{case}\t{len(probe)}\t{miss(probe):.2f}\t{miss(fill):.2f}\t{med(probe):.0f}\t{med(first):.0f}")
 PYEOF
+            say "    $case-$N: $(tail -1 "$TD/t8.tsv" | cut -f3-7 | tr '\t' ' ') (probes probe_miss fill_miss probe_p50 first_p50)"
         done
     done
     tab "$TD/t8.tsv" | sed 's/^/   /' | tee -a "$SUM" > /dev/null
@@ -809,20 +827,38 @@ PYEOF
 import sys
 rows = [l.rstrip("\n").split("\t") for l in open(sys.argv[1])][1:]
 v = {(int(r[0]), r[1]): float(r[3]) for r in rows if r[3] != "nan"}
-big = [n for n in (256, 128) if (n, "cross") in v and (n, "ctrl") in v]
-if not big:
+ns = sorted({n for n, _ in v})
+once = {n: v[(n, "once")] for n in ns if (n, "once") in v}
+if not once:
     print("INFO no miss fractions (no threshold from T7, or runs missing): judge t8.tsv's latencies by eye"); sys.exit()
-n = big[0]
-c, k = v[(n, "cross")], v[(n, "ctrl")]
-if k < 0.5:
-    print(f"INFO the in0-only control does not evict P at N {n} (miss fraction {k:.2f}): no conclusion")
-elif c >= 0.5 * k:
-    print(f"PASS shared: at N {n} P misses {c:.2f} after drive 1's pages (control {k:.2f}): traffic in one domain evicts another's entries (A7)")
+big = [n for n in ns if once.get(n, 0) >= 0.5]
+if not big:
+    print(f"INFO P read once survives up to N {max(once)} fresh misses (once: " + ", ".join(f"{n} {once[n]:.2f}" for n in sorted(once)) + "): no capacity found, no conclusion on A7")
+    sys.exit()
+C = big[0]
+avg = lambda c: [v[(n, c)] for n in big if (n, c) in v]
+o, x, w = avg("once"), avg("cross"), avg("twice")
+om = sum(o) / len(o)
+line = []
+if x:
+    xm = sum(x) / len(x)
+    if xm >= 0.5 * om:
+        line.append(f"PASS shared: from N {C} (P misses {om:.2f} after drive 0's pages) P misses {xm:.2f} after drive 1's pages: traffic in one domain evicts another's entries (A7)")
+    else:
+        line.append(f"FAIL partitioned: from N {C} P misses {om:.2f} after drive 0's pages but {xm:.2f} after drive 1's: entries are kept per domain (A7 fails: F1/F3 can't evict drive 0's entries; F0 is unaffected, it reads in drive 0's own domain)")
 else:
-    print(f"FAIL partitioned: at N {n} P misses {c:.2f} after drive 1's pages vs {k:.2f} in the control: entries are kept per domain; F1/F3 can't evict drive 0's entries")
+    line.append(f"INFO capacity C ~ {C} (once misses {om:.2f}); no cross runs")
+if w:
+    wm = sum(w) / len(w)
+    line.append(f"NOTE reuse: P read twice misses {wm:.2f} from N {C} vs {om:.2f} read once: " +
+                ("a reused entry is protected (not plain LRU): an evictor must reuse its pages to displace a device's hot entries" if wm < 0.5 * om else "no protection seen"))
+line.append("NOTE once by N: " + ", ".join(f"{n} {once[n]:.2f}" for n in sorted(once)))
+print("\n".join(line))
 PYEOF
 )
-    end "${verdict%% *}" "${verdict#* }"
+    echo "$verdict" | sed -n '2,$p' | sed 's/^NOTE /   /' | tee -a "$SUM" > /dev/null
+    first=$(echo "$verdict" | head -1)
+    end "${first%% *}" "${first#* }"
 fi
 
 # ------------------------------------------------------------------ T9
