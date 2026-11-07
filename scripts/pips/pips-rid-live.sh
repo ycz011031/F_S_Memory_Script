@@ -126,7 +126,8 @@ LOG="$OUT/log.txt"; SUM="$OUT/summary.txt"; RES="$OUT/results.tsv"
 say() { echo "[rid-live $(date +%T) +$((SECONDS - T_START))s] $*" | tee -a "$LOG"; }
 sum() { echo "$*" | tee -a "$SUM" >> "$LOG"; echo "$*"; }
 pipsc() { sudo -n "$PIPS" "$@"; }
-kv() { sed -n "s/^$1=//p" "$2" 2>/dev/null | tail -1; }
+# the last KEY=value token in a file: `pips bg` prints some keys one per line, others several to a line
+kv() { awk -v k="$1=" '{ for (i = 1; i <= NF; i++) if (index($i, k) == 1) v = substr($i, length(k) + 1) } END { if (v != "") print v }' "$2" 2>/dev/null; }
 now_ms() { date +%s%3N; }
 hsleep() { local n=0; while [ "$n" -lt "$1" ]; do sleep 1; n=$((n + 1)); [ $((n % 30)) = 0 ] && say "  ... $2 ($n of $1 s)"; done; }
 tab() { column -t "$1" 2>/dev/null || cat "$1"; }
