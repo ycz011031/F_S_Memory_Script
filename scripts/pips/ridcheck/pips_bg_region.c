@@ -10,7 +10,8 @@
  *   rmmod pips_bg_region                            # unmaps (one IOTLB invalidation) and frees
  *
  * Per device: `backing` pages (a power of two), page j holding j in its first
- * 8 bytes, and a scatterlist of `npages` page-sized entries, entry k on
+ * 4 bytes (DW0) and the device's position in dev= (1, 2) in the next 4 (DW1),
+ * so a 2-DW read shows whose region answered (pips-rid-live.sh T2/T3), and a scatterlist of `npages` page-sized entries, entry k on
  * backing page k mod backing, mapped with ONE dma_map_sg(&dev->dev, ...,
  * DMA_TO_DEVICE) call: the IOMMU DMA layer puts a whole list in one IOVA
  * allocation, so region page k sits at base + k * 4 KiB and holds k mod
@@ -148,7 +149,7 @@ static int region_make(struct region *r, const char *bdf)
 		if (!r->pg[j])
 			return -ENOMEM;
 		p = page_address(r->pg[j]);
-		p[0] = j;
+		p[0] = j | ((u64)(r - g_r + 1) << 32);   /* DW0 j, DW1 the device's number */
 	}
 	ret = sg_alloc_table(&r->sgt, npages, GFP_KERNEL);
 	if (ret)
@@ -182,8 +183,8 @@ static int region_make(struct region *r, const char *bdf)
 		return -EINVAL;
 	}
 	pr_info("pips_bg_region[%s]: %s: %u pages at IOVA 0x%llx-0x%llx (%d segments), backing %u pages, "
-		"page k holds k mod %u\n", token, pci_name(r->pdev), npages, (unsigned long long)r->base,
-		(unsigned long long)want, r->nents, backing, backing);
+		"page k holds k mod %u (DW1 %d)\n", token, pci_name(r->pdev), npages, (unsigned long long)r->base,
+		(unsigned long long)want, r->nents, backing, backing, (int)(r - g_r + 1));
 	return 0;
 }
 

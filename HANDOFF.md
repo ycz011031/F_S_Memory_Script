@@ -1303,7 +1303,7 @@ gating present):
 | Measures | issued, completions by status (SC/UR/CA/other/poisoned/malformed/unexpected), timeouts, latency sum/min/max, 64-bin histogram, a per-read latency trace (4096 reads from `TRACE_SKIP`), stalls (arb/tags/credits), data check against the holder's page tags | `pips bg counters / hist / trace FILE / run trace=1 dcheck=1 backing=N` |
 | Test extensions | leak monitor (completions for the engine that reached the router's outputs: must be 0), **tag census** (every tag each device used, `WIN_HITS`), straddle counters, NP credits and head-of-line cycles (`TFC`, `HOL_ENGINE/DEVICE`), capture of the last 64 completions (descriptor, `req_done`), clash detector (F2) | `pips bg census [clear] / facts [clear] / capture [N]` |
 
-**Tools** (all on the host, bigserver tested; icx not yet):
+**Tools** (all on the host, bigserver tested; icx written, not run):
 - `pips bg ...` (pips.c): `info`, `set`, `start/stop/wait`, `run K=V... [secs=S]`
   (start, heartbeat, stop, print every counter as `key=value`), and the
   commands in the table. `pips bg help` lists the keys.
@@ -1314,6 +1314,13 @@ gating present):
   flushes those IOTLB entries: T8 uses that). Run:
   `bash scripts/pips/pips-rid-live.sh --start-holder --reboot --tmux --no-ridcheck`
   (~16-25 min, reboots at the end: the holder can't release the drives).
+  On icx (written 11-07, not yet run) no holder: `pips_bg_region.ko` maps
+  65536 tagged pages in each NIC's own domain (DW0 = page mod 8192, DW1 = the
+  NIC's number, so T2/T3 see whose domain answered; a reload flushes them for
+  T8), and the load windows run alias-rdma READs on both NICs against servers
+  on styx (ports BASE_PORTS + 760, utils/setup-server.sh). Run on icx, IOMMU
+  strict or lazy, kernel headers installed, styx's repo pulled:
+  `bash scripts/pips/pips-rid-live.sh --tmux` (~20 min, no reboot).
   Output `~/pips-rid-live-<host>-<MMDD-HHMMSS>/` + `.tar.gz`: `summary.txt`,
   `results.tsv`, `T*/`.
 - `pips-campaign.sh` refuses 0x0A08 (it accepts 0x0A06/0x0A07 only); the
@@ -1362,7 +1369,8 @@ Rate and cost (T4/T6, drives at 866/785 kIOPS without the engine):
   test doc §4 "Third run", not written) would settle what earns the hold.
 
 **State:** bigserver runs 0x0A08; its holder from the third run still holds
-the drives (reboot before the next run). icx: not run. Results in
+the drives (reboot before the next run). icx: the same tests, to run
+(command above). Results in
 `dualssd/1106/rid-live/` (FILE-MAP §7).
 
 ### 0x0A08 stress campaign (`pips-campaign.sh ssd --bg`, written 11-07, not run)
@@ -1442,6 +1450,7 @@ syntax-checked (MinGW, stubs); the scripts by `bash -n` and the dry run.
 ### Next
 
 Status 11-07 (evening): **0x0A08 stress campaign written, not run** (section above): on bigserver `git pull`, the native smoke (~45 min, no reboot), then `pips-campaign.sh ssd --bg --tmux` (~30 h, reboot at the end). icx side next (needs the engine's bring-up on icx first: census of the NICs' tags, data check).
+Status 11-07 (icx bring-up): `pips-rid-live.sh` now runs on icx without a holder: pages from `pips_bg_region.ko` in each NIC's domain (DW1 = the NIC's number), a built-in alias-rdma load against styx; the old TLP-log harvest is gone (the pages it found were unmapped once its load ended). To run: `bash scripts/pips/pips-rid-live.sh --tmux` on icx (IOMMU strict or lazy). Copy back `~/pips-rid-live-icx-*.tar.gz`.
 Status 11-07 (third run, 15:00): **T0-T9 all PASS.** F0, A7 (one shared IOTLB), engine-first free to ~2.5 M reads/s, the IOTLB keeps reused entries against one-shot reads (test doc §4 "Third run"). Next: the replacement probe (T8b) if the evictor design needs it; 0x0A09 = the engine's extras, tag window default 128-255.
 Status 11-07 (first results, 01:04 run): **T2/T3 PASS: F0 holds** (port IDs read their drives' pages, isolated). **T4 FAIL**: in every train one completion came back SC with byte count or "request completed" wrong, then timed out; the failing tags were all in drive 0's 0-127: the core tracks requests by tag alone and the devices' tags pass through to it (new assumption A11). Fixed in the script: the engine's tags = the largest range unused in T0's census (128-255), MAX_OUT capped to it, T4 checks `CPL_MALFORMED` and `WIN_HITS`, captures saved on errors (`req_done=` in `pips bg capture`). Next: a fresh run, as a campaign (the 01:04 run's holder is gone): on bigserver `git pull`, then `bash scripts/pips/pips-rid-live.sh --start-holder --reboot --tmux` (new `--tmux`; ~1 h; reboots at the end; tarball `~/pips-rid-live-bigserver-*.tar.gz` written before the reboot). Its captures say which field the core sets. Test doc §4 "First run".
 Status 11-07 (first attempt): bigserver's first `pips-rid-live.sh` run (01:01) stopped at the engine check although the bitstream is right (design 0x0a08, `bg_id=0x52494450`, `bg_caps=0x46cd0100` = RTL `BG_CAPS_VAL`, buses b1/b2/b4): the script's `kv` read only one key per line, and `pips bg info` prints several to a line. Fixed (`kv` reads KEY=value tokens; this also lets `leak_seen`/`clash_seen` from the status line through, which never matched before). Rerun the same command.

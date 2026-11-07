@@ -520,8 +520,13 @@ As written (the plan that follows below it is kept for the record):
 - **`scripts/pips/pips-rid-live.sh`:** T0-T9, T10/T11 with `--fallbacks`
   (or `--t10`, `--t11`), T12 with `--t12`; `--help`. bigserver through the
   alias-nvme holder (a running one, or `--start-holder`), whose new `map`
-  command re-tags the regions before each data check; icx with
-  `--load-cmd` and pages from a TLP log. `summary.txt` per test: pass
+  command re-tags the regions before each data check. icx (11-07): pages
+  from `ridcheck/pips_bg_region.ko` in each NIC's own domain (DW0 = page
+  mod 8192, DW1 = the NIC's number: T2 checks each port reaches its own
+  NIC's region, T3 passes on UR or on any other mapping), reloaded before
+  each T8 run to flush; a built-in alias-rdma load on both NICs against
+  styx, or `--load-cmd`. The earlier TLP-log harvest is gone: the pages a
+  NIC load had mapped were unmapped once that load ended. `summary.txt` per test: pass
   condition, numbers, DMAR lines per BDF, AER deltas, verdict; then the
   decision of the tree above.
 - **`scripts/pips/ridcheck/pips_bg_pages.c`** (§5.3): written; T11 builds

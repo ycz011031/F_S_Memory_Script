@@ -38,10 +38,15 @@
 # sync; sudo systemctl reboot -ff; --reboot does it at the end). The holder's
 # regions sit at IOVA 0x4000000000 in each drive's own domain, page k tagged
 # k (mod backing); "map" commands re-tag them before every data check.
-# icx (NICs): no holder. --load-cmd 'CMD' runs a NIC load in the background
-# for the load windows (e.g. an alias-rdma run); the pages to read are taken
-# from a short TLP log of the NICs' own reads (pages they read are mapped in
-# their domain), so a load must run for T2-T8. Without it those are skipped.
+# icx (NICs): no holder; the NICs stay on mlx5. The pages to read come from
+# ridcheck/pips_bg_region.ko, loaded for both NICs at the start: 65536 pages
+# (256 MiB of IOVA) in each NIC's own DMA domain, page k holding k mod 8192 in
+# DW0 and the NIC's number (1, 2) in DW1, so a read shows whose domain
+# translated it. Reloading it flushes those IOTLB entries (T8). The load
+# windows run alias-rdma READs on both NICs against servers on styx (ssh, as
+# run-dualnic-experiment.sh --gen alias; utils/setup-server.sh), or
+# --load-cmd 'CMD'. Needs the IOMMU in strict or lazy mode and the kernel
+# headers. Nothing to reboot afterwards.
 #
 #   bash scripts/pips/pips-rid-live.sh                   # T0-T9, holder found
 #   bash scripts/pips/pips-rid-live.sh --start-holder    # bigserver after a reboot
@@ -50,6 +55,7 @@
 #   bash scripts/pips/pips-rid-live.sh --only T7,T8      # selected tests (T0 always)
 #   bash scripts/pips/pips-rid-live.sh --dry-run         # the plan only
 #   bash scripts/pips/pips-rid-live.sh --start-holder --reboot --tmux   # a fresh bigserver run, as a campaign
+#   bash scripts/pips/pips-rid-live.sh --tmux                       # icx (NICs on mlx5, IOMMU strict or lazy)
 # Options:
 #   --hold DIR          the holder's folder (default: the running holder's)
 #   --start-holder      start one (bigserver; the drives stay held until a reboot)
@@ -57,7 +63,8 @@
 #   --reboot            end with sync; systemctl reboot -ff (only with --start-holder)
 #   --tmux              run in a new tmux session (asks for the sudo password
 #                       there; survives a dropped ssh). Attach: tmux attach -t pips-rid-live-1
-#   --load-cmd CMD      icx: the NIC load to run in the background in load windows
+#   --load-cmd CMD      icx: run CMD as the NIC load instead of the built-in one
+#                       (alias-rdma READs, 4 QPs x depth 16, ws 64, both NICs)
 #   --quick             T4 grid INTERVAL {1000,1} x MAX_OUT {1,64}, shorter loads
 #   --keep-going        do not stop at a failing test
 #   --t10 --t11 --t12 --fallbacks   (above)
@@ -123,9 +130,10 @@ pips-rid-live (dry run) on $HOSTN, output $OUT
   T0 baselines (pips-rid-check.sh $( [ "$RIDCHECK" = 1 ] && echo on || echo off ), census under load, straddle/TFC)
   T1 usp read; T2 in0/in1 port reads (SC, tag, no fault, no leak); T3 isolation (page 32)
   T4-T6 engine trains under load: $( [ "$QUICK" = 1 ] && echo "INTERVAL {1000,1} x MAX_OUT {1,64}" || echo "INTERVAL {1000,100,10,1} x MAX_OUT {1,8,64,256}") x {idle-fill, engine-first}; engine tags ${TAGWIN:-the largest range free in the census}, MAX_OUT capped to its size
-  T7 latency hit/miss + strides 512, 262144; T8 cross-domain prime/probe N = 32 64 96 128 256; T9 census under load
+  T7 latency hit/miss + strides 512, 262144 (icx: 512 only); T8 once/cross/twice, N = 32-512, from a flushed IOTLB; T9 census under load
   T10 $( [ "$T10" = 1 ] && echo on || { [ "$FALLBACKS" = 1 ] && echo "if T2 fails" || echo off; }) T11 $( [ "$T11" = 1 ] && echo "on ($F3PORT)" || { [ "$FALLBACKS" = 1 ] && echo "if T2 faults" || echo off; }) T12 $( [ "$T12" = 1 ] && echo "${SOAK_MIN} min" || echo off)
-  holder: $( [ "$START_HOLDER" = 1 ] && echo "started here (drives held until a reboot$( [ "$REBOOT" = 1 ] && echo "; reboot at the end"))" || echo "${HOLD:-the running one (pgrep)}")
+  bigserver holder: $( [ "$START_HOLDER" = 1 ] && echo "started here (drives held until a reboot$( [ "$REBOOT" = 1 ] && echo "; reboot at the end"))" || echo "${HOLD:-the running one (pgrep)}")
+  icx: pips_bg_region.ko pages in each NIC's domain; NIC load: ${LOAD_CMD:-built in (alias-rdma READs against styx, both NICs)}
 EOF
     exit 0
 fi
@@ -161,12 +169,14 @@ sudo -v || { echo "pips-rid-live: needs sudo" >&2; exit 2; }
 pips_build >> "$LOG" 2>&1 || { echo "ERROR: pips does not build (log.txt)" >&2; exit 2; }
 
 # ------------------------------------------------------------------ cleanup
-LOAD_PID=""; F3_LOADED=0; HOLD_LOAD=""; ABORT=0
+LOAD_PID=""; F3_LOADED=0; HOLD_LOAD=""; ABORT=0; NIC_LOAD=0; RGN_LOADED=0
 cleanup() {
     pipsc bg stop 3000 >> "$LOG" 2>&1
     [ -n "$HOLD_LOAD" ] && [ -n "$HOLD" ] && touch "$HOLD/stop" 2>/dev/null
     [ -n "$LOAD_PID" ] && { pkill -INT -P "$LOAD_PID" 2>/dev/null; kill -INT "$LOAD_PID" 2>/dev/null; }
+    [ "$NIC_LOAD" = 1 ] && nic_alias_stop
     [ "$F3_LOADED" = 1 ] && sudo -n rmmod pips_bg_pages 2>/dev/null
+    [ "$RGN_LOADED" = 1 ] && sudo -n rmmod pips_bg_region 2>/dev/null
     kill "$SUDO_KEEP" 2>/dev/null
 }
 trap 'say "interrupted: stopping the engine and the loads"; cleanup; exit 130' INT TERM
@@ -350,49 +360,127 @@ hold_load_end() {   # stop the load (if still running), wait for its done line; 
 }
 
 # ------------------------------------------------------------------ icx: the NIC load and the pages
-nic_load_start() {
-    [ -n "$LOAD_CMD" ] || return 1
-    say "  NIC load: $LOAD_CMD"
-    setsid bash -c "$LOAD_CMD" > "$TD/load.txt" 2>&1 < /dev/null & LOAD_PID=$!
-    sleep 15
-    kill -0 "$LOAD_PID" 2>/dev/null || { say "  the NIC load ended at once (load.txt)"; LOAD_PID=""; return 1; }
+# The built-in load: per NIC an alias-rdma server on styx (ssh, screen) and a client here that READs from it,
+# its NIC writing the responses into a 64-page MR (4 QPs x depth 16, 4 KiB), until stopped. Ports
+# BASE_PORTS[i] + 760 (run-dualnic-experiment.sh uses + 700). NI0/NI1: the config index of each NIC.
+rsh_try() {
+    if [ -n "${CLIENT_PWD:-}" ]; then
+        sshpass -p "$CLIENT_PWD" ssh -n -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "$CLIENT_USERNAME@$CLIENT_SSH_IP" "$@"
+    else
+        ssh -n -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "$CLIENT_USERNAME@$CLIENT_SSH_IP" "$@"
+    fi
+}
+NI0=0; NI1=1; ALIAS_RDMA=""; R_ALIAS_RDMA=""
+nic_port() { echo $(( ${BASE_PORTS[$1]:-$((3000 + 1000 * $1))} + 760 )); }
+nic_index() {   # <bdf>: the index of its netdev in SERVER_INTFS, or the default given
+    local nd i
+    nd=$(ls "/sys/bus/pci/devices/$1/net" 2>/dev/null | head -1)
+    for i in "${!SERVER_INTFS[@]}"; do [ "${SERVER_INTFS[$i]}" = "$nd" ] && { echo "$i"; return; }; done
+    echo "$2"
+}
+nic_setup() {   # the built-in load's prerequisites: config, builds on both hosts, data-plane links
+    [ -r "$REPO/utils/setup-server.sh" ] || { sum "icx: no utils/setup-server.sh (the NICs' config): no built-in load"; return 1; }
+    . "$REPO/utils/setup-server.sh"
+    [ -n "${CLIENT_SSH_IP:-}" ] && [ "${#SERVER_INTFS[@]}" -ge 2 ] && [ "${#CLIENT_NIC_IPS[@]}" -ge 2 ] ||
+        { sum "icx: utils/setup-server.sh lacks CLIENT_SSH_IP / SERVER_INTFS / CLIENT_NIC_IPS for two NICs: no built-in load"; return 1; }
+    NI0=$(nic_index "$D0" 0); NI1=$(nic_index "$D1" 1)
+    say "icx: in0's NIC $D0 = ${SERVER_INTFS[$NI0]} -> styx ${CLIENT_NIC_IPS[$NI0]}; in1's NIC $D1 = ${SERVER_INTFS[$NI1]} -> styx ${CLIENT_NIC_IPS[$NI1]}"
+    if pgrep -f 'alias-rdm[a] --role client' > /dev/null; then
+        sum "icx: an alias-rdma client already runs here (a campaign?): stop it first"; return 1
+    fi
+    ALIAS_RDMA=$(bash "$HERE/alias/alias-run.sh" --build alias-rdma 2>&1 | tail -1)
+    [ -x "$ALIAS_RDMA" ] || { sum "icx: alias-rdma does not build here: $ALIAS_RDMA"; return 1; }
+    R_ALIAS_RDMA=$(rsh_try "bash '$HERE/alias/alias-run.sh' --build alias-rdma" 2>&1 | tail -1)
+    rsh_try "test -x '$R_ALIAS_RDMA'" || { sum "icx: alias-rdma does not build on styx ($R_ALIAS_RDMA): same repo path there, git pull, libibverbs-dev"; return 1; }
+    local i
+    for i in "$NI0" "$NI1"; do
+        ping -c 2 -W 3 -I "${SERVER_INTFS[$i]}" "${CLIENT_NIC_IPS[$i]}" > /dev/null 2>&1 && continue
+        say "  NIC $i: no data-plane link: setup-envir.sh on both ends (as run-dualnic-experiment.sh)"
+        ( cd "$REPO/utils" && sudo -n bash setup-envir.sh -i "${SERVER_INTFS[$i]}" -a "${SERVER_NIC_IPS[$i]}" -m "${MTU:-4000}" \
+            --ring_buffer "${RING_BUFFER:-1024}" --buf "${SOCK_BUF_MB:-1}" ) >> "$LOG" 2>&1
+        rsh_try "cd '$REPO/utils' && sudo bash setup-envir.sh -i ${CLIENT_INTFS[$i]} -a ${CLIENT_NIC_IPS[$i]} -m ${MTU:-4000} --ring_buffer ${RING_BUFFER:-1024} --buf ${SOCK_BUF_MB:-1}" >> "$LOG" 2>&1
+        sleep 5
+        ping -c 2 -W 3 -I "${SERVER_INTFS[$i]}" "${CLIENT_NIC_IPS[$i]}" > /dev/null 2>&1 ||
+            { sum "icx: NIC $i (${SERVER_INTFS[$i]}) cannot reach styx's ${CLIENT_NIC_IPS[$i]}: no built-in load"; return 1; }
+    done
+    sum "icx: built-in load ready: alias-rdma $ALIAS_RDMA here, $R_ALIAS_RDMA on styx"
+}
+nic_alias_stop() {
+    sudo -n pkill -INT -f 'alias-rdm[a] --role client .*--name ridlive_nic' 2>/dev/null
+    wait_until 60 "the alias-rdma clients to end" sh -c "! pgrep -f 'alias-rdm[a] --role client .*--name ridlive_nic' > /dev/null"
+    rsh_try "sudo pkill -INT -f 'alias-rdm[a] --role server .*--port ($(nic_port "$NI0")|$(nic_port "$NI1"))( |\$)' > /dev/null 2>&1; screen -wipe > /dev/null 2>&1; true"
+    NIC_LOAD=0
+}
+nic_load_start() {   # <secs> <dir>: secs is ignored (runs until nic_load_end)
+    local d=${2:-$TD/load} i n port
+    mkdir -p "$d"
+    if [ -n "$LOAD_CMD" ]; then
+        say "  NIC load: $LOAD_CMD"
+        setsid bash -c "$LOAD_CMD" > "$d/load.txt" 2>&1 < /dev/null & LOAD_PID=$!
+        sleep 15
+        kill -0 "$LOAD_PID" 2>/dev/null || { say "  the NIC load ended at once (load.txt)"; LOAD_PID=""; return 1; }
+        return 0
+    fi
+    [ "$NIC_OK" = 1 ] || return 1
+    NIC_LOAD=1
+    for i in "$NI0" "$NI1"; do
+        port=$(nic_port "$i")
+        rsh_try "screen -dmS ridlive_srv$i bash -c \"sudo $R_ALIAS_RDMA --role server --netdev ${CLIENT_INTFS[$i]} --port $port --heartbeat 30 > /tmp/ridlive-srv$i.log 2>&1\""
+    done
+    sleep 2
+    for i in "$NI0" "$NI1"; do
+        port=$(nic_port "$i"); rm -f "$d/ready-nic$i"
+        sudo -n setsid "$ALIAS_RDMA" --role client --netdev "${SERVER_INTFS[$i]}" --server-ip "${CLIENT_NIC_IPS[$i]}" --port "$port" \
+            --qps 4 --depth 16 --bs 4096 --ws 64 --stride 1 --warm 2 --seconds 0 --heartbeat 10 \
+            $( [ -n "${SERVER_CORES[$i]:-}" ] && echo "--cpu ${SERVER_CORES[$i]%%,*}" ) \
+            --name "ridlive_nic$i" --out "$d/fio-nic$i" --ready-file "$d/ready-nic$i" > "$d/alias-rdma-nic$i.log" 2>&1 < /dev/null &
+    done
+    n=0
+    until [ -e "$d/ready-nic$NI0" ] && [ -e "$d/ready-nic$NI1" ]; do
+        sleep 1; n=$((n + 1)); [ $((n % 10)) = 0 ] && say "  ... waiting for the NIC load to start (${n} s)"
+        if [ "$n" -ge 90 ]; then
+            say "  the NIC load did not start: $(tail -2 "$d"/alias-rdma-nic*.log | xargs | cut -c1-300)"
+            nic_alias_stop; return 1
+        fi
+    done
+    sleep 4
+    say "  NICs under load (alias-rdma READs, 4 QPs x depth 16, ws 64, both NICs; $d)"
 }
 nic_load_end() {
-    [ -n "$LOAD_PID" ] || return 0
-    kill -INT -- -"$LOAD_PID" 2>/dev/null || kill -INT "$LOAD_PID" 2>/dev/null
-    wait_until 120 "the NIC load to end" sh -c "! kill -0 $LOAD_PID 2>/dev/null"
-    LOAD_PID=""
+    if [ -n "$LOAD_PID" ]; then
+        kill -INT -- -"$LOAD_PID" 2>/dev/null || kill -INT "$LOAD_PID" 2>/dev/null
+        wait_until 120 "the NIC load to end" sh -c "! kill -0 $LOAD_PID 2>/dev/null"
+        LOAD_PID=""; return 0
+    fi
+    [ "$NIC_LOAD" = 1 ] || return 0
+    nic_alias_stop
+    ! grep -q -E '^ERROR|READ on QP .* failed' "$TD"/load/alias-rdma-nic*.log 2>/dev/null
 }
-load_start() { if [ "$KIND" = ssd ]; then hold_load_start "$@"; else nic_load_start; fi; }
+load_start() { if [ "$KIND" = ssd ]; then hold_load_start "$@"; else nic_load_start "$@"; fi; }
 load_end() { if [ "$KIND" = ssd ]; then hold_load_end; else nic_load_end; fi; }
-# pages the NICs read, from a 2 s TLP log under load: $OUT/pages/in0.txt, in1.txt (IOVA page addresses)
-harvest() {
-    local d="$OUT/pages"; mkdir -p "$d"
-    pipsc log-clear >> "$LOG" 2>&1; pipsc log-start >> "$LOG" 2>&1; sleep 2
-    pipsc log-stop 3000 >> "$LOG" 2>&1; pipsc log-dump "$d/log.bin" >> "$LOG" 2>&1
-    python3 "$HERE/pips-log-decode.py" "$d/log.bin" --design-id 0x0a08 --csv "$d/log.csv" > "$d/decode.txt" 2>&1
-    python3 - "$d" <<'PYEOF'
-import csv, sys
-d = sys.argv[1]
-pages = {0: {}, 1: {}}
-with open(f"{d}/log.csv") as f:
-    r = csv.reader(l for l in f if not l.startswith("#"))
-    h = next(r)
-    ip, it, ia = h.index("port"), h.index("type"), h.index("addr")
-    for row in r:
-        if row[it] != "MRd":
-            continue
-        port = 0 if row[ip] in ("in0", "0") else 1 if row[ip] in ("in1", "1") else None
-        if port is None:
-            continue
-        pg = int(row[ia], 0) >> 12
-        pages[port][pg] = pages[port].get(pg, 0) + 1
-for p in (0, 1):
-    with open(f"{d}/in{p}.txt", "w") as o:
-        for pg in sorted(pages[p]):
-            o.write(f"0x{pg << 12:x} {pages[p][pg]}\n")
-    print(f"in{p}: {len(pages[p])} distinct pages read by the device")
-PYEOF
+
+# icx: pips_bg_region.ko for both NICs: RGN_N pages from each NIC's base RB0 / RB1, page k = k mod RGN_BK in
+# DW0 and the NIC's number in DW1. A reload unmaps (flushing those IOTLB entries) and maps again.
+RGN_N=65536; RGN_BK=8192; RB0=""; RB1=""
+nic_region_load() {
+    local d="$OUT/rgn" r
+    if [ ! -e "$d/pips_bg_region.ko" ]; then
+        [ -d "/lib/modules/$(uname -r)/build" ] || { sum "icx: no kernel headers (/lib/modules/$(uname -r)/build): install linux-headers-$(uname -r)"; return 1; }
+        mkdir -p "$d" && cp "$HERE/ridcheck/pips_bg_region.c" "$HERE/ridcheck/Makefile" "$d/"
+        make -C "$d" MODS=pips_bg_region > "$d/build.txt" 2>&1 || { sum "icx: pips_bg_region does not build ($d/build.txt)"; return 1; }
+    fi
+    lsmod | grep -q '^pips_bg_region ' && { sudo -n rmmod pips_bg_region || return 1; }
+    RGN_LOADED=0
+    sudo -n insmod "$d/pips_bg_region.ko" dev="$D0,$D1" npages=$RGN_N backing=$RGN_BK token="$TOKEN" 2> "$d/insmod.txt" ||
+        { sum "icx: insmod pips_bg_region failed: $(cat "$d/insmod.txt") $(sudo -n dmesg | grep "pips_bg_region\[$TOKEN\]" | tail -2 | xargs)"; return 1; }
+    RGN_LOADED=1
+    r=$(sudo -n cat /sys/kernel/debug/pips_bg_region/regions 2>/dev/null); printf '%s\n' "$r" > "$d/regions.txt"
+    RB0=$(echo "$r" | awk -v d="$D0" '$2 == d { print $4 }'); RB1=$(echo "$r" | awk -v d="$D1" '$2 == d { print $4 }')
+    [ -n "$RB0" ] && [ -n "$RB1" ] || { sum "icx: the module's regions are not as expected: $r"; return 1; }
+    if echo "$r" | awk '{ for (i = 1; i < NF; i++) if ($i == "domain") print $(i + 1) }' | grep -q -v -E '^dma(-fq)?$'; then
+        sum "icx: a NIC is not in a translating DMA domain ($(echo "$r" | xargs)): boot with the IOMMU in strict or lazy mode"; return 1
+    fi
+    sleep 0.2   # lazy mode: the unmap's flush queue drains within ~10 ms
 }
 
 # ------------------------------------------------------------------ setup
@@ -415,7 +503,10 @@ if [ "$KIND" = ssd ]; then
         { sum "the holder's drives ($HD0, $HD1) are not the ones below in0/in1 ($D0, $D1): stop"; exit 2; }
     sum "holder: $HOLD ($(cat "$HOLD/state")); regions at IOVA $REG in each drive's domain"
 else
-    [ -n "$LOAD_CMD" ] || sum "icx: no --load-cmd: the tests that need pages the NICs have mapped (T2-T8) are skipped"
+    NIC_OK=0
+    if [ -n "$LOAD_CMD" ] || nic_setup; then NIC_OK=1; else sum "icx: no NIC load: T0's census, T4-T6 and T9 run without one or are skipped"; fi
+    nic_region_load || exit 2
+    sum "icx: pips_bg_region.ko: $RGN_N pages at IOVA $RB0 in $D0's domain, $RB1 in $D1's (page k = k mod $RGN_BK in DW0, the NIC's number in DW1)"
 fi
 pipsc bg stop 3000 >> "$LOG" 2>&1
 pipsc bg clear twice >> "$LOG" 2>&1
@@ -424,7 +515,8 @@ pipsc bg clear twice >> "$LOG" 2>&1
 begin T0 "baselines: host view, census under load, straddle and flow control" "RC_STRADDLE = 0 and RQ_STRADDLE = 0; census tag maps saved"
 if [ "$RIDCHECK" = 1 ]; then
     say "  pips-rid-check.sh --module --pt (host view; a few minutes)"
-    bash "$HERE/pips-rid-check.sh" --module --pt --iova "$REG,$((REG + 0x1000)),$((REG + 0x3f000))" --out "$TD/ridcheck" > "$TD/ridcheck.txt" 2>&1
+    IV=$REG; [ "$KIND" = nic ] && IV=$RB0
+    bash "$HERE/pips-rid-check.sh" --module --pt --iova "$IV,$((IV + 0x1000)),$((IV + 0x3f000))" --out "$TD/ridcheck" > "$TD/ridcheck.txt" 2>&1
     sum "   host view (pips-rid-check.sh, exit $?): $(grep -E '^(HOLDS|FAILS|NOT DECIDED)' "$TD/ridcheck/summary.txt" 2>/dev/null | head -1 | cut -c1-160)"
 fi
 pipsc bg facts clear >> "$LOG" 2>&1; pipsc bg census clear >> "$LOG" 2>&1
@@ -436,7 +528,6 @@ if load_start 45 "$TD/load"; then
 else
     sleep 5; pipsc bg census > "$TD/census.txt" 2>&1; pipsc bg facts > "$TD/facts.txt" 2>&1
 fi
-[ "$KIND" = nic ] && [ "$T0_LOAD" = 1 ] && { say "  harvesting the NICs' pages from a TLP log"; load_start && { harvest | tee -a "$SUM"; load_end; }; }
 sum "   census: in0 $(kv in0_mrd "$TD/census.txt") MRd, tags $(kv in0_tags "$TD/census.txt") (max $(kv in0_tag_max "$TD/census.txt"), free $(kv in0_free_max "$TD/census.txt")); in1 $(kv in1_mrd "$TD/census.txt") MRd, tags $(kv in1_tags "$TD/census.txt") (free $(kv in1_free_max "$TD/census.txt"))"
 sum "   facts: rc_straddle $(kv rc_straddle "$TD/facts.txt") rq_straddle $(kv rq_straddle "$TD/facts.txt") tfc_present $(kv tfc_present "$TD/facts.txt") nph_av $(kv tfc_nph_av "$TD/facts.txt") (min $(kv tfc_nph_min "$TD/facts.txt")) npd_av $(kv tfc_npd_av "$TD/facts.txt") hol_device $(kv hol_device "$TD/facts.txt")"
 # The engine's tags. The core (client tags on) tracks requests by tag alone, and the devices' tags pass through
@@ -484,25 +575,26 @@ decide_stop() {   # <why>: stop here unless --keep-going
 STOPPED=""
 [ "${V[T0]}" = FAIL ] && decide_stop "T0: straddle"
 
-# The pages for T1-T3: bigserver regions (drive 0 ws 64, drive 1 ws 16: page 32 only in drive 0's);
-# icx: the harvested pages.
-PG0=""; PG1=""; NPG0=0; NPG1=0; IBASE=0
-icx_pages() {   # base = the lowest page of both; table index of each page
-    [ -s "$OUT/pages/in0.txt" ] || return 1
-    IBASE=$(python3 -c "import sys; print(hex(min(int(l.split()[0], 16) for f in sys.argv[1:] for l in open(f) if l.strip())))" "$OUT/pages/in0.txt" "$OUT/pages/in1.txt" 2>/dev/null)
-    NPG0=$(wc -l < "$OUT/pages/in0.txt"); NPG1=$(wc -l < "$OUT/pages/in1.txt" 2>/dev/null || echo 0)
-    [ -n "$IBASE" ]
+# The pages: bigserver: the holder's regions at REG in both drives' domains (hold_map sets them and BK0/BK1);
+# icx: pips_bg_region's, B0 in NIC 0's domain, B1 in NIC 1's. A table mixing both ports reads from BB with
+# the offsets O0/O1 (pages); the regions are size-aligned, so the offsets keep k mod backing.
+nic_bases() {
+    if [ "$KIND" = ssd ]; then B0=$REG; B1=$REG; BB=$REG; O0=0; O1=0; return; fi
+    B0=$RB0; B1=$RB1; BK0=$RGN_BK; BK1=$RGN_BK
+    if [ $((RB0)) -le $((RB1)) ]; then BB=$RB0; else BB=$RB1; fi
+    O0=$(( (RB0 - BB) / 4096 )); O1=$(( (RB1 - BB) / 4096 ))
 }
-idx_list() {   # <in0|in1> <n> <slot>: table lines "index:slot" of the first n harvested pages
-    local a _
-    head -n "$2" "$OUT/pages/$1.txt" | while read -r a _; do echo "$(( (a - IBASE) / 4096 )):$3"; done
+t8_ok() {   # a mixed table reaches both regions from BB: indices < 2^30; the data check needs offsets = 0 mod backing
+    T8DC="dcheck=1 backing=$BK0"; [ $(( O0 % BK0 )) = 0 ] && [ $(( O1 % BK0 )) = 0 ] || T8DC="dcheck=0"
+    [ $(( (O0 > O1 ? O0 : O1) + 70000 )) -lt $(( 1 << 30 )) ]
 }
+nic_bases
 
 # ------------------------------------------------------------------ T1
 if [ -z "$STOPPED" ] && want T1; then
     begin T1 "one read under the upstream port's ID (A4)" "one completion comes back (UR/CA expected: nothing is mapped for the usp), timeouts 0, no leak"
-    if [ "$KIND" = ssd ]; then hold_map 64 1 16 1; B=$REG; else icx_pages && B=$IBASE || B=$REG; fi
-    erun usp rid=usp base="$B" ws=1 count=1
+    [ "$KIND" = ssd ] && hold_map 64 1 16 1
+    erun usp rid=usp base="$B0" ws=1 count=1
     f="$TD/usp.txt"
     pipsc bg capture 1 > "$TD/capture.txt" 2>&1
     sum "   completion: sc $(kv cpl_sc "$f") ur $(kv cpl_ur "$f") ca $(kv cpl_ca "$f") other $(kv cpl_other "$f") timeouts $(kv timeouts "$f"); $(grep '^cap ' "$TD/capture.txt" | cut -c1-200)"
@@ -520,38 +612,30 @@ if [ -z "$STOPPED" ] && want T2; then
     begin T2 "the main assumption: a downstream port's ID reads through its device's domain (A1-A3)" \
         "per port: SC, payload = the page's tag, no DMAR fault, LEAK_CPL 0, AER unchanged; then 64 (in0) / 16 (in1) reads, all SC, no data mismatch"
     ok=1; why=""
-    if [ "$KIND" = ssd ]; then
-        hold_map 64 1 16 1
-        erun in0-one rid=in0 base=$REG first=5 ws=1 count=1 dcheck=1 backing=$BK0
-        erun in0-64 rid=in0 base=$REG ws=64 count=64 dcheck=1 backing=$BK0
-        erun in1-one rid=in1 base=$REG first=7 ws=1 count=1 dcheck=1 backing=$BK1
-        erun in1-16 rid=in1 base=$REG ws=16 count=16 dcheck=1 backing=$BK1
+    [ "$KIND" = ssd ] && hold_map 64 1 16 1
+    erun in0-one rid=in0 base=$B0 first=5 ws=1 count=1 dcheck=1 backing=$BK0
+    erun in0-64 rid=in0 base=$B0 ws=64 count=64 dcheck=1 backing=$BK0
+    erun in1-one rid=in1 base=$B1 first=7 ws=1 count=1 dcheck=1 backing=$BK1
+    erun in1-16 rid=in1 base=$B1 ws=16 count=16 dcheck=1 backing=$BK1
+    for p in in0 in1; do
+        o="$TD/$p-one.txt"; m="$TD/$p-$([ $p = in0 ] && echo 64 || echo 16).txt"; want_tag=$([ $p = in0 ] && echo 5 || echo 7)
+        n=$([ $p = in0 ] && echo 64 || echo 16)
+        line="$p: one read sc $(kv cpl_sc "$o") ur $(kv cpl_ur "$o") ca $(kv cpl_ca "$o") timeouts $(kv timeouts "$o") data $(kv last_data "$o") (tag $want_tag); $n reads: sc $(kv cpl_sc "$m")/$n mismatch $(kv data_mismatch "$m") lat_mean $(kv lat_mean_ns "$m") ns"
+        sum "   $line"
+        if [ "$(kv cpl_sc "$o")" = 1 ] && [ $(( $(kv last_data "$o") )) = "$want_tag" ] && [ "$(kv cpl_sc "$m")" = "$n" ] && [ "$(kv data_mismatch "$m")" = 0 ]; then :; else
+            ok=0; why="$why $p"
+            if [ "$(cpl_total "$o")" = 0 ]; then T2_KIND=${T2_KIND:-nocpl}; else T2_KIND=${T2_KIND:-fault}; fi
+        fi
+    done
+    if [ "$KIND" = nic ]; then   # DW1 = the NIC whose region answered: each port must reach its own NIC's
         for p in in0 in1; do
-            o="$TD/$p-one.txt"; m="$TD/$p-$([ $p = in0 ] && echo 64 || echo 16).txt"; want_tag=$([ $p = in0 ] && echo 5 || echo 7)
-            n=$([ $p = in0 ] && echo 64 || echo 16)
-            line="$p: one read sc $(kv cpl_sc "$o") ur $(kv cpl_ur "$o") ca $(kv cpl_ca "$o") timeouts $(kv timeouts "$o") data $(kv last_data "$o") (tag $want_tag); $n reads: sc $(kv cpl_sc "$m")/$n mismatch $(kv data_mismatch "$m") lat_mean $(kv lat_mean_ns "$m") ns"
-            sum "   $line"
-            if [ "$(kv cpl_sc "$o")" = 1 ] && [ $(( $(kv last_data "$o") )) = "$want_tag" ] && [ "$(kv cpl_sc "$m")" = "$n" ] && [ "$(kv data_mismatch "$m")" = 0 ]; then :; else
-                ok=0; why="$why $p"
-                if [ "$(cpl_total "$o")" = 0 ]; then T2_KIND=${T2_KIND:-nocpl}; else T2_KIND=${T2_KIND:-fault}; fi
-            fi
+            want_n=$([ $p = in0 ] && echo 1 || echo 2); pb=$([ $p = in0 ] && echo "$B0" || echo "$B1")
+            erun "$p-id" rid=$p base="$pb" first=9 ws=1 count=1 dw=2
+            pipsc bg capture 1 > "$TD/$p-id-capture.txt" 2>&1
+            d1=$(grep -o 'dw1=0x[0-9a-f]*' "$TD/$p-id-capture.txt" | head -1 | cut -d= -f2)
+            sum "   $p: a 2-DW read: sc $(kv cpl_sc "$TD/$p-id.txt") DW0 $(grep -o 'dw0=0x[0-9a-f]*' "$TD/$p-id-capture.txt" | head -1 | cut -d= -f2) DW1 ${d1:-?} (NIC $want_n's region)"
+            [ "$(kv cpl_sc "$TD/$p-id.txt")" = 1 ] && [ $(( ${d1:-0} )) = "$want_n" ] || { ok=0; why="$why $p(region of NIC $(( ${d1:-0} )))"; T2_KIND=${T2_KIND:-fault}; }
         done
-    elif icx_pages; then
-        for p in in0 in1; do
-            n=$([ $p = in0 ] && echo "$NPG0" || echo "$NPG1"); [ "$n" -gt 64 ] && n=64
-            [ "$n" -gt 0 ] || { sum "   $p: no harvested pages"; ok=0; why="$why $p(no-pages)"; continue; }
-            idx_list $p "$n" 0 > "$TD/$p.tbl"
-            tblrun "$p-$n" "$TD/$p.tbl" rid=$p base="$IBASE" count="$n"
-            m="$TD/$p-$n.txt"
-            pipsc bg capture 8 > "$TD/$p-capture.txt" 2>&1
-            sum "   $p: $n harvested pages: sc $(kv cpl_sc "$m")/$n ur $(kv cpl_ur "$m") ca $(kv cpl_ca "$m") timeouts $(kv timeouts "$m"); first DWs: $(grep -o 'dw0=0x[0-9a-f]*' "$TD/$p-capture.txt" | head -8 | cut -d= -f2 | xargs)"
-            if [ "$(kv cpl_sc "$m")" != "$n" ]; then
-                ok=0; why="$why $p"
-                if [ "$(cpl_total "$m")" = 0 ]; then T2_KIND=${T2_KIND:-nocpl}; else T2_KIND=${T2_KIND:-fault}; fi
-            fi
-        done
-    else
-        end SKIP "icx without harvested pages (--load-cmd)"; T2_KIND=skip
     fi
     if [ "$T2_KIND" != skip ]; then
         kseg T2 "$TD/dmesg-now.txt"
@@ -568,29 +652,24 @@ F0=0; [ "${V[T2]:-}" = PASS ] && F0=1
 
 # ------------------------------------------------------------------ T3
 if [ -z "$STOPPED" ] && [ "$F0" = 1 ] && want T3; then
-    if [ "$KIND" = ssd ]; then
-        begin T3 "isolation: each port uses its own device's domain (A1)" \
-            "page 32 (mapped only in drive 0's domain): in0's port SC with tag 32; in1's port UR/CA and a DMAR fault naming it"
-        hold_map 64 1 16 1
-        erun in0-p32 rid=in0 base=$REG first=32 ws=1 count=1 dcheck=1 backing=$BK0
-        erun in1-p32 rid=in1 base=$REG first=32 ws=1 count=1
-        a="$TD/in0-p32.txt"; b="$TD/in1-p32.txt"
-        kseg T3 "$TD/dmesg-now.txt"; f1=$(dmar_for "$TD/dmesg-now.txt" "$P1")
-        sum "   in0 port: sc $(kv cpl_sc "$a") data $(kv last_data "$a"); in1 port: sc $(kv cpl_sc "$b") ur $(kv cpl_ur "$b") ca $(kv cpl_ca "$b") data $(kv last_data "$b"); DMAR naming in1's port: $f1"
-        if [ "$(kv cpl_sc "$a")" = 1 ] && [ $(( $(kv last_data "$a") )) = 32 ] && [ "$(kv cpl_sc "$b")" = 0 ] && [ "$(cpl_total "$b")" = 1 ]; then
-            end PASS "each port translates in its own device's domain$( [ "$f1" = 0 ] && echo " (no DMAR line naming in1's port: rate-limited or not logged)")"
-        else
-            end FAIL "the ports do not keep to their devices' domains (in1's port read page 32: data $(kv last_data "$b")): F0 is not isolated"
-            decide_stop "T3: isolation"
-        fi
+    begin T3 "isolation: each port uses its own device's domain (A1)" \
+        "page 32 of device 0's pages: in0's port SC with tag 32; in1's port UR/CA (bigserver: mapped only in drive 0's domain), or on icx SC from another mapping (DW1 not 1)"
+    [ "$KIND" = ssd ] && hold_map 64 1 16 1
+    erun in0-p32 rid=in0 base=$B0 first=32 ws=1 count=1 dcheck=1 backing=$BK0
+    erun in1-p32 rid=in1 base=$B0 first=32 ws=1 count=1 dw=2
+    pipsc bg capture 1 > "$TD/in1-p32-capture.txt" 2>&1
+    a="$TD/in0-p32.txt"; b="$TD/in1-p32.txt"
+    d1=$(grep -o 'dw1=0x[0-9a-f]*' "$TD/in1-p32-capture.txt" | head -1 | cut -d= -f2)
+    kseg T3 "$TD/dmesg-now.txt"; f1=$(dmar_for "$TD/dmesg-now.txt" "$P1")
+    sum "   in0 port: sc $(kv cpl_sc "$a") data $(kv last_data "$a"); in1 port: sc $(kv cpl_sc "$b") ur $(kv cpl_ur "$b") ca $(kv cpl_ca "$b") data $(kv last_data "$b") DW1 ${d1:-?}; DMAR naming in1's port: $f1"
+    iso=""
+    if [ "$(kv cpl_sc "$b")" = 0 ] && [ "$(cpl_total "$b")" = 1 ]; then iso="UR/CA through in1's port"
+    elif [ "$KIND" = nic ] && [ "$(kv cpl_sc "$b")" = 1 ] && [ $(( ${d1:-1} )) != 1 ]; then iso="in1's port reached another mapping at that IOVA (DW1 ${d1}: $( [ $(( d1 )) = 2 ] && echo "NIC 1's region" || echo "not a region page"))"; fi
+    if [ "$(kv cpl_sc "$a")" = 1 ] && [ $(( $(kv last_data "$a") )) = 32 ] && [ -n "$iso" ]; then
+        end PASS "each port translates in its own device's domain: $iso$( [ "$f1" = 0 ] && [ "$(kv cpl_sc "$b")" = 0 ] && echo " (no DMAR line naming in1's port: rate-limited or not logged)")"
     else
-        begin T3 "isolation, icx (informative: both NICs' IOVA allocators may hand out the same IOVAs)" "in0's pages through in1's port: UR/CA, unless the IOVA is mapped there too"
-        if icx_pages && [ "$NPG0" -gt 0 ]; then
-            n=$(( NPG0 < 16 ? NPG0 : 16 ))
-            idx_list in0 "$n" 0 > "$TD/x.tbl"; tblrun cross "$TD/x.tbl" rid=in1 base="$IBASE" count="$n"
-            sum "   in0's $n pages through in1's port: sc $(kv cpl_sc "$TD/cross.txt") ur $(kv cpl_ur "$TD/cross.txt") ca $(kv cpl_ca "$TD/cross.txt")"
-            end INFO "see the counts (an SC here is not proof of sharing on icx)"
-        else end SKIP "no harvested pages"; fi
+        end FAIL "the ports do not keep to their devices' domains (in1's port read page 32: data $(kv last_data "$b") DW1 ${d1:-?}): F0 is not isolated"
+        decide_stop "T3: isolation"
     fi
 fi
 
@@ -613,9 +692,7 @@ if [ -z "$STOPPED" ] && [ "$F0" = 1 ] && want T4; then
         for arb in idle engine; do for i in $IVLS; do for m in $MOS; do
             [ "$ABORT" = 1 ] && break 3
             c="t-$arb-i$i-m$m"
-            if [ "$KIND" = ssd ]; then base=(base=$REG ws=64); else
-                idx_list in0 "$(( NPG0 < 64 ? NPG0 : 64 ))" 0 > "$TD/t.tbl"; pipsc bg table load "$TD/t.tbl" >> "$LOG" 2>&1
-                base=(src=table base="$IBASE" ws="$(( NPG0 < 64 ? NPG0 : 64 ))"); fi
+            base=(base=$B0 ws=64)
             t0=$(now_ms)
             erun "$c" rid=in0 "${base[@]}" count=0 interval="$i" maxout="$m" arb="$arb" secs=20
             printf '%s\t%s\t%s\n' "$c" "$t0" "$(now_ms)" >> "$TD/windows.tsv"
@@ -631,20 +708,23 @@ if [ -z "$STOPPED" ] && [ "$F0" = 1 ] && want T4; then
         say "  20 s without the engine (baseline B)"; t0=$(now_ms); sleep 20; printf 'base-b\t%s\t%s\n' "$t0" "$(now_ms)" >> "$TD/windows.tsv"
         load_end; lok=$?
         tab "$TD/trains.tsv" | sed 's/^/   /' | tee -a "$SUM" > /dev/null
-        # the devices' throughput in each window (bigserver: the holder's per-second IOPS logs)
-        if [ "$KIND" = ssd ]; then
-            python3 - "$TD" <<'PYEOF' | tee "$TD/iops.tsv" | sed 's/^/   /' | tee -a "$SUM"
-import glob, sys, collections
-d = sys.argv[1]
+        # the devices' throughput in each window (bigserver: the holder's per-second IOPS logs; icx: alias-rdma's)
+        if ls "$TD"/load/fio-*_iops.1.log > /dev/null 2>&1; then
+            python3 - "$TD" "$KIND" "$NI0" <<'PYEOF' | tee "$TD/iops.tsv" | sed 's/^/   /' | tee -a "$SUM"
+import glob, re, sys, collections
+d, kind, ni0 = sys.argv[1], sys.argv[2], int(sys.argv[3])
 per = {0: collections.Counter(), 1: collections.Counter()}
-for f in glob.glob(f"{d}/load/fio-ssd*-*_iops.1.log"):
-    dev = int(f.split("fio-ssd")[1].split("-")[0])
+for f in glob.glob(f"{d}/load/fio-*_iops.1.log"):
+    m = re.search(r"fio-(ssd|nic)(\d)", f)
+    if not m:
+        continue
+    dev = int(m.group(2)) if m.group(1) == "ssd" else (0 if int(m.group(2)) == ni0 else 1)
     for l in open(f):
         p = l.split(",")
         if len(p) > 1:
             per[dev][int(p[0]) // 1000] += float(p[1])
 win = [l.rstrip("\n").split("\t") for l in open(f"{d}/windows.tsv")][1:]
-print("window\tkiops_ssd0\tkiops_ssd1\tseconds")
+print(f"window\tkiops_{kind}0\tkiops_{kind}1\tseconds")
 for name, a, b in win:
     s0, s1 = int(a) // 1000 + 1, int(b) // 1000 - 1
     secs = [s for s in range(s0, s1 + 1) if s in per[0]]
@@ -715,12 +795,14 @@ if [ -z "$STOPPED" ] && [ "$F0" = 1 ] && want T7; then
         hold_map 256 262144 64 1
         erun s262144 rid=in0 base=$REG ws=256 stride=262144 count=4096 interval=1000 trace=1 dcheck=1 backing=$BK0
         pipsc bg trace "$TD/s262144.csv" > "$TD/s262144-trace.txt" 2>&1
-    elif icx_pages && [ "$NPG0" -ge 16 ]; then
-        idx_list in0 8 0 > "$TD/h.tbl"; tblrun hit "$TD/h.tbl" rid=in0 base="$IBASE" count=4160 tskip=64 interval=1000 trace=1
+    else   # icx: NIC 0's region (256 MiB of IOVA): ws 4096 cyclic misses the 32 x 8 IOTLB; stride 512 (one set) fits, 1 GiB does not
+        erun hit rid=in0 base=$B0 ws=8 count=4160 tskip=64 interval=1000 trace=1 dcheck=1 backing=$BK0
         pipsc bg trace "$TD/hit.csv" > "$TD/hit-trace.txt" 2>&1
-        idx_list in0 "$NPG0" 0 > "$TD/m.tbl"; tblrun miss "$TD/m.tbl" rid=in0 base="$IBASE" count=4096 interval=1000 trace=1
+        erun miss rid=in0 base=$B0 ws=4096 count=4096 interval=1000 trace=1 dcheck=1 backing=$BK0
         pipsc bg trace "$TD/miss.csv" > "$TD/miss-trace.txt" 2>&1
-        sum "   icx: 'miss' = all $NPG0 harvested pages cyclic ($( [ "$NPG0" -lt 512 ] && echo "fewer than 2x the IOTLB's 256 entries: partly hits" || echo ok))"
+        erun s512 rid=in0 base=$B0 ws=128 stride=512 count=4096 interval=1000 trace=1 dcheck=1 backing=$BK0
+        pipsc bg trace "$TD/s512.csv" > "$TD/s512-trace.txt" 2>&1
+        sum "   icx: s512 = 128 pages 2 MiB apart; no 1 GiB stride run (the region is 256 MiB)"
     fi
     if [ -s "$TD/hit.csv" ] && [ -s "$TD/miss.csv" ]; then
         out=$(python3 - "$TD" <<'PYEOF'
@@ -770,7 +852,7 @@ if [ -z "$STOPPED" ] && [ "$F0" = 1 ] && want T8; then
     begin T8 "one IOTLB for all domains (A7); does reuse protect an entry" \
         "from a flushed IOTLB, fresh pages: 'once' sets the capacity C (P misses >= 0.5); 'cross' misses at N >= C as 'once' -> shared, else partitioned; 'twice' vs 'once' at N >= C -> reuse protection"
     [ -n "$HIT_THR" ] || sum "   no hit/miss threshold from T7: the miss fractions are not computed"
-    [ "$KIND" = nic ] && sum "   icx: no IOTLB flush between runs (the NICs' mappings): pages are fresh within a run only"
+    [ "$KIND" = nic ] && sum "   icx: every run reloads pips_bg_region.ko (its unmap flushes the regions' IOTLB entries)"
     printf 'n\tcase\tprobes\tprobe_miss\tfill_miss\tprobe_p50_ns\tfirst_p50_ns\tprobe_by_round\n' > "$TD/t8.tsv"
     for N in 32 64 96 128 192 256 384 512; do
         R=$(( 4096 / (N + 3) )); [ "$R" -gt 16 ] && R=16
@@ -778,27 +860,19 @@ if [ -z "$STOPPED" ] && [ "$F0" = 1 ] && want T8; then
             [ "$ABORT" = 1 ] && break 2
             t="$TD/$case-$N.tbl"
             if [ "$KIND" = ssd ]; then
-                awk -v N="$N" -v R="$R" -v c="$case" 'BEGIN { for (r = 0; r < R; r++) {
-                    print r ":0"; if (c == "twice") print r ":0"
-                    for (j = 0; j < N; j++) print (1000 + r * N + j) ":" (c == "cross" ? 1 : 0)
-                    print r ":0" } }' > "$t"
                 hold_map 8192 1 8192 1 > /dev/null   # flushes both regions' IOTLB entries; tags = page mod 8192
-                b=$REG
             else
-                need=$(( R * (N + 1) ))
-                if [ "$NPG0" -lt "$need" ] || { [ "$case" = cross ] && [ "$NPG1" -lt $(( R * N )) ]; }; then
-                    sum "   icx: too few harvested pages for N $N ($case)"; continue
-                fi
-                idx_list in0 "$need" 0 > "$TD/p0.lst"; idx_list in1 $(( R * N )) 1 > "$TD/p1.lst"
-                awk -v N="$N" -v R="$R" -v c="$case" 'FNR == NR { a[n0++] = $0; next } { b1[n1++] = $0 }
-                    END { for (r = 0; r < R; r++) { print a[r]; if (c == "twice") print a[r]
-                        for (j = 0; j < N; j++) print (c == "cross" ? b1[r * N + j] : a[R + r * N + j]); print a[r] } }' \
-                    "$TD/p0.lst" "$TD/p1.lst" > "$t"
-                b=$IBASE
+                nic_region_load > /dev/null || { sum "   icx: the region reload failed: stop T8"; break 2; }
+                nic_bases
             fi
+            t8_ok || { sum "   icx: the NICs' regions are too far apart for one table ($B0, $B1): stop T8"; break 2; }
+            awk -v N="$N" -v R="$R" -v c="$case" -v o0="$O0" -v o1="$O1" 'BEGIN { for (r = 0; r < R; r++) {
+                print (o0 + r) ":0"; if (c == "twice") print (o0 + r) ":0"
+                for (j = 0; j < N; j++) print (c == "cross" ? o1 + 1000 + r * N + j ":1" : o0 + 1000 + r * N + j ":0")
+                print (o0 + r) ":0" } }' > "$t"
+            b=$BB
             n=$(wc -l < "$t")
-            tblrun "$case-$N" "$t" rid=in0 rid1=in1 base="$b" count="$n" interval=1000 maxout=1 trace=1 \
-                $( [ "$KIND" = ssd ] && echo dcheck=1 backing="$BK0" )
+            tblrun "$case-$N" "$t" rid=in0 rid1=in1 base="$b" count="$n" interval=1000 maxout=1 trace=1 $T8DC
             pipsc bg trace "$TD/$case-$N.csv" > /dev/null 2>&1
             python3 - "$TD/$case-$N.csv" "$N" "$R" "$case" "${HIT_THR:-0}" <<'PYEOF' >> "$TD/t8.tsv"
 import csv, sys
@@ -934,20 +1008,16 @@ if [ "$ABORT" = 0 ] && [ "$RUN10" = 1 ] && want T10; then
         lo=${W%-*}; hi=${W#*-}; wn=$((hi - lo + 1)); mo=$(( wn < 8 ? wn : 8 ))
         F2KV="rid=dev0 unsafe=1 tagwin=$W ridtag=1"
         pipsc bg census clear >> "$LOG" 2>&1
-        [ "$KIND" = ssd ] && { hold_map 64 1 64 1; B=$REG; } || { icx_pages; B=$IBASE; }
-        if [ "$KIND" = ssd ]; then
-            erun f2-idle-64 $F2KV base=$B ws=64 count=64 maxout=$mo dcheck=1 backing=$BK0
-        else
-            idx_list in0 "$(( NPG0 < 64 ? NPG0 : 64 ))" 0 > "$TD/i.tbl"; tblrun f2-idle-64 "$TD/i.tbl" $F2KV base=$B count=64 maxout=$mo
-        fi
+        [ "$KIND" = ssd ] && hold_map 64 1 64 1
+        B=$B0
+        erun f2-idle-64 $F2KV base=$B ws=64 count=64 maxout=$mo dcheck=1 backing=$BK0
         bad=""
         f="$TD/f2-idle-64.txt"; [ "$(kv cpl_sc "$f")" = 64 ] && [ "$(kv clash "$f")" = 0 ] && [ "$(kv leak_cpl "$f")" = 0 ] && [ "$(kv data_mismatch "$f")" = 0 ] || bad="$bad idle"
         sum "   idle: sc $(kv cpl_sc "$f")/64 mismatch $(kv data_mismatch "$f") clash $(kv clash "$f") leak $(kv leak_cpl "$f") win_hits $(kv win_hits "$f")"
         if [ -z "$bad" ] && load_start 200 "$TD/load"; then
             for i in 100 10 1; do for m in 1 "$mo"; do
                 [ "$ABORT" = 1 ] && break 2
-                if [ "$KIND" = ssd ]; then erun "f2-i$i-m$m" $F2KV base=$B ws=64 count=1000000 interval=$i maxout=$m secs=20
-                else tblrun "f2-i$i-m$m" "$TD/i.tbl" $F2KV base=$B count=1000000 interval=$i maxout=$m secs=20; fi
+                erun "f2-i$i-m$m" $F2KV base=$B ws=64 count=0 interval=$i maxout=$m secs=20
                 f="$TD/f2-i$i-m$m.txt"
                 [ "$(kv clash "$f")" = 0 ] && [ "$(kv leak_cpl "$f")" = 0 ] && [ "$(kv cpl_sc "$f")" = "$(kv issued "$f")" ] || bad="$bad i$i-m$m"
             done; done
@@ -974,8 +1044,7 @@ if [ "$ABORT" = 0 ] && [ "$T12" = 1 ] && [ -z "$STOPPED" ] && want T12; then
         [ "$KIND" = ssd ] && hold_map 64 1 64 1
         if load_start $((S + 60)) "$TD/load"; then
             if [ "$MODE" = F0 ]; then KVS="rid=in0"; else KVS="rid=dev0 unsafe=1 tagwin=$W ridtag=1"; fi
-            if [ "$KIND" = ssd ]; then erun soak $KVS base=$REG ws=64 count=0 interval=$SOAK_IVL maxout=$SOAK_MO arb=idle secs=$S beat=60
-            else idx_list in0 "$(( NPG0 < 64 ? NPG0 : 64 ))" 0 > "$TD/s.tbl"; tblrun soak "$TD/s.tbl" $KVS base="$IBASE" count=0 interval=$SOAK_IVL maxout=$SOAK_MO arb=idle secs=$S beat=60; fi
+            erun soak $KVS base=$B0 ws=64 count=0 interval=$SOAK_IVL maxout=$SOAK_MO arb=idle secs=$S beat=60
             load_end; lok=$?
             f="$TD/soak.txt"
             sum "   issued $(kv issued "$f") sc $(kv cpl_sc "$f") timeouts $(kv timeouts "$f") unexpected $(kv cpl_unexpected "$f") leak $(kv leak_cpl "$f") rate $(kv issue_rate_mrd_s "$f")/s lat_mean $(kv lat_mean_ns "$f") ns; load $([ $lok = 0 ] && echo ok || echo FAILED)"
@@ -1013,6 +1082,9 @@ sum ""
 sum "done in $(( (SECONDS - T_START) / 60 )) min; output $OUT"
 if [ "$KIND" = ssd ]; then
     sum "the drives stay held by the holder ($HOLD); end with a reboot: sync; sudo systemctl reboot -ff"
+else
+    [ "$RGN_LOADED" = 1 ] && sudo -n rmmod pips_bg_region && RGN_LOADED=0
+    sum "icx: pips_bg_region unloaded$( [ "$RGN_LOADED" = 1 ] && echo " (rmmod FAILED: sudo rmmod pips_bg_region)"); the NICs stay on mlx5, nothing to reboot"
 fi
 ( cd "$(dirname "$OUT")" && tar -czf "$OUT.tar.gz" "$(basename "$OUT")" ) && say "tarball: $OUT.tar.gz"
 if [ "$REBOOT" = 1 ] && [ "$START_HOLDER" = 1 ]; then
