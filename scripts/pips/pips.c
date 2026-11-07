@@ -2303,11 +2303,12 @@ static int cmd_bg_capture(int argc, char **argv)
         for (int j = 0; j < 8; j++)
             w[j] = bg_rd(PIPS_BG_CAP + 32u * i + 4u * (uint32_t)j);
         printf("cap i=%u seq=%u slot=%u late=%u lat_ns=%.0f rid=0x%04x(%s) tag=%u status=%u poisoned=%u err=%u "
-               "bytes=%u dwords=%u lower_addr=0x%03x completer=0x%04x dw0=0x%08x dw1=0x%08x desc=0x%08x,0x%08x,0x%08x\n",
+               "bytes=%u dwords=%u req_done=%u lower_addr=0x%03x completer=0x%04x dw0=0x%08x dw1=0x%08x "
+               "desc=0x%08x,0x%08x,0x%08x\n",
                i, w[6], w[7] & 3, !!(w[7] & 0x100), w[5] * BG_CYCLE_NS, w[1] >> 16,
                bg_rid_name((uint16_t)(w[1] >> 16), pri, sec, sub), w[2] & 0xFF, (w[1] >> 11) & 7, !!(w[1] & (1u << 14)),
-               (w[0] >> 12) & 15, (w[0] >> 16) & 0x1FFF, w[1] & 0x7FF, w[0] & 0xFFF, (w[2] >> 8) & 0xFFFF, w[3], w[4],
-               w[0], w[1], w[2]);
+               (w[0] >> 12) & 15, (w[0] >> 16) & 0x1FFF, w[1] & 0x7FF, !!(w[0] & (1u << 30)), w[0] & 0xFFF,
+               (w[2] >> 8) & 0xFFFF, w[3], w[4], w[0], w[1], w[2]);
     }
     return 0;
 }

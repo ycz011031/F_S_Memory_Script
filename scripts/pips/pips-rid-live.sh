@@ -58,7 +58,10 @@
 #   --quick             T4 grid INTERVAL {1000,1} x MAX_OUT {1,64}, shorter loads
 #   --keep-going        do not stop at a failing test
 #   --t10 --t11 --t12 --fallbacks   (above)
-#   --tagwin LO-HI      T10's window (default: T9's largest free range of input 0)
+#   --tagwin LO-HI|off  the engine's tags in every run (default: the largest
+#                       range no device used in T0's census; off = all 256,
+#                       which collides with the devices' tags in the core: T4
+#                       11-07). T10 takes T9's range unless this is LO-HI
 #   --f3-port in0|in1|usp   T11's port (default in0)
 #   --soak-min N        T12 minutes (30); --soak-interval C (100) --soak-maxout M (64)
 #   --no-ridcheck       skip pips-rid-check.sh in T0
@@ -88,7 +91,8 @@ while [ $# -gt 0 ]; do
         --t11) T11=1; shift ;;
         --t12) T12=1; shift ;;
         --fallbacks) FALLBACKS=1; shift ;;
-        --tagwin) TAGWIN=$2; shift 2 ;;
+        --tagwin) TAGWIN=$2; shift 2
+            [ "$TAGWIN" = off ] || [[ "$TAGWIN" =~ ^[0-9]+-[0-9]+$ ]] || { echo "--tagwin LO-HI or off" >&2; exit 2; } ;;
         --f3-port) F3PORT=$2; shift 2 ;;
         --soak-min) SOAK_MIN=$2; shift 2 ;;
         --soak-interval) SOAK_IVL=$2; shift 2 ;;
@@ -113,7 +117,7 @@ if [ "$DRY" = 1 ]; then
 pips-rid-live (dry run) on $HOSTN, output $OUT
   T0 baselines (pips-rid-check.sh $( [ "$RIDCHECK" = 1 ] && echo on || echo off ), census under load, straddle/TFC)
   T1 usp read; T2 in0/in1 port reads (SC, tag, no fault, no leak); T3 isolation (page 32)
-  T4-T6 engine trains under load: $( [ "$QUICK" = 1 ] && echo "INTERVAL {1000,1} x MAX_OUT {1,64}" || echo "INTERVAL {1000,100,10,1} x MAX_OUT {1,8,64,256}") x {idle-fill, engine-first}
+  T4-T6 engine trains under load: $( [ "$QUICK" = 1 ] && echo "INTERVAL {1000,1} x MAX_OUT {1,64}" || echo "INTERVAL {1000,100,10,1} x MAX_OUT {1,8,64,256}") x {idle-fill, engine-first}; engine tags ${TAGWIN:-the census's largest free range}, MAX_OUT capped to its size
   T7 latency hit/miss + strides 512, 262144; T8 cross-domain prime/probe N = 32 64 96 128 256; T9 census under load
   T10 $( [ "$T10" = 1 ] && echo on || { [ "$FALLBACKS" = 1 ] && echo "if T2 fails" || echo off; }) T11 $( [ "$T11" = 1 ] && echo "on ($F3PORT)" || { [ "$FALLBACKS" = 1 ] && echo "if T2 faults" || echo off; }) T12 $( [ "$T12" = 1 ] && echo "${SOAK_MIN} min" || echo off)
   holder: $( [ "$START_HOLDER" = 1 ] && echo "started here (drives held until a reboot$( [ "$REBOOT" = 1 ] && echo "; reboot at the end"))" || echo "${HOLD:-the running one (pgrep)}")
@@ -240,7 +244,13 @@ erun() {
         pipsc bg clear twice >> "$f" 2>&1
         pipsc bg run $ENG_DEF "$@" >> "$f" 2>&1; ERC=$?
     fi
-    say "    $n: exit $ERC issued $(kv issued "$f") sc $(kv cpl_sc "$f") ur $(kv cpl_ur "$f") ca $(kv cpl_ca "$f") timeouts $(kv timeouts "$f") mism $(kv data_mismatch "$f") leak $(kv leak_cpl "$f") lat_mean $(kv lat_mean_ns "$f") ns last_data $(kv last_data "$f")"
+    say "    $n: exit $ERC issued $(kv issued "$f") sc $(kv cpl_sc "$f") ur $(kv cpl_ur "$f") ca $(kv cpl_ca "$f") timeouts $(kv timeouts "$f") malformed $(kv cpl_malformed "$f") mism $(kv data_mismatch "$f") leak $(kv leak_cpl "$f") lat_mean $(kv lat_mean_ns "$f") ns last_data $(kv last_data "$f")"
+    # a malformed completion (SC with byte count != 4*dw or the core's "request completed" bit clear) or a
+    # timeout: keep the last 64 completions (req_done= per line) for the hardware agent
+    local malf tmo; malf=$(kv cpl_malformed "$f"); tmo=$(kv timeouts "$f")
+    if [ "${malf:-0}" != 0 ] || [ "${tmo:-0}" != 0 ]; then
+        pipsc bg capture 64 > "$TD/$n-capture.txt" 2>&1
+    fi
     if [ "$ERC" = 5 ] || [ "$(kv leak_seen "$f")" = 1 ] || [ "$(kv clash_seen "$f")" = 1 ]; then
         ABORT=1
         sum "   !! $n: LEAK or CLASH (leak_cpl $(kv leak_cpl "$f") last rid $(kv leak_last_rid "$f") tag $(kv leak_last_tag "$f") path $(kv leak_last_path "$f"); clash $(kv clash "$f")): the engine is stopped and is not restarted in this run"
@@ -415,6 +425,38 @@ fi
 [ "$KIND" = nic ] && [ "$T0_LOAD" = 1 ] && { say "  harvesting the NICs' pages from a TLP log"; load_start && { harvest | tee -a "$SUM"; load_end; }; }
 sum "   census: in0 $(kv in0_mrd "$TD/census.txt") MRd, tags $(kv in0_tags "$TD/census.txt") (max $(kv in0_tag_max "$TD/census.txt"), free $(kv in0_free_max "$TD/census.txt")); in1 $(kv in1_mrd "$TD/census.txt") MRd, tags $(kv in1_tags "$TD/census.txt") (free $(kv in1_free_max "$TD/census.txt"))"
 sum "   facts: rc_straddle $(kv rc_straddle "$TD/facts.txt") rq_straddle $(kv rq_straddle "$TD/facts.txt") tfc_present $(kv tfc_present "$TD/facts.txt") nph_av $(kv tfc_nph_av "$TD/facts.txt") (min $(kv tfc_nph_min "$TD/facts.txt")) npd_av $(kv tfc_npd_av "$TD/facts.txt") hol_device $(kv hol_device "$TD/facts.txt")"
+# The engine's tags. The core (client tags on) tracks requests by tag alone, and the devices' tags pass through
+# to it unchanged, so an engine read on a tag a device has in flight comes back SC with "request completed" clear:
+# CPL_MALFORMED, then a timeout (11-07: 32 of 32 T4 trains, every failing tag in drive 0's 0-127). Every run
+# from here keeps the engine in the largest range no device used in this census, unless --tagwin.
+free_win() {   # <census file>: "LO-HI N", the largest tag range unused by every input and completion path
+    [ -n "$(kv in0_tags "$1")" ] || { echo "none 0"; return; }
+    echo "$(kv in0_tags "$1"),$(kv in1_tags "$1"),$(kv cpl0_tags "$1"),$(kv cpl1_tags "$1")" | awk -F, '{
+        for (i = 1; i <= NF; i++) {
+            if ($i == "" || $i == "none") continue
+            n = split($i, r, "-"); lo = r[1] + 0; hi = (n > 1 ? r[2] : r[1]) + 0
+            for (t = lo; t <= hi; t++) used[t] = 1
+        }
+        s = -1; bl = -1; bn = 0
+        for (t = 0; t <= 256; t++) {
+            if (t < 256 && !(t in used)) { if (s < 0) s = t }
+            else if (s >= 0) { if (t - s > bn) { bn = t - s; bl = s }; s = -1 }
+        }
+        if (bn) printf "%d-%d %d\n", bl, bl + bn - 1, bn; else print "none 0"
+    }'
+}
+read -r FW FWN <<< "$(free_win "$TD/census.txt")"
+case "${TAGWIN:-}" in
+    off) ENG_WIN=off; WIN_N=256; sum "   engine tags: all 256 (--tagwin off): reads on a device's live tag come back malformed" ;;
+    ?*)  ENG_WIN=$TAGWIN; WIN_N=$(( ${TAGWIN#*-} - ${TAGWIN%-*} + 1 )); sum "   engine tags: $ENG_WIN (--tagwin; the census left $FW free)" ;;
+    *)   if [ "$T0_LOAD" = 1 ] && [ "${FWN:-0}" -ge 16 ]; then ENG_WIN=$FW; WIN_N=$FWN
+             sum "   engine tags: $ENG_WIN ($WIN_N), the largest range no device used under load$( [ "$FWN" -lt 64 ] && echo "; MAX_OUT is capped at $WIN_N")"
+         else ENG_WIN=off; WIN_N=256
+             sum "   WARNING: engine tags: all 256 (census under load: $( [ "$T0_LOAD" = 1 ] && echo "free range $FW ($FWN) < 16" || echo "no load ran")): reads may collide with the devices' tags (malformed + timeout)"
+         fi ;;
+esac
+ENG_DEF=${ENG_DEF/tagwin=off/tagwin=$ENG_WIN}
+cap_mo() { echo $(( $1 > WIN_N ? WIN_N : $1 )); }
 if [ "$(kv rc_straddle "$TD/facts.txt")" = 0 ] && [ "$(kv rq_straddle "$TD/facts.txt")" = 0 ]; then
     end PASS "no straddle$( [ "$T0_LOAD" = 0 ] && echo " (no load ran: idle traffic only)")"
 else
@@ -541,16 +583,18 @@ fi
 # ------------------------------------------------------------------ T4, T5, T6
 if [ -z "$STOPPED" ] && [ "$F0" = 1 ] && want T4; then
     if [ "$QUICK" = 1 ]; then IVLS="1000 1"; MOS="1 64"; else IVLS="1000 100 10 1"; MOS="1 8 64 256"; fi
+    MOS=$(for m in $MOS; do cap_mo "$m"; done | awk '!s[$1]++' | xargs)   # MAX_OUT <= the tag window
     ncombo=$(( $(echo $IVLS | wc -w) * $(echo $MOS | wc -w) * 2 ))
-    begin T4 "no leak under load: $ncombo engine trains through in0's port while both devices run (A3)" \
-        "every train: LEAK_CPL 0, CPL_UNEXPECTED 0, CPL_SC = ISSUED, timeouts 0; the devices' load ends ok; no DMAR fault; AER unchanged"
+    begin T4 "no leak under load: $ncombo engine trains through in0's port while both devices run, engine tags $ENG_WIN (A3)" \
+        "every train: LEAK_CPL 0, CPL_UNEXPECTED 0, CPL_MALFORMED 0, CPL_SC = ISSUED, timeouts 0; WIN_HITS 0 (no device tag in the engine's window); the devices' load ends ok; no DMAR fault; AER unchanged"
+    pipsc bg census clear >> "$LOG" 2>&1
     LS=$(( 60 + ncombo * 25 ))
     [ "$KIND" = ssd ] && hold_map 64 1 64 1
     if load_start "$LS" "$TD/load"; then
         printf 'name\tt0_ms\tt1_ms\n' > "$TD/windows.tsv"
         say "  20 s without the engine (baseline A)"; t0=$(now_ms); sleep 20; printf 'base-a\t%s\t%s\n' "$t0" "$(now_ms)" >> "$TD/windows.tsv"
         bad=""; pipsc bg facts clear >> "$LOG" 2>&1
-        printf 'combo\tinterval\tmax_out\tarb\tissued\tcpl_sc\ttimeouts\tunexpected\tleak\trate_mrd_s\tlat_mean_ns\trc_straddle\trq_straddle\thol_engine\thol_device\tnph_min\n' > "$TD/trains.tsv"
+        printf 'combo\tinterval\tmax_out\tarb\tissued\tcpl_sc\ttimeouts\tmalformed\tunexpected\tleak\trate_mrd_s\tlat_mean_ns\trc_straddle\trq_straddle\thol_engine\thol_device\tnph_min\n' > "$TD/trains.tsv"
         RCS=0; RQS=0
         for arb in idle engine; do for i in $IVLS; do for m in $MOS; do
             [ "$ABORT" = 1 ] && break 3
@@ -563,10 +607,10 @@ if [ -z "$STOPPED" ] && [ "$F0" = 1 ] && want T4; then
             printf '%s\t%s\t%s\n' "$c" "$t0" "$(now_ms)" >> "$TD/windows.tsv"
             f="$TD/$c.txt"
             RCS=$(( RCS + $(kv rc_straddle "$f") )); RQS=$(( RQS + $(kv rq_straddle "$f") ))
-            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$c" "$i" "$m" "$arb" "$(kv issued "$f")" "$(kv cpl_sc "$f")" \
-                "$(kv timeouts "$f")" "$(kv cpl_unexpected "$f")" "$(kv leak_cpl "$f")" "$(kv issue_rate_mrd_s "$f")" "$(kv lat_mean_ns "$f")" \
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$c" "$i" "$m" "$arb" "$(kv issued "$f")" "$(kv cpl_sc "$f")" \
+                "$(kv timeouts "$f")" "$(kv cpl_malformed "$f")" "$(kv cpl_unexpected "$f")" "$(kv leak_cpl "$f")" "$(kv issue_rate_mrd_s "$f")" "$(kv lat_mean_ns "$f")" \
                 "$(kv rc_straddle "$f")" "$(kv rq_straddle "$f")" "$(kv hol_engine "$f")" "$(kv hol_device "$f")" "$(kv tfc_nph_min "$f")" >> "$TD/trains.tsv"
-            [ "$(kv leak_cpl "$f")" = 0 ] && [ "$(kv cpl_unexpected "$f")" = 0 ] && [ "$(kv cpl_sc "$f")" = "$(kv issued "$f")" ] && [ "$(kv timeouts "$f")" = 0 ] || bad="$bad $c"
+            [ "$(kv leak_cpl "$f")" = 0 ] && [ "$(kv cpl_unexpected "$f")" = 0 ] && [ "$(kv cpl_malformed "$f")" = 0 ] && [ "$(kv cpl_sc "$f")" = "$(kv issued "$f")" ] && [ "$(kv timeouts "$f")" = 0 ] || bad="$bad $c"
             pipsc bg facts clear >> "$LOG" 2>&1
             sleep 3
         done; done; done
@@ -598,6 +642,10 @@ for name, a, b in win:
 PYEOF
         fi
         [ "$lok" = 0 ] || bad="$bad load-failed"
+        pipsc bg census > "$TD/census-after.txt" 2>&1
+        WH=$(kv win_hits "$TD/census-after.txt")
+        sum "   device MRds with a tag in the engine's window ($ENG_WIN) over T4: win_hits ${WH:-?}; device tags in0 $(kv in0_tags "$TD/census-after.txt"), in1 $(kv in1_tags "$TD/census-after.txt")"
+        [ "$ENG_WIN" = off ] || [ "${WH:-1}" = 0 ] || bad="$bad win_hits=${WH:-?}"
         if [ -z "$bad" ]; then end PASS "no leak, every read SC, the load clean, over $ncombo trains"
         else end FAIL "trains that failed:$bad"; decide_stop "T4: leak or errors under load"; fi
         # T5
@@ -827,7 +875,7 @@ fi
 # ------------------------------------------------------------------ T10 (F2)
 RUN10=$T10; [ "$FALLBACKS" = 1 ] && [ -n "$T2_KIND" ] && [ "$T2_KIND" != skip ] && [ "${V[T2]:-}" = FAIL ] && [ "$F3_OK" = 0 ] && [ "${V[T9]:-}" = PASS ] && RUN10=1
 if [ "$ABORT" = 0 ] && [ "$RUN10" = 1 ] && want T10; then
-    W=${TAGWIN:-$CENSUS_FREE}
+    W=$CENSUS_FREE; [ "${TAGWIN:-off}" != off ] && W=$TAGWIN
     begin T10 "F2: drive 0's own ID, engine tags only in $W, sink RID+tag, the clash detector armed" "idle: the T2 checks; under load: T4's trains; CLASH 0, WIN_HITS 0, LEAK_CPL 0, the load clean, the data right"
     if [ -z "$W" ] || [ "$W" = none ]; then end SKIP "no tag window (T9, or --tagwin LO-HI)"
     else
@@ -865,6 +913,7 @@ fi
 # ------------------------------------------------------------------ T12 (soak)
 if [ "$ABORT" = 0 ] && [ "$T12" = 1 ] && [ -z "$STOPPED" ] && want T12; then
     MODE=""; [ "$F0" = 1 ] && MODE=F0
+    SOAK_MO=$(cap_mo "$SOAK_MO"); W=$CENSUS_FREE; [ "${TAGWIN:-off}" != off ] && W=$TAGWIN
     [ -z "$MODE" ] && [ "${V[T10]:-}" = PASS ] && MODE=F2
     begin T12 "soak: ${MODE:-no mode} at INTERVAL $SOAK_IVL, MAX_OUT $SOAK_MO, idle-fill, both devices under load, $SOAK_MIN min" "as T4: no leak, every read SC, the load clean, no host trouble"
     if [ -z "$MODE" ]; then end SKIP "no working mode (F0 or F2)"
@@ -872,7 +921,7 @@ if [ "$ABORT" = 0 ] && [ "$T12" = 1 ] && [ -z "$STOPPED" ] && want T12; then
         S=$((SOAK_MIN * 60))
         [ "$KIND" = ssd ] && hold_map 64 1 64 1
         if load_start $((S + 60)) "$TD/load"; then
-            if [ "$MODE" = F0 ]; then KVS="rid=in0"; else KVS="rid=dev0 unsafe=1 tagwin=${TAGWIN:-$CENSUS_FREE} ridtag=1"; fi
+            if [ "$MODE" = F0 ]; then KVS="rid=in0"; else KVS="rid=dev0 unsafe=1 tagwin=$W ridtag=1"; fi
             if [ "$KIND" = ssd ]; then erun soak $KVS base=$REG ws=64 count=0 interval=$SOAK_IVL maxout=$SOAK_MO arb=idle secs=$S beat=60
             else idx_list in0 "$(( NPG0 < 64 ? NPG0 : 64 ))" 0 > "$TD/s.tbl"; tblrun soak "$TD/s.tbl" $KVS base="$IBASE" count=0 interval=$SOAK_IVL maxout=$SOAK_MO arb=idle secs=$S beat=60; fi
             load_end; lok=$?

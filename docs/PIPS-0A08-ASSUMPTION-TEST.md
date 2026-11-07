@@ -3,8 +3,10 @@
 Status: **built** (FPGA repo `5fe3bda`, 2026-11-06: P1-P3, everything in §3;
 the FPGA side's decisions H1-H16, e.g. a START state and config errors 11/12,
 in that repo's `0A08_UPGRADE_PLAN.md` §2 and `sw_handoff/README.md` §12).
-Not yet run on hardware. Host tools for the live tests written 2026-11-07
-(§5.2): `pips bg`, `scripts/pips/pips-rid-live.sh`, `pips_bg_pages.ko`.
+Host tools for the live tests written 2026-11-07 (§5.2): `pips bg`,
+`scripts/pips/pips-rid-live.sh`, `pips_bg_pages.ko`. **First run on
+bigserver 2026-11-07 (§4, "First run"): T2/T3 pass, so F0 holds; T4 found
+that the engine's tags must stay out of the devices' tags (A11).**
 
 The background read engine ([PIPS-BG-READ-ENGINE.md](PIPS-BG-READ-ENGINE.md),
 "the engine doc") rests on assumptions the host alone can't prove. The main
@@ -37,6 +39,7 @@ the test tools and run the tests (§4-§5).
 | A7 | One IOTLB serves all domains of a unit, so traffic in one domain evicts another's entries | no | T8 (cross-domain prime/probe by latency) |
 | A8 | Per-read latency separates an IOTLB hit from a miss | no | T7 |
 | A9 | Fallback F2 is viable: a device uses a known, bounded set of tags, so a disjoint window is free for engine reads under the device's own ID | no | T9 (tag census), T10 |
+| A11 | (found in the first run, 11-07) The core tracks outstanding requests by tag alone, and device tags pass through to it unchanged, so engine tags must be disjoint from every device's tags even under a port's ID | no | T0 census sets the engine's window; T4 (`CPL_MALFORMED`, `WIN_HITS`) |
 | A10 | Fallback F3 is viable: a port with its own DMA domain, with background pages mapped by a kernel helper, translates engine reads | partly (the module shows the port's domain type) | T11 |
 
 ## 2. Fallbacks, and what each needs
@@ -307,6 +310,52 @@ T2 fail (no completion)    -> sink/route/root-complex problem: capture, leak, IL
 F3 not usable              -> T9/T10 (F2)
 F2 clashes or no free tags -> F4: no in-switch evictor; the study keeps the alias campaigns
 ```
+
+### First run: bigserver, 2026-11-07 01:04 (`dualssd/1106/rid-live/`)
+
+T0-T3 PASS, T4 FAIL, T5 PASS, T6 no data. Stopped after T4 (3 min).
+
+- **T2, T3: F0 holds.** A read under in0's port ID (`b2:00.0`) returned
+  drive 0's page tag (page 5: `0x5`; 64 reads, all SC, no data mismatch, mean
+  1033 ns); in1's port returned drive 1's (tag 7; 16 reads). Page 32, mapped
+  only in drive 0's domain, read SC with tag 32 through in0's port and UR
+  through in1's. No DMAR line, no AER change. The host check (`pips-rid-check.sh`)
+  agreed.
+- **T1:** the upstream port's ID read: UR, as expected (nothing mapped).
+- **T0/T5:** no straddle on RC or RQ, idle or under load. TFC present,
+  NPH/NPD 15.
+- **T4: every train (32 of 32) stopped within 1-4 ms**, after 6-769 reads,
+  on one `CPL_MALFORMED` and the matching timeout (2 and 2 in four trains).
+  No leak, no unexpected completion, `CPL_SC = ISSUED` (the malformed
+  completion is SC). The devices' load ended clean.
+  - In the RTL a completion is malformed when it is SC and its byte count is
+    not `4*READ_DW` or the core's "request completed" bit (RC descriptor
+    bit 30) is clear. With the bit clear the tag is not freed, so it times
+    out 1 ms later.
+  - **Cause: the engine's tags collide with the devices' tags in the core.**
+    `cq_to_rq_converter` passes each device's tag to the upstream core
+    unchanged (client tags on), and the core tracks its outstanding requests
+    by tag alone. The census under load: drive 0 uses tags 0-127, drive 1
+    0-63, none uses 128-255. In the 12 trains whose malformed completion was
+    the last one (`last_cpl_tag` is its tag) the tag was 7-111 every time,
+    inside drive 0's range (p = 1/4096 by chance). The 80 reads of T2/T3,
+    idle, had none.
+  - In0 and in1 already share tags 0-63 in the core; the devices don't care,
+    since the router passes completions by requester ID and never reads
+    bit 30.
+- **A11 (new):** the engine's tags must be disjoint from every device's tags
+  even under port IDs (F0): the requester ID keeps the sink and the router
+  right, but the core's own completion tracking is per tag.
+- **Fixed in the script (11-07):** every engine run from T1 on uses
+  `tagwin=` = the largest range no device used in T0's census (here
+  128-255), MAX_OUT capped at its size (T4's 256 becomes 128); T4 fails on
+  `CPL_MALFORMED` or `WIN_HITS` > 0; a run with a malformed completion or a
+  timeout saves `pips bg capture 64` (now with `req_done=`), so the next run
+  shows which field the core sets.
+- **For 0x0A09:** the tag window should default to the upper half (or be
+  required), and the hardware agent should know that 8-bit device tags pass
+  through to the core: a device that uses all 256 tags leaves the engine
+  none.
 
 ## 5. Software for the tests
 

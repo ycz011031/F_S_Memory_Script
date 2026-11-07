@@ -17,7 +17,14 @@ an option is added).
   which sweep and design, which report generator reads what, the published
   pages). On the Windows analysis machine `claude.md` (git-ignored) adds its
   local paths, tools and editing gotchas.
-- **Last updated:** 2026-11-07 (later): **0x0A08 is built** (FPGA repo `5fe3bda`, P1-P3, not
+- **Last updated:** 2026-11-07 (first run): **0x0A08's main assumption holds (F0)**: on
+  bigserver a read under a downstream port's ID returns that drive's page, and only through
+  its own port (T2, T3 PASS). T4 failed: the engine's tags collided with drive 0's tags
+  (0-127) inside the PCIe core, giving a malformed completion and a timeout in every train.
+  The script now keeps the engine's tags in the census's free range (128-255); rerun.
+  Results: `dualssd/1106/rid-live/`; [docs/PIPS-0A08-ASSUMPTION-TEST.md](docs/PIPS-0A08-ASSUMPTION-TEST.md)
+  §4 "First run".
+- **2026-11-07 (later):** **0x0A08 is built** (FPGA repo `5fe3bda`, P1-P3, not
   yet run on hardware) and **its live-test tools are written, not yet run**:
   `scripts/pips/pips-rid-live.sh` (T0-T12), `pips bg` (pips.c, `PIPS_BG_*` merged into
   `pips_regs.h`), the holder's `map` command (alias-nvme: fresh page tags without I/O),
@@ -1135,7 +1142,8 @@ reanalysis likely found nothing either (no c1105 files left in ~).
 
 ### Next
 
-Status 11-07 (first run): bigserver's first `pips-rid-live.sh` run (01:01) stopped at the engine check although the bitstream is right (design 0x0a08, `bg_id=0x52494450`, `bg_caps=0x46cd0100` = RTL `BG_CAPS_VAL`, buses b1/b2/b4): the script's `kv` read only one key per line, and `pips bg info` prints several to a line. Fixed (`kv` reads KEY=value tokens; this also lets `leak_seen`/`clash_seen` from the status line through, which never matched before). Rerun the same command.
+Status 11-07 (first results, 01:04 run): **T2/T3 PASS: F0 holds** (port IDs read their drives' pages, isolated). **T4 FAIL**: in every train one completion came back SC with byte count or "request completed" wrong, then timed out; the failing tags were all in drive 0's 0-127: the core tracks requests by tag alone and the devices' tags pass through to it (new assumption A11). Fixed in the script: the engine's tags = the largest range unused in T0's census (128-255), MAX_OUT capped to it, T4 checks `CPL_MALFORMED` and `WIN_HITS`, captures saved on errors (`req_done=` in `pips bg capture`). Next: the same command again; its captures say which field the core sets. Test doc §4 "First run".
+Status 11-07 (first attempt): bigserver's first `pips-rid-live.sh` run (01:01) stopped at the engine check although the bitstream is right (design 0x0a08, `bg_id=0x52494450`, `bg_caps=0x46cd0100` = RTL `BG_CAPS_VAL`, buses b1/b2/b4): the script's `kv` read only one key per line, and `pips bg info` prints several to a line. Fixed (`kv` reads KEY=value tokens; this also lets `leak_seen`/`clash_seen` from the status line through, which never matched before). Rerun the same command.
 Status 11-07 (later): **0x0A08 built (FPGA `5fe3bda`), live tests written.** Once the bitstream is on bigserver: `git pull`, then `bash scripts/pips/pips-rid-live.sh --start-holder --fallbacks` after a reboot (drives on nvme), or without `--start-holder` while a holder runs; ~1 h; ends with the drives held (reboot: `sync; sudo systemctl reboot -ff`). Copy back `~/pips-rid-live-*.tar.gz`. icx: `--load-cmd '<a NIC load>'`. `pips-campaign.sh` still refuses 0x0A08 (it asks for 0x0a06/0x0a07).
 Status 11-07: **run `pips-rid-check.sh` on both hosts** (bigserver with `--module --pt --vfio-drive0`, icx with `--module --pt`; read-only apart from drive 0's short VFIO bind) and copy back `~/pips-rid-check-*.tar.gz`. Then the hardware agent builds `0x0A08` ([docs/PIPS-0A08-ASSUMPTION-TEST.md](docs/PIPS-0A08-ASSUMPTION-TEST.md)), and its live tests T0-T12 decide F0/F1/F2/F3/F4.
 Status 11-06 (night): **background read engine designed, not built** ([docs/PIPS-BG-READ-ENGINE.md](docs/PIPS-BG-READ-ENGINE.md)): next is the hardware agent's build of `0x0A08` (its §9, testbench §9.1, open questions §13), then host software S1-S8 (§10) and the bring-up X0 on bigserver (§12). The one assumption to test first: a PIPS downstream port's own requester ID translates through its device's IOMMU domain.
