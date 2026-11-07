@@ -83,8 +83,9 @@ an option is added).
     icx's IOTLB has 256 entries, set-associative; bigserver's ~96, no set
     conflicts; a miss costs nothing measurable; the batcher doesn't move
     aliasing misses.
-  - **Alias campaign 2: set up (`634b53777`); icx's first launch ran 1 sweep
-    per phase (stdin bug, fixed), to be resumed** (§8 "Alias campaign 2").
+  - **Alias campaign 2 in (11-07): both hosts complete** (drives 58 sweeps,
+    NICs 151 after a resume), in `dualssd/1106/`, `dualnic/1106/`; analysis
+    under way (§8 "Alias campaign 2", "Back").
 - **Headline across both testbeds:** IOMMU strict costs throughput only
   where every I/O is mapped and unmapped and the I/O is small: drives at 4k
   (strict ~30-40% of off). Everywhere else (NICs at any flow count, drives
@@ -1146,6 +1147,22 @@ analysis and the tarball then cover all of them; ~17 h left):
 (nothing in the drive runner reads stdin); tarball
 `~/pips-campaign-ssd-c11060312.tar.gz`, to copy back. Its 11-05
 reanalysis likely found nothing either (no c1105 files left in ~).
+
+**Back (11-07):** both tarballs unpacked: `dualssd/1106/pips-campaign-ssd-c11060312/`
+(58 sweeps, 5h00, switch fine), `dualnic/1106/pips-campaign-nic-c11060312/`
+(151 sweeps after the resume, 23h44, switch fine; the first launch's 12-sweep
+tarball is `dualnic/1106/pips-campaign-nic-c11060312-partial.tar.gz`). The NIC
+resume's analysis did not run: `pips-analyze` refused because the first
+launch's `analyze-new/` was there (its `analyze-new/` in the tarball is the
+first launch's, 12 sweeps). Fixed in the campaign (an earlier analysis
+folder is moved aside to `<dir>.prev-<time>`). Redo it by hand on icx
+(about 2-3 h): `O=~/pips-campaign-nic-c11060312`; move `$O/analyze-new`
+aside; `awk -F'\t' '$1=="done"{print "--manifest", $4}' $O/progress.tsv`
+gives the manifests; run `pips-analyze.sh nic --sweeps ''
+<them> -j 16 -o $O/analyze-new` with `PIPS_SEQ_STRICT=0
+PIPS_SEQ_IOTLB=32x8,64x4,128x2,1x256` (what `--alias2` exports). The
+counters (misses, lookups, Gb/s, latency) need no analysis: tables from
+`results/` and `runs/` locally.
 
 ### Next
 

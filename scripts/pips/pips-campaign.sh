@@ -1251,6 +1251,15 @@ sudo -n "$PIPS" status > "$OUT/status-at-end.txt" 2>&1
 [ "$KIND" = nic ] && snapshot_nics after
 
 # ------------------------------------------------------------------ analysis
+# A resumed campaign reruns the analysis over every sweep: an earlier launch's
+# output folder is moved aside first (pips-analyze refuses an existing -o;
+# 11-07 the resumed icx alias2 run lost its analysis so).
+aside() {   # <dir>: move <dir> and <dir>.tar.gz to <dir>.prev-<time>
+    local t; t=$(date +%m%d-%H%M%S)
+    [ -e "$1" ] && mv "$1" "$1.prev-$t" && say "moved the earlier $(basename "$1")/ aside: $(basename "$1").prev-$t"
+    [ -e "$1.tar.gz" ] && mv "$1.tar.gz" "$1.prev-$t.tar.gz"
+    return 0
+}
 if [ "${#MANIFESTS[@]}" -gt 0 ]; then
     python3 "$HERE/pips-status-table.py" "${MANIFESTS[@]}" --repo "$REPO" --tsv "$OUT/status.tsv" > "$OUT/status.txt" 2>&1
     say "status registers: $(grep -E '^[0-9]+ runs, [0-9]+ flagged|^no runs' "$OUT/status.txt" | head -1)"
@@ -1259,6 +1268,7 @@ fi
 if [ "$ANALYSIS" = 1 ] && [ "${#MANIFESTS[@]}" -gt 0 ]; then
     margs=(); for m in "${MANIFESTS[@]}"; do margs+=(--manifest "$m"); done
     say "analysis 1/2: this campaign's ${#MANIFESTS[@]} sweep(s): recorded and arrival order, listings, IOTLB, lengths (-j $JOBS)"
+    aside "$OUT/analyze-new"
     HEARTBEAT=120 bash "$HERE/pips-analyze.sh" "$KIND" --sweeps "" "${margs[@]}" -j "$JOBS" -o "$OUT/analyze-new" ||
         note "analysis of the new sweeps exited $? (analyze-new/analyze.log)"
     rm -f "$OUT/analyze-new.tar.gz"
@@ -1279,6 +1289,7 @@ if [ "$ANALYSIS" = 1 ] && [ "$ALIAS2" = 1 ]; then
     if [ "${#old[@]}" -gt 0 ]; then
         margs=(); for m in "${old[@]}"; do margs+=(--manifest "$m"); done
         say "analysis 1b: the 11-05 alias campaign's ${#old[@]} sweep(s) again, IOTLB simulated as ${PIPS_SEQ_IOTLB} (not strict)"
+        aside "$OUT/analyze-1105"
         HEARTBEAT=120 bash "$HERE/pips-analyze.sh" "$KIND" --sweeps "" "${margs[@]}" -j "$JOBS" -o "$OUT/analyze-1105" ||
             note "reanalysis of the 11-05 sweeps exited $? (analyze-1105/analyze.log)"
         rm -f "$OUT/analyze-1105.tar.gz"
@@ -1289,6 +1300,7 @@ fi
 if [ "$ANALYSIS" = 1 ] && [ "$PENDING" = 1 ]; then
     say "analysis 2/2: pending, the 0x0A04/0x0A05 sweeps with the fixed model (HANDOFF §8 Next item 0)"
     pend=(); [ "$KIND" = ssd ] && pend=(--no-lengths)
+    aside "$OUT/analyze-pending"
     HEARTBEAT=120 bash "$HERE/pips-analyze.sh" "$KIND" "${pend[@]}" -j "$JOBS" -o "$OUT/analyze-pending" ||
         note "pending analysis exited $? (analyze-pending/analyze.log)"
     rm -f "$OUT/analyze-pending.tar.gz"
