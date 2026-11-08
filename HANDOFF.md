@@ -17,7 +17,14 @@ an option is added).
   which sweep and design, which report generator reads what, the published
   pages). On the Windows analysis machine `claude.md` (git-ignored) adds its
   local paths, tools and editing gotchas.
-- **Last updated:** 2026-11-07 (icx, 18:25): **0x0A08's tests pass on icx too (T0-T9)**: each
+- **Last updated:** 2026-11-07 (19:30): **the 0x0A08 stress campaign now covers both hosts,
+  written, not run** (§8 "0x0A08 stress campaign"). bigserver (`ssd --bg`, ~44 h 30): the base
+  fio runs widened (user, 11-07): 8k in nstress/nheavy, `nseq` (fio sequential reads, each
+  instance its own slice), `ndeep` (iodepth 128 and 512, its own tag census). icx (`nic --bg`,
+  ~33 h, no reboot): iperf3 TCP and alias-rdma (fits / one-set rotation / capacity) under the
+  engine, the engine alone, and the IOTLB's replacement policy from traced tables. The NIC
+  runner got `PIPS_BG`; the tag window takes 128-255 when the free range reaches 255.
+- **2026-11-07 (icx, 18:25):** **0x0A08's tests pass on icx too (T0-T9)**: each
   port reads in its own NIC's domain, 8.2 G engine reads under both NICs' load all SC, one
   IOTLB for both NICs (a page evicted after 256 fresh ones: 32 x 8). Cost: idle-fill free up
   to 15 M reads/s, engine-first -4% at 25 M, -30% at 87 M, -64% at 167 M. Engine tags 128-255
@@ -117,7 +124,7 @@ an option is added).
     downstream port's ID reads in its drive's domain (F0), one IOTLB serves
     both domains, engine tags 128-255; engine-first is free up to ~2.5 M
     reads/s; one-shot reads evict only entries not yet reused. **Stress
-    campaign written (11-07, `--bg`, not run):** §8 "0x0A08 stress campaign".
+    campaign written for both hosts (11-07, `ssd|nic --bg`, not run):** §8 "0x0A08 stress campaign".
 - **Headline across both testbeds:** IOMMU strict costs throughput only
   where every I/O is mapped and unmapped and the I/O is small: drives at 4k
   (strict ~30-40% of off). Everywhere else (NICs at any flow count, drives
@@ -1396,7 +1403,7 @@ the drives (reboot before the next run). icx: every test passes (third run,
 11-07 18:25); nothing held, nothing to reboot. Results in
 `dualssd/1106/rid-live/` (FILE-MAP §7).
 
-### 0x0A08 stress campaign (`pips-campaign.sh ssd --bg`, written 11-07, not run)
+### 0x0A08 stress campaign (`pips-campaign.sh ssd|nic --bg`, written 11-07, not run)
 
 Why (user, 11-07): the engine loads the IOMMU cheaply. A 1-DW read is one
 translation for ~24 B of uplink (a drive's 4 KiB read: ~18 lookups for 4 KiB),
@@ -1417,9 +1424,11 @@ VFIO can't be undone without a reboot):
 |---|---|
 | `nprep` | Drives on nvme. `ridcheck/pips_bg_region.ko` maps 65536 pages (256 MiB, on 4096 tagged backing pages) contiguously with one `dma_map_sg` in each drive's DMA domain (shared with the port above it: A1). 64-read data check through in0 and in1. Tag census under fio (16 x 4k, 4 x 1m, both drives) -> the engine's tag window (largest free range, 16 tags kept clear of the devices' when wide) and MAX_OUT (window size, <= 128) |
 | `nalone` | Drives idle. X2: reads/s and latency against MAX_OUT 1-128 (interval 1) and against INTERVAL 250-1 at MAX_OUT with pcm-iio (IOTLB counters of the engine alone), for hits (ws 8), one-shot misses (ws 65536 random), 2 MiB apart (ws 128 stride 512). X1: capacity knee by latency, ws 16-512 cyclic and random, one read at a time, last 4096 reads traced; module reloaded per point (the unmap flushes) |
-| `nstress` | fio 4k/16k/64k/1m x 4 per drive, drive 0 alone and both, d1t0c1 / d16t218c1 x pb 0/1, 2 runs; one sweep per engine level (below), light to heavy |
-| `nheavy` | fio 4k/64k x 16 per drive, both; levels off m16 v16 mx |
+| `nstress` | fio random reads 4k/8k/16k/64k/1m x 4 per drive, drive 0 alone and both, d1t0c1 / d16t218c1 x pb 0/1, 2 runs; one sweep per engine level (below), light to heavy |
+| `nseq` | fio **sequential** reads (`--rw read`; each instance its own slice of the drive) 4k/8k/1m x 4, same settings; levels off h16 m16 v16 mx |
+| `nheavy` | fio 4k/8k/64k x 16 per drive, both; levels off m16 v16 mx |
 | `ncross` | the engine in drive 1's domain (in1) with drive 0 alone and both; m16 v16 mx; 1 run |
+| `ndeep` | **deeper queues**: a tag census under 4 x qd 512 (random, sequential) gives this phase its own tag window (the engine stays off here if under 32 tags are free), then fio random 4k/8k x 4 at iodepth 128 and 512 (32 elsewhere), same settings; levels off h16 m16 v16 mx |
 | `nend` | module unloaded |
 | `vprep` | hold_up (both drives to vfio-pci, one `alias-nvme --hold`, BMC guard), the holder's `bgmap` maps the engine's own region (2097152 pages = 8 GiB of IOVA at 0x2000000000, on 65536 backing pages) apart from the drives' load regions; data check; census under alias loads |
 | `valone` | drive regions flushed (`map`); X1 (region remapped per point: the unmap flushes); **T8b**: 155 tables (192 warm fresh pages; per round P read k times back to back or d fresh pages apart, N fresh pages, P probed; k 1-32, N 4-256, 0 or 10 us between reads; `t8b/roles.tsv` names each read); X2 down to 1 GiB apart |
@@ -1459,19 +1468,47 @@ IOMMU's share; the hit control alone is the link's.
 - Soft lockups in the native half end the native half only (the vfio half
   still runs). The campaign reboots at the end only if the vfio half started.
 
+Widened 11-07 (user: "avenues for the base fio runs"): 8k, sequential reads,
+deeper queues (rows above). The engine-off sweeps of every phase run even when
+the half has no usable engine (they are the base runs); `nseq`/`ndeep` are in
+the native half only (the holder's qd and bs are fixed).
+
+**icx (`pips-campaign.sh nic --bg`, ~33 h, IOMMU strict, no VFIO, no reboot):**
+
+| Phase | What |
+|---|---|
+| `iprep` | the devices below in0's and in1's ports (from `pips bg info`; a note if NIC 0's interface is not in0's), `pips_bg_region.ko` in each NIC's domain, data check, tag census under iperf3 30 flows and alias-rdma 32 QPs (one-set rotation) on both NICs -> window (128-255 expected) |
+| `ialone` | X2 and X1 as on bigserver (knee ws 16-512: 256 entries expected) |
+| `irepl` | the replacement policy (alias campaign 2 item 3: LRU, tree-PLRU or FIFO), 14 traced tables in one set (pages 5 + 32 j): `fA fB fE` (A..H fresh, A, I fresh, probe A / B / E: FIFO / LRU / tree-PLRU miss there), `u<P>s<S>` uniform random over 9-16 pages, `h6f<K>` 6 hot pages + a fresh one every K reads; `bg/nic/repl/roles.tsv` |
+| `itcp` | iperf3 TCP (map/unmap per packet) 5 and 30 flows per NIC, NIC0 alone and both, d1t0c1/d16t218c1 x pb 0/1, 2 runs; one sweep per level |
+| `irdma` | alias-rdma READs into a static MR: `f` ws 64 (fits, 4 QPs), `r` ws 64 stride 4096 (one set: the rotation, 7.4 misses per page alone and the batcher's cut to 2.0; 32 QPs, MTU 2048), `t` ws 65536 (4 QPs); same settings and levels |
+| `icross` | the engine in NIC 1's domain, patterns f and r, levels m16 v16 mx, 1 run |
+| `iend` | module unloaded |
+
+icx levels: as bigserver without `d16` (a 2 MiB stride costs nothing there,
+T7); `c16` = 128 pages (4 of each set's 8 ways), `v16` = 512 (twice the
+capacity). Rates on icx: engine-first free up to ~12 M reads/s, -4% at 25 M,
+-30% at 87 M, -64% at 167 M (§ above). Same reading as bigserver: each level
+against its same-rate hit control.
+
 **Run (bigserver, booted strict, drives on nvme, no holder):**
 `git pull`, then `bash scripts/pips/pips-campaign.sh ssd --bg --dry-run`, then
-`bash scripts/pips/pips-campaign.sh ssd --bg --smoke --only "nprep nalone nstress nheavy ncross nend" --tmux`
-(~45 min, native only, no reboot: checks the module, the census, the
-runner hook), then `bash scripts/pips/pips-campaign.sh ssd --bg --tmux` (~30 h,
-reboots at the end). Copy back `~/pips-campaign-ssd-<stamp>.tar.gz`; `bg/` in it
+`bash scripts/pips/pips-campaign.sh ssd --bg --smoke --only "nprep nalone nstress nseq nheavy ncross ndeep nend" --tmux`
+(~1 h 05, native only, no reboot: checks the module, the census, the
+runner hook), then `bash scripts/pips/pips-campaign.sh ssd --bg --tmux` (~44 h 30,
+reboots at the end). **icx** (booted strict, styx up, kernel headers): `git pull`, then
+`bash scripts/pips/pips-campaign.sh nic --bg --tmux` (~33 h; `--smoke` ~2 h 25 first if
+wanted). Copy back `~/pips-campaign-nic-<stamp>.tar.gz`. Copy back `~/pips-campaign-ssd-<stamp>.tar.gz`; `bg/` in it
 holds the engine-alone data (x1/x2/t8b traces, pcm reports, census).
 
 **Not checked here** (no Linux): the module and the holder change are only
-syntax-checked (MinGW, stubs); the scripts by `bash -n` and the dry run.
+syntax-checked (MinGW, stubs); the scripts by `bash -n` and the dry runs (both
+kinds, full and smoke). fio's `--offset=N% --size=N%` (nseq) and the NIC runner's
+engine hook have not run on a host.
 
 ### Next
 
+Status 11-07 (19:30): **stress campaign for both hosts, not run**: bigserver `pips-campaign.sh ssd --bg --tmux` (~44 h 30, + 8k, nseq, ndeep; reboot at the end), icx `pips-campaign.sh nic --bg --tmux` (~33 h, no reboot). Section above.
 Status 11-07 (evening): **0x0A08 stress campaign written, not run** (section above): on bigserver `git pull`, the native smoke (~45 min, no reboot), then `pips-campaign.sh ssd --bg --tmux` (~30 h, reboot at the end). icx side next (needs the engine's bring-up on icx first: census of the NICs' tags, data check).
 Status 11-07 (third icx run, 18:25): **T0-T9 all PASS on icx** (test doc §4 "Third icx run"). 0x0A08's assumption tests are done on both hosts.
 Status 11-07 (second icx run, 18:02): the NIC load ran. T4: 6.6 G engine reads all SC, but NIC 0's tags grew from 0-5 (T0 census) to 0-21 under heavy trains, 23 inside the window 6-255 -> FAIL, run stopped before T7-T9. Fixed: the window is the upper half (128-255) of a free range ending at 255. Cost on icx: idle-fill free up to 15 M reads/s, engine-first free to ~12 M, -4% at 25 M, -29% at 84 M, -96% at 245 M. Census `cpl0`/`cpl1` maps are swapped vs the doc (both hosts). Rerun the same command.

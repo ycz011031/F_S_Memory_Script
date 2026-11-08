@@ -771,7 +771,10 @@ for ((j = 0; j < num_runs; j++)); do
             # instance ran through the measurement windows and gives IOPS for
             # exactly those seconds (fio-sum --windows). fio logs nothing
             # during ramp_time.
+            # Sequential (--rw read): each instance reads its own slice of the
+            # drive (offset k/J, size 1/J), so the instances are J streams.
             sudo fio --name="dualssd_${i}_${k}" --filename="${DEVS[$i]}" --readonly \
+                $( [ "$rw" = read ] && echo "--offset=$(( k * 100 / JOBS[i] ))% --size=$(( 100 / JOBS[i] ))%") \
                 --rw="$rw" --bs="$bs" --iodepth="$iodepth" --numjobs=1 --thread \
                 --direct=1 --ioengine="$ioengine" --cpus_allowed="$core" \
                 --time_based --ramp_time="$warm" --runtime="$fio_runtime" \

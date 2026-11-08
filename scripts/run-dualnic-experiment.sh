@@ -70,6 +70,17 @@
 # Avg_iperf_tput, so sweeps and dualnic-results.py read it as before; the
 # results add gen=alias and alias_* (pattern). Strict or lazy mode: with pt or
 # off the MR is not translated and there is no IOTLB to alias.
+#
+# PIPS_BG="K=V ..." (set by pips-campaign.sh nic --bg; design 0x0A08): the
+# switch's background read engine runs through every run, as in
+# run-dualssd-experiment.sh: `pips bg run PIPS_BG stopwin=1` starts once the
+# load runs (before the warm-up) and is stopped after the measurement window.
+# Per run: logs/<run>/bg-run.txt, bg-hist.txt, reports/<run>/bg.rpt; results
+# bg_spec, bg_label (PIPS_BG_LABEL), bg_rate_mrd_s, bg_lat_ns, bg_lat_max_ns,
+# bg_errors (bg_spec=off without). Any engine problem (non-SC completion,
+# timeout, data mismatch, leak, a NIC tag in the engine's window, no reads)
+# makes the run invalid (exit 3) and writes PIPS_BG_STOPFILE (default
+# ~/.pips-bg-stop); while it exists every runner with PIPS_BG refuses to start.
 set -u
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -404,6 +415,16 @@ preflight() {
     # The PIPS switch's build and setting, when a NIC is behind it; its TLP
     # log needs it to answer (--pips-log 1).
     pips_identify NIC ${NIC_BDFS[@]+"${NIC_BDFS[@]}"}
+    if [ -n "${PIPS_BG:-}" ]; then
+        if [ -e "$BG_STOPFILE" ]; then
+            PROBLEMS+=("PIPS_BG is set, but the read engine was stopped for good: $BG_STOPFILE says
+      $(head -3 "$BG_STOPFILE" 2>/dev/null)")
+        elif ! sudo -n "$PIPS" bg info 2>&1 | grep -q 'bg_id=0x'; then
+            PROBLEMS+=("PIPS_BG is set, but the switch has no background read engine (pips bg info: design 0x0A08)")
+        else
+            echo "   read engine (PIPS_BG): ${PIPS_BG_LABEL:+$PIPS_BG_LABEL: }$PIPS_BG"
+        fi
+    fi
 
     if [ "${#PROBLEMS[@]}" -gt 0 ]; then
         echo >&2
@@ -456,7 +477,75 @@ iommu_mode=$(for i in "${ACTIVE[@]}"; do
 # The alias generators by their binary path at the start of the command line.
 ALIAS_MATCH='^(/[^ ]*/)?alias-rdm[a] --role'
 alias_count() { local n; n=$(pgrep -c -f "$ALIAS_MATCH client" 2>/dev/null); echo "${n:-0}"; }
+
+# ------------------------------------------------------------ the read engine (PIPS_BG)
+# As run-dualssd-experiment.sh's: started once the load runs, stopped after the window.
+BG_STOPFILE=${PIPS_BG_STOPFILE:-$HOME/.pips-bg-stop}
+BG_PID=""
+bg_begin() {   # <log dir>: start the engine for this run; 1 if it did not start
+    [ -n "${PIPS_BG:-}" ] || return 0
+    rm -f "$1/bg-run.txt"
+    echo "\$ pips bg run $PIPS_BG secs=$(( 4 * dur + 600 )) beat=10 stopwin=1" > "$1/bg-cmd.txt"
+    sudo -n "$PIPS" bg run $PIPS_BG secs=$(( 4 * dur + 600 )) beat=10 stopwin=1 > "$1/bg-run.txt" 2>&1 9>&- &
+    BG_PID=$!
+    for _ in $(seq 50); do
+        grep -q '^# bg run: started' "$1/bg-run.txt" 2>/dev/null && { echo "   read engine on: ${PIPS_BG_LABEL:-$PIPS_BG}"; return 0; }
+        kill -0 "$BG_PID" 2>/dev/null || break
+        sleep 0.1
+    done
+    echo "ERROR: the read engine did not start: $(tail -3 "$1/bg-run.txt" 2>/dev/null | tr '\n' ' ')" >&2
+    bg_end "$1" "" >/dev/null 2>&1
+    return 1
+}
+bg_end() {   # <log dir> <report dir or "">: stop it, keep its counters; 1 if the engine had a problem
+    [ -n "$BG_PID" ] || return 0
+    local rc k v errs=0 why="" f="$1/bg-run.txt"
+    sudo -n pkill -INT -f "^$PIPS bg run " >/dev/null 2>&1
+    for _ in $(seq 150); do kill -0 "$BG_PID" 2>/dev/null || break; sleep 0.1; done
+    if kill -0 "$BG_PID" 2>/dev/null; then
+        echo "WARNING: pips bg run did not end 15 s after SIGINT: killing it, then pips bg stop" >&2
+        sudo -n pkill -KILL -f "^$PIPS bg run " >/dev/null 2>&1
+    fi
+    wait "$BG_PID" 2>/dev/null; rc=$?
+    BG_PID=""
+    sudo -n "$PIPS" bg stop 3000 >> "$1/bg-cmd.txt" 2>&1
+    [ -n "$2" ] || return 0
+    sudo -n "$PIPS" bg hist > "$1/bg-hist.txt" 2>&1
+    bgv() { awk -v k="$1=" '{ for (i = 1; i <= NF; i++) if (index($i, k) == 1) v = substr($i, length(k) + 1) } END { print (v == "" ? 0 : v) }' "$f" 2>/dev/null; }
+    {
+        echo "bg_spec: ${PIPS_BG}"
+        echo "bg_label: ${PIPS_BG_LABEL:-}"
+        echo "bg_rc: $rc"
+        for k in bg_run_s run_s issued issue_rate_mrd_s lat_mean_ns lat_min_ns lat_max_ns cpl_sc cpl_ur cpl_ca cpl_other \
+                 cpl_poisoned cpl_malformed cpl_unexpected timeouts data_mismatch leak_cpl win_hits stall_arb stall_tags \
+                 stall_fc tfc_nph_min hol_engine hol_device out_max; do
+            echo "bg_${k#bg_}: $(bgv "$k")"
+        done
+    } > "$2/bg.rpt"
+    for k in cpl_ur cpl_ca cpl_other cpl_poisoned cpl_malformed cpl_unexpected timeouts data_mismatch leak_cpl; do
+        v=$(bgv "$k"); case "$v" in ''|*[!0-9]*) v=0 ;; esac
+        [ "$v" -gt 0 ] && { errs=$((errs + v)); why="$why $k=$v"; }
+    done
+    case "$rc" in 0) ;; 6) why="$why a NIC used a tag in the engine's window (WIN_HITS)" ;; 5) why="$why LEAK or CLASH" ;;
+                  *) why="$why pips bg run exit $rc" ;; esac
+    [ "$(bgv issued)" = 0 ] && why="$why no reads issued"
+    echo "   read engine: $(bgv issued) reads, $(awk -v r="$(bgv issue_rate_mrd_s)" 'BEGIN { printf "%.2f", r / 1e6 }') M/s," \
+         "latency mean $(bgv lat_mean_ns) ns, max $(bgv lat_max_ns) ns, errors $errs, exit $rc"
+    if [ -n "$why" ]; then
+        echo "ERROR: the read engine had a problem in $RUN:$why. The engine is stopped for good ($BG_STOPFILE)." >&2
+        printf '%s %s:%s\n(run logs %s)\n' "$(date '+%F %T')" "$RUN" "$why" "$1" >> "$BG_STOPFILE"
+        return 1
+    fi
+    return 0
+}
+bg_go() {   # the engine on before the warm-up; the run stops if it does not start
+    bg_begin "$L" && return 0
+    printf '%s %s: the engine did not start\n(run logs %s)\n' "$(date '+%F %T')" "$RUN" "$L" >> "$BG_STOPFILE"
+    exit 3
+}
+
 cleanup() {
+    [ -n "$BG_PID" ] && bg_end "${L:-/tmp}" ""
     sudo pkill -9 iperf3 >/dev/null 2>&1 || true
     rsh_try "sudo pkill -9 iperf3; screen -wipe" >/dev/null 2>&1 || true
     if [ "$gen" = alias ]; then
@@ -653,6 +742,7 @@ for ((j = 0; j < num_runs; j++)); do
         fi
         grep -E 'pattern|MR |connected' "$L/alias-rdma-nic$i.log" | sed "s/^/   NIC $i: /"
     done
+    bg_go
     echo "warming up..."; sleep 12
     running=$(alias_count)
     echo "   alias-rdma clients running: $running/${#ACTIVE[@]}"
@@ -714,6 +804,7 @@ for ((j = 0; j < num_runs; j++)); do
              -b $flow_bw --cca $cca --no_kill\""
     done
 
+    bg_go
     echo "warming up..."; sleep 12
 
     # A screen session that died on startup leaves nothing running, and the run
@@ -747,6 +838,10 @@ for ((j = 0; j < num_runs; j++)); do
     nicstats_report
     echo "   window counters: $(cat "$setup_dir/reports/$RUN/retx-client.rpt" 2>/dev/null | xargs);" \
          "pause/discard deltas: $(cat "$setup_dir/reports/$RUN"/nicstats-nic*.rpt 2>/dev/null | grep -c .) nonzero"
+    if ! bg_end "$L" "$setup_dir/reports/$RUN"; then
+        echo "ERROR: run $j of '$exp' is not valid (the read engine, above); stopping. Its logs: $L/" >&2
+        exit 3
+    fi
 
     # The window is over: dump and decode the TLP log while iperf3 finishes.
     t_pips=$SECONDS
@@ -899,6 +994,18 @@ flow_bw=$(per_flow_bw "$bandwidth" "$num_clients")
 fl_meta="$num_servers"
 [ "$nics" -eq 2 ] && [ -n "$flows1" ] && [ "$flows1" != "$num_servers" ] && fl_meta="${num_servers}x$flows1"
 pips_meta       # the PIPS build, setting and log status, when the NICs are behind it
+# The read engine's spec and its mean rate, latency and errors over the runs.
+bgr() { awk -v k="^$2:" '$0 ~ k { print $2; exit }' "$1" 2>/dev/null; }
+if [ -n "${PIPS_BG:-}" ]; then
+    bgmean() { for ((j = 0; j < num_runs; j++)); do bgr "$setup_dir/reports/$exp-RUN-server-$j/bg.rpt" "$1"; done | mean_sd | cut -d' ' -f1; }
+    BGMETA=( --meta "bg_spec=$PIPS_BG" --meta "bg_label=${PIPS_BG_LABEL:-}" --meta "bg_rate_mrd_s=$(bgmean bg_issue_rate_mrd_s)"
+             --meta "bg_lat_ns=$(bgmean bg_lat_mean_ns)" --meta "bg_lat_max_ns=$(bgmean bg_lat_max_ns)"
+             --meta "bg_errors=$(for ((j = 0; j < num_runs; j++)); do f=$setup_dir/reports/$exp-RUN-server-$j/bg.rpt
+                 for k in bg_cpl_ur bg_cpl_ca bg_timeouts bg_data_mismatch bg_cpl_malformed; do bgr "$f" "$k"; done
+                 done | awk '{ s += $1 } END { print s + 0 }')" )
+else
+    BGMETA=( --meta bg_spec=off --meta bg_label=off )
+fi
 python3 "$HERE/dualnic-results.py" dump \
     --reports "$setup_dir/reports" --exp "$exp" --runs "$num_runs" \
     --nics "$(IFS=,; echo "${ACTIVE[*]}")" --out "$results_file" \
@@ -916,5 +1023,5 @@ python3 "$HERE/dualnic-results.py" dump \
         alias_sge_bytes="$a_sge" alias_rdma_mtu="$a_mtu" alias_ws1="${a_ws1:-$a_ws}" alias_stride1="${a_stride1:-$a_stride}" \
         alias_first1="${a_first1:-$a_first}" alias_order1="${a_order1:-$a_order}" alias_list1="${a_list1:-${a_list:-none}}") \
     --meta dur_s="$dur" --meta cca="$cca" --meta cpu_util_cores="$active_cores" \
-    ${PIPS_META[@]+"${PIPS_META[@]}"} \
+    ${PIPS_META[@]+"${PIPS_META[@]}"} "${BGMETA[@]}" \
     || echo "WARNING: could not write $results_file; the .rpt files are intact." >&2

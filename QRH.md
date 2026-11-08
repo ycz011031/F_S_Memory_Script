@@ -44,7 +44,7 @@ raw TLP logs stay on the host.
 | `--minimal` | The short 0x0A07 rerun. Drives: depths 1/4/16/64 × pb 0/1, cap on, w31. NICs: `rcap`, `uneven` (NIC0 link 50G), `wire50` (both links 50G). No knob phases and no pending analysis. | ssd ~3 h, nic ~4 h |
 | `--paper` | The paper list (E1, E2, E5-E13), **one IOMMU leg per launch**. The leg is the mode the host booted with. Phases: `pcie`, drives `head`, NICs `g100 e8 rcap0` (rcap0 on the strict leg only), `ops` (needs `perf`). | ~2h50 per leg |
 | `--alias` | The aliasing campaign 1: fio/iperf3 are replaced by `alias-nvme`/`alias-rdma`. Phases `ageom acap aconf`. | ssd ~1h55 + reboot, nic ~2h30 |
-| `--bg` | The 0x0A08 stress campaign (11-07, ssd, IOMMU strict, design 0x0a08): the switch's read engine as IOMMU stressor. Native half (drives on nvme, module region): `nprep nalone nstress nheavy ncross nend`; then vfio half (holder, `bgmap` region): `vprep valone vstress vcross`. Engine levels `off h16 m1 m4 m16 c16 v16 d16 h50 m50 hx mx`. No analysis. Reboots at the end only if the vfio half started. | ~30 h |
+| `--bg` | The 0x0A08 stress campaign (11-07, IOMMU strict, design 0x0a08): the switch's read engine as IOMMU stressor. **ssd:** native half (drives on nvme, module region): `nprep nalone nstress nseq nheavy ncross ndeep nend` (fio random 4k/8k/16k/64k/1m, sequential 4k/8k/1m, iodepth 128/512 with its own tag census); then vfio half (holder, `bgmap` region): `vprep valone vstress vcross`. Levels `off h16 m1 m4 m16 c16 v16 d16 h50 m50 hx mx`. Reboots at the end only if the vfio half started. **nic** (icx, NICs stay on mlx5, no reboot): `iprep ialone irepl itcp irdma icross iend` (iperf3 5/30 flows; alias-rdma fits / one-set rotation / capacity; replacement-policy tables); levels as ssd without d16. No analysis. | ssd ~44 h 30, nic ~33 h |
 | `--alias2` | The aliasing campaign 2 (11-06): everything `--alias` does, with new phases. icx: `n2ways n2sets n2rot n2small n2sge n2place n2share n2walk n2cap n2lat n2quant n2rep`. bigserver: `s2cap s2probe s2place s2order s2walk s2rep`. It also reanalyses the 11-05 sweeps (`analyze-1105/`). | nic ~19h30, ssd ~5 h + reboot |
 
 ### Modifiers
@@ -60,7 +60,7 @@ raw TLP logs stay on the host.
 | `--no-hw` | NICs: leaves out the phase paced in styx's NIC hardware. |
 | `--stamp S` | The label prefix for this campaign's sweeps (default `c<MMDDhhmm>`). |
 | `--fresh` | Starts a new campaign even if a half-done one is there. The old one is left as it is. |
-| `--smoke` | With `--bg`: every step once, small (levels off/m16/mx, 1 run, 4k, two settings, 6 T8b tables). ~1 h 30 with both halves; `--only "nprep nalone nstress nheavy ncross nend"` = native only, ~45 min, no reboot. |
+| `--smoke` | With `--bg`: every step once, small (levels off/m16/mx, 1 run, 4k, two settings, 6 T8b tables, ndeep qd 512, nseq 4k; nic 5 flows, patterns f/r). ssd ~1 h 45 with both halves; `--only "nprep nalone nstress nseq nheavy ncross ndeep nend"` = native only, ~1 h 05, no reboot. nic ~2 h 25. |
 | `--no-reboot` | `ssd --alias/--alias2/--bg`: at the end the drives stay held, and you run the reboot yourself (`sync; sudo systemctl reboot -ff`). |
 | `--retire S` | Runs nothing. Moves campaign S's results, run folders and TLP logs into `~/pips-retired/S/`. Nothing is deleted. |
 
@@ -106,8 +106,9 @@ to start over instead.
 bash scripts/pips/pips-campaign.sh nic --alias2 --dry-run     # always first
 bash scripts/pips/pips-campaign.sh nic --alias2 --tmux        # icx
 bash scripts/pips/pips-campaign.sh ssd --alias2 --tmux        # bigserver (reboots at the end)
-bash scripts/pips/pips-campaign.sh ssd --bg --smoke --only "nprep nalone nstress nheavy ncross nend" --tmux   # 0x0A08, native smoke
-bash scripts/pips/pips-campaign.sh ssd --bg --tmux            # 0x0A08 stress, ~30 h (reboots at the end)
+bash scripts/pips/pips-campaign.sh ssd --bg --smoke --only "nprep nalone nstress nseq nheavy ncross ndeep nend" --tmux   # 0x0A08, native smoke
+bash scripts/pips/pips-campaign.sh ssd --bg --tmux            # 0x0A08 stress, ~44 h 30 (reboots at the end)
+bash scripts/pips/pips-campaign.sh nic --bg --tmux            # 0x0A08 stress on icx, ~33 h (no reboot)
 bash scripts/pips/pips-campaign.sh ssd --paper --leg strict --tmux
 bash scripts/pips/pips-campaign.sh ssd --minimal --tmux
 bash scripts/pips/pips-campaign.sh ssd --retire c11051830     # move a failed campaign aside

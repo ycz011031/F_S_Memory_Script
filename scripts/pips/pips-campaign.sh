@@ -121,7 +121,7 @@
 #                     The analysis simulates the fitted IOTLBs, not strict
 #                     (PIPS_SEQ_STRICT=0, PIPS_SEQ_IOTLB), and also reanalyses
 #                     the 11-05 alias sweeps so (analyze-1105/)
-#   --bg              ssd: the 0x0A08 stress campaign (11-07, HANDOFF §8
+#   --bg              ssd or nic: the 0x0A08 stress campaign (11-07, HANDOFF §8
 #                     "0x0A08 stress campaign"): the switch's background read
 #                     engine as a cheap IOMMU stressor (a 1-DW read is one
 #                     translation; its completion is swallowed in the switch)
@@ -133,13 +133,18 @@
 #                             data check through in0/in1; tag census under fio
 #                     nalone  the engine alone: reads/s and latency against
 #                             MAX_OUT and rate (pcm-iio), capacity knee by latency
-#                     nstress fio 4k-1m x 4, drive 0 alone and both, d1t0c1/
-#                             d16t218c1 x pb 0/1; one sweep per engine level:
-#                             off, hits (h16 h50 hx), one-shot misses (m1 m4 m16
-#                             m50 mx), 96 / 256 reused pages (c16 v16), 2 MiB
-#                             apart (d16)
+#                     nstress fio 4k/8k/16k/64k/1m x 4, drive 0 alone and both,
+#                             d1t0c1/d16t218c1 x pb 0/1; one sweep per engine
+#                             level: off, hits (h16 h50 hx), one-shot misses (m1
+#                             m4 m16 m50 mx), 96 / 256 reused pages (c16 v16),
+#                             2 MiB apart (d16)
+#                     nseq    fio sequential reads 4k/8k/1m x 4 (own slices);
+#                             levels off h16 m16 v16 mx
 #                     nheavy  fio 16 per drive; ncross the engine in drive 1's
-#                             domain; nend the module unloaded
+#                             domain
+#                     ndeep   fio 4k/8k x 4 at iodepth 128 and 512, its own tag
+#                             census; levels off h16 m16 v16 mx; nend the
+#                             module unloaded
 #                     vprep   one alias-nvme --hold (as --alias, BMC guard), the
 #                             engine's own region (holder "bgmap"), census
 #                     valone  capacity knee, T8b replacement probe, reads/s
@@ -150,10 +155,20 @@
 #                     after the fact by hand). A problem with the engine stops
 #                     it for the rest of that half; soft lockups end the native
 #                     half (the vfio half still runs). Ends with a reboot once
-#                     the vfio half has started (--no-reboot leaves it to you)
-#   --smoke           with --bg: every step once, small (~1 h 30 with the reboot):
-#                     levels off/m16/mx, 1 run, 4k, d1t0c1 and d16t218c1 pb 0,
-#                     knee ws 32/128, 6 T8b tables, vfio ws 32 only; its own
+#                     the vfio half has started (--no-reboot leaves it to you).
+#                     nic (icx, IOMMU strict, NICs stay on mlx5, no reboot):
+#                     iprep   the module's region in each NIC's domain, data
+#                             check, census under iperf3 and alias-rdma
+#                     ialone  the engine alone (rate, latency, knee); irepl
+#                             the IOTLB's replacement policy (traced tables)
+#                     itcp    iperf3 5/30 flows, NIC0 alone and both; irdma
+#                             alias-rdma ws 64 / one-set rotation / ws 65536;
+#                             one sweep per level (no d16, c16 = 128 pages, v16
+#                             = 512); icross the engine in NIC 1's domain
+#   --smoke           with --bg: every step once, small: levels off/m16/mx, 1
+#                     run, 4k, d1t0c1 and d16t218c1 pb 0, knee ws 32/128, 6
+#                     T8b tables, vfio ws 32 only, ndeep qd 512 and nseq 4k at
+#                     m16; nic 5 flows, patterns f/r, 4 policy tables; its own
 #                     resume pointer
 #   --leg M           with --paper: the leg expected (strict, lazy, pt, off);
 #                     refused when the devices are not so (a reboot missed).
@@ -293,7 +308,7 @@ fi
 STAMP_GIVEN=$STAMP
 STAMP=${STAMP:-c$(date +%m%d%H%M)}
 [ $(( MINIMAL + PAPER + ALIAS + BG )) -gt 1 ] && { echo "pips-campaign: one of --minimal, --paper, --alias, --bg" >&2; exit 2; }
-[ "$BG" = 1 ] && [ "$KIND" = nic ] && { echo "pips-campaign: --bg is written for the drives (ssd) so far" >&2; exit 2; }
+[ "$BG" = 1 ] && [ "$KIND" = nic ] && BN_H=nic     # pips-bg-lib.sh: the module's half on icx
 [ "$BG" = 1 ] && ANALYSIS=0      # misses per I/O and throughput: no page-order analysis
 [ "$SMOKE" = 1 ] && [ "$BG" = 0 ] && { echo "pips-campaign: --smoke goes with --bg" >&2; exit 2; }
 [ "$SMOKE" = 1 ] && bg_smoke
@@ -468,6 +483,7 @@ if [ "$BG" = 1 ]; then
     read -r -a PHASES <<< "$(bg_phases)"
     [ "$DRY" = 1 ] && bg_dry_init
     MIN_PER_PT=1.08
+    [ "$KIND" = nic ] && MIN_PER_PT=1.6        # alias-rdma runs; bg_nsweeps counts iperf3 runs 13/8
 elif [ "$ALIAS2" = 1 ]; then
     if [ "$KIND" = nic ]; then PHASES=(n2ways n2sets n2rot n2small n2sge n2place n2share n2walk n2cap n2lat n2quant n2rep)
     else PHASES=(s2cap s2probe s2place s2order s2walk s2rep); fi
@@ -1164,7 +1180,8 @@ guard() { bash "$HERE/alias/alias-guard.sh" "$@" 2>&1 | while IFS= read -r l; do
 if [ "$DRY" = 1 ]; then
     [ "$RESUME" = 1 ] && echo "(dry run) a launch now RESUMES campaign $STAMP ($(grep -c '^done' "$OUT/progress.tsv" 2>/dev/null || echo 0) sweep(s) done); --fresh starts a new one"
     if [ "$BG" = 1 ]; then
-        echo "(dry run) --bg: the native half first (drives on nvme, module region), then the vfio half (holder, BMC guard; reboot at the end once it started)"
+        if [ "$KIND" = ssd ]; then echo "(dry run) --bg: the native half first (drives on nvme, module region), then the vfio half (holder, BMC guard; reboot at the end once it started)"
+        else echo "(dry run) --bg: the NICs stay on mlx5 (module region in each NIC's domain); no VFIO, no reboot"; fi
         echo "(dry run) engine levels:"; bg_levels_line
     fi
     if [ "$KIND" = ssd ] && [ "$ALIAS" = 1 ]; then
@@ -1247,6 +1264,7 @@ elif [ "$KIND" = ssd ]; then
     fi
 fi
 if [ "$BG" = 1 ]; then
+    [ "$KIND" = nic ] && bg_init
     sudo -n "$PIPS" bg info > "$OUT/bg/bg-info.txt" 2>&1
     grep -q 'bg_id=0x' "$OUT/bg/bg-info.txt" || { echo "ERROR: --bg: pips bg info does not answer (design 0x0A08's engine): $OUT/bg/bg-info.txt" >&2; exit 1; }
     sudo -n "$PIPS" bg stop 3000 >> "$OUT/bg/bg-info.txt" 2>&1
