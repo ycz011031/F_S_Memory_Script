@@ -17,7 +17,12 @@ an option is added).
   which sweep and design, which report generator reads what, the published
   pages). On the Windows analysis machine `claude.md` (git-ignored) adds its
   local paths, tools and editing gotchas.
-- **Last updated:** 2026-11-07 (evening): **the 0x0A08 stress campaign is written, not
+- **Last updated:** 2026-11-07 (icx, 18:25): **0x0A08's tests pass on icx too (T0-T9)**: each
+  port reads in its own NIC's domain, 8.2 G engine reads under both NICs' load all SC, one
+  IOTLB for both NICs (a page evicted after 256 fresh ones: 32 x 8). Cost: idle-fill free up
+  to 15 M reads/s, engine-first -4% at 25 M, -30% at 87 M, -64% at 167 M. Engine tags 128-255
+  on both hosts (NIC tags grow under load). Test doc §4 "Third icx run".
+- **2026-11-07 (evening):** **the 0x0A08 stress campaign is written, not
   run** (§8 "0x0A08 stress campaign"): `pips-campaign.sh ssd --bg` uses the engine as a cheap
   IOMMU stressor, ~30 h on bigserver, IOMMU strict. Native half first (drives on nvme, the
   engine reading a region a new module maps in each drive's DMA domain), then the vfio half
@@ -1303,7 +1308,7 @@ gating present):
 | Measures | issued, completions by status (SC/UR/CA/other/poisoned/malformed/unexpected), timeouts, latency sum/min/max, 64-bin histogram, a per-read latency trace (4096 reads from `TRACE_SKIP`), stalls (arb/tags/credits), data check against the holder's page tags | `pips bg counters / hist / trace FILE / run trace=1 dcheck=1 backing=N` |
 | Test extensions | leak monitor (completions for the engine that reached the router's outputs: must be 0), **tag census** (every tag each device used, `WIN_HITS`), straddle counters, NP credits and head-of-line cycles (`TFC`, `HOL_ENGINE/DEVICE`), capture of the last 64 completions (descriptor, `req_done`), clash detector (F2) | `pips bg census [clear] / facts [clear] / capture [N]` |
 
-**Tools** (all on the host, bigserver tested; icx written, not run):
+**Tools** (all on the host, tested on both):
 - `pips bg ...` (pips.c): `info`, `set`, `start/stop/wait`, `run K=V... [secs=S]`
   (start, heartbeat, stop, print every counter as `key=value`), and the
   commands in the table. `pips bg help` lists the keys.
@@ -1314,13 +1319,13 @@ gating present):
   flushes those IOTLB entries: T8 uses that). Run:
   `bash scripts/pips/pips-rid-live.sh --start-holder --reboot --tmux --no-ridcheck`
   (~16-25 min, reboots at the end: the holder can't release the drives).
-  On icx (written 11-07, not yet run) no holder: `pips_bg_region.ko` maps
+  On icx no holder: `pips_bg_region.ko` maps
   65536 tagged pages in each NIC's own domain (DW0 = page mod 8192, DW1 = the
   NIC's number, so T2/T3 see whose domain answered; a reload flushes them for
   T8), and the load windows run alias-rdma READs on both NICs against servers
   on styx (ports BASE_PORTS + 700 as the campaigns, utils/setup-server.sh). Run on icx, IOMMU
   strict or lazy, kernel headers installed, styx's repo pulled:
-  `bash scripts/pips/pips-rid-live.sh --tmux` (~20 min, no reboot).
+  `bash scripts/pips/pips-rid-live.sh --tmux` (~16 min, no reboot).
   Output `~/pips-rid-live-<host>-<MMDD-HHMMSS>/` + `.tar.gz`: `summary.txt`,
   `results.tsv`, `T*/`.
 - `pips-campaign.sh` refuses 0x0A08 (it accepts 0x0A06/0x0A07 only); the
@@ -1352,9 +1357,27 @@ Rate and cost (T4/T6, drives at 866/785 kIOPS without the engine):
 | engine-first, INTERVAL 1, MAX_OUT 64 | 62 M | -29% | -24% |
 | engine-first, INTERVAL 1, MAX_OUT 128 | 118 M (MAX_OUT / ~1 us) | -59% | -57% (NP header credits hit 0) |
 
+**Results on icx (3 runs, 11-07; the third: every test passes):** T2/T3: each
+port reads its own NIC's region (both regions at IOVA `0xc0000000`; in1's port
+read in1's NIC's page there, DW1 2). T4: 8.2 G reads under both NICs' load, all
+SC. T7: hit 520 ns, miss 748 ns (p50), 4% misclassified; a 2 MiB stride adds
+nothing. T8: one IOTLB for both NICs, a page evicted after 256 fresh ones (32
+sets x 8 ways, LRU family; two reads protect nothing). T9: NIC 0 tags 0-7 to
+0-21 depending on load, NIC 1 0-3. Rate and cost (NICs at 1587/1588 kIOPS of 4
+KiB READs without the engine):
+
+| Engine | Reads/s | NIC 0 | NIC 1 |
+|---|---|---|---|
+| idle-fill, any setting | 0.25-15.0 M | 0% | 0% |
+| engine-first, up to MAX_OUT 8 | <= 12.3 M | 0% | 0% |
+| engine-first, INTERVAL 10, MAX_OUT 64+ | 25 M | -4% | -5% |
+| engine-first, INTERVAL 1, MAX_OUT 64 | 87 M | -30% | -31% |
+| engine-first, INTERVAL 1, MAX_OUT 128 | 167 M | -64% | -65% |
+
 **Rules learned (keep them in any engine use):**
-- Engine tags in the census's free range: **128-255 on bigserver**, so
-  `MAX_OUT` <= 128. Redo the census at the experiment's load (`pips bg census`):
+- Engine tags in the census's free range: **128-255 on both hosts** (the
+  script cuts a free range ending at 255 to its upper half: NIC 0's tags grew
+  from 0-5 to 0-21 under heavy engine trains), so `MAX_OUT` <= 128. Redo the census at the experiment's load (`pips bg census`):
   the set can grow with queue depth.
 - `count=0` for timed runs (a count ends the run early).
 - Idle-fill gives at most ~0.66 M reads/s under the drives' load, about 0.7
@@ -1369,8 +1392,8 @@ Rate and cost (T4/T6, drives at 866/785 kIOPS without the engine):
   test doc §4 "Third run", not written) would settle what earns the hold.
 
 **State:** bigserver runs 0x0A08; its holder from the third run still holds
-the drives (reboot before the next run). icx: first run 11-07 17:47, T1-T3,
-T7, T8 pass, the loaded tests to rerun (command above). Results in
+the drives (reboot before the next run). icx: every test passes (third run,
+11-07 18:25); nothing held, nothing to reboot. Results in
 `dualssd/1106/rid-live/` (FILE-MAP §7).
 
 ### 0x0A08 stress campaign (`pips-campaign.sh ssd --bg`, written 11-07, not run)
@@ -1450,6 +1473,7 @@ syntax-checked (MinGW, stubs); the scripts by `bash -n` and the dry run.
 ### Next
 
 Status 11-07 (evening): **0x0A08 stress campaign written, not run** (section above): on bigserver `git pull`, the native smoke (~45 min, no reboot), then `pips-campaign.sh ssd --bg --tmux` (~30 h, reboot at the end). icx side next (needs the engine's bring-up on icx first: census of the NICs' tags, data check).
+Status 11-07 (third icx run, 18:25): **T0-T9 all PASS on icx** (test doc §4 "Third icx run"). 0x0A08's assumption tests are done on both hosts.
 Status 11-07 (second icx run, 18:02): the NIC load ran. T4: 6.6 G engine reads all SC, but NIC 0's tags grew from 0-5 (T0 census) to 0-21 under heavy trains, 23 inside the window 6-255 -> FAIL, run stopped before T7-T9. Fixed: the window is the upper half (128-255) of a free range ending at 255. Cost on icx: idle-fill free up to 15 M reads/s, engine-first free to ~12 M, -4% at 25 M, -29% at 84 M, -96% at 245 M. Census `cpl0`/`cpl1` maps are swapped vs the doc (both hosts). Rerun the same command.
 Status 11-07 (first icx run, 17:47): **T1-T3 PASS: F0 holds on icx** (each port reads its own NIC's region; both regions at IOVA 0xc0000000, in1's port read in1's NIC's page there), T7 hit 520 / miss 752 ns, **T8: one shared IOTLB**, evicted from N 256 (32 x 8). T4-T6, T9 skipped: styx dropped the load's ports 3760/4760; fixed (+700, as the campaigns). Rerun the same command. Test doc §4 "First icx run".
 Status 11-07 (icx bring-up): `pips-rid-live.sh` now runs on icx without a holder: pages from `pips_bg_region.ko` in each NIC's domain (DW1 = the NIC's number), a built-in alias-rdma load against styx; the old TLP-log harvest is gone (the pages it found were unmapped once its load ended). To run: `bash scripts/pips/pips-rid-live.sh --tmux` on icx (IOMMU strict or lazy). Copy back `~/pips-rid-live-icx-*.tar.gz`.

@@ -536,6 +536,37 @@ before T7-T9. 14 min.
   leave the Gen4 x8 uplink idle cycles. Latency at low rate 586 ns (hits).
 - **T2/T3 PASS** again, as in the first icx run.
 
+### Third icx run: 2026-11-07 18:25 (`dualnic/1106/rid-live/pips-rid-live-icx-1107-182522/`)
+
+**Every test passes, T0-T9**, engine tags 128-255. 16 min.
+
+- **T4 PASS:** 32 trains of 20 s, 8.2 G engine reads under both NICs' load
+  (1587 / 1588 kIOPS of 4 KiB READs each), all SC, no malformed, no timeout,
+  no leak, `WIN_HITS` 0 (NIC 0 used tags 0-12, NIC 1 0-3). T5 PASS.
+- **T6 PASS, cost by engine rate** (MAX_OUT capped at 128):
+
+  | engine trains | reads/s | NIC 0 | NIC 1 |
+  |---|---|---|---|
+  | idle-fill, any setting | 0.25-15.0 M | 0.0% | 0.0% |
+  | engine-first, up to MAX_OUT 8 | <= 12.3 M | 0.0% | 0.0% |
+  | engine-first, INTERVAL 10, MAX_OUT 64/128 | 25.0 M | -3.9% | -4.6% |
+  | engine-first, INTERVAL 1, MAX_OUT 64 | 86.5 M | -30.0% | -30.7% |
+  | engine-first, INTERVAL 1, MAX_OUT 128 | 167 M | -64.4% | -64.8% |
+
+  Latency at low rate ~595 ns (hits), 736 ns at 167 M reads/s.
+- **T7 PASS:** hit p50 520 ns, miss 748 ns, 4.1% misclassified at 626 ns;
+  2 MiB stride 744 ns (no extra walk level).
+- **T8 PASS: one IOTLB for both NICs' domains.** P survives up to N 192
+  (miss <= 0.12), and is evicted from N 256 (0.57-1.00) whether the fresh
+  pages are NIC 0's or NIC 1's: 32 sets x 8 ways. Two reads earn no
+  protection.
+- **T9 PASS:** NIC 0 tags 0-7, NIC 1 0-2 under the READ load.
+- **icx and bigserver compared:** F0 and A7 hold on both. icx's idle-fill
+  gives 15 M reads/s for free (bigserver 0.66 M); engine-first costs about
+  the same per read on both (-4% at 25 M reads/s); icx's IOTLB evicts a page
+  after 256 fresh ones (32 x 8, LRU family), bigserver's after <= 32 once
+  full but keeps reused entries.
+
 ## 5. Software for the tests
 
 ### 5.1 Now: `scripts/pips/pips-rid-check.sh` (written, 2026-11-06)
