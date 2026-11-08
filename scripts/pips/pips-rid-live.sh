@@ -565,11 +565,15 @@ free_win() {   # <census file>: "LO-HI N", the largest tag range unused by every
     }'
 }
 read -r FW FWN <<< "$(free_win "$TD/census.txt")"
+# Headroom: a device takes more tags when it waits longer (icx 11-07: NIC 0 used 0-5 in T0's census, 0-21
+# under T4's engine-first trains, 23 reads inside the window 6-255). A free range ending at 255 is cut to
+# its upper half, from 128, when that leaves at least 64 tags.
+if [ "${FW#*-}" = 255 ] && [ "${FW%-*}" -lt 128 ] 2>/dev/null; then FW=128-255; FWN=128; fi
 case "${TAGWIN:-}" in
     off) ENG_WIN=off; WIN_N=256; sum "   engine tags: all 256 (--tagwin off): reads on a device's live tag come back malformed" ;;
     ?*)  ENG_WIN=$TAGWIN; WIN_N=$(( ${TAGWIN#*-} - ${TAGWIN%-*} + 1 )); sum "   engine tags: $ENG_WIN (--tagwin; the census left $FW free)" ;;
     *)   if [ "$T0_LOAD" = 1 ] && [ "${FWN:-0}" -ge 16 ]; then ENG_WIN=$FW; WIN_N=$FWN
-             sum "   engine tags: $ENG_WIN ($WIN_N), the largest range no device used under load$( [ "$FWN" -lt 64 ] && echo "; MAX_OUT is capped at $WIN_N")"
+             sum "   engine tags: $ENG_WIN ($WIN_N), from the largest range no device used under load (its upper half when it reaches 255)$( [ "$FWN" -lt 64 ] && echo "; MAX_OUT is capped at $WIN_N")"
          elif [ "${FWN:-0}" -ge 16 ]; then ENG_WIN=$FW; WIN_N=$FWN   # no load: the idle census is still better than all 256
              sum "   WARNING: engine tags: $ENG_WIN ($WIN_N), from an idle census (no load ran): a loaded device may use more tags"
          else ENG_WIN=off; WIN_N=256

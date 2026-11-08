@@ -506,6 +506,36 @@ the NIC load never started**. 5 min.
   the fresh pages. Reading P twice protects nothing (LRU family). At N 512
   a few probes hit (0.71): noise of 7 probes, or a pseudo-LRU.
 
+### Second icx run: 2026-11-07 18:02 (`dualnic/1106/rid-live/pips-rid-live-icx-1107-180211/`)
+
+The NIC load ran (alias-rdma, 1587 / 1588 kIOPS of 4 KiB READs per NIC).
+T0-T3, T5, T6 PASS; **T4 FAIL on `WIN_HITS` 23**, which stopped the run
+before T7-T9. 14 min.
+
+- **T4: every engine read was right, but the window wasn't free.** 32
+  trains, 6.6 G reads, all SC, no malformed completion, no timeout, no leak.
+  T0's 30 s census saw NIC 0 using tags 0-5, so the engine took 6-255; under
+  T4's heavy engine-first trains NIC 0 reached tag 21 (its reads waited
+  longer, so more were outstanding), and 23 of its reads fell in the window.
+  None met an engine read in flight. **Fixed:** a free range ending at 255 is
+  cut to its upper half, 128-255 (bigserver's window already was).
+- **Census labels:** on both hosts `cpl0_tags` holds in1's tags and
+  `cpl1_tags` in0's, the reverse of §3.4 ("CPL0 = path dsp0"). Harmless for
+  the window (it takes all four maps); for the hardware agent.
+- **T6 PASS, cost by engine rate on icx** (`T4/iops.tsv`):
+
+  | engine trains | reads/s | NIC 0 | NIC 1 |
+  |---|---|---|---|
+  | idle-fill, any setting | 0.25-15.0 M | 0.0% | 0.0% |
+  | engine-first, up to MAX_OUT 8 | <= 12.2 M | 0.0% | 0.0% |
+  | engine-first, INTERVAL 10, MAX_OUT 64/250 | 25.0 M | -3.9% | -4.3% |
+  | engine-first, INTERVAL 1, MAX_OUT 64 | 83.8 M | -28.9% | -29.4% |
+  | engine-first, INTERVAL 1, MAX_OUT 250 | 245 M | -95.9% | -95.9% |
+
+  Idle-fill reaches 15 M reads/s here (bigserver 0.66 M): the NICs' writes
+  leave the Gen4 x8 uplink idle cycles. Latency at low rate 586 ns (hits).
+- **T2/T3 PASS** again, as in the first icx run.
+
 ## 5. Software for the tests
 
 ### 5.1 Now: `scripts/pips/pips-rid-check.sh` (written, 2026-11-06)
