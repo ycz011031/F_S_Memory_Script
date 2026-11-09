@@ -20,10 +20,15 @@ an option is added).
 - **Last updated:** 2026-11-09 (15:30): **icx `nic --bg` (c11091247, started 12:47) stopped
   short the same way**: at 15:15 the first engine-on run (bith16, f5 nic0only RUN-0) gave "the
   engine did not start", the stop file skipped every later engine-on sweep, and the campaign
-  ended DONE at 2 h 27. Most likely icx ran the runner from before `ceebe0666` (12:42, the
-  30 s / 3-try start below); the run's `bg-cmd.txt` says (try lines = the fix was in). Not
-  styx: styx-check said SAFE. Relaunch with `--fresh` (a resume would skip the engine-on
-  sweeps). Also: the campaign now syncs styx's repo only when styx's copies of the files it
+  ended DONE at 2 h 27. **Cause: the runner's liveness test, not the engine.** The 3-try
+  start was in (`bg-cmd.txt`: tries at 15:15:41/43/45, each try's log empty); `BG_PID` is
+  sudo's PID and on icx `kill -0` from yz69 fails on it (EPERM), so each try took the engine
+  for dead at the first 0.1 s check, before pips printed "started"; the last try's pips did
+  start and the cleanup's SIGINT stopped it ("signal 2 at 0.0 s", 676k reads, 0 errors).
+  bigserver's kill -0 on sudo works (14 engine runs started there), so its 5 s failure is the
+  slow start below. **Fixed:** both runners test with `bg_alive` (this shell's job table,
+  `jobs -rp`). The census was fine: tags 0-45 / 0-20 -> window 128-255. Not styx (styx-check
+  SAFE). Relaunch with `--fresh` (a resume would skip the engine-on sweeps). Also: the campaign now syncs styx's repo only when styx's copies of the files it
   runs differ from icx's (`git hash-object`), stops if one still differs after the sync, and
   says when a styx snapshot fails for lack of user disk room.
 - **2026-11-09:** **bigserver `ssd --bg` (c11082355) is NOT complete**: it ran

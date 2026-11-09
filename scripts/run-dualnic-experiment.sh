@@ -485,6 +485,12 @@ BG_PID=""
 # 11-09: the start is given 30 s and up to 3 tries. Campaign c11082355 lost
 # both halves to a 5 s wait: pips reached "started" at ~5 s (behind the BAR0
 # lock or a slow sudo) and was then stopped as "did not start".
+# Is the engine's sudo still running? Not kill -0: BG_PID is sudo's, and on icx
+# (11-09, c11091247) kill -0 from the user gets EPERM on it, so every start
+# looked dead on the first 0.1 s check, before pips said "started" (3 tries
+# in 4 s, empty logs; the cleanup's SIGINT then stopped the engine at 0.0 s).
+# This shell's job table needs no permission: a job that ended is not listed.
+bg_alive() { jobs -rp | grep -qx "$1"; }
 bg_begin() {   # <log dir>: start the engine for this run; 1 if it did not start
     [ -n "${PIPS_BG:-}" ] || return 0
     local try t0 dt
@@ -501,7 +507,7 @@ bg_begin() {   # <log dir>: start the engine for this run; 1 if it did not start
                 echo "bg_start_ms: $dt try $try" >> "$1/bg-cmd.txt"
                 return 0
             fi
-            kill -0 "$BG_PID" 2>/dev/null || break
+            bg_alive "$BG_PID" || break
             sleep 0.1
         done
         echo "WARNING: the read engine did not start (try $try, $(( ($(date +%s%3N) - t0) / 1000 )) s): $(tail -3 "$1/bg-run.txt" 2>/dev/null | tr '\n' ' ')" >&2
@@ -518,8 +524,8 @@ bg_end() {   # <log dir> <report dir or "">: stop it, keep its counters; 1 if th
     [ -n "$BG_PID" ] || return 0
     local rc k v errs=0 why="" f="$1/bg-run.txt"
     sudo -n pkill -INT -f "^$PIPS bg run " >/dev/null 2>&1
-    for _ in $(seq 150); do kill -0 "$BG_PID" 2>/dev/null || break; sleep 0.1; done
-    if kill -0 "$BG_PID" 2>/dev/null; then
+    for _ in $(seq 150); do bg_alive "$BG_PID" || break; sleep 0.1; done
+    if bg_alive "$BG_PID"; then
         echo "WARNING: pips bg run did not end 15 s after SIGINT: killing it, then pips bg stop" >&2
         sudo -n pkill -KILL -f "^$PIPS bg run " >/dev/null 2>&1
     fi
