@@ -1536,6 +1536,7 @@ engine hook have not run on a host.
 
 ### Next
 
+Status 11-09 (later): bigserver rebooted by the campaign's end: drive 0's interrupts now on CPUs 39/44 (36/41, 40/45 in earlier boots), so `SSD_CORES[0]` -> "37,42,38,43,40,45" (host-local `utils/setup-server.sh`); re-check `ssd-irq-placement.sh --check` after every boot.
 Status 11-09: **bigserver `ssd --bg` c11082355 ran 5 h 27 and stopped short** (engine start failure in each half stopped all engine-on sweeps; engine-off sweeps and the engine-alone phases complete): "Last updated" at the top; results `dualssd/1108/`.
 Status 11-08 (23:55): **bigserver `ssd --bg` launched, refused at preflight** (nothing ran): this boot drive 0's queues interrupt on CPUs 36/41 (earlier boots 40/45), and its fio cores held both. bigserver's `utils/setup-server.sh` (host-local) now `SSD_CORES=( "37,42,38,43,39,44" "46,50,47,51,49,53" )`, SSD_SPLIT_CORES=0; `ssd-irq-placement.sh --check`: OK. Relaunch resumes the same stamp. Re-check after the campaign's final reboot.
 Status 11-08: **icx campaign stopped at iprep, styx's disk full**: run `bash scripts/pips/styx-check.sh` on icx; on SAFE, `bash scripts/pips/pips-campaign.sh nic --bg --tmux` resumes. bigserver's not started.
