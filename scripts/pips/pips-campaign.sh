@@ -1419,7 +1419,7 @@ for m in ${MANIFESTS[@]+"${MANIFESTS[@]}"}; do
               -o -name 'pips-log-record.txt' -o -name 'windows.txt' -o -name 'pips-bp.tsv' \
               -o -name 'iommu-ops.txt' -o -name 'fio-nic*.json' -o -name 'fio-ssd*.json' \
               -o -name 'alias-rdma-nic*.log' -o -name 'alias-nvme.out' -o -name 'bg-run.txt' -o -name 'bg-hist.txt' \
-              -o -name 'bg-cmd.txt' \) -print0 2>/dev/null |
+              -o -name 'bg-cmd.txt' -o -name 'bg-run-try*.txt' \) -print0 2>/dev/null |
           xargs -0 -r cp --parents -t "$OUT/runs/" )
         ( cd "$REPO" && [ -d "$rd" ] && find "$rd"* -maxdepth 1 -type f -name '*.rpt' -size -1M -print0 2>/dev/null |
           xargs -0 -r cp --parents -t "$OUT/runs/" )
@@ -1427,6 +1427,15 @@ for m in ${MANIFESTS[@]+"${MANIFESTS[@]}"}; do
     done < <(grep -v '^#' "$m" | tail -n +2)
 done
 say "packed the small files of $nruns runs"
+# The run that stopped the engine is in no manifest: keep its engine files (11-09).
+for sf in "$OUT"/bg/stop-*; do
+    [ -f "$sf" ] || continue
+    sed -n 's/^(run logs \(.*\))$/\1/p' "$sf" | while read -r d; do
+        [ -d "$d" ] || continue
+        mkdir -p "$OUT/bg/stopped/${d##*/logs/}" &&
+            cp "$d"/bg-*.txt "$d"/*.err "$d"/alias-nvme.out "$OUT/bg/stopped/${d##*/logs/}/" 2>/dev/null
+    done
+done
 {
     echo "pips-campaign $KIND $STAMP on $(hostname), $(date '+%F %T'), +$(fmt_min $(( (SECONDS - T0) / 60 )))"
     echo "sweeps: ${NAMES[*]:-none}"

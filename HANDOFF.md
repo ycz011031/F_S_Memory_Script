@@ -17,7 +17,27 @@ an option is added).
   which sweep and design, which report generator reads what, the published
   pages). On the Windows analysis machine `claude.md` (git-ignored) adds its
   local paths, tools and editing gotchas.
-- **Last updated:** 2026-11-08: **icx campaign (`nic --bg`) started 23:33 and stopped by the
+- **Last updated:** 2026-11-09: **bigserver `ssd --bg` (c11082355) is NOT complete**: it ran
+  5 h 27 of ~44 h 30 (`dualssd/1108/`). In each half `pips bg run` gave no output within the
+  runner's 5 s start wait, once (native: bnh16 d1t0c1p1w31 8k ssd0only RUN-0, after 14 good
+  engine runs; vfio: bvh16f d1t0c1p1w31 4k ssd0only RUN-0, after 2), and that one "did not
+  start" wrote the stop file, which skips every later engine-on sweep of the half. So the
+  data has no engine-under-load results beyond bnh16's first 7 experiments (15.5 M reads/s,
+  0 errors) and bvh16f's first 2. Complete: nprep, nalone, valone (x1, x2, T8b 155 tables),
+  census and deep census, and the engine-off sweeps bnoff, bnsoff, bnhoff, bnq128off,
+  bnq512off, bvofff/e/t (no failures). **Cause (the host's bg-run.txt of both runs): the
+  engine DID start**, at ~5 s, the moment the runner's 5 s wait ran out; the runner then
+  sent SIGINT ("signal 2 at 0.0 s", 450k reads, 0 errors). Why pips took ~5 s to start is
+  not known (the BAR0 lock, whose `take_lock` also gives up at 5 s, or a slow sudo). Also:
+  after exit 3 the runner's leftovers kept the experiment lock, so the sweep's next 6
+  experiments were refused ("another experiment is already running"). **Fixed 11-09:**
+  both runners' `bg_begin` wait 30 s, retry up to 3 times (not after a config refusal), and
+  log `bg_start_ms` in bg-cmd.txt and "started in N ms" on the console; failed tries kept as
+  `bg-run-try<k>.txt`; pips says "waiting for /tmp/... (another pips holds it)" after 1 s
+  on the lock; the bp sampler closes fd 9 and `cleanup` stops it; the campaign's pack keeps
+  the stopping run's engine files in `bg/stopped/`. Rerun with `--fresh` (the old stamp
+  would resume at vstress and never redo the native engine-on sweeps).
+- **2026-11-08:** **icx campaign (`nic --bg`) started 23:33 and stopped by the
   user: styx's disk is full** (`/` 751G, 713G used, 0 available to users; our logs and
   reports there are ~27 MB, so it is someone else's data; admin contacted). Its repo could
   not fetch and the styx snapshot failed. The campaign does not need styx's repo current
@@ -1516,6 +1536,7 @@ engine hook have not run on a host.
 
 ### Next
 
+Status 11-09: **bigserver `ssd --bg` c11082355 ran 5 h 27 and stopped short** (engine start failure in each half stopped all engine-on sweeps; engine-off sweeps and the engine-alone phases complete): "Last updated" at the top; results `dualssd/1108/`.
 Status 11-08 (23:55): **bigserver `ssd --bg` launched, refused at preflight** (nothing ran): this boot drive 0's queues interrupt on CPUs 36/41 (earlier boots 40/45), and its fio cores held both. bigserver's `utils/setup-server.sh` (host-local) now `SSD_CORES=( "37,42,38,43,39,44" "46,50,47,51,49,53" )`, SSD_SPLIT_CORES=0; `ssd-irq-placement.sh --check`: OK. Relaunch resumes the same stamp. Re-check after the campaign's final reboot.
 Status 11-08: **icx campaign stopped at iprep, styx's disk full**: run `bash scripts/pips/styx-check.sh` on icx; on SAFE, `bash scripts/pips/pips-campaign.sh nic --bg --tmux` resumes. bigserver's not started.
 Status 11-07 (19:30): **stress campaign for both hosts, not run**: bigserver `pips-campaign.sh ssd --bg --tmux` (~44 h 30, + 8k, nseq, ndeep; reboot at the end), icx `pips-campaign.sh nic --bg --tmux` (~33 h, no reboot). Section above.

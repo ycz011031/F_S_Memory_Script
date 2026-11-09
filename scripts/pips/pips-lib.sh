@@ -437,6 +437,7 @@ pips_bp_start() {
     printf 'ms\tbp_cycles_0\tbp_cycles_1\tcap_hold_cycles_0\tcap_hold_cycles_1\n' > "$f"
     pips_bp_sample >> "$f"
     (
+        exec 9>&-   # not the runner's experiment lock: a runner that exits early frees it at once
         trap 'exit 0' TERM INT
         end=$(( $(date +%s) + 10800 ))
         while kill -0 "$parent" 2>/dev/null && [ "$(date +%s)" -lt "$end" ]; do

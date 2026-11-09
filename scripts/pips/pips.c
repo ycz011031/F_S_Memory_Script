@@ -294,6 +294,8 @@ static void take_lock(void)
     for (int i = 0; flock(fd, LOCK_EX | LOCK_NB); i++) {
         if (i == 50)
             die("another pips has held %s for 5 s", LOCK_FILE);
+        if (i == 10)
+            fprintf(stderr, "pips: waiting for %s (another pips holds it)\n", LOCK_FILE);
         sleep_ms(100);
     }
     g_lock_fd = fd;

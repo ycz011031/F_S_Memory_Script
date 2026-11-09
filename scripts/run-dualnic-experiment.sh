@@ -482,19 +482,36 @@ alias_count() { local n; n=$(pgrep -c -f "$ALIAS_MATCH client" 2>/dev/null); ech
 # As run-dualssd-experiment.sh's: started once the load runs, stopped after the window.
 BG_STOPFILE=${PIPS_BG_STOPFILE:-$HOME/.pips-bg-stop}
 BG_PID=""
+# 11-09: the start is given 30 s and up to 3 tries. Campaign c11082355 lost
+# both halves to a 5 s wait: pips reached "started" at ~5 s (behind the BAR0
+# lock or a slow sudo) and was then stopped as "did not start".
 bg_begin() {   # <log dir>: start the engine for this run; 1 if it did not start
     [ -n "${PIPS_BG:-}" ] || return 0
-    rm -f "$1/bg-run.txt"
-    echo "\$ pips bg run $PIPS_BG secs=$(( 4 * dur + 600 )) beat=10 stopwin=1" > "$1/bg-cmd.txt"
-    sudo -n "$PIPS" bg run $PIPS_BG secs=$(( 4 * dur + 600 )) beat=10 stopwin=1 > "$1/bg-run.txt" 2>&1 9>&- &
-    BG_PID=$!
-    for _ in $(seq 50); do
-        grep -q '^# bg run: started' "$1/bg-run.txt" 2>/dev/null && { echo "   read engine on: ${PIPS_BG_LABEL:-$PIPS_BG}"; return 0; }
-        kill -0 "$BG_PID" 2>/dev/null || break
-        sleep 0.1
+    local try t0 dt
+    for try in 1 2 3; do
+        rm -f "$1/bg-run.txt"
+        echo "\$ pips bg run $PIPS_BG secs=$(( 4 * dur + 600 )) beat=10 stopwin=1   (try $try, $(date '+%T'))" >> "$1/bg-cmd.txt"
+        t0=$(date +%s%3N)
+        sudo -n "$PIPS" bg run $PIPS_BG secs=$(( 4 * dur + 600 )) beat=10 stopwin=1 > "$1/bg-run.txt" 2>&1 9>&- &
+        BG_PID=$!
+        for _ in $(seq 300); do
+            if grep -q '^# bg run: started' "$1/bg-run.txt" 2>/dev/null; then
+                dt=$(( $(date +%s%3N) - t0 ))
+                echo "   read engine on: ${PIPS_BG_LABEL:-$PIPS_BG} (started in $dt ms$( [ "$try" -gt 1 ] && echo ", try $try"))"
+                echo "bg_start_ms: $dt try $try" >> "$1/bg-cmd.txt"
+                return 0
+            fi
+            kill -0 "$BG_PID" 2>/dev/null || break
+            sleep 0.1
+        done
+        echo "WARNING: the read engine did not start (try $try, $(( ($(date +%s%3N) - t0) / 1000 )) s): $(tail -3 "$1/bg-run.txt" 2>/dev/null | tr '\n' ' ')" >&2
+        cp "$1/bg-run.txt" "$1/bg-run-try$try.txt" 2>/dev/null
+        bg_end "$1" "" >/dev/null 2>&1
+        # An engine error (not a slow start) is not retried.
+        grep -qE '^pips: bg start refused|^pips: .*config error' "$1/bg-run.txt" 2>/dev/null && break
+        sleep 2
     done
     echo "ERROR: the read engine did not start: $(tail -3 "$1/bg-run.txt" 2>/dev/null | tr '\n' ' ')" >&2
-    bg_end "$1" "" >/dev/null 2>&1
     return 1
 }
 bg_end() {   # <log dir> <report dir or "">: stop it, keep its counters; 1 if the engine had a problem
@@ -546,6 +563,7 @@ bg_go() {   # the engine on before the warm-up; the run stops if it does not sta
 
 cleanup() {
     [ -n "$BG_PID" ] && bg_end "${L:-/tmp}" ""
+    pips_bp_stop 2>/dev/null
     sudo pkill -9 iperf3 >/dev/null 2>&1 || true
     rsh_try "sudo pkill -9 iperf3; screen -wipe" >/dev/null 2>&1 || true
     if [ "$gen" = alias ]; then
