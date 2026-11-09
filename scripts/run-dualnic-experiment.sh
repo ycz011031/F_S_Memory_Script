@@ -485,10 +485,12 @@ BG_PID=""
 # 11-09: the start is given 30 s and up to 3 tries. Campaign c11082355 lost
 # both halves to a 5 s wait: pips reached "started" at ~5 s (behind the BAR0
 # lock or a slow sudo) and was then stopped as "did not start".
-# Is the engine's sudo still running? Not kill -0: BG_PID is sudo's, and on icx
-# (11-09, c11091247) kill -0 from the user gets EPERM on it, so every start
-# looked dead on the first 0.1 s check, before pips said "started" (3 tries
-# in 4 s, empty logs; the cleanup's SIGINT then stopped the engine at 0.0 s).
+# Is the engine's sudo still running? Not kill -0: BG_PID is sudo's, and for its
+# first moments sudo runs with every uid root (checking its policy), so kill -0
+# from the user gets EPERM; later it is back on the user's ruid and kill -0
+# works. The first check comes right after the launch, so on icx (11-09,
+# c11091247) 5 of 6 tries "did not start (0 s)" while pips was starting; the
+# cleanup's SIGINT then stopped it at 0.0 s.
 # This shell's job table needs no permission: a job that ended is not listed.
 bg_alive() { jobs -rp | grep -qx "$1"; }
 bg_begin() {   # <log dir>: start the engine for this run; 1 if it did not start

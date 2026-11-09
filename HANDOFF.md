@@ -21,12 +21,13 @@ an option is added).
   short the same way**: at 15:15 the first engine-on run (bith16, f5 nic0only RUN-0) gave "the
   engine did not start", the stop file skipped every later engine-on sweep, and the campaign
   ended DONE at 2 h 27. **Cause: the runner's liveness test, not the engine.** The 3-try
-  start was in (`bg-cmd.txt`: tries at 15:15:41/43/45, each try's log empty); `BG_PID` is
-  sudo's PID and on icx `kill -0` from yz69 fails on it (EPERM), so each try took the engine
-  for dead at the first 0.1 s check, before pips printed "started"; the last try's pips did
-  start and the cleanup's SIGINT stopped it ("signal 2 at 0.0 s", 676k reads, 0 errors).
-  bigserver's kill -0 on sudo works (14 engine runs started there), so its 5 s failure is the
-  slow start below. **Fixed:** both runners test with `bg_alive` (this shell's job table,
+  start was in; `BG_PID` is sudo's PID, and for its first moments sudo runs with every uid
+  root (policy check), so `kill -0` from yz69 gets EPERM there (later it works: ruid back to
+  1021, checked by hand). The runner's first check comes right after the launch: the sweep
+  log has bith16 RUN-0 tries 1-2 "did not start (0 s)", try 3 "started in 114 ms"; the next
+  run all three at 0 s, while pips was in fact starting (try 3's log: started, then the
+  cleanup's SIGINT at 0.0 s, 676k reads, 0 errors). A race, so bigserver can hit it too
+  (14 starts went fine there). **Fixed:** both runners test with `bg_alive` (this shell's job table,
   `jobs -rp`). The census was fine: tags 0-45 / 0-20 -> window 128-255. Not styx (styx-check
   SAFE). Relaunch with `--fresh` (a resume would skip the engine-on sweeps). Also: the campaign now syncs styx's repo only when styx's copies of the files it
   runs differ from icx's (`git hash-object`), stops if one still differs after the sync, and
