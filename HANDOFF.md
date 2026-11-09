@@ -1516,6 +1516,7 @@ engine hook have not run on a host.
 
 ### Next
 
+Status 11-08 (23:55): **bigserver `ssd --bg` launched, refused at preflight** (nothing ran): this boot drive 0's queues interrupt on CPUs 36/41 (earlier boots 40/45), and its fio cores held both. bigserver's `utils/setup-server.sh` (host-local) now `SSD_CORES=( "37,42,38,43,39,44" "46,50,47,51,49,53" )`, SSD_SPLIT_CORES=0; `ssd-irq-placement.sh --check`: OK. Relaunch resumes the same stamp. Re-check after the campaign's final reboot.
 Status 11-08: **icx campaign stopped at iprep, styx's disk full**: run `bash scripts/pips/styx-check.sh` on icx; on SAFE, `bash scripts/pips/pips-campaign.sh nic --bg --tmux` resumes. bigserver's not started.
 Status 11-07 (19:30): **stress campaign for both hosts, not run**: bigserver `pips-campaign.sh ssd --bg --tmux` (~44 h 30, + 8k, nseq, ndeep; reboot at the end), icx `pips-campaign.sh nic --bg --tmux` (~33 h, no reboot). Section above.
 Status 11-07 (evening): **0x0A08 stress campaign written, not run** (section above): on bigserver `git pull`, the native smoke (~45 min, no reboot), then `pips-campaign.sh ssd --bg --tmux` (~30 h, reboot at the end). icx side next (needs the engine's bring-up on icx first: census of the NICs' tags, data check).
