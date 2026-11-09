@@ -17,7 +17,15 @@ an option is added).
   which sweep and design, which report generator reads what, the published
   pages). On the Windows analysis machine `claude.md` (git-ignored) adds its
   local paths, tools and editing gotchas.
-- **Last updated:** 2026-11-07 (19:30): **the 0x0A08 stress campaign now covers both hosts,
+- **Last updated:** 2026-11-08: **icx campaign (`nic --bg`) started 23:33 and stopped by the
+  user: styx's disk is full** (`/` 751G, 713G used, 0 available to users; our logs and
+  reports there are ~27 MB, so it is someone else's data; admin contacted). Its repo could
+  not fetch and the styx snapshot failed. The campaign does not need styx's repo current
+  (nothing styx runs changed since alias campaign 2), only matching copies, a built
+  alias-rdma and root write room (the loads run under sudo, into ext4's root reserve).
+  `bash scripts/pips/styx-check.sh` (on icx) checks exactly that and prints SAFE / NOT SAFE;
+  then `pips-campaign.sh nic --bg --tmux` resumes.
+- **2026-11-07 (19:30):** **the 0x0A08 stress campaign now covers both hosts,
   written, not run** (§8 "0x0A08 stress campaign"). bigserver (`ssd --bg`, ~44 h 30): the base
   fio runs widened (user, 11-07): 8k in nstress/nheavy, `nseq` (fio sequential reads, each
   instance its own slice), `ndeep` (iodepth 128 and 512, its own tag census). icx (`nic --bg`,
@@ -1508,6 +1516,7 @@ engine hook have not run on a host.
 
 ### Next
 
+Status 11-08: **icx campaign stopped at iprep, styx's disk full**: run `bash scripts/pips/styx-check.sh` on icx; on SAFE, `bash scripts/pips/pips-campaign.sh nic --bg --tmux` resumes. bigserver's not started.
 Status 11-07 (19:30): **stress campaign for both hosts, not run**: bigserver `pips-campaign.sh ssd --bg --tmux` (~44 h 30, + 8k, nseq, ndeep; reboot at the end), icx `pips-campaign.sh nic --bg --tmux` (~33 h, no reboot). Section above.
 Status 11-07 (evening): **0x0A08 stress campaign written, not run** (section above): on bigserver `git pull`, the native smoke (~45 min, no reboot), then `pips-campaign.sh ssd --bg --tmux` (~30 h, reboot at the end). icx side next (needs the engine's bring-up on icx first: census of the NICs' tags, data check).
 Status 11-07 (third icx run, 18:25): **T0-T9 all PASS on icx** (test doc §4 "Third icx run"). 0x0A08's assumption tests are done on both hosts.
