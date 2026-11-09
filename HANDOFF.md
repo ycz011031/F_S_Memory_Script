@@ -27,7 +27,9 @@ an option is added).
   log has bith16 RUN-0 tries 1-2 "did not start (0 s)", try 3 "started in 114 ms"; the next
   run all three at 0 s, while pips was in fact starting (try 3's log: started, then the
   cleanup's SIGINT at 0.0 s, 676k reads, 0 errors). A race, so bigserver can hit it too
-  (14 starts went fine there). **Fixed:** both runners test with `bg_alive` (this shell's job table,
+  (14 starts went fine there) bigserver's c11082355 failure has the same signature (sweep log:
+  "did not start:" with an empty bg-run.txt tail, before the 30 s / 3-try code), so it was
+  most likely this race too; `ceebe0666`'s longer wait and retries only improve the odds. **Fixed:** both runners test with `bg_alive` (this shell's job table,
   `jobs -rp`). The census was fine: tags 0-45 / 0-20 -> window 128-255. Not styx (styx-check
   SAFE). Relaunch with `--fresh` (a resume would skip the engine-on sweeps). Also: the campaign now syncs styx's repo only when styx's copies of the files it
   runs differ from icx's (`git hash-object`), stops if one still differs after the sync, and
