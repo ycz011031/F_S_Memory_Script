@@ -814,7 +814,9 @@ if [ "$KIND" = nic ]; then
            rcp_back "$r.tar.gz" "$OUT/snapshots/styx-$1.tar.gz" 2>/dev/null; then
             rsh_try "rm -rf '$r' '$r.tar.gz'" >/dev/null 2>&1
         else
-            note "styx snapshot ($1) failed (is scripts/nic-host-snapshot.sh in styx's copy of the repo?)"
+            local av; av=$(rsh_try "df -Pk /tmp | awk 'NR == 2 { print \$4 }'" 2>/dev/null)
+            if [ "${av:-1}" = 0 ]; then note "styx snapshot ($1) not taken: styx's disk has no room for $CLIENT_USERNAME (df: 0 available)"
+            else note "styx snapshot ($1) failed (is scripts/nic-host-snapshot.sh in styx's copy of the repo?)"; fi
         fi
     }
 fi
@@ -1272,9 +1274,35 @@ if [ "$BG" = 1 ]; then
     say "read engine: $(grep -E '^(bg_id|bg_caps)' "$OUT/bg/bg-info.txt" | xargs)$( [ "$BG_DEAD" = 1 ] && echo "; STOPPED FOR GOOD before (bg/DEAD)")"
 fi
 if [ "$KIND" = nic ]; then
-    say "client: syncing styx's repo (git pull --ff-only), as run-dualnic-experiment.sh --sync-client"
-    rsh_try "cd '$REPO' && git fetch -q origin && git checkout -q $(git -C "$REPO" rev-parse --abbrev-ref HEAD) && git pull -q --ff-only" ||
-        note "styx's repo did not sync: the runs use whatever it has"
+    # styx runs its own copies of these (the runner sends icx's paths). Sync
+    # its repo only when one differs from ours (11-09: styx's disk was full
+    # and every fetch failed, while its copies were all current). A file the
+    # runs use that still differs after the sync stops the campaign here;
+    # the snapshot script only costs the snapshots.
+    CLIENT_RUN="utils/setup-envir.sh utils/tcp/run-netapp-tput.sh scripts/pips/alias/alias-rdma.c scripts/pips/alias/alias_common.h scripts/pips/alias/alias-run.sh scripts/pips/alias/Makefile"
+    CLIENT_ALL="$CLIENT_RUN scripts/nic-host-snapshot.sh"
+    client_differs() {   # <files>: those whose content on styx is not ours (all of them if ssh fails)
+        local f h
+        h=$(rsh_try "cd '$REPO' && for f in $1; do printf '%s ' \"\$f\"; git hash-object \"\$f\" 2>/dev/null || echo missing; done" 2>/dev/null) || { echo "$1"; return; }
+        for f in $1; do
+            [ "$(awk -v f="$f" '$1 == f { print $2 }' <<< "$h")" = "$(git -C "$REPO" hash-object "$f" 2>/dev/null)" ] || printf '%s ' "$f"
+        done
+    }
+    cd_=$(client_differs "$CLIENT_ALL")
+    if [ -z "$cd_" ]; then
+        say "client: styx's copies of the files it runs match ours: its repo is not synced (not needed)"
+    else
+        say "client: styx's copies differ ($cd_): syncing its repo (git pull --ff-only)"
+        rsh_try "cd '$REPO' && git fetch -q origin && git checkout -q $(git -C "$REPO" rev-parse --abbrev-ref HEAD) && git pull -q --ff-only" ||
+            note "styx's repo did not sync (full disk? bash scripts/pips/styx-check.sh)"
+        cd_=$(client_differs "$CLIENT_RUN")
+        if [ -n "$cd_" ]; then
+            echo "ERROR: styx's copies of $cd_ still differ from ours, and the runs would use them." >&2
+            echo "  Bring styx's repo up to date (bash scripts/pips/styx-check.sh says what is wrong), then relaunch." >&2
+            exit 1
+        fi
+        [ -z "$(client_differs scripts/nic-host-snapshot.sh)" ] || note "styx's nic-host-snapshot.sh differs from ours: its snapshots use its own copy"
+    fi
     HW_OK=0
     if rsh_try "sudo -n sh -c 'echo 10000 > /sys/class/net/$C0/queues/tx-0/tx_maxrate && echo 0 > /sys/class/net/$C0/queues/tx-0/tx_maxrate'" 2>/dev/null; then
         HW_OK=1; say "styx $C0 takes tx_maxrate: hardware pacing available"
