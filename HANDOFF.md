@@ -35,6 +35,14 @@ an option is added).
   refused (`random order needs ws a power of two`: x1 left order=random): fixed in
   `pips-bg-lib.sh` (tables run order=cyclic; x1 random only powers of two). Next: why icx
   died; resume icx (`pips-campaign.sh nic --bg --tmux`, check `--dry-run`); rerun the probes.
+  Batching (page v2, counters; page order assumed as 0x0A06/0x0A07, user 11-11): with the engine
+  off, depth 16 gives icx NIC 0 alone +17-19% alias-rdma (fits too: the batching, not misses;
+  rotation misses 17.7 -> 5.8 M/s) and +16-18% TCP at 5 flows; bigserver's drives within a few %,
+  no pattern; the engine's cost is the same under all four settings on both hosts. icx TCP 30
+  flows both NICs sits at 48 Gb/s (24 per NIC) everywhere: an outside limit, not looked into.
+  Skylake IOTLB: the geometry models left out each drive's 8 hot queue pages (4 SQ + 4 CQ, every
+  command); counting them: knee ~96 data pages -> ~104 entries (engine alone: ~112-128), the
+  eviction probe's ~40 -> ~42-56: still apart; T8b (fixed) to settle it.
 - **2026-11-09 (15:30):** **icx `nic --bg` (c11091247, started 12:47) stopped
   short the same way**: at 15:15 the first engine-on run (bith16, f5 nic0only RUN-0) gave "the
   engine did not start", the stop file skipped every later engine-on sweep, and the campaign
