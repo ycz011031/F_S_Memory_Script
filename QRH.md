@@ -60,6 +60,7 @@ raw TLP logs stay on the host.
 | `--no-hw` | NICs: leaves out the phase paced in styx's NIC hardware. |
 | `--stamp S` | The label prefix for this campaign's sweeps (default `c<MMDDhhmm>`). |
 | `--fresh` | Starts a new campaign even if a half-done one is there. The old one is left as it is. |
+| `--nic-modes "M ..."` | nic `--bg`: the alias-rdma modes (default `nic0only both`). | |
 | `--levels "L ..."` | With `--bg`: only these engine levels in the stress sweeps (the cross phases keep theirs); e.g. `pips-icx-finish.sh`. | |
 | `--smoke` | With `--bg`: every step once, small (levels off/m16/mx, 1 run, 4k, two settings, 6 T8b tables, ndeep qd 512, nseq 4k; nic 5 flows, patterns f/r). ssd ~1 h 45 with both halves; `--only "nprep nalone nstress nseq nheavy ncross ndeep nend"` = native only, ~1 h 05, no reboot. nic ~2 h 25. |
 | `--no-reboot` | `ssd --alias/--alias2/--bg`: at the end the drives stay held, and you run the reboot yourself (`sync; sudo systemctl reboot -ff`). |

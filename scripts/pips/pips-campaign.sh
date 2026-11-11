@@ -184,6 +184,8 @@
 #   --levels "L ..."  with --bg: the engine levels of the stress sweeps (default
 #                     all: ssd off h16 m1 m4 m16 c16 v16 d16 h50 m50 hx mx, nic
 #                     the same without d16); the cross phases keep theirs
+#   --nic-modes "M .."  nic --bg: the alias-rdma modes (default "nic0only both";
+#                     both NICs sit at the shared uplink's cap)
 #   --fresh           start a new campaign even if a half-done one of this
 #                     kind is there (it stays as it is)
 #   --no-reboot       ssd --alias: at the end, leave the drives held and the
@@ -255,7 +257,7 @@ case "$KIND" in
 esac
 PASS=("$KIND"); IN_TMUX=0
 for a in "$@"; do if [ "$a" = --tmux ]; then IN_TMUX=1; else PASS+=("$a"); fi; done
-LEVELS_OPT=""; DRY=0; ONLY=""; SKIP=""; ANALYSIS=1; PENDING=""; WIRE=1; HW=1; JOBS=""; STAMP=""; RETIRE=""; MINIMAL=0; PAPER=0; LEG_WANT=""; RUNS=""; ALIAS=0; ALIAS2=0; FRESH=0; REBOOT=1
+LEVELS_OPT=""; NICMODES_OPT=""; DRY=0; ONLY=""; SKIP=""; ANALYSIS=1; PENDING=""; WIRE=1; HW=1; JOBS=""; STAMP=""; RETIRE=""; MINIMAL=0; PAPER=0; LEG_WANT=""; RUNS=""; ALIAS=0; ALIAS2=0; FRESH=0; REBOOT=1
 BG=0; LOCKUP_SOFT=0; SMOKE=0
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -281,6 +283,7 @@ while [ $# -gt 0 ]; do
         --stamp) STAMP="$2"; shift 2 ;;
         --fresh) FRESH=1; shift ;;
         --levels) LEVELS_OPT="$2"; shift 2 ;;
+        --nic-modes) NICMODES_OPT="$2"; shift 2 ;;
         --no-reboot) REBOOT=0; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "pips-campaign: unknown option $1 (--help)" >&2; exit 2 ;;
@@ -323,6 +326,10 @@ if [ -n "$LEVELS_OPT" ]; then
             { echo "pips-campaign: --levels: '$l' is not a level for $KIND (off h16 m1 m4 m16 c16 v16 d16 h50 m50 hx mx; no d16 on nic)" >&2; exit 2; }
     done
     BG_LEVELS=$LEVELS_OPT; BG_ILEVELS=$LEVELS_OPT
+fi
+if [ -n "$NICMODES_OPT" ]; then
+    for m in $NICMODES_OPT; do case $m in nic0only|nic1only|both) ;; *) echo "pips-campaign: --nic-modes: nic0only, nic1only or both, not '$m'" >&2; exit 2 ;; esac; done
+    BG_IMODES=$NICMODES_OPT
 fi
 # --minimal, --paper and --alias leave the pending 0x0A04/0x0A05 analysis out unless --pending.
 [ -n "$PENDING" ] || { if [ "$MINIMAL" = 1 ] || [ "$PAPER" = 1 ] || [ "$ALIAS" = 1 ] || [ "$BG" = 1 ]; then PENDING=0; else PENDING=1; fi; }

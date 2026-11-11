@@ -54,6 +54,7 @@ BG_ILEVELS="off h16 m1 m4 m16 c16 v16 h50 m50 hx mx"
 BG_ICROSS_LEVELS="m16 v16 mx"
 BG_IFLOWS="5 30"
 BG_IPATS="f r t"
+BG_IMODES="nic0only both"                # alias-rdma modes (pips-campaign --nic-modes)
 BG_IREPL_MAX=0
 # --smoke: every step once, small: the levels off, m16 and mx, one run, 4k,
 # d1t0c1 and d16t218c1 (pb 0), ws 32 and 128 in the knee, 6 T8b tables, the
@@ -588,8 +589,8 @@ bg_nsweeps() {   # <phase>: runs (each sweep adds its datapath run) or minutes /
         ialone) echo $(( 10 + $(nw $BG_X1_WS) )) ;;
         irepl) echo 4 ;;
         itcp) echo $(( $(nw $BG_ILEVELS) * (s * 2 * $(nw $BG_IFLOWS) * RUNS + 1) * 13 / 8 )) ;;
-        irdma) echo $(( $(nw $BG_ILEVELS) * $(nw $BG_IPATS) * (s * 2 * RUNS + 1) )) ;;
-        icross) echo $(( $(nw $BG_ICROSS_LEVELS) * $(nw $(echo $BG_IPATS | tr ' ' '\n' | grep -v t)) * (s * 2 + 1) )) ;;
+        irdma) echo $(( $(nw $BG_ILEVELS) * $(nw $BG_IPATS) * (s * $(nw $BG_IMODES) * RUNS + 1) )) ;;
+        icross) echo $(( $(nw $BG_ICROSS_LEVELS) * $(nw $(echo $BG_IPATS | tr ' ' '\n' | grep -v t)) * (s * $(nw $BG_IMODES) + 1) )) ;;
         iend) echo 0 ;;
         *) echo 0 ;;
     esac
@@ -778,8 +779,8 @@ bg_phase() {
             say "  region again: NIC 0 IOVA $BN_B0, NIC 1 $BN_B1"
             step_mark irepl ;;
         itcp)    bg_sweeps nic bit in0 "$BG_ILEVELS" --modes "nic0only both" "$BG_IFLOWS" uncapped "$RUNS" ;;
-        irdma)   bg_sweeps nic bir in0 "$BG_ILEVELS" --modes "nic0only both" "@QPS@" uncapped "$RUNS" ;;
-        icross)  bg_sweeps nic bix in1 "$BG_ICROSS_LEVELS" --modes "nic0only both" "@QPS@" uncapped 1 ;;
+        irdma)   bg_sweeps nic bir in0 "$BG_ILEVELS" --modes "$BG_IMODES" "@QPS@" uncapped "$RUNS" ;;
+        icross)  bg_sweeps nic bix in1 "$BG_ICROSS_LEVELS" --modes "$BG_IMODES" "@QPS@" uncapped 1 ;;
         iend)
             if [ "$DRY" = 1 ]; then echo "    rmmod pips_bg_region"; return 0; fi
             bn_mod_unload; step_mark nic-done; say "icx: module unloaded" ;;
