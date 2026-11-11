@@ -407,6 +407,9 @@ bg_x1() {
     mkdir -p "$d"
     for o in cyclic random; do
         for w in $BG_X1_WS; do
+            # random order needs ws a power of two (pips: config error 3); campaigns
+            # c11091248/c11091541 ran ws 48, 80 ... random, every one refused (11-11)
+            [ "$o" = random ] && [ $((w & (w - 1))) != 0 ] && continue
             bg_flush "$h" || return 1
             if [ "$h" != vfio ]; then bk=$BN_BK; base=$BN_B0; win=$BN_WIN; else bk=$BG_FLUSH_BK; base=$BV_B0; win=$BV_WIN; fi
             eng_run "$d/$o-w$w.txt" rid=in0 base=$base backing=$bk tagwin=$win maxout=1 ws=$w stride=1 order=$o \
@@ -480,8 +483,11 @@ bg_tables_run() {
         bg_flush "$h" || return 1
         if [ "$h" = vfio ]; then base=$BV_B0; else base=$BN_B0; fi   # a remap may put the region elsewhere
         pipsb bg table load "$d/tables/$name.txt" > "$d/$name-load.txt" 2>&1 || { note "$h tables $name: table load failed"; continue; }
+        # order=cyclic: the engine keeps its settings between runs, and x1's last
+        # order=random with a table's ws (not a power of two) is refused: all
+        # 155 T8b and 14 icx tables of c11091248/c11091541 were (11-11)
         eng_run "$d/$name.txt" rid=in0 base=$base backing=$bk tagwin=$win maxout=1 src=table ws=$n count=$n \
-            interval=$iv trace=1 tskip=0 secs=30 || true
+            order=cyclic stride=1 interval=$iv trace=1 tskip=0 secs=30 || true
         pipsb bg trace "$d/$name.csv" 4096 > "$d/$name-trace.txt" 2>&1
         [ $((i % 20)) = 0 ] && say "  tables: $i of $tot done"
         [ "$BG_DEAD" = 1 ] && return 1

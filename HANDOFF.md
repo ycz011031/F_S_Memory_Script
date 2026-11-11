@@ -17,7 +17,25 @@ an option is added).
   which sweep and design, which report generator reads what, the published
   pages). On the Windows analysis machine `claude.md` (git-ignored) adds its
   local paths, tools and editing gotchas.
-- **Last updated:** 2026-11-09 (15:30): **icx `nic --bg` (c11091247, started 12:47) stopped
+- **Last updated:** 2026-11-11: **0x0A08 stress campaign results in, both hosts** (page "PIPS
+  0x0A08 Stress Campaign" https://claude.ai/artifact/J8Dmy92vXFQTzEBxYrfKfX; data
+  `dualssd/1110/`, `dualnic/1110/`; `report-gen/c1110.py`, `a1110.py`, `page1110.py`).
+  **bigserver c11091248 complete** (39 h 05, 1176 of 1208 points; lost: ndeep qd 512 at v16,
+  where 39 engine reads passed the 1 ms timeout in one run's first 31 ms, and qd 512 mx).
+  **icx c11091541 died at ~01:38 11-11** (33 h 57, cause unknown, heartbeat stopped too):
+  itcp all 11 levels, irdma off..m16 f (m16 r half); not run: irdma m16 t, c16..mx, icross,
+  iend, pack. Findings: hits cost about as much as misses (native fio h16 -6.9% median, m16
+  -8.2% at only 6.8 M/s; h50/hx -17/-24%, -51% at 4k; vfio both drives h16/m16 -7%, a lone
+  vfio drive ~0 except m50/mx -6%); the engine's one-shot misses evict the drives' entries
+  (device misses per I/O 4k 1.3 -> 7.4, 1m 271 -> 433 native; 0.6-1.0 -> 1.5-2.0 vfio); native
+  miss reads wait 16-22 us under fio (1.2 us on vfio, 1.7 us alone); with both drives the miss
+  cost lands on drive 1 (-29..-49%) while drive 0 gains, in either domain; icx TCP -4..-20%
+  (v16, 512 pages over the 256-entry IOTLB, worst), alias-rdma <= 1.5%. **Lost to a script
+  bug:** all T8b (155) and icx policy (14) tables and x1's non-power-of-two random points were
+  refused (`random order needs ws a power of two`: x1 left order=random): fixed in
+  `pips-bg-lib.sh` (tables run order=cyclic; x1 random only powers of two). Next: why icx
+  died; resume icx (`pips-campaign.sh nic --bg --tmux`, check `--dry-run`); rerun the probes.
+- **2026-11-09 (15:30):** **icx `nic --bg` (c11091247, started 12:47) stopped
   short the same way**: at 15:15 the first engine-on run (bith16, f5 nic0only RUN-0) gave "the
   engine did not start", the stop file skipped every later engine-on sweep, and the campaign
   ended DONE at 2 h 27. **Cause: the runner's liveness test, not the engine.** The 3-try
@@ -1553,6 +1571,7 @@ engine hook have not run on a host.
 
 ### Next
 
+Status 11-11: **0x0A08 stress campaign in**: bigserver complete, icx died at 33 h 57 (irdma c16..mx, icross to run); page https://claude.ai/artifact/J8Dmy92vXFQTzEBxYrfKfX; "Last updated" at the top.
 Status 11-09 (later): bigserver rebooted by the campaign's end: drive 0's interrupts now on CPUs 39/44 (36/41, 40/45 in earlier boots), so `SSD_CORES[0]` -> "37,42,38,43,40,45" (host-local `utils/setup-server.sh`); re-check `ssd-irq-placement.sh --check` after every boot.
 Status 11-09: **bigserver `ssd --bg` c11082355 ran 5 h 27 and stopped short** (engine start failure in each half stopped all engine-on sweeps; engine-off sweeps and the engine-alone phases complete): "Last updated" at the top; results `dualssd/1108/`.
 Status 11-08 (23:55): **bigserver `ssd --bg` launched, refused at preflight** (nothing ran): this boot drive 0's queues interrupt on CPUs 36/41 (earlier boots 40/45), and its fio cores held both. bigserver's `utils/setup-server.sh` (host-local) now `SSD_CORES=( "37,42,38,43,39,44" "46,50,47,51,49,53" )`, SSD_SPLIT_CORES=0; `ssd-irq-placement.sh --check`: OK. Relaunch resumes the same stamp. Re-check after the campaign's final reboot.
