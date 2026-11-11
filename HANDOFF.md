@@ -1579,6 +1579,7 @@ engine hook have not run on a host.
 
 ### Next
 
+Status 11-11 (later): **icx finish written, not run**: `bash scripts/pips/pips-icx-finish.sh` (on icx; `--dry-run` first) resumes c11091541 in place: iprep, irepl (fixed tables), the 20 remaining irdma sweeps, icross, iend, pack; ~17 h, no reboot. Checks styx first.
 Status 11-11: **0x0A08 stress campaign in**: bigserver complete, icx died at 33 h 57 (irdma c16..mx, icross to run); page https://claude.ai/artifact/J8Dmy92vXFQTzEBxYrfKfX; "Last updated" at the top.
 Status 11-09 (later): bigserver rebooted by the campaign's end: drive 0's interrupts now on CPUs 39/44 (36/41, 40/45 in earlier boots), so `SSD_CORES[0]` -> "37,42,38,43,40,45" (host-local `utils/setup-server.sh`); re-check `ssd-irq-placement.sh --check` after every boot.
 Status 11-09: **bigserver `ssd --bg` c11082355 ran 5 h 27 and stopped short** (engine start failure in each half stopped all engine-on sweeps; engine-off sweeps and the engine-alone phases complete): "Last updated" at the top; results `dualssd/1108/`.
