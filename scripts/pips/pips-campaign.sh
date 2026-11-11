@@ -181,6 +181,9 @@
 #   --no-hw           NIC: leave out the hardware-paced phase
 #   -j N              logs at a time in the analysis (default: half the CPUs, at most 16)
 #   --stamp S         the label prefix of this campaign's sweeps (default c<MMDDhhmm>)
+#   --levels "L ..."  with --bg: the engine levels of the stress sweeps (default
+#                     all: ssd off h16 m1 m4 m16 c16 v16 d16 h50 m50 hx mx, nic
+#                     the same without d16); the cross phases keep theirs
 #   --fresh           start a new campaign even if a half-done one of this
 #                     kind is there (it stays as it is)
 #   --no-reboot       ssd --alias: at the end, leave the drives held and the
@@ -252,7 +255,7 @@ case "$KIND" in
 esac
 PASS=("$KIND"); IN_TMUX=0
 for a in "$@"; do if [ "$a" = --tmux ]; then IN_TMUX=1; else PASS+=("$a"); fi; done
-DRY=0; ONLY=""; SKIP=""; ANALYSIS=1; PENDING=""; WIRE=1; HW=1; JOBS=""; STAMP=""; RETIRE=""; MINIMAL=0; PAPER=0; LEG_WANT=""; RUNS=""; ALIAS=0; ALIAS2=0; FRESH=0; REBOOT=1
+LEVELS_OPT=""; DRY=0; ONLY=""; SKIP=""; ANALYSIS=1; PENDING=""; WIRE=1; HW=1; JOBS=""; STAMP=""; RETIRE=""; MINIMAL=0; PAPER=0; LEG_WANT=""; RUNS=""; ALIAS=0; ALIAS2=0; FRESH=0; REBOOT=1
 BG=0; LOCKUP_SOFT=0; SMOKE=0
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -277,6 +280,7 @@ while [ $# -gt 0 ]; do
         -j) JOBS="$2"; shift 2 ;;
         --stamp) STAMP="$2"; shift 2 ;;
         --fresh) FRESH=1; shift ;;
+        --levels) LEVELS_OPT="$2"; shift 2 ;;
         --no-reboot) REBOOT=0; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "pips-campaign: unknown option $1 (--help)" >&2; exit 2 ;;
@@ -312,6 +316,14 @@ STAMP=${STAMP:-c$(date +%m%d%H%M)}
 [ "$BG" = 1 ] && ANALYSIS=0      # misses per I/O and throughput: no page-order analysis
 [ "$SMOKE" = 1 ] && [ "$BG" = 0 ] && { echo "pips-campaign: --smoke goes with --bg" >&2; exit 2; }
 [ "$SMOKE" = 1 ] && bg_smoke
+if [ -n "$LEVELS_OPT" ]; then
+    [ "$BG" = 1 ] || { echo "pips-campaign: --levels goes with --bg" >&2; exit 2; }
+    for l in $LEVELS_OPT; do
+        bg_level "$l" "$( [ "$KIND" = nic ] && echo nic || echo native)" ||
+            { echo "pips-campaign: --levels: '$l' is not a level for $KIND (off h16 m1 m4 m16 c16 v16 d16 h50 m50 hx mx; no d16 on nic)" >&2; exit 2; }
+    done
+    BG_LEVELS=$LEVELS_OPT; BG_ILEVELS=$LEVELS_OPT
+fi
 # --minimal, --paper and --alias leave the pending 0x0A04/0x0A05 analysis out unless --pending.
 [ -n "$PENDING" ] || { if [ "$MINIMAL" = 1 ] || [ "$PAPER" = 1 ] || [ "$ALIAS" = 1 ] || [ "$BG" = 1 ]; then PENDING=0; else PENDING=1; fi; }
 [ -n "$RUNS" ] || { if [ "$ALIAS2" = 1 ] || [ "$BG" = 1 ]; then RUNS=2; elif [ "$ALIAS" = 1 ]; then RUNS=1; else RUNS=3; fi; }
@@ -483,7 +495,7 @@ if [ "$BG" = 1 ]; then
     read -r -a PHASES <<< "$(bg_phases)"
     [ "$DRY" = 1 ] && bg_dry_init
     MIN_PER_PT=1.08
-    [ "$KIND" = nic ] && MIN_PER_PT=1.6        # alias-rdma runs; bg_nsweeps counts iperf3 runs 13/8
+    [ "$KIND" = nic ] && MIN_PER_PT=2.6        # measured c11091541: alias-rdma 45 min per 17-run sweep; bg_nsweeps counts iperf3 runs 13/8
 elif [ "$ALIAS2" = 1 ]; then
     if [ "$KIND" = nic ]; then PHASES=(n2ways n2sets n2rot n2small n2sge n2place n2share n2walk n2cap n2lat n2quant n2rep)
     else PHASES=(s2cap s2probe s2place s2order s2walk s2rep); fi
